@@ -2158,7 +2158,8 @@ fn main() {
 /// send_command plus the daemon-shutdown-race recovery: ensure_daemon no
 /// longer pays a settle-sleep on every invocation, so a daemon that exited
 /// right after its liveness check surfaces as an unreachable socket on the
-/// request itself. Respawn once and retry before reporting failure.
+/// request itself. Recover once only when connection failed before sending;
+/// unknown command outcomes never enter daemon recovery or automatic replay.
 fn send_command_with_respawn(
     cmd: serde_json::Value,
     session: &str,

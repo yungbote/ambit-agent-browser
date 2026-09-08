@@ -13,6 +13,8 @@
 //! without retrying the launch, and gives state saving a
 //! one-second grace period before closing owned browsers. Sandbox policy also
 //! keeps NetworkServiceInProcess disabled after plugin launch mutations.
+//! Command delivery uses the same CLI transport: once sending is attempted,
+//! lost/invalid responses report an unknown outcome without automatic replay.
 //! Owned Windows Chrome uses the same private headless desktop and Job Object
 //! lifetime through MCP; headed and external-connection semantics are unchanged.
 
@@ -4841,6 +4843,22 @@ mod tests {
             result["structuredContent"]["response"]["data"]["lastUrl"],
             "https://example.com/path"
         );
+    }
+
+    #[test]
+    fn tool_result_preserves_unknown_command_outcome() {
+        let error = "Command outcome unknown: response lost. Inspect current browser or external state before retrying.";
+        let result = tool_result_from_run(CliRun {
+            exit_code: Some(1),
+            stdout: json!({"success": false, "error": error}).to_string(),
+            stderr: String::new(),
+        });
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["response"]["error"], error);
+        assert!(result["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("before retrying"));
     }
 
     #[test]

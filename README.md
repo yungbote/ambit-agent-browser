@@ -552,6 +552,10 @@ agent-browser skills path [name]      # Print skill directory path
 
 Serves bundled skill content that always matches the installed CLI version. AI agents use this to get current instructions rather than relying on cached copies. Set `AGENT_BROWSER_SKILLS_DIR` to override the skills directory path.
 
+### Command delivery and recovery
+
+Temporary connection failures can be retried before a command is sent. Once sending is attempted, agent-browser never automatically replays the command after a write failure, lost response, timeout, or invalid response. It reports `Command outcome unknown` because the action may already have been applied. Inspect the current browser or external state before repeating it. This applies to every command, including batch commands and MCP tools, with or without `--require-daemon`.
+
 ### Supervised daemon
 
 Run `agent-browser daemon` under a process supervisor to keep the daemon in the invoking process with its original PID and stderr. It uses ordinary global flags and config files, refuses an occupied session, and publishes its configuration before accepting commands. The browser launches when a client first needs it. `close` saves configured state, closes owned browsers, and removes session metadata. Ctrl+C and Unix SIGTERM/SIGHUP cancel active commands, pending Chrome startup, and maintenance work before closing owned browsers. A canceled startup reaps its owned process group without retrying. On a termination signal, state saving gets a one-second grace period; a timeout is reported on stderr and the latest changes may not be saved. A released `.lock` file remains so concurrent starters always use the same lock.

@@ -728,3 +728,7 @@ agent-browser screenshot output.png
 The `--allow-file-access` flag enables JavaScript to access other local files. Chromium only.
 
 See [Files & Clipboard](/files) for local files, uploads, downloads, screenshots, PDFs, and clipboard workflows.
+
+## Command delivery and recovery
+
+Temporary connection failures can be retried before a command is sent. Once sending is attempted, agent-browser never automatically replays the command after a write failure, lost response, timeout, or invalid response. It reports `Command outcome unknown` because the action may already have been applied. Inspect the current browser or external state before repeating it. This applies to every command, including batch commands and MCP tools, with or without `--require-daemon`.

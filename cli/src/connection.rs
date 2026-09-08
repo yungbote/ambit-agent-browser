@@ -1125,101 +1125,93 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
     Err(format!("Daemon failed to start ({})", endpoint_info))
 }
 
-fn connect(session: &str) -> Result<Connection, String> {
+fn connect(session: &str) -> std::io::Result<Connection> {
     #[cfg(unix)]
     {
         let socket_path = get_socket_path(session);
-        UnixStream::connect(&socket_path)
-            .map(Connection::Unix)
-            .map_err(|e| format!("Failed to connect: {}", e))
+        UnixStream::connect(&socket_path).map(Connection::Unix)
     }
     #[cfg(windows)]
     {
         let port = resolve_port(session);
-        TcpStream::connect(format!("127.0.0.1:{}", port))
-            .map(Connection::Tcp)
-            .map_err(|e| format!("Failed to connect: {}", e))
+        TcpStream::connect(format!("127.0.0.1:{}", port)).map(Connection::Tcp)
     }
 }
 
-pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
-    // Retry logic for transient errors (EAGAIN/EWOULDBLOCK/connection issues)
-    const MAX_RETRIES: u32 = 5;
-    const RETRY_DELAY_MS: u64 = 200;
+/// Delivery phase is the retry authority. No error after the first write
+/// attempt can prove the daemon did not execute the command, even if write_all
+/// itself failed or the response was empty, malformed, or timed out.
+#[derive(Debug)]
+enum CommandAttemptError {
+    Connect(std::io::Error),
+    NotSent(String),
+    OutcomeUnknown(String),
+}
 
-    let mut last_error = String::new();
+const CONNECT_ERROR_PREFIX: &str = "Failed to connect: ";
 
-    for attempt in 0..MAX_RETRIES {
-        if attempt > 0 {
-            thread::sleep(Duration::from_millis(RETRY_DELAY_MS * (attempt as u64)));
-        }
-
-        match send_command_once(&cmd, session) {
-            Ok(response) => return Ok(response),
-            Err(e) => {
-                if is_transient_error(&e) {
-                    last_error = e;
-                    continue;
-                }
-                // Non-transient error, fail immediately
-                return Err(e);
-            }
-        }
+impl CommandAttemptError {
+    fn can_retry_connection(&self) -> bool {
+        matches!(self, Self::Connect(error) if matches!(error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                | std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+        ))
     }
 
+    fn into_message(self) -> String {
+        match self {
+            Self::Connect(error) => format!("{}{}", CONNECT_ERROR_PREFIX, error),
+            Self::NotSent(error) => format!("Command was not sent: {}", error),
+            Self::OutcomeUnknown(error) => format!(
+                "Command outcome unknown: {}. The command may have executed. Inspect current browser or external state before retrying.",
+                error
+            ),
+        }
+    }
+}
+
+/// Retry only temporary connection failures that occurred before sending.
+/// A lost response never triggers automatic replay, for any command or client.
+pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
+    const MAX_CONNECT_ATTEMPTS: u32 = 5;
+    const RETRY_DELAY_MS: u64 = 200;
+
+    let mut request = serde_json::to_vec(&cmd)
+        .map_err(|error| format!("Command was not sent: failed to encode request: {}", error))?;
+    request.push(b'\n');
+    let read_timeout = read_timeout_for(&cmd);
+    let mut last_error = String::new();
+    for attempt in 0..MAX_CONNECT_ATTEMPTS {
+        if attempt > 0 {
+            thread::sleep(Duration::from_millis(RETRY_DELAY_MS * u64::from(attempt)));
+        }
+        match send_command_once(&request, read_timeout, session) {
+            Ok(response) => return Ok(response),
+            Err(error) if error.can_retry_connection() => {
+                last_error = error.into_message();
+            }
+            Err(error) => return Err(error.into_message()),
+        }
+    }
     Err(format!(
-        "{} (after {} retries - daemon may be busy or unresponsive)",
-        last_error, MAX_RETRIES
+        "{} (after {} connection attempts; no command was sent)",
+        last_error, MAX_CONNECT_ATTEMPTS
     ))
 }
 
-/// Check if an error is transient and worth retrying against the SAME daemon.
-/// Transient errors include:
-/// - EAGAIN/EWOULDBLOCK (os error 35 on macOS, 11 on Linux)
-/// - EOF errors (daemon closed connection before responding)
-/// - Connection reset/broken pipe (daemon crashed or restarting)
-///
-/// Connection refused / missing socket are NOT transient: no daemon is
-/// listening, so backing off cannot help. Callers use daemon_unreachable()
-/// to respawn via ensure_daemon and retry once instead.
-fn is_transient_error(error: &str) -> bool {
-    has_os_error(error, 35) // EAGAIN on macOS
-        || has_os_error(error, 11) // EAGAIN on Linux
-        || error.contains("WouldBlock")
-        || error.contains("Resource temporarily unavailable")
-        || error.contains("EOF")
-        || error.contains("line 1 column 0") // Empty JSON response
-        || error.contains("Connection reset")
-        || error.contains("Broken pipe")
-        || has_os_error(error, 54) // Connection reset by peer (macOS)
-        || has_os_error(error, 104) // Connection reset by peer (Linux)
-        || has_os_error(error, 10054) // Connection reset by peer (Windows)
-}
-
-/// True when the error means no daemon is listening on the session socket
-/// (exited or never started), as opposed to a live-but-busy daemon. The
-/// remedy is a respawn through ensure_daemon, not a retry.
+/// Only connection-stage failures may trigger daemon recovery. An unknown
+/// outcome may contain any OS error or protocol text, but must never respawn
+/// the daemon and replay a command whose execution is uncertain.
 pub fn daemon_unreachable(error: &str) -> bool {
-    error.contains("Failed to connect")
-        || has_os_error(error, 2) // No such file or directory (socket gone)
-        || has_os_error(error, 61) // Connection refused (macOS)
-        || has_os_error(error, 111) // Connection refused (Linux)
-        || has_os_error(error, 10061) // Connection refused (Windows)
-}
-
-/// Exact `(os error N)` match. Bare substring checks like "os error 11"
-/// also matched "os error 111" (connection refused on Linux), which made
-/// EAGAIN handling swallow refused connections.
-fn has_os_error(error: &str, code: u32) -> bool {
-    error.contains(&format!("(os error {})", code))
+    error.starts_with(CONNECT_ERROR_PREFIX)
 }
 
 /// Socket read timeout for one request. Ordinary commands get a 30s floor.
 /// Commands carrying an operation timeout (the wait family, which
 /// parse_command stamps with AGENT_BROWSER_DEFAULT_TIMEOUT when no explicit
 /// --timeout is given) get that timeout plus margin, so the daemon can report
-/// a proper operation timeout instead of the client dying with EAGAIN at 30s
-/// and the retry loop re-sending the whole long-running command.
+/// a proper operation timeout instead of the client reaching an ambiguous
+/// read timeout at 30s. Ambiguous outcomes are reported without replay.
 ///
 /// The env var is deliberately NOT consulted here. Reading it would apply a
 /// long wait budget to every command, so a genuinely hung daemon on a simple
@@ -1232,26 +1224,41 @@ fn read_timeout_for(cmd: &Value) -> Duration {
     Duration::from_millis(op_ms.saturating_add(10_000).max(30_000))
 }
 
-fn send_command_once(cmd: &Value, session: &str) -> Result<Response, String> {
-    let mut stream = connect(session)?;
-
-    stream.set_read_timeout(Some(read_timeout_for(cmd))).ok();
-    stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
-
-    let mut json_str = serde_json::to_string(cmd).map_err(|e| e.to_string())?;
-    json_str.push('\n');
-
+fn send_command_once(
+    request: &[u8],
+    read_timeout: Duration,
+    session: &str,
+) -> Result<Response, CommandAttemptError> {
+    let mut stream = connect(session).map_err(CommandAttemptError::Connect)?;
     stream
-        .write_all(json_str.as_bytes())
-        .map_err(|e| format!("Failed to send: {}", e))?;
+        .set_read_timeout(Some(read_timeout))
+        .map_err(|error| {
+            CommandAttemptError::NotSent(format!("failed to set read timeout: {}", error))
+        })?;
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .map_err(|error| {
+            CommandAttemptError::NotSent(format!("failed to set write timeout: {}", error))
+        })?;
 
+    // From this point forward a partial write or missing response leaves the
+    // command outcome unknown. Never reinterpret such failures as reconnects.
+    stream.write_all(request).map_err(|error| {
+        CommandAttemptError::OutcomeUnknown(format!("failed to send request: {}", error))
+    })?;
     let mut reader = BufReader::new(stream);
     let mut response_line = String::new();
-    reader
-        .read_line(&mut response_line)
-        .map_err(|e| format!("Failed to read: {}", e))?;
-
-    serde_json::from_str(&response_line).map_err(|e| format!("Invalid response: {}", e))
+    let bytes = reader.read_line(&mut response_line).map_err(|error| {
+        CommandAttemptError::OutcomeUnknown(format!("failed to read response: {}", error))
+    })?;
+    if bytes == 0 {
+        return Err(CommandAttemptError::OutcomeUnknown(
+            "daemon closed the connection without a response".to_string(),
+        ));
+    }
+    serde_json::from_str(&response_line).map_err(|error| {
+        CommandAttemptError::OutcomeUnknown(format!("invalid response: {}", error))
+    })
 }
 
 #[cfg(test)]
@@ -1536,115 +1543,62 @@ mod tests {
         assert!(daemon_config_matches(session, &opts));
     }
 
-    // === Transient Error Detection Tests ===
+    #[test]
+    fn only_temporary_connect_failures_are_retryable() {
+        for kind in [
+            std::io::ErrorKind::WouldBlock,
+            std::io::ErrorKind::Interrupted,
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+        ] {
+            assert!(CommandAttemptError::Connect(std::io::Error::from(kind)).can_retry_connection());
+        }
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            assert!(
+                !CommandAttemptError::Connect(std::io::Error::from(kind)).can_retry_connection()
+            );
+        }
+    }
 
     #[test]
-    fn test_is_transient_error_eagain_macos() {
-        assert!(is_transient_error(
-            "Failed to read: Resource temporarily unavailable (os error 35)"
+    fn uncertain_delivery_cannot_retry_or_trigger_daemon_recovery() {
+        for cause in [
+            "Failed to connect: No such file or directory (os error 2)",
+            "Resource temporarily unavailable (os error 11)",
+            "Connection refused (os error 111)",
+            "Connection reset by peer (os error 104)",
+            "Broken pipe",
+            "EOF",
+            "Invalid response at line 1 column 0",
+        ] {
+            let error = CommandAttemptError::OutcomeUnknown(cause.to_string());
+            assert!(!error.can_retry_connection());
+            let message = error.into_message();
+            assert!(!daemon_unreachable(&message), "{message}");
+            assert!(message.contains("before retrying"));
+        }
+        let not_sent =
+            CommandAttemptError::NotSent("No such file or directory (os error 2)".to_string());
+        assert!(!not_sent.can_retry_connection());
+        assert!(!daemon_unreachable(&not_sent.into_message()));
+    }
+
+    #[test]
+    fn only_connection_errors_can_request_daemon_recovery() {
+        for kind in [
+            std::io::ErrorKind::ConnectionRefused,
+            std::io::ErrorKind::NotFound,
+        ] {
+            let message = CommandAttemptError::Connect(std::io::Error::from(kind)).into_message();
+            assert!(daemon_unreachable(&message));
+        }
+        assert!(!daemon_unreachable(
+            "Failed to read: No such file or directory (os error 2)"
         ));
-    }
-
-    #[test]
-    fn test_is_transient_error_eagain_linux() {
-        assert!(is_transient_error(
-            "Failed to read: Resource temporarily unavailable (os error 11)"
-        ));
-    }
-
-    #[test]
-    fn test_is_transient_error_would_block() {
-        assert!(is_transient_error("operation WouldBlock"));
-    }
-
-    #[test]
-    fn test_is_transient_error_resource_unavailable() {
-        assert!(is_transient_error("Resource temporarily unavailable"));
-    }
-
-    #[test]
-    fn test_is_transient_error_eof() {
-        assert!(is_transient_error(
-            "Invalid response: EOF while parsing a value at line 1 column 0"
-        ));
-    }
-
-    #[test]
-    fn test_is_transient_error_empty_json() {
-        assert!(is_transient_error(
-            "Invalid response: expected value at line 1 column 0"
-        ));
-    }
-
-    #[test]
-    fn test_is_transient_error_connection_reset() {
-        assert!(is_transient_error("Connection reset by peer"));
-    }
-
-    #[test]
-    fn test_is_transient_error_broken_pipe() {
-        assert!(is_transient_error("Broken pipe"));
-    }
-
-    #[test]
-    fn test_is_transient_error_connection_reset_macos() {
-        assert!(is_transient_error(
-            "Failed to send: Connection reset by peer (os error 54)"
-        ));
-    }
-
-    #[test]
-    fn test_is_transient_error_connection_reset_linux() {
-        assert!(is_transient_error(
-            "Failed to send: Connection reset by peer (os error 104)"
-        ));
-    }
-
-    // Connection refused / missing socket mean no daemon is listening:
-    // not transient (retry can't help), handled by respawn via
-    // daemon_unreachable instead.
-    #[test]
-    fn test_socket_not_found_is_unreachable_not_transient() {
-        let error = "Failed to connect: No such file or directory (os error 2)";
-        assert!(!is_transient_error(error));
-        assert!(daemon_unreachable(error));
-    }
-
-    #[test]
-    fn test_connection_refused_macos_is_unreachable_not_transient() {
-        let error = "Failed to connect: Connection refused (os error 61)";
-        assert!(!is_transient_error(error));
-        assert!(daemon_unreachable(error));
-    }
-
-    #[test]
-    fn test_connection_refused_linux_is_unreachable_not_transient() {
-        let error = "Failed to connect: Connection refused (os error 111)";
-        assert!(!is_transient_error(error));
-        assert!(daemon_unreachable(error));
-    }
-
-    #[test]
-    fn test_connection_refused_windows_is_unreachable_not_transient() {
-        let error = "Failed to connect: No connection could be made because the target machine actively refused it. (os error 10061)";
-        assert!(!is_transient_error(error));
-        assert!(daemon_unreachable(error));
-    }
-
-    #[test]
-    fn test_is_transient_error_connection_reset_windows() {
-        assert!(is_transient_error(
-            "Failed to send: An existing connection was forcibly closed by the remote host. (os error 10054)"
-        ));
-    }
-
-    #[test]
-    fn test_is_transient_error_non_transient() {
-        // These should NOT be considered transient
-        assert!(!is_transient_error("Unknown command: foo"));
-        assert!(!is_transient_error("Invalid JSON syntax"));
-        assert!(!is_transient_error("Permission denied"));
-        assert!(!is_transient_error("Daemon not found"));
     }
 
     #[test]

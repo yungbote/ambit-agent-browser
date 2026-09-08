@@ -434,6 +434,88 @@ fn required_client_does_not_spawn_after_socket_disappears_during_request() {
 }
 
 #[test]
+fn lost_response_never_replays_a_command_in_either_client_mode() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    struct StopServer(Arc<AtomicBool>);
+    impl Drop for StopServer {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::Relaxed);
+        }
+    }
+
+    let cases: [(&str, &[u8]); 4] = [
+        ("false", b""),
+        ("true", b""),
+        ("false", b"{malformed}\n"),
+        ("true", b"{malformed}\n"),
+    ];
+    for (require_daemon, reply) in cases {
+        let fixture = Fixture::new();
+        let daemon = fixture.start(&[]);
+        let config = fs::read(fixture.path("config")).unwrap();
+        daemon.signal(libc::SIGTERM);
+        assert!(daemon.finish().status.success());
+        fs::write(fixture.path("config"), config).unwrap();
+        fs::write(fixture.path("version"), env!("CARGO_PKG_VERSION")).unwrap();
+        let listener = UnixListener::bind(fixture.path("sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        thread::scope(|scope| {
+            let stop = StopServer(Arc::new(AtomicBool::new(false)));
+            let stopped = stop.0.clone();
+            let witness = scope.spawn(move || {
+                let mut commands = Vec::new();
+                while !stopped.load(Ordering::Relaxed) {
+                    match listener.accept() {
+                        Ok((mut stream, _)) => {
+                            stream
+                                .set_read_timeout(Some(Duration::from_secs(1)))
+                                .unwrap();
+                            let mut line = String::new();
+                            if BufReader::new(&mut stream)
+                                .read_line(&mut line)
+                                .unwrap_or(0)
+                                > 0
+                            {
+                                commands.push(serde_json::from_str::<Value>(&line).unwrap());
+                                // The daemon may have performed the action here.
+                                // A lost or malformed response cannot prove otherwise.
+                                stream.write_all(reply).unwrap();
+                            }
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(error) => panic!("witness accept failed: {error}"),
+                    }
+                }
+                commands
+            });
+            let output = fixture.run(&[
+                "--json",
+                "--require-daemon",
+                require_daemon,
+                "click",
+                "#submit",
+            ]);
+            stop.0.store(true, Ordering::Relaxed);
+            let commands = witness.join().unwrap();
+            assert!(!output.status.success());
+            assert_eq!(
+                commands.len(),
+                1,
+                "require_daemon={require_daemon}: {commands:?}"
+            );
+            assert_eq!(commands[0]["action"], "click");
+            let error = response(&output)["error"].as_str().unwrap().to_string();
+            assert!(error.contains("outcome unknown"), "{error}");
+            assert!(error.contains("before retrying"), "{error}");
+        });
+    }
+}
+
+#[test]
 fn foreground_parser_rejects_subcommands_and_unsafe_session_names() {
     let fixture = Fixture::new();
     for args in [

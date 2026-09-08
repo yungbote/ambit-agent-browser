@@ -539,3 +539,7 @@ AGENT_BROWSER_PLUGINS='[{"name":"vault","command":"agent-browser-plugin-vault","
 `agent-browser [options] daemon` runs in the invoking process for a host supervisor. Clients use `--require-daemon` with the same session and daemon settings. Termination cancels active commands and pending Chrome startup without retrying, and allows one second for state saving before browser cleanup; a timeout is reported on stderr. It never spawns or restarts a missing or incompatible daemon. See [Session management](session-management.md#supervised-daemon) for shutdown, configuration, and MCP behavior.
 
 `--require-sandbox` requires a locally launched Chrome browser and disables automatic unsandboxed fallback. It rejects sandbox-disabling user and plugin arguments, including feature lists that enable `NetworkServiceInProcess`. Use the same setting on the daemon and clients; see [Required Chrome sandbox](session-management.md#required-chrome-sandbox).
+
+## Command delivery and recovery
+
+Temporary connection failures can be retried before a command is sent. Once sending is attempted, agent-browser never automatically replays the command after a write failure, lost response, timeout, or invalid response. It reports `Command outcome unknown` because the action may already have been applied. Inspect the current browser or external state before repeating it. This applies to every command, including batch commands and MCP tools, with or without `--require-daemon`.

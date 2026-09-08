@@ -3977,6 +3977,12 @@ Options:
   --debug                    Debug output
   --version, -V              Show version
 
+Command delivery:
+  Temporary connection failures may retry before sending. After a write attempt,
+  a lost, invalid, or timed-out response reports "Command outcome unknown" and
+  is never replayed automatically. Inspect current browser or external state
+  before repeating the command. This also applies to batch and MCP tools.
+
 Configuration:
   agent-browser looks for agent-browser.json in these locations (lowest to highest priority):
     1. ~/.agent-browser/config.json      User-level defaults
