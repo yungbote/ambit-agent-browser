@@ -125,6 +125,21 @@ impl Drop for Process {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn live_process_group_members(group: i32) -> Vec<i32> {
+    fs::read_dir("/proc")
+        .unwrap()
+        .flatten()
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<i32>().ok()?;
+            let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
+            let fields: Vec<_> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+            (fields.get(2)?.parse::<i32>().ok()? == group && !matches!(*fields.first()?, "Z" | "X"))
+                .then_some(pid)
+        })
+        .collect()
+}
+
 fn response(output: &Output) -> Value {
     serde_json::from_slice(&output.stdout).unwrap_or_else(|e| panic!("{e}: {output:?}"))
 }
@@ -478,6 +493,108 @@ fn required_sandbox_rejects_unsafe_launch_without_replacing_supervisor() {
     fixture.assert_clean();
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn foreground_signal_cancels_chrome_before_devtools_is_ready() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct BrowserGroup(i32);
+    impl Drop for BrowserGroup {
+        fn drop(&mut self) {
+            unsafe {
+                libc::kill(-self.0, libc::SIGKILL);
+            }
+        }
+    }
+
+    let fixture = Fixture::new();
+    let chrome = fixture.0.path().join("delayed-chrome");
+    fs::write(
+        &chrome,
+        r#"#!/bin/sh
+for argument do
+  case "$argument" in
+    --user-data-dir=*) profile="${argument#*=}" ;;
+  esac
+done
+mkdir -p "$profile"
+printf '%s\n' "$$" >> "$profile/startup-pids"
+sleep 60 &
+wait
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&chrome, fs::Permissions::from_mode(0o700)).unwrap();
+    let profile = fixture.0.path().join("profile");
+    fixture.config(
+        &serde_json::json!({
+            "executablePath": chrome,
+            "profile": profile,
+            "idleTimeout": "0",
+        })
+        .to_string(),
+    );
+    let daemon = fixture.start(&[]);
+    let navigation = Process(Some(
+        fixture
+            .command(&["--json", "--require-daemon", "open"])
+            .spawn()
+            .unwrap(),
+    ));
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let browser_pid = loop {
+        if let Ok(pids) = fs::read_to_string(profile.join("startup-pids")) {
+            if let Some(pid) = pids
+                .lines()
+                .next()
+                .and_then(|line| line.parse::<i32>().ok())
+            {
+                break pid;
+            }
+        }
+        assert!(Instant::now() < deadline, "fake Chrome did not start");
+        thread::sleep(Duration::from_millis(10));
+    };
+    let _cleanup = BrowserGroup(browser_pid);
+    assert!(!profile.join("DevToolsActivePort").exists());
+    let stopped = Instant::now();
+    daemon.signal(libc::SIGTERM);
+    let output = daemon.finish();
+    let elapsed = stopped.elapsed();
+    assert!(output.status.success(), "{output:?}");
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "startup cancellation took {elapsed:?}"
+    );
+    assert!(!navigation.finish().status.success());
+    assert_eq!(
+        unsafe { libc::kill(browser_pid, 0) },
+        -1,
+        "launching browser survived"
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ESRCH)
+    );
+    assert!(
+        live_process_group_members(browser_pid).is_empty(),
+        "launching Chrome helpers survived"
+    );
+    assert_eq!(
+        fs::read_to_string(profile.join("startup-pids"))
+            .unwrap()
+            .lines()
+            .count(),
+        1,
+        "canceled launch must not retry"
+    );
+    fixture.assert_clean();
+    eprintln!(
+        "startup_stop_ms={} browser_reaped=true retries=0",
+        elapsed.as_millis()
+    );
+}
+
 /// Run in an ephemeral container with Chrome and a sandbox-capable seccomp
 /// policy. The HTTP server is loopback-only and intentionally never responds.
 #[cfg(target_os = "linux")]
@@ -603,18 +720,7 @@ fn foreground_signal_stops_blocked_navigation_and_owned_chrome() {
             std::io::Error::last_os_error().raw_os_error(),
             Some(libc::ESRCH)
         );
-        let surviving_helpers: Vec<_> = fs::read_dir("/proc")
-            .unwrap()
-            .flatten()
-            .filter_map(|entry| {
-                let pid = entry.file_name().to_str()?.parse::<i32>().ok()?;
-                let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
-                let fields: Vec<_> = stat.rsplit_once(')')?.1.split_whitespace().collect();
-                (fields.get(2)?.parse::<i32>().ok()? == browser_pid
-                    && !matches!(*fields.first()?, "Z" | "X"))
-                .then_some(pid)
-            })
-            .collect();
+        let surviving_helpers = live_process_group_members(browser_pid);
         assert!(
             surviving_helpers.is_empty(),
             "Chrome helpers survived: {surviving_helpers:?}"

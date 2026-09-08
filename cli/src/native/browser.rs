@@ -509,9 +509,7 @@ impl BrowserManager {
                 (url, BrowserProcess::Lightpanda(lp))
             }
             _ => {
-                let chrome = tokio::task::spawn_blocking(move || launch_chrome(&options))
-                    .await
-                    .map_err(|e| format!("Chrome launch task failed: {}", e))??;
+                let chrome = launch_chrome(options).await?;
                 let url = chrome.ws_url.clone();
                 (url, BrowserProcess::Chrome(chrome))
             }

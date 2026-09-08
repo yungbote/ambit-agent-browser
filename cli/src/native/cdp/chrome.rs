@@ -4,7 +4,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::process::{Child, Command, Stdio};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use super::discovery::discover_cdp_url;
@@ -756,16 +757,31 @@ fn run_certutil(args: &[&str], action: &str) -> Result<(), String> {
     }
 }
 
-fn terminate_launched_chrome(child: &mut Child) {
-    let _ = child.kill();
-    #[cfg(unix)]
-    unsafe {
-        libc::kill(-(child.id() as i32), libc::SIGKILL);
+/// Cancellation of the async request must reach its blocking launch thread.
+/// Dropping a Tokio JoinHandle alone does not stop spawn_blocking work.
+struct CancelLaunchOnDrop(Arc<AtomicBool>);
+
+impl Drop for CancelLaunchOnDrop {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Relaxed);
     }
-    let _ = child.wait();
 }
 
-pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
+pub async fn launch_chrome(options: LaunchOptions) -> Result<ChromeProcess, String> {
+    let canceled = Arc::new(AtomicBool::new(false));
+    let _cancel_on_drop = CancelLaunchOnDrop(canceled.clone());
+    tokio::task::spawn_blocking(move || launch_chrome_blocking(&options, &canceled))
+        .await
+        .map_err(|e| format!("Chrome launch task failed: {}", e))?
+}
+
+fn launch_chrome_blocking(
+    options: &LaunchOptions,
+    canceled: &AtomicBool,
+) -> Result<ChromeProcess, String> {
+    if canceled.load(Ordering::Relaxed) {
+        return Err("Chrome launch canceled".to_string());
+    }
     // Reject deterministic policy conflicts before touching profiles or retrying.
     validate_sandbox_options(options, Some("chrome"), false)?;
     let chrome_path = match &options.executable_path {
@@ -815,7 +831,11 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
     let mut last_err = String::new();
 
     for attempt in 1..=max_attempts {
-        match try_launch_chrome(&chrome_path, effective_options) {
+        if canceled.load(Ordering::Relaxed) {
+            last_err = "Chrome launch canceled".to_string();
+            break;
+        }
+        match try_launch_chrome(&chrome_path, effective_options, canceled) {
             Ok(mut process) => {
                 // Transfer profile temp dir ownership to ChromeProcess for cleanup on Drop.
                 // The try_launch_chrome temp_user_data_dir is None here because we set profile
@@ -827,6 +847,9 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
             }
             Err(e) => {
                 last_err = e;
+                if canceled.load(Ordering::Relaxed) {
+                    break;
+                }
                 if attempt < max_attempts {
                     // Use write! instead of eprintln! to avoid panicking
                     // if the daemon's stderr pipe is broken (parent dropped it).
@@ -850,7 +873,11 @@ pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
     Err(last_err)
 }
 
-fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<ChromeProcess, String> {
+fn try_launch_chrome(
+    chrome_path: &Path,
+    options: &LaunchOptions,
+    canceled: &AtomicBool,
+) -> Result<ChromeProcess, String> {
     let ChromeArgs {
         args,
         user_data_dir,
@@ -923,125 +950,120 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
         }
     }
 
+    if canceled.load(Ordering::Relaxed) {
+        cleanup_temp_dir(&temp_user_data_dir);
+        return Err("Chrome launch canceled".to_string());
+    }
     #[cfg(not(windows))]
     let spawned = cmd.spawn();
     #[cfg(windows)]
     let spawned = Child::spawn(chrome_path, &args, options.effectively_headless());
-    let mut child = spawned.map_err(|e| {
+    let child = spawned.map_err(|e| {
         cleanup_temp_dir(&temp_user_data_dir);
         format!("Failed to launch Chrome at {:?}: {}", chrome_path, e)
     })?;
 
-    // Shared overall deadline so we don't double-wait (poll + stderr fallback).
-    let deadline = std::time::Instant::now() + Duration::from_secs(30);
-
-    // Primary path: use DevToolsActivePort written into user-data-dir.
-    // This is more reliable on Windows than scraping stderr for "DevTools listening on ...",
-    // which can be missing/empty depending on how Chrome is launched.
-    let ws_url = match wait_for_devtools_active_port(&mut child, &user_data_dir, deadline) {
-        Ok(url) => url,
-        Err(primary_err) => {
-            // Fallback: scrape stderr (legacy behavior) for better diagnostics.
-            let stderr = child.stderr.take().ok_or_else(|| {
-                terminate_launched_chrome(&mut child);
-                cleanup_temp_dir(&temp_user_data_dir);
-                "Failed to capture Chrome stderr".to_string()
-            })?;
-            let reader = BufReader::new(stderr);
-            match wait_for_ws_url_until(reader, deadline, options.require_sandbox) {
-                Ok(url) => url,
-                Err(fallback_err) => {
-                    terminate_launched_chrome(&mut child);
-                    cleanup_temp_dir(&temp_user_data_dir);
-                    return Err(format!(
-                        "{}\n(also tried parsing stderr) {}",
-                        primary_err, fallback_err
-                    ));
-                }
-            }
-        }
-    };
-
+    // Own Chrome before waiting for readiness. Cancellation or any error now
+    // follows the same Drop path as a fully initialized browser, including its
+    // process group and temporary profile/display/CA resources.
     #[cfg(unix)]
-    let pgid = {
-        let pid = child.id() as i32;
-        // The child called setpgid(0,0) via process_group(0), so its PGID
-        // equals its own PID.
-        Some(pid)
-    };
-
-    Ok(ChromeProcess {
+    let pgid = Some(child.id() as i32);
+    let mut process = ChromeProcess {
         child,
-        ws_url,
+        ws_url: String::new(),
         temp_user_data_dir,
         temp_nss_home,
         #[cfg(unix)]
         pgid,
         #[cfg(target_os = "linux")]
         xvfb,
-    })
+    };
+    let stderr = process
+        .child
+        .stderr
+        .take()
+        .ok_or("Failed to capture Chrome stderr")?;
+    let (stderr_tx, stderr_rx) = mpsc::sync_channel(64);
+    // A pipe read can block indefinitely even after the startup deadline.
+    // Drain it independently so endpoint polling always observes cancellation.
+    // Continue draining after readiness to avoid filling Chrome's stderr pipe;
+    // killing the owned Chrome tree closes the pipe and ends this I/O thread.
+    std::thread::Builder::new()
+        .name("chrome-stderr".to_string())
+        .spawn(move || {
+            for line in BufReader::new(stderr).lines() {
+                let Ok(line) = line else {
+                    break;
+                };
+                let _ = stderr_tx.send(line);
+            }
+        })
+        .map_err(|e| format!("Failed to read Chrome stderr: {}", e))?;
+    process.ws_url = wait_for_devtools_endpoint(
+        &mut process.child,
+        &user_data_dir,
+        &stderr_rx,
+        std::time::Instant::now() + Duration::from_secs(30),
+        canceled,
+        options.require_sandbox,
+    )?;
+    Ok(process)
 }
 
-fn wait_for_devtools_active_port(
+/// Both endpoint sources share a deadline and a cancellation boundary. Bounded
+/// stderr batches keep a noisy browser from starving the cancellation check.
+fn wait_for_devtools_endpoint(
     child: &mut Child,
     user_data_dir: &Path,
+    stderr: &mpsc::Receiver<String>,
     deadline: std::time::Instant,
-) -> Result<String, String> {
-    let poll_interval = Duration::from_millis(50);
-
-    while std::time::Instant::now() <= deadline {
-        if let Ok(Some(status)) = child.try_wait() {
-            // Chrome exited before writing DevToolsActivePort -- report the
-            // exit code so the caller can surface it alongside stderr output.
-            let code = status
-                .code()
-                .map(|c| format!("{}", c))
-                .unwrap_or_else(|| "unknown".to_string());
-            return Err(format!(
-                "Chrome exited early (exit code: {}) without writing DevToolsActivePort",
-                code
-            ));
-        }
-
-        if let Some((port, ws_path)) = read_devtools_active_port(user_data_dir) {
-            let ws_url = format!("ws://127.0.0.1:{}{}", port, ws_path);
-            return Ok(ws_url);
-        }
-
-        std::thread::sleep(poll_interval);
-    }
-
-    Err("Timeout waiting for DevToolsActivePort".to_string())
-}
-
-fn wait_for_ws_url_until(
-    reader: impl BufRead,
-    deadline: std::time::Instant,
+    canceled: &AtomicBool,
     require_sandbox: bool,
 ) -> Result<String, String> {
-    let prefix = "DevTools listening on ";
-    let mut stderr_lines: Vec<String> = Vec::new();
-
-    for line in reader.lines() {
-        if std::time::Instant::now() > deadline {
+    let poll_interval = Duration::from_millis(50);
+    let mut stderr_lines = std::collections::VecDeque::with_capacity(64);
+    let mut stderr_finished = false;
+    loop {
+        if canceled.load(Ordering::Relaxed) {
+            return Err("Chrome launch canceled".to_string());
+        }
+        if let Some((port, ws_path)) = read_devtools_active_port(user_data_dir) {
+            return Ok(format!("ws://127.0.0.1:{}{}", port, ws_path));
+        }
+        for _ in 0..64 {
+            match stderr.try_recv() {
+                Ok(line) => {
+                    if let Some(url) = line.strip_prefix("DevTools listening on ") {
+                        return Ok(url.trim().to_string());
+                    }
+                    if stderr_lines.len() == 64 {
+                        stderr_lines.pop_front();
+                    }
+                    stderr_lines.push_back(line);
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    stderr_finished = true;
+                    break;
+                }
+            }
+        }
+        let exited = matches!(child.try_wait(), Ok(Some(_)));
+        let timed_out = std::time::Instant::now() >= deadline;
+        if timed_out || (exited && stderr_finished) {
+            let message = if exited {
+                "Chrome exited before providing DevTools URL"
+            } else {
+                "Timeout waiting for Chrome DevTools URL"
+            };
             return Err(chrome_launch_error(
-                "Timeout waiting for Chrome DevTools URL",
-                &stderr_lines,
+                message,
+                &stderr_lines.into_iter().collect::<Vec<_>>(),
                 require_sandbox,
             ));
         }
-        let line = line.map_err(|e| format!("Failed to read Chrome stderr: {}", e))?;
-        if let Some(url) = line.strip_prefix(prefix) {
-            return Ok(url.trim().to_string());
-        }
-        stderr_lines.push(line);
+        std::thread::sleep(poll_interval);
     }
-
-    Err(chrome_launch_error(
-        "Chrome exited before providing DevTools URL",
-        &stderr_lines,
-        require_sandbox,
-    ))
 }
 
 fn chrome_launch_error(message: &str, stderr_lines: &[String], require_sandbox: bool) -> String {
@@ -1942,7 +1964,7 @@ mod tests {
                     .err()
                     .unwrap()
                     .contains("--require-sandbox"));
-                assert!(launch_chrome(&options)
+                assert!(launch_chrome_blocking(&options, &AtomicBool::new(false))
                     .err()
                     .unwrap()
                     .contains("--require-sandbox"));

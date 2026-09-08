@@ -554,7 +554,7 @@ Serves bundled skill content that always matches the installed CLI version. AI a
 
 ### Supervised daemon
 
-Run `agent-browser daemon` under a process supervisor to keep the daemon in the invoking process with its original PID and stderr. It uses ordinary global flags and config files, refuses an occupied session, and publishes its configuration before accepting commands. The browser launches when a client first needs it. `close` saves configured state, closes owned browsers, and removes session metadata. Ctrl+C and Unix SIGTERM/SIGHUP cancel active commands and maintenance work before closing owned browsers. On a termination signal, state saving gets a one-second grace period; a timeout is reported on stderr and the latest changes may not be saved. A released `.lock` file remains so concurrent starters always use the same lock.
+Run `agent-browser daemon` under a process supervisor to keep the daemon in the invoking process with its original PID and stderr. It uses ordinary global flags and config files, refuses an occupied session, and publishes its configuration before accepting commands. The browser launches when a client first needs it. `close` saves configured state, closes owned browsers, and removes session metadata. Ctrl+C and Unix SIGTERM/SIGHUP cancel active commands, pending Chrome startup, and maintenance work before closing owned browsers. A canceled startup reaps its owned process group without retrying. On a termination signal, state saving gets a one-second grace period; a timeout is reported on stderr and the latest changes may not be saved. A released `.lock` file remains so concurrent starters always use the same lock.
 
 ```bash
 # Supervisor command; stays in the foreground

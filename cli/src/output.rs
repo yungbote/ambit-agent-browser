@@ -3485,7 +3485,8 @@ Usage: agent-browser [options] daemon
 Runs in the invoking process with ordinary global flags and config files.
 Stderr remains attached, including --debug output. Refuses an occupied session.
 The browser launches when a client first needs it. Close saves state and exits.
-Ctrl+C and Unix SIGTERM/SIGHUP cancel active work, allow 1s to save state, then
+Ctrl+C and Unix SIGTERM/SIGHUP cancel active work and pending Chrome startup,
+reap owned processes without retrying, allow 1s to save state, then
 close owned browsers. A save timeout is reported on stderr; latest changes may
 not be saved.
 
