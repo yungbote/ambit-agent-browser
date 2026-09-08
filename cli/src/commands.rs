@@ -124,6 +124,7 @@ pub fn is_top_level_command(value: &str) -> bool {
             | "pdf"
             | "snapshot"
             | "eval"
+            | "daemon"
             | "close"
             | "quit"
             | "exit"
@@ -378,6 +379,22 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
     }
 
     match cmd {
+        // Host lifecycle command; main runs it in place after applying startup
+        // options. It is never sent to the browser action dispatcher.
+        "daemon" => {
+            if !rest.is_empty() {
+                return Err(ParseError::InvalidValue {
+                    message: "daemon accepts global options only".to_string(),
+                    usage: "[options] daemon",
+                });
+            }
+            if !is_valid_session_name(&flags.session) {
+                return Err(ParseError::InvalidSessionName {
+                    name: flags.session.clone(),
+                });
+            }
+            Ok(json!({ "id": id, "action": "daemon" }))
+        }
         // === Navigation ===
         // Maps to "navigate" action in protocol; reflected in ACTION_CATEGORIES in action-policy.ts
         "open" | "goto" | "navigate" => {
@@ -3433,6 +3450,7 @@ mod tests {
 
     fn default_flags() -> Flags {
         Flags {
+            require_daemon: false,
             session: "test".to_string(),
             json: false,
             headed: false,

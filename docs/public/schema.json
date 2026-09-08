@@ -210,6 +210,11 @@
       "enum": ["png", "jpeg"],
       "description": "Screenshot format."
     },
+    "requireDaemon": {
+      "type": "boolean",
+      "description": "Require an existing compatible daemon without starting or restarting one.",
+      "default": false
+    },
     "idleTimeout": {
       "type": "string",
       "description": "Auto-shutdown the daemon after inactivity (e.g., '30s', '5m', '1h', or raw milliseconds like '60000')."

@@ -191,6 +191,7 @@ pub(super) fn check(checks: &mut Vec<Check>, opts: &DoctorOptions) {
     }
 
     let daemon_opts = DaemonOptions {
+        require_existing: false,
         headed: opts.headed,
         debug: opts.debug,
         executable_path: None,

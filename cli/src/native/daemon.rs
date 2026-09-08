@@ -3,7 +3,6 @@ use std::env;
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
-use std::process;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,76 +17,44 @@ use super::actions::{
 use super::cdp::client::CdpClient;
 use super::state;
 use super::stream::{IdleActivity, StreamServer};
-use crate::connection::INTERNAL_DAEMON_SHUTDOWN_ACTION;
+use crate::connection::{DaemonSession, INTERNAL_DAEMON_SHUTDOWN_ACTION};
 
-pub async fn run_daemon(session: &str) {
+/// Foreground daemons retain the invoking PID and stderr for a process supervisor.
+/// Detached daemons preserve the ordinary CLI's background logging behavior.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum DaemonMode {
+    Detached,
+    Foreground,
+}
+
+pub async fn run_daemon(session: &str, mode: DaemonMode) -> Result<(), String> {
+    // Claim ownership before changing metadata, sockets, or log files. The guard
+    // cleans up only this daemon's files and releases its lock after shutdown.
+    let _session = DaemonSession::acquire(session, mode == DaemonMode::Foreground)?;
     let socket_dir = get_daemon_socket_dir();
-    if !socket_dir.exists() {
-        let _ = fs::create_dir_all(&socket_dir);
-    }
-
-    // When debug mode is on, redirect stderr to a log file so daemon
-    // output can be inspected (the daemon normally has stderr piped to its
-    // parent which drops the read end after startup).
-    #[cfg(unix)]
-    if env::var("AGENT_BROWSER_DEBUG").is_ok() {
-        let log_path = socket_dir.join(format!("{}.log", session));
-        if let Ok(file) = fs::File::create(&log_path) {
-            use std::os::unix::io::IntoRawFd;
-            let fd = file.into_raw_fd();
-            unsafe {
-                libc::dup2(fd, 2);
-                libc::close(fd);
-            }
-            let _ = writeln!(
-                std::io::stderr(),
-                "[daemon] Debug logging started for session: {}",
-                session
-            );
-        }
-    } else {
-        // Redirect stderr to /dev/null to prevent daemon crash when the
-        // parent CLI drops the piped stderr handle after startup.  Cloud
-        // providers (AgentCore, Browserbase, etc.) may write to stderr
-        // during connection setup; a broken pipe would kill the daemon.
-        #[cfg(unix)]
-        {
-            use std::os::unix::io::IntoRawFd;
-            if let Ok(devnull) = fs::File::create("/dev/null") {
-                let fd = devnull.into_raw_fd();
-                unsafe {
-                    libc::dup2(fd, 2);
-                    libc::close(fd);
-                }
-            }
-        }
-    }
-
-    let pid_path = socket_dir.join(format!("{}.pid", session));
-    let _ = fs::write(&pid_path, process::id().to_string());
-
-    let version_path = socket_dir.join(format!("{}.version", session));
-    let _ = fs::write(&version_path, env!("CARGO_PKG_VERSION"));
-
-    // On Unix the daemon listens on a Unix domain socket; on Windows it uses
-    // TCP, so there is no .sock file — only a .port file written by the server.
     let socket_path = socket_dir.join(format!("{}.sock", session));
+    let stream_path = socket_dir.join(format!("{}.stream", session));
 
     #[cfg(unix)]
-    if socket_path.exists() {
-        let _ = fs::remove_file(&socket_path);
+    if mode == DaemonMode::Detached {
+        use std::os::unix::io::AsRawFd;
+        let log_path = if env::var("AGENT_BROWSER_DEBUG").is_ok() {
+            socket_dir.join(format!("{}.log", session))
+        } else {
+            PathBuf::from("/dev/null")
+        };
+        if let Ok(file) = fs::File::create(log_path) {
+            // Keep detached logging independent of the spawning CLI's pipe.
+            unsafe { libc::dup2(file.as_raw_fd(), 2) };
+        }
     }
-
-    #[cfg(windows)]
-    {
-        let _ = fs::remove_file(socket_dir.join(format!("{}.port", session)));
+    if env::var("AGENT_BROWSER_DEBUG").is_ok() {
+        let _ = writeln!(
+            std::io::stderr(),
+            "[daemon] Started for session: {}",
+            session
+        );
     }
-
-    let stream_path = socket_dir.join(format!("{}.stream", session));
-    let _ = fs::remove_file(&stream_path);
-    let _ = fs::remove_file(socket_dir.join(format!("{}.engine", session)));
-    let _ = fs::remove_file(socket_dir.join(format!("{}.provider", session)));
-    let _ = fs::remove_file(socket_dir.join(format!("{}.extensions", session)));
 
     if let Ok(days_str) = env::var("AGENT_BROWSER_STATE_EXPIRE_DAYS") {
         if let Ok(days) = days_str.parse::<u64>() {
@@ -132,7 +99,7 @@ pub async fn run_daemon(session: &str) {
 
     let autosave_interval_ms = autosave_interval_ms_from_env();
 
-    let result = run_socket_server(
+    run_socket_server(
         &socket_path,
         session,
         stream_client,
@@ -141,27 +108,7 @@ pub async fn run_daemon(session: &str) {
         idle_timeout,
         autosave_interval_ms,
     )
-    .await;
-
-    #[cfg(unix)]
-    {
-        let _ = fs::remove_file(&socket_path);
-    }
-    #[cfg(windows)]
-    {
-        let _ = fs::remove_file(socket_dir.join(format!("{}.port", session)));
-    }
-    let _ = fs::remove_file(&pid_path);
-    let _ = fs::remove_file(&version_path);
-    let _ = fs::remove_file(&stream_path);
-    let _ = fs::remove_file(socket_dir.join(format!("{}.engine", session)));
-    let _ = fs::remove_file(socket_dir.join(format!("{}.provider", session)));
-    let _ = fs::remove_file(socket_dir.join(format!("{}.extensions", session)));
-
-    if let Err(e) = result {
-        let _ = writeln!(std::io::stderr(), "Daemon error: {}", e);
-        process::exit(1);
-    }
+    .await
 }
 
 /// Idle timeout applied when AGENT_BROWSER_IDLE_TIMEOUT_MS is unset, so an
@@ -228,6 +175,8 @@ async fn run_socket_server(
 ) -> Result<(), String> {
     use tokio::net::UnixListener;
 
+    let shutdown = shutdown_signal()?;
+    tokio::pin!(shutdown);
     let idle_timeout_ms = idle_timeout.map(|t| t.ms);
 
     let listener =
@@ -344,7 +293,7 @@ async fn run_socket_server(
                 // so destructors fire.
                 break;
             }
-            _ = shutdown_signal() => {
+            _ = &mut shutdown => {
                 let mut s = state.lock().await;
                 let _ = auto_save_restore_state(&mut s).await;
                 let _ = close_all_browser_backends(&mut s).await;
@@ -368,6 +317,8 @@ async fn run_socket_server(
 ) -> Result<(), String> {
     use tokio::net::TcpListener;
 
+    let shutdown = shutdown_signal()?;
+    tokio::pin!(shutdown);
     let idle_timeout_ms = idle_timeout.map(|t| t.ms);
 
     let preferred_port = get_port_for_session(session);
@@ -487,7 +438,7 @@ async fn run_socket_server(
                 let _ = fs::remove_file(&port_path);
                 break;
             }
-            _ = shutdown_signal() => {
+            _ = &mut shutdown => {
                 let mut s = state.lock().await;
                 let _ = auto_save_restore_state(&mut s).await;
                 let _ = close_all_browser_backends(&mut s).await;
@@ -618,48 +569,33 @@ fn close_completed_response(action: &str, response: &Value) -> bool {
     })
 }
 
-async fn shutdown_signal() {
+/// Register Unix handlers before publishing a listener, then keep the same
+/// future alive across loop iterations so shutdown signals cannot be discarded.
+fn shutdown_signal() -> Result<impl std::future::Future<Output = ()>, String> {
     #[cfg(unix)]
     {
-        let mut sigint = match signal::unix::signal(signal::unix::SignalKind::interrupt()) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = writeln!(std::io::stderr(), "Failed to install SIGINT handler: {}", e);
-                process::exit(1);
+        let mut sigint = signal::unix::signal(signal::unix::SignalKind::interrupt())
+            .map_err(|e| format!("Failed to install SIGINT handler: {}", e))?;
+        let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+            .map_err(|e| format!("Failed to install SIGTERM handler: {}", e))?;
+        let mut sighup = signal::unix::signal(signal::unix::SignalKind::hangup())
+            .map_err(|e| format!("Failed to install SIGHUP handler: {}", e))?;
+        Ok(async move {
+            tokio::select! {
+                _ = sigint.recv() => {}
+                _ = sigterm.recv() => {}
+                _ = sighup.recv() => {}
             }
-        };
-        let mut sigterm = match signal::unix::signal(signal::unix::SignalKind::terminate()) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "Failed to install SIGTERM handler: {}",
-                    e
-                );
-                process::exit(1);
-            }
-        };
-        let mut sighup = match signal::unix::signal(signal::unix::SignalKind::hangup()) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = writeln!(std::io::stderr(), "Failed to install SIGHUP handler: {}", e);
-                process::exit(1);
-            }
-        };
-
-        tokio::select! {
-            _ = sigint.recv() => {}
-            _ = sigterm.recv() => {}
-            _ = sighup.recv() => {}
-        }
+        })
     }
 
     #[cfg(windows)]
     {
-        if let Err(e) = signal::ctrl_c().await {
-            let _ = writeln!(std::io::stderr(), "Failed to install Ctrl+C handler: {}", e);
-            process::exit(1);
-        }
+        Ok(async {
+            if let Err(e) = signal::ctrl_c().await {
+                let _ = writeln!(std::io::stderr(), "Failed to install Ctrl+C handler: {}", e);
+            }
+        })
     }
 }
 

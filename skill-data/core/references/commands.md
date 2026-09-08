@@ -526,8 +526,13 @@ AGENT_BROWSER_NO_XVFB="1"                    # Disable automatic Xvfb for headed
 AGENT_BROWSER_PROVIDER="browserbase"         # Browser provider or configured provider plugin
 AGENT_BROWSER_STREAM_PORT="9223"             # Override WebSocket streaming port (default: OS-assigned)
 AGENT_BROWSER_DASHBOARD_ALLOWED_ORIGINS="https://dashboard.example.com" # Trusted HTTPS reverse-proxied dashboard origins
+AGENT_BROWSER_REQUIRE_DAEMON="1"            # Require an existing compatible daemon
 AGENT_BROWSER_CONFIG="./agent-browser.json"  # Custom config file
 AGENT_BROWSER_CDP="9222"                     # Connect daemon to CDP port or WebSocket URL
 AGENT_BROWSER_ALLOWED_DOMAINS="example.com"  # Restrict network domains; requires a fresh controllable browser context without profile/session startup args, restore/state replay, or direct-page provider plugins
 AGENT_BROWSER_PLUGINS='[{"name":"vault","command":"agent-browser-plugin-vault","capabilities":["credential.read"]},{"name":"stealth","command":"agent-browser-plugin-stealth","capabilities":["launch.mutate"]}]'
 ```
+
+## Foreground daemon
+
+`agent-browser [options] daemon` runs in the invoking process for a host supervisor. Clients use `--require-daemon` with the same session and daemon settings. It never spawns or restarts a missing or incompatible daemon. See [Session management](session-management.md#supervised-daemon) for shutdown, configuration, and MCP behavior.

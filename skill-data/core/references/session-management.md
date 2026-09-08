@@ -201,3 +201,20 @@ rm /tmp/auth-state.json
 # Set timeout for automated scripts
 timeout 60 agent-browser --session long-task get text body
 ```
+
+## Supervised daemon
+
+Run `agent-browser daemon` under a process supervisor to keep the daemon in the invoking process with its original PID and stderr. It uses ordinary global flags and config files, refuses an occupied session, and publishes its configuration before accepting commands. The browser launches when a client first needs it. `close`, Ctrl+C, and Unix SIGTERM/SIGHUP save configured state, close owned browsers, and remove the session metadata. A released `.lock` file remains so concurrent starters always use the same lock.
+
+```bash
+# Supervisor command; stays in the foreground
+agent-browser --session worker --idle-timeout 0 daemon
+
+# Clients use the same session and daemon options
+agent-browser --session worker --idle-timeout 0 --require-daemon open example.com
+agent-browser --session worker --idle-timeout 0 --require-daemon close
+```
+
+`--require-daemon` (environment `AGENT_BROWSER_REQUIRE_DAEMON=1`, config `"requireDaemon": true`) fails if the daemon is unavailable or its version or daemon configuration differs. It never starts, stops, or restarts a daemon, including after a connection fails. Matching ordinary clients can also reuse a foreground daemon, but cannot automatically restart it on a mismatch. Restart it through its supervisor. Daemon configuration includes debug logging, action policy, confirmation categories, idle timeout, default timeout, and automatic dialog handling; use the same settings for daemon and clients. Browser launch options retain their existing per-command behavior. Explicit `close` still closes the session.
+
+The default CLI behavior remains automatic startup and configuration-driven restart for background daemons. MCP tools expose the common `requireDaemon` boolean through the normal CLI parser. The `daemon` command has no MCP tool because its foreground process and stdio belong to the host supervisor.

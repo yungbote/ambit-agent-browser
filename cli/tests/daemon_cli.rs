@@ -1,0 +1,386 @@
+#![cfg(unix)]
+
+//! Real CLI processes and Unix sockets verify supervisor custody without Chrome.
+use serde_json::Value;
+use std::fs;
+use std::io::{BufRead, BufReader};
+use std::os::unix::fs::MetadataExt;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::process::{Child, Command, Output, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
+use tempfile::TempDir;
+
+const BIN: &str = env!("CARGO_BIN_EXE_agent-browser");
+const SESSION: &str = "supervised";
+
+struct Fixture(TempDir);
+
+impl Fixture {
+    fn new() -> Self {
+        let fixture = Self(tempfile::tempdir().unwrap());
+        fixture.config("{}");
+        fixture
+    }
+
+    fn config(&self, value: &str) {
+        fs::write(self.0.path().join("settings.json"), value).unwrap();
+    }
+
+    fn path(&self, extension: &str) -> std::path::PathBuf {
+        self.0.path().join(format!("{SESSION}.{extension}"))
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new(BIN);
+        for (key, _) in std::env::vars_os() {
+            if key.to_string_lossy().starts_with("AGENT_BROWSER_") {
+                command.env_remove(key);
+            }
+        }
+        command
+            .arg("--config")
+            .arg(self.0.path().join("settings.json"))
+            .args(["--session", SESSION])
+            .args(args)
+            .env("AGENT_BROWSER_SOCKET_DIR", self.0.path())
+            .env("NO_COLOR", "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        command
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Process(Some(self.command(args).spawn().unwrap())).finish()
+    }
+
+    fn start(&self, args: &[&str]) -> Process {
+        let mut command = self.command(args);
+        command.arg("daemon");
+        let mut process = Process(Some(command.spawn().unwrap()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            if UnixStream::connect(self.path("sock")).is_ok() {
+                // A connectable socket must never precede published metadata.
+                assert_eq!(self.pid(), process.pid());
+                for extension in ["config", "version", "supervised"] {
+                    assert!(self.path(extension).exists());
+                }
+                return process;
+            }
+            if process.0.as_mut().unwrap().try_wait().unwrap().is_some() {
+                panic!("daemon exited: {:?}", process.finish());
+            }
+            assert!(Instant::now() < deadline, "daemon did not become ready");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    fn pid(&self) -> u32 {
+        fs::read_to_string(self.path("pid"))
+            .unwrap()
+            .parse()
+            .unwrap()
+    }
+
+    fn assert_clean(&self) {
+        for extension in ["sock", "pid", "config", "version", "stream", "supervised"] {
+            assert!(!self.path(extension).exists(), "leftover {extension}");
+        }
+    }
+}
+
+struct Process(Option<Child>);
+
+impl Process {
+    fn pid(&self) -> u32 {
+        self.0.as_ref().unwrap().id()
+    }
+
+    fn signal(&self, signal: i32) {
+        assert_eq!(unsafe { libc::kill(self.pid() as i32, signal) }, 0);
+    }
+
+    fn finish(mut self) -> Output {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while self.0.as_mut().unwrap().try_wait().unwrap().is_none() {
+            assert!(
+                Instant::now() < deadline,
+                "process {} did not exit",
+                self.pid()
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
+        self.0.take().unwrap().wait_with_output().unwrap()
+    }
+}
+
+impl Drop for Process {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
+}
+
+fn response(output: &Output) -> Value {
+    serde_json::from_slice(&output.stdout).unwrap_or_else(|e| panic!("{e}: {output:?}"))
+}
+
+#[test]
+fn foreground_keeps_pid_process_group_and_configured_client_reuses_it() {
+    let fixture = Fixture::new();
+    fixture.config(r#"{"idleTimeout":"0","noAutoDialog":true,"requireDaemon":true}"#);
+    let daemon = fixture.start(&[]);
+    assert_eq!(unsafe { libc::getpgid(daemon.pid() as i32) }, unsafe {
+        libc::getpgrp()
+    });
+    assert_eq!(unsafe { libc::getsid(daemon.pid() as i32) }, unsafe {
+        libc::getsid(0)
+    });
+    let inspection = fixture.run(&["--json", "inspect"]);
+    assert!(inspection.status.success(), "{inspection:?}");
+    assert_eq!(response(&inspection)["success"], true);
+    assert_eq!(fixture.pid(), daemon.pid());
+    let close = fixture.run(&["--json", "close"]);
+    assert!(close.status.success(), "{close:?}");
+    assert!(daemon.finish().status.success());
+    fixture.assert_clean();
+}
+
+#[test]
+fn absent_required_daemon_never_creates_session_files() {
+    let fixture = Fixture::new();
+    for use_env in [false, true] {
+        let mut command = fixture.command(&["--json", "inspect"]);
+        if use_env {
+            command.env("AGENT_BROWSER_REQUIRE_DAEMON", "1");
+        } else {
+            command.arg("--require-daemon");
+        }
+        let output = Process(Some(command.spawn().unwrap())).finish();
+        assert!(!output.status.success());
+        assert!(response(&output)["error"]
+            .as_str()
+            .unwrap()
+            .contains("is unavailable"));
+        fixture.assert_clean();
+        assert!(!fixture.path("lock").exists());
+    }
+}
+
+#[test]
+fn mismatch_never_restarts_supervised_daemon_even_for_ordinary_clients() {
+    let fixture = Fixture::new();
+    let daemon = fixture.start(&["--idle-timeout", "0"]);
+    let config = fs::read(fixture.path("config")).unwrap();
+    let inode = fs::metadata(fixture.path("sock")).unwrap().ino();
+    for require in ["true", "false"] {
+        let output = fixture.run(&["--json", "--require-daemon", require, "inspect"]);
+        assert!(!output.status.success());
+        assert!(response(&output)["error"]
+            .as_str()
+            .unwrap()
+            .contains("configuration"));
+        assert_eq!(fixture.pid(), daemon.pid());
+        assert_eq!(fs::read(fixture.path("config")).unwrap(), config);
+        assert_eq!(fs::metadata(fixture.path("sock")).unwrap().ino(), inode);
+    }
+    fs::write(fixture.path("version"), "different-version").unwrap();
+    let output = fixture.run(&[
+        "--json",
+        "--require-daemon",
+        "--idle-timeout",
+        "0",
+        "inspect",
+    ]);
+    assert!(!output.status.success());
+    assert!(response(&output)["error"]
+        .as_str()
+        .unwrap()
+        .contains("version"));
+    assert_eq!(fixture.pid(), daemon.pid());
+    daemon.signal(libc::SIGTERM);
+    assert!(daemon.finish().status.success());
+    fixture.assert_clean();
+}
+
+#[test]
+fn second_foreground_daemon_cannot_change_live_session() {
+    let fixture = Fixture::new();
+    let daemon = fixture.start(&[]);
+    assert!(fixture.run(&["inspect"]).status.success());
+    assert_eq!(fixture.pid(), daemon.pid());
+    let config = fs::read(fixture.path("config")).unwrap();
+    let inode = fs::metadata(fixture.path("sock")).unwrap().ino();
+    let contender = fixture.run(&["--debug", "--idle-timeout", "5s", "daemon"]);
+    assert!(!contender.status.success());
+    assert!(String::from_utf8_lossy(&contender.stderr).contains("Cannot own session"));
+    assert_eq!(fixture.pid(), daemon.pid());
+    assert_eq!(fs::read(fixture.path("config")).unwrap(), config);
+    assert_eq!(fs::metadata(fixture.path("sock")).unwrap().ino(), inode);
+    assert!(!fixture.path("log").exists());
+    assert!(fixture.run(&["--require-daemon", "close"]).status.success());
+    assert!(daemon.finish().status.success());
+    fixture.assert_clean();
+}
+
+#[test]
+fn concurrent_foreground_starts_leave_exactly_one_owner() {
+    for _ in 0..5 {
+        let fixture = Fixture::new();
+        let first = Process(Some(fixture.command(&["daemon"]).spawn().unwrap()));
+        let second = Process(Some(fixture.command(&["daemon"]).spawn().unwrap()));
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while UnixStream::connect(fixture.path("sock")).is_err() {
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(10));
+        }
+        let (winner, loser) = if fixture.pid() == first.pid() {
+            (first, second)
+        } else {
+            assert_eq!(fixture.pid(), second.pid());
+            (second, first)
+        };
+        assert!(!loser.finish().status.success());
+        assert!(fixture
+            .run(&["--require-daemon", "inspect"])
+            .status
+            .success());
+        assert_eq!(fixture.pid(), winner.pid());
+        winner.signal(libc::SIGTERM);
+        assert!(winner.finish().status.success());
+        fixture.assert_clean();
+    }
+}
+
+#[test]
+fn ordinary_clients_still_start_and_restart_background_daemons() {
+    let fixture = Fixture::new();
+    // The fixture's socket directory is the sole authority for this process.
+    struct Cleanup<'a>(&'a Fixture);
+    impl Drop for Cleanup<'_> {
+        fn drop(&mut self) {
+            if let Ok(pid) = fs::read_to_string(self.0.path("pid")) {
+                if let Ok(pid) = pid.parse::<i32>() {
+                    unsafe {
+                        libc::kill(pid, libc::SIGTERM);
+                    }
+                }
+            }
+        }
+    }
+    let _cleanup = Cleanup(&fixture);
+    let first = fixture.run(&["--json", "inspect"]);
+    assert!(first.status.success(), "{first:?}");
+    let first_pid = fixture.pid();
+    assert_ne!(unsafe { libc::getsid(first_pid as i32) }, unsafe {
+        libc::getsid(0)
+    });
+    assert!(!fixture.path("supervised").exists());
+    let second = fixture.run(&["--json", "--idle-timeout", "0", "inspect"]);
+    assert!(second.status.success(), "{second:?}");
+    assert_ne!(fixture.pid(), first_pid);
+    assert!(fixture
+        .run(&["--idle-timeout", "0", "close"])
+        .status
+        .success());
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while fixture.path("pid").exists() {
+        assert!(Instant::now() < deadline);
+        thread::sleep(Duration::from_millis(10));
+    }
+    fixture.assert_clean();
+}
+
+#[test]
+fn signals_cleanup_and_keep_debug_output_on_stderr() {
+    for signal in [libc::SIGTERM, libc::SIGHUP, libc::SIGINT] {
+        let fixture = Fixture::new();
+        let daemon = fixture.start(&["--debug"]);
+        daemon.signal(signal);
+        let output = daemon.finish();
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("[daemon] Started"));
+        assert!(!fixture.path("log").exists());
+        fixture.assert_clean();
+        let restarted = fixture.start(&[]);
+        restarted.signal(libc::SIGTERM);
+        assert!(restarted.finish().status.success());
+    }
+}
+
+#[test]
+fn old_live_socket_without_lock_is_never_unlinked() {
+    let fixture = Fixture::new();
+    let listener = UnixListener::bind(fixture.path("sock")).unwrap();
+    fs::write(fixture.path("pid"), std::process::id().to_string()).unwrap();
+    let inode = fs::metadata(fixture.path("sock")).unwrap().ino();
+    let output = fixture.run(&["daemon"]);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("already owns"));
+    assert_eq!(fixture.pid(), std::process::id());
+    assert_eq!(fs::metadata(fixture.path("sock")).unwrap().ino(), inode);
+    drop(listener);
+}
+
+#[test]
+fn required_client_does_not_spawn_after_socket_disappears_during_request() {
+    let fixture = Fixture::new();
+    let daemon = fixture.start(&[]);
+    let config = fs::read(fixture.path("config")).unwrap();
+    daemon.signal(libc::SIGTERM);
+    assert!(daemon.finish().status.success());
+    fs::write(fixture.path("config"), config).unwrap();
+    fs::write(fixture.path("version"), env!("CARGO_PKG_VERSION")).unwrap();
+    let listener = UnixListener::bind(fixture.path("sock")).unwrap();
+    let socket = fixture.path("sock");
+    let server = thread::spawn(move || {
+        let (ready, _) = listener.accept().unwrap();
+        let mut line = String::new();
+        assert_eq!(BufReader::new(ready).read_line(&mut line).unwrap(), 0);
+        let (request, _) = listener.accept().unwrap();
+        fs::remove_file(socket).unwrap();
+        drop(listener);
+        BufReader::new(request).read_line(&mut line).unwrap();
+        assert!(line.contains("inspect"));
+    });
+    let output = fixture.run(&["--json", "--require-daemon", "inspect"]);
+    server.join().unwrap();
+    assert!(!output.status.success(), "{output:?}");
+    assert!(!fixture.path("pid").exists());
+    assert!(!fixture.path("sock").exists());
+}
+
+#[test]
+fn foreground_parser_rejects_subcommands_and_unsafe_session_names() {
+    let fixture = Fixture::new();
+    for args in [
+        &["daemon", "start"][..],
+        &["--session", "../outside", "daemon"][..],
+    ] {
+        let output = fixture.run(args);
+        assert!(!output.status.success());
+        fixture.assert_clean();
+        assert!(!fixture.path("lock").exists());
+    }
+}
+
+#[test]
+fn batch_cannot_dispatch_the_host_daemon_command() {
+    let fixture = Fixture::new();
+    let daemon = fixture.start(&[]);
+    let output = fixture.run(&["--json", "--require-daemon", "batch", "daemon"]);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(response(&output)[0]["error"]
+        .as_str()
+        .unwrap()
+        .contains("standalone foreground process"));
+    assert_eq!(fixture.pid(), daemon.pid());
+    daemon.signal(libc::SIGTERM);
+    assert!(daemon.finish().status.success());
+    fixture.assert_clean();
+}

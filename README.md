@@ -552,6 +552,23 @@ agent-browser skills path [name]      # Print skill directory path
 
 Serves bundled skill content that always matches the installed CLI version. AI agents use this to get current instructions rather than relying on cached copies. Set `AGENT_BROWSER_SKILLS_DIR` to override the skills directory path.
 
+### Supervised daemon
+
+Run `agent-browser daemon` under a process supervisor to keep the daemon in the invoking process with its original PID and stderr. It uses ordinary global flags and config files, refuses an occupied session, and publishes its configuration before accepting commands. The browser launches when a client first needs it. `close`, Ctrl+C, and Unix SIGTERM/SIGHUP save configured state, close owned browsers, and remove the session metadata. A released `.lock` file remains so concurrent starters always use the same lock.
+
+```bash
+# Supervisor command; stays in the foreground
+agent-browser --session worker --idle-timeout 0 daemon
+
+# Clients use the same session and daemon options
+agent-browser --session worker --idle-timeout 0 --require-daemon open example.com
+agent-browser --session worker --idle-timeout 0 --require-daemon close
+```
+
+`--require-daemon` (environment `AGENT_BROWSER_REQUIRE_DAEMON=1`, config `"requireDaemon": true`) fails if the daemon is unavailable or its version or daemon configuration differs. It never starts, stops, or restarts a daemon, including after a connection fails. Matching ordinary clients can also reuse a foreground daemon, but cannot automatically restart it on a mismatch. Restart it through its supervisor. Daemon configuration includes debug logging, action policy, confirmation categories, idle timeout, default timeout, and automatic dialog handling; use the same settings for daemon and clients. Browser launch options retain their existing per-command behavior. Explicit `close` still closes the session.
+
+The default CLI behavior remains automatic startup and configuration-driven restart for background daemons. MCP tools expose the common `requireDaemon` boolean through the normal CLI parser. The `daemon` command has no MCP tool because its foreground process and stdio belong to the host supervisor.
+
 ### MCP Server
 
 ```bash
@@ -1018,6 +1035,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--confirm-actions <list>` | Action categories requiring confirmation (or `AGENT_BROWSER_CONFIRM_ACTIONS` env) |
 | `--confirm-interactive` | Interactive confirmation prompts; auto-denies if stdin is not a TTY (or `AGENT_BROWSER_CONFIRM_INTERACTIVE` env) |
 | `--engine <name>` | Browser engine: `chrome` (default), `lightpanda` (or `AGENT_BROWSER_ENGINE` env) |
+| `--require-daemon` | Require an existing compatible daemon without starting or restarting it (or `AGENT_BROWSER_REQUIRE_DAEMON` env; config `requireDaemon`) |
 | `--idle-timeout <time>` | Shut down the daemon after inactivity (`10s`, `3m`, `1h`, or raw ms). Defaults to `1h`; use `0` to disable (or `AGENT_BROWSER_IDLE_TIMEOUT_MS` env) |
 | `--no-auto-dialog` | Disable automatic dismissal of `alert`/`beforeunload` dialogs (or `AGENT_BROWSER_NO_AUTO_DIALOG` env) |
 | `--model <name>` | AI model for chat command (or `AI_GATEWAY_MODEL` env) |

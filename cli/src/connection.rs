@@ -157,6 +157,84 @@ fn get_config_path(session: &str) -> PathBuf {
     get_socket_dir().join(format!("{}.config", session))
 }
 
+fn daemon_is_supervised(session: &str) -> bool {
+    get_socket_dir()
+        .join(format!("{}.supervised", session))
+        .exists()
+}
+
+/// Holds exclusive ownership of a session's socket and metadata until shutdown.
+/// The lock file stays in place so concurrent openers always lock the same inode;
+/// the operating system releases the lock even after an ungraceful process exit.
+pub struct DaemonSession {
+    session: String,
+    _lock: fs::File,
+}
+
+impl DaemonSession {
+    pub fn acquire(session: &str, supervised: bool) -> Result<Self, String> {
+        let socket_dir = get_socket_dir();
+        fs::create_dir_all(&socket_dir)
+            .map_err(|e| format!("Failed to create socket directory: {}", e))?;
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(socket_dir.join(format!("{}.lock", session)))
+            .map_err(|e| format!("Failed to open daemon session lock: {}", e))?;
+        lock.try_lock().map_err(|e| {
+            format!("Cannot own session '{}': {}. Another daemon may be starting or running; use another session or stop it through its owner.", session, e)
+        })?;
+
+        // Older daemons have no session lock. Never unlink their live socket or
+        // overwrite their PID, including while they are still starting up.
+        let live_pid = fs::read_to_string(get_pid_path(session))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<u32>().ok())
+            .is_some_and(is_pid_alive);
+        if daemon_ready(session) || live_pid {
+            return Err(format!(
+                "A daemon already owns session '{}'. Use another session or stop it through its owner.",
+                session
+            ));
+        }
+
+        let owner = Self {
+            session: session.to_string(),
+            _lock: lock,
+        };
+        owner.cleanup();
+        // Publish all startup metadata before opening the command listener.
+        for (extension, value) in [
+            ("pid", Some(std::process::id().to_string())),
+            ("version", Some(env!("CARGO_PKG_VERSION").to_string())),
+            ("config", env::var("AGENT_BROWSER_DAEMON_CONFIG").ok()),
+            ("supervised", supervised.then(|| "1".to_string())),
+        ] {
+            if let Some(value) = value {
+                fs::write(socket_dir.join(format!("{}.{}", session, extension)), value)
+                    .map_err(|e| format!("Failed to write daemon {}: {}", extension, e))?;
+            }
+        }
+        Ok(owner)
+    }
+
+    fn cleanup(&self) {
+        cleanup_stale_files(&self.session);
+        for extension in ["engine", "provider", "extensions", "supervised"] {
+            let _ =
+                fs::remove_file(get_socket_dir().join(format!("{}.{}", self.session, extension)));
+        }
+    }
+}
+
+impl Drop for DaemonSession {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
 /// Clean up stale socket and PID files for a session
 pub fn cleanup_stale_files(session: &str) {
     let pid_path = get_pid_path(session);
@@ -427,11 +505,13 @@ pub struct DaemonResult {
     pub restarted: bool,
 }
 
-/// Options forwarded to the daemon process as environment variables.
+/// Daemon startup options and the client policy for acquiring a session.
 /// Note: `confirm_interactive` is intentionally absent -- it is a CLI-side
 /// UX concern (prompting the user on stdin) and not a daemon configuration.
 /// The daemon only needs `confirm_actions` to gate action categories.
 pub struct DaemonOptions<'a> {
+    /// Client-only policy, excluded from daemon configuration and its fingerprint.
+    pub require_existing: bool,
     pub headed: bool,
     pub debug: bool,
     pub executable_path: Option<&'a str>,
@@ -471,121 +551,148 @@ pub struct DaemonOptions<'a> {
     pub plugins: Option<&'a str>,
 }
 
-fn apply_daemon_env(cmd: &mut Command, session: &str, opts: &DaemonOptions) {
-    cmd.env("AGENT_BROWSER_DAEMON", "1")
-        .env("AGENT_BROWSER_SESSION", session);
+/// Canonical environment for both detached and foreground daemon startup.
+/// Absent values clear inherited options so explicit CLI false values remain false.
+fn daemon_environment(session: &str, opts: &DaemonOptions) -> Vec<(&'static str, Option<String>)> {
+    vec![
+        ("AGENT_BROWSER_DAEMON", Some("1".to_string())),
+        ("AGENT_BROWSER_SESSION", Some(session.to_string())),
+        (
+            "AGENT_BROWSER_DAEMON_CONFIG",
+            Some(daemon_config_fingerprint(opts)),
+        ),
+        ("AGENT_BROWSER_HEADED", opts.headed.then(|| "1".to_string())),
+        ("AGENT_BROWSER_DEBUG", opts.debug.then(|| "1".to_string())),
+        (
+            "AGENT_BROWSER_EXECUTABLE_PATH",
+            opts.executable_path.map(str::to_string),
+        ),
+        (
+            "AGENT_BROWSER_EXTENSIONS",
+            (!opts.extensions.is_empty()).then(|| opts.extensions.join(",")),
+        ),
+        (
+            "AGENT_BROWSER_INIT_SCRIPTS",
+            (!opts.init_scripts.is_empty()).then(|| opts.init_scripts.join(",")),
+        ),
+        (
+            "AGENT_BROWSER_ENABLE",
+            (!opts.enable.is_empty()).then(|| opts.enable.join(",")),
+        ),
+        ("AGENT_BROWSER_ARGS", opts.args.map(str::to_string)),
+        (
+            "AGENT_BROWSER_USER_AGENT",
+            opts.user_agent.map(str::to_string),
+        ),
+        ("AGENT_BROWSER_PROXY", opts.proxy.map(str::to_string)),
+        (
+            "AGENT_BROWSER_PROXY_BYPASS",
+            opts.proxy_bypass.map(str::to_string),
+        ),
+        (
+            "AGENT_BROWSER_PROXY_USERNAME",
+            opts.proxy_username.map(str::to_string),
+        ),
+        (
+            "AGENT_BROWSER_PROXY_PASSWORD",
+            opts.proxy_password.map(str::to_string),
+        ),
+        (
+            "AGENT_BROWSER_IGNORE_HTTPS_ERRORS",
+            opts.ignore_https_errors.then(|| "1".to_string()),
+        ),
+        (
+            "AGENT_BROWSER_ALLOW_FILE_ACCESS",
+            opts.allow_file_access.then(|| "1".to_string()),
+        ),
+        (
+            "AGENT_BROWSER_HIDE_SCROLLBARS",
+            Some(if opts.hide_scrollbars { "1" } else { "0" }.to_string()),
+        ),
+        ("AGENT_BROWSER_WEBGPU", opts.webgpu.then(|| "1".to_string())),
+        ("AGENT_BROWSER_PROFILE", opts.profile.map(str::to_string)),
+        ("AGENT_BROWSER_STATE", opts.state.map(str::to_string)),
+        ("AGENT_BROWSER_PROVIDER", opts.provider.map(str::to_string)),
+        ("AGENT_BROWSER_IOS_DEVICE", opts.device.map(str::to_string)),
+        (
+            "AGENT_BROWSER_SESSION_NAME",
+            opts.session_name.map(str::to_string),
+        ),
+        (
+            "AGENT_BROWSER_RESTORE_SAVE",
+            opts.restore_save.map(str::to_string),
+        ),
+        (
+            "AGENT_BROWSER_RESTORE_CHECK_URL",
+            opts.restore_check_url.map(str::to_string),
+        ),
+        (
+            "AGENT_BROWSER_RESTORE_CHECK_TEXT",
+            opts.restore_check_text.map(str::to_string),
+        ),
+        (
+            "AGENT_BROWSER_RESTORE_CHECK_FN",
+            opts.restore_check_fn.map(str::to_string),
+        ),
+        (
+            "AGENT_BROWSER_DOWNLOAD_PATH",
+            opts.download_path.map(str::to_string),
+        ),
+        (
+            "AGENT_BROWSER_ALLOWED_DOMAINS",
+            opts.allowed_domains.map(|domains| domains.join(",")),
+        ),
+        (
+            "AGENT_BROWSER_ACTION_POLICY",
+            opts.action_policy.map(str::to_string),
+        ),
+        (
+            "AGENT_BROWSER_CONFIRM_ACTIONS",
+            opts.confirm_actions.map(str::to_string),
+        ),
+        ("AGENT_BROWSER_ENGINE", opts.engine.map(str::to_string)),
+        (
+            "AGENT_BROWSER_AUTO_CONNECT",
+            opts.auto_connect.then(|| "1".to_string()),
+        ),
+        (
+            "AGENT_BROWSER_PIN_TAB",
+            opts.pin_tab.then(|| "1".to_string()),
+        ),
+        (
+            "AGENT_BROWSER_IDLE_TIMEOUT_MS",
+            opts.idle_timeout.map(str::to_string),
+        ),
+        (
+            "AGENT_BROWSER_DEFAULT_TIMEOUT",
+            opts.default_timeout.map(|timeout| timeout.to_string()),
+        ),
+        ("AGENT_BROWSER_CDP", opts.cdp.map(str::to_string)),
+        (
+            "AGENT_BROWSER_NO_AUTO_DIALOG",
+            opts.no_auto_dialog.then(|| "1".to_string()),
+        ),
+        ("AGENT_BROWSER_PLUGINS", opts.plugins.map(str::to_string)),
+    ]
+}
 
-    if opts.headed {
-        cmd.env("AGENT_BROWSER_HEADED", "1");
+fn apply_daemon_env(cmd: &mut Command, session: &str, opts: &DaemonOptions) {
+    for (key, value) in daemon_environment(session, opts) {
+        match value {
+            Some(value) => cmd.env(key, value),
+            None => cmd.env_remove(key),
+        };
     }
-    if opts.debug {
-        cmd.env("AGENT_BROWSER_DEBUG", "1");
-    }
-    if let Some(path) = opts.executable_path {
-        cmd.env("AGENT_BROWSER_EXECUTABLE_PATH", path);
-    }
-    if !opts.extensions.is_empty() {
-        cmd.env("AGENT_BROWSER_EXTENSIONS", opts.extensions.join(","));
-    }
-    if !opts.init_scripts.is_empty() {
-        cmd.env("AGENT_BROWSER_INIT_SCRIPTS", opts.init_scripts.join(","));
-    }
-    if !opts.enable.is_empty() {
-        cmd.env("AGENT_BROWSER_ENABLE", opts.enable.join(","));
-    }
-    if let Some(a) = opts.args {
-        cmd.env("AGENT_BROWSER_ARGS", a);
-    }
-    if let Some(ua) = opts.user_agent {
-        cmd.env("AGENT_BROWSER_USER_AGENT", ua);
-    }
-    if let Some(p) = opts.proxy {
-        cmd.env("AGENT_BROWSER_PROXY", p);
-    }
-    if let Some(pb) = opts.proxy_bypass {
-        cmd.env("AGENT_BROWSER_PROXY_BYPASS", pb);
-    }
-    if let Some(pu) = opts.proxy_username {
-        cmd.env("AGENT_BROWSER_PROXY_USERNAME", pu);
-    }
-    if let Some(pp) = opts.proxy_password {
-        cmd.env("AGENT_BROWSER_PROXY_PASSWORD", pp);
-    }
-    if opts.ignore_https_errors {
-        cmd.env("AGENT_BROWSER_IGNORE_HTTPS_ERRORS", "1");
-    }
-    if opts.allow_file_access {
-        cmd.env("AGENT_BROWSER_ALLOW_FILE_ACCESS", "1");
-    }
-    cmd.env(
-        "AGENT_BROWSER_HIDE_SCROLLBARS",
-        if opts.hide_scrollbars { "1" } else { "0" },
-    );
-    if opts.webgpu {
-        cmd.env("AGENT_BROWSER_WEBGPU", "1");
-    }
-    if let Some(prof) = opts.profile {
-        cmd.env("AGENT_BROWSER_PROFILE", prof);
-    }
-    if let Some(st) = opts.state {
-        cmd.env("AGENT_BROWSER_STATE", st);
-    }
-    if let Some(p) = opts.provider {
-        cmd.env("AGENT_BROWSER_PROVIDER", p);
-    }
-    if let Some(d) = opts.device {
-        cmd.env("AGENT_BROWSER_IOS_DEVICE", d);
-    }
-    if let Some(sn) = opts.session_name {
-        cmd.env("AGENT_BROWSER_SESSION_NAME", sn);
-    }
-    if let Some(policy) = opts.restore_save {
-        cmd.env("AGENT_BROWSER_RESTORE_SAVE", policy);
-    }
-    if let Some(check) = opts.restore_check_url {
-        cmd.env("AGENT_BROWSER_RESTORE_CHECK_URL", check);
-    }
-    if let Some(check) = opts.restore_check_text {
-        cmd.env("AGENT_BROWSER_RESTORE_CHECK_TEXT", check);
-    }
-    if let Some(check) = opts.restore_check_fn {
-        cmd.env("AGENT_BROWSER_RESTORE_CHECK_FN", check);
-    }
-    if let Some(dp) = opts.download_path {
-        cmd.env("AGENT_BROWSER_DOWNLOAD_PATH", dp);
-    }
-    if let Some(ad) = opts.allowed_domains {
-        cmd.env("AGENT_BROWSER_ALLOWED_DOMAINS", ad.join(","));
-    }
-    if let Some(ap) = opts.action_policy {
-        cmd.env("AGENT_BROWSER_ACTION_POLICY", ap);
-    }
-    if let Some(ca) = opts.confirm_actions {
-        cmd.env("AGENT_BROWSER_CONFIRM_ACTIONS", ca);
-    }
-    if let Some(engine) = opts.engine {
-        cmd.env("AGENT_BROWSER_ENGINE", engine);
-    }
-    if opts.auto_connect {
-        cmd.env("AGENT_BROWSER_AUTO_CONNECT", "1");
-    }
-    if opts.pin_tab {
-        cmd.env("AGENT_BROWSER_PIN_TAB", "1");
-    }
-    if let Some(idle) = opts.idle_timeout {
-        cmd.env("AGENT_BROWSER_IDLE_TIMEOUT_MS", idle);
-    }
-    if let Some(timeout) = opts.default_timeout {
-        cmd.env("AGENT_BROWSER_DEFAULT_TIMEOUT", timeout.to_string());
-    }
-    if let Some(cdp) = opts.cdp {
-        cmd.env("AGENT_BROWSER_CDP", cdp);
-    }
-    if opts.no_auto_dialog {
-        cmd.env("AGENT_BROWSER_NO_AUTO_DIALOG", "1");
-    }
-    if let Some(plugins) = opts.plugins {
-        cmd.env("AGENT_BROWSER_PLUGINS", plugins);
+}
+
+/// Apply parsed startup options in place before creating the foreground runtime.
+/// Must be called while the CLI is still single-threaded.
+pub fn configure_foreground_daemon(session: &str, opts: &DaemonOptions) {
+    for (key, value) in daemon_environment(session, opts) {
+        match value {
+            Some(value) => env::set_var(key, value),
+            None => env::remove_var(key),
+        }
     }
 }
 
@@ -621,6 +728,7 @@ fn daemon_config_matches(session: &str, opts: &DaemonOptions) -> bool {
     daemon_config_status(session, opts) == DaemonConfigStatus::Matches
 }
 
+#[cfg(test)]
 fn write_daemon_config(session: &str, opts: &DaemonOptions) {
     let _ = fs::write(get_config_path(session), daemon_config_fingerprint(opts));
 }
@@ -638,8 +746,9 @@ fn ready_spawned_daemon_result(
     spawned_pid: Option<u32>,
     restarted: bool,
 ) -> Option<DaemonResult> {
-    if spawned_pid.is_some_and(|pid| daemon_pid_matches(session, pid)) {
-        write_daemon_config(session, opts);
+    if spawned_pid.is_some_and(|pid| daemon_pid_matches(session, pid))
+        && daemon_config_matches(session, opts)
+    {
         return Some(DaemonResult {
             already_running: false,
             restarted,
@@ -789,7 +898,30 @@ fn stop_existing_daemon_for_restart(session: &str) {
     }
 }
 
+/// Connect to a compatible daemon without changing session ownership or files.
+fn require_existing_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult, String> {
+    let reason = if !daemon_ready(session) {
+        "is unavailable"
+    } else if !daemon_version_matches(session) {
+        "has a different or unknown version"
+    } else if !daemon_config_matches(session, opts) {
+        "has different or unpublished daemon configuration"
+    } else {
+        return Ok(DaemonResult {
+            already_running: true,
+            restarted: false,
+        });
+    };
+    Err(format!(
+        "Required daemon for session '{}' {}. Start `agent-browser daemon` with the same session and daemon options, or restart it through its supervisor. No daemon was started or stopped.",
+        session, reason
+    ))
+}
+
 pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult, String> {
+    if opts.require_existing {
+        return require_existing_daemon(session, opts);
+    }
     let mut restarted = false;
 
     // Socket connectivity is the sole liveness check — no PID check — so
@@ -802,6 +934,9 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
     // this check is handled at request time: callers respawn via
     // ensure_daemon when the request fails with daemon_unreachable().
     if daemon_ready(session) {
+        if daemon_is_supervised(session) {
+            return require_existing_daemon(session, opts);
+        }
         // Check version: if the running daemon is from a different CLI
         // version (e.g. after an upgrade), kill it and start a fresh one.
         if !daemon_version_matches(session) {
@@ -823,8 +958,7 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
         }
     }
 
-    // Clean up any stale socket/pid files before starting fresh
-    cleanup_stale_files(session);
+    // The daemon cleans stale files only after acquiring session ownership.
 
     // Ensure socket directory exists
     let socket_dir = get_socket_dir();
@@ -941,22 +1075,18 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
                 }
                 let stderr_trimmed = stderr_output.trim();
 
-                // If the daemon failed because another instance won the bind
-                // race ("Address already in use"), check whether that winner is
-                // now accepting connections and piggyback on it.
-                if stderr_trimmed.contains("Address already in use")
-                    || stderr_trimmed.contains("Failed to bind")
-                {
-                    thread::sleep(Duration::from_millis(200));
-                    if daemon_ready(session) {
-                        if wait_for_matching_ready_daemon(session, opts, Duration::from_secs(1)) {
-                            return Ok(DaemonResult {
-                                already_running: true,
-                                restarted,
-                            });
-                        }
-                        return Err(concurrent_daemon_config_error(session));
+                // Any failed contender may have lost session ownership to a
+                // concurrent startup. Reuse that winner without interpreting
+                // platform-specific bind or file-lock error messages.
+                thread::sleep(Duration::from_millis(200));
+                if daemon_ready(session) {
+                    if wait_for_matching_ready_daemon(session, opts, Duration::from_secs(1)) {
+                        return Ok(DaemonResult {
+                            already_running: true,
+                            restarted,
+                        });
                     }
+                    return Err(concurrent_daemon_config_error(session));
                 }
 
                 if !stderr_trimmed.is_empty() {
@@ -1244,6 +1374,7 @@ mod tests {
         allowed_domains: Option<&'a [String]>,
     ) -> DaemonOptions<'a> {
         DaemonOptions {
+            require_existing: false,
             headed: false,
             debug: false,
             executable_path: None,
@@ -1379,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    fn test_spawn_owner_writes_config() {
+    fn test_spawn_owner_requires_published_config() {
         let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_NAMESPACE"]);
         let dir = tempfile::tempdir().unwrap();
         guard.set("AGENT_BROWSER_SOCKET_DIR", dir.path().to_str().unwrap());
@@ -1392,6 +1523,8 @@ mod tests {
         fs::create_dir_all(get_socket_dir()).unwrap();
         fs::write(get_pid_path(session), spawned_pid.to_string()).unwrap();
 
+        assert!(ready_spawned_daemon_result(session, &opts, Some(spawned_pid), true).is_none());
+        write_daemon_config(session, &opts);
         let result = ready_spawned_daemon_result(session, &opts, Some(spawned_pid), true)
             .expect("spawn owner should be accepted");
 

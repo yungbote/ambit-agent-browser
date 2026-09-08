@@ -599,6 +599,7 @@ See [Init Scripts & Extensions](/init-scripts) for launch-time scripts, runtime 
 --confirm-actions <list> # Action categories requiring confirmation
 --confirm-interactive    # Interactive confirmation prompts (auto-denies if stdin is not a TTY)
 --engine <name>          # Browser engine: chrome (default), lightpanda
+--require-daemon         # Require an existing compatible daemon without spawning or restarting
 --idle-timeout <time>    # Auto-shutdown daemon after inactivity (default: 1h; 0 disables)
 --no-auto-dialog         # Disable auto-accept for alert and beforeunload dialogs
 --model <name>           # AI model for chat (or AI_GATEWAY_MODEL env)
@@ -639,6 +640,10 @@ echo '[
     <tr><td><code>--json</code></td><td>Output results as a JSON array</td></tr>
   </tbody>
 </table>
+
+## Foreground daemon
+
+`agent-browser [options] daemon` runs in the invoking process for a host supervisor and retains stderr. Clients use `--require-daemon` (or `AGENT_BROWSER_REQUIRE_DAEMON=1`, config `requireDaemon`) with matching session and daemon settings. See [Supervised daemon](/sessions#supervised-daemon) for lifecycle and configuration behavior.
 
 ## MCP server
 
@@ -693,7 +698,7 @@ Common tools include:
 - `agent_browser_eval`
 - `agent_browser_close`
 
-Each tool has typed fields such as `url`, `selector`, `text`, `key`, `session`, `allowedDomains`, and `idleTimeout`, so MCP clients show meaningful approval prompts instead of raw command arrays. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions. The common `idleTimeout` string maps to `--idle-timeout`, accepts values such as `30s`, `5m`, `1h`, or raw milliseconds, and accepts `0` to disable idle shutdown. Each tool also accepts `extraArgs` for advanced CLI flags and exact CLI parity. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally.
+Each tool has typed fields such as `url`, `selector`, `text`, `key`, `session`, `allowedDomains`, and `idleTimeout`, so MCP clients show meaningful approval prompts instead of raw command arrays. The common `allowedDomains` array maps to `--allowed-domains` and activates the same WebRTC containment and launch-mode restrictions. The common `idleTimeout` string maps to `--idle-timeout`, accepts values such as `30s`, `5m`, `1h`, or raw milliseconds, and accepts `0` to disable idle shutdown. The common `requireDaemon` boolean maps to `--require-daemon`, preventing client startup or restart of supervised daemons. The foreground `daemon` command is intentionally a host lifecycle command without an MCP tool. Each tool also accepts `extraArgs` for advanced CLI flags and exact CLI parity. Tool discovery is paginated and includes read-only/open-world annotations so modern MCP clients can load the large typed surface incrementally.
 
 Tool invocations use the same config files and environment variables as the CLI. Use `session` in the tool arguments, or set `AGENT_BROWSER_SESSION`, to isolate browser state.
 

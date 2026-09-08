@@ -5,6 +5,9 @@
 //! so MCP behavior stays aligned with the normal CLI command surface. Daemon
 //! lifecycle settings, including the default idle timeout, use the same CLI
 //! parser and daemon as direct commands.
+//! `requireDaemon` delegates to --require-daemon. The foreground `daemon`
+//! command is intentionally omitted: a host supervisor owns its process and
+//! stdio lifetime, which cannot be represented by a bounded MCP tool call.
 //! Owned Windows Chrome uses the same private headless desktop and Job Object
 //! lifetime through MCP; headed and external-connection semantics are unchanged.
 
@@ -2013,6 +2016,13 @@ fn tool(name: &str, title: &str, description: &str, properties: Value, required:
         }),
     );
     props.insert(
+        "requireDaemon".to_string(),
+        json!({
+            "type": "boolean",
+            "description": "Require an existing compatible daemon; never start or restart one. Use when a host supervisor owns the daemon."
+        }),
+    );
+    props.insert(
         "extraArgs".to_string(),
         json!({
             "type": "array",
@@ -3722,6 +3732,11 @@ fn append_common_global_args(
     }
     append_session_args(args, session);
 
+    if let Some(require_daemon) = optional_bool(arguments, "requireDaemon")? {
+        args.push("--require-daemon".to_string());
+        args.push(require_daemon.to_string());
+    }
+
     if let Some(idle_timeout) = optional_string(arguments, "idleTimeout")? {
         args.push("--idle-timeout".to_string());
         args.push(idle_timeout);
@@ -4503,6 +4518,35 @@ mod tests {
         .unwrap();
 
         assert_eq!(args, vec!["--idle-timeout", "0"]);
+    }
+
+    #[test]
+    fn common_require_daemon_uses_canonical_parser() {
+        let guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_REQUIRE_DAEMON"]);
+        guard.set("AGENT_BROWSER_REQUIRE_DAEMON", "1");
+        for required in [true, false] {
+            let args = cli_tool_args(
+                &json!({ "requireDaemon": required }),
+                vec!["inspect".to_string()],
+                None,
+            )
+            .unwrap();
+            let flags = crate::flags::parse_flags(&args);
+            assert_eq!(flags.require_daemon, required);
+            assert_eq!(crate::flags::clean_args(&args), ["inspect"]);
+        }
+        assert!(cli_tool_args(
+            &json!({ "requireDaemon": "true" }),
+            vec!["inspect".to_string()],
+            None,
+        )
+        .is_err());
+        for tool in tools() {
+            assert_eq!(
+                tool["inputSchema"]["properties"]["requireDaemon"]["type"],
+                "boolean"
+            );
+        }
     }
 
     #[test]

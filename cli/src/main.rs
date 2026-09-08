@@ -1347,7 +1347,13 @@ fn main() {
         }
         let session = env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string());
         let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
-        rt.block_on(native::daemon::run_daemon(&session));
+        if let Err(error) = rt.block_on(native::daemon::run_daemon(
+            &session,
+            native::daemon::DaemonMode::Detached,
+        )) {
+            eprintln!("Daemon error: {}", error);
+            exit(1);
+        }
         return;
     }
 
@@ -1683,6 +1689,7 @@ fn main() {
     let plugin_registry_json =
         serde_json::to_string(&flags.plugins).unwrap_or_else(|_| "[]".to_string());
     let daemon_opts = DaemonOptions {
+        require_existing: flags.require_daemon,
         headed: flags.headed,
         debug: flags.debug,
         executable_path: flags.executable_path.as_deref(),
@@ -1721,6 +1728,21 @@ fn main() {
         no_auto_dialog: flags.no_auto_dialog,
         plugins: Some(plugin_registry_json.as_str()),
     };
+
+    if cmd.get("action").and_then(serde_json::Value::as_str) == Some("daemon") {
+        // Apply the same parsed options as detached startup, before the runtime
+        // creates threads. No fork, exec, setsid, or stdio redirection occurs.
+        connection::configure_foreground_daemon(&flags.session, &daemon_opts);
+        let rt = tokio::runtime::Runtime::new().expect("Failed to create tokio runtime");
+        if let Err(error) = rt.block_on(native::daemon::run_daemon(
+            &flags.session,
+            native::daemon::DaemonMode::Foreground,
+        )) {
+            eprintln!("Daemon error: {}", error);
+            exit(1);
+        }
+        return;
+    }
 
     let daemon_result = match ensure_daemon(&flags.session, &daemon_opts) {
         Ok(result) => result,
@@ -2116,10 +2138,12 @@ fn send_command_with_respawn(
 ) -> Result<connection::Response, String> {
     let first_attempt = send_command(cmd.clone(), session);
     match first_attempt {
-        Err(ref e) if daemon_unreachable(e) => match ensure_daemon(session, daemon_opts) {
-            Ok(_) => send_command(cmd, session),
-            Err(_) => first_attempt,
-        },
+        Err(ref e) if daemon_unreachable(e) && !daemon_opts.require_existing => {
+            match ensure_daemon(session, daemon_opts) {
+                Ok(_) => send_command(cmd, session),
+                Err(_) => first_attempt,
+            }
+        }
         other => other,
     }
 }
@@ -2182,7 +2206,16 @@ fn run_batch(
             continue;
         }
 
-        let mut parsed = match parse_command(cmd_args, flags) {
+        let mut parsed = match parse_command(cmd_args, flags).and_then(|command| {
+            if command.get("action").and_then(serde_json::Value::as_str) == Some("daemon") {
+                Err(ParseError::InvalidValue {
+                    message: "daemon must run as a standalone foreground process".to_string(),
+                    usage: "[options] daemon",
+                })
+            } else {
+                Ok(command)
+            }
+        }) {
             Ok(c) => c,
             Err(e) => {
                 had_error = true;

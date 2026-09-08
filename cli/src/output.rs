@@ -3476,6 +3476,36 @@ Examples:
 "##
         }
 
+        "daemon" => {
+            r##"
+agent-browser daemon - Run a foreground browser daemon
+
+Usage: agent-browser [options] daemon
+
+Runs in the invoking process with ordinary global flags and config files.
+Stderr remains attached, including --debug output. Refuses an occupied session.
+The browser launches when a client first needs it. Close or Ctrl+C shuts down;
+on Unix, SIGTERM and SIGHUP also save configured state and clean up.
+
+Use the same session and daemon options on clients. --require-daemon prevents
+clients from starting or restarting a daemon, including after a connection fails.
+Foreground daemons also refuse automatic restarts by ordinary clients when
+configuration or versions differ. Restart them through the owning supervisor.
+
+Examples:
+  agent-browser --session worker --idle-timeout 0 daemon
+  agent-browser --session worker --idle-timeout 0 --require-daemon open example.com
+  agent-browser --session worker --idle-timeout 0 --require-daemon close
+
+Environment:
+  AGENT_BROWSER_REQUIRE_DAEMON=1  Require an existing compatible daemon
+  AGENT_BROWSER_SOCKET_DIR        Shared directory for session sockets and metadata
+
+Config: {{"requireDaemon": true}}. MCP clients use the common requireDaemon
+argument; starting the foreground daemon belongs to the host supervisor.
+"##
+        }
+
         "mcp" => {
             r##"
 agent-browser mcp - Start an MCP stdio server
@@ -3824,6 +3854,7 @@ Confirmation:
 Sessions:
   session                    Show current session name
   session list               List active sessions
+  daemon                     Run a foreground daemon for a process supervisor
 
 MCP:
   mcp                        Start an MCP stdio server exposing agent-browser tools
@@ -3925,6 +3956,7 @@ Options:
   --engine <name>            Browser engine: chrome (default), lightpanda (or AGENT_BROWSER_ENGINE)
   --idle-timeout <time>      Shut down daemon after inactivity: 10s, 3m, 1h, or raw ms
                              (default: 1h; 0 disables; dashboard input resets the timer)
+  --require-daemon           Require an existing compatible daemon; never start or restart
   --no-auto-dialog           Disable automatic dismissal of alert/beforeunload dialogs (or AGENT_BROWSER_NO_AUTO_DIALOG)
   --model <name>             AI model for chat (or AI_GATEWAY_MODEL env)
   -v, --verbose              Show tool commands and their raw output
@@ -3961,6 +3993,7 @@ Configuration:
     {{"plugins":[{{"name":"vault","command":"agent-browser-plugin-vault","capabilities":["credential.read"]}},{{"name":"stealth","command":"agent-browser-plugin-stealth","capabilities":["launch.mutate"]}}]}}
 
 Environment:
+  AGENT_BROWSER_REQUIRE_DAEMON   Require an existing compatible daemon (1 or true)
   AGENT_BROWSER_CONFIG           Path to config file (or use --config)
   AGENT_BROWSER_SESSION          Session name (default: "default")
   AGENT_BROWSER_NAMESPACE        Namespace for daemon sockets and restore state

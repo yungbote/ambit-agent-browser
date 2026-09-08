@@ -102,6 +102,7 @@ pub struct Config {
     pub screenshot_quality: Option<u32>,
     pub screenshot_format: Option<String>,
     pub idle_timeout: Option<String>,
+    pub require_daemon: Option<bool>,
     pub no_auto_dialog: Option<bool>,
     pub model: Option<String>,
     pub plugins: Option<Vec<PluginConfig>>,
@@ -185,6 +186,7 @@ impl Config {
             screenshot_quality: other.screenshot_quality.or(self.screenshot_quality),
             screenshot_format: other.screenshot_format.or(self.screenshot_format),
             idle_timeout: other.idle_timeout.or(self.idle_timeout),
+            require_daemon: other.require_daemon.or(self.require_daemon),
             no_auto_dialog: other.no_auto_dialog.or(self.no_auto_dialog),
             model: other.model.or(self.model),
             plugins: match (self.plugins, other.plugins) {
@@ -413,6 +415,8 @@ pub struct Flags {
     pub screenshot_quality: Option<u32>,
     pub screenshot_format: Option<String>,
     pub idle_timeout: Option<String>, // Canonical milliseconds string for AGENT_BROWSER_IDLE_TIMEOUT_MS
+    /// Require an existing compatible daemon; never spawn or restart one.
+    pub require_daemon: bool,
     pub default_timeout: Option<u64>, // AGENT_BROWSER_DEFAULT_TIMEOUT in ms
     pub no_auto_dialog: bool,
     pub model: Option<String>,
@@ -646,6 +650,9 @@ pub fn parse_flags(args: &[String]) -> Flags {
             "AGENT_BROWSER_IDLE_TIMEOUT_MS",
         )
         .or(config.idle_timeout),
+        require_daemon: env_var_bool("AGENT_BROWSER_REQUIRE_DAEMON")
+            .or(config.require_daemon)
+            .unwrap_or(false),
         default_timeout: env::var("AGENT_BROWSER_DEFAULT_TIMEOUT")
             .ok()
             .and_then(|s| s.parse::<u64>().ok()),
@@ -1079,6 +1086,13 @@ pub fn parse_flags(args: &[String]) -> Flags {
                     i += 1;
                 }
             }
+            "--require-daemon" => {
+                let (val, consumed) = parse_bool_arg(args, i);
+                flags.require_daemon = val;
+                if consumed {
+                    i += 1;
+                }
+            }
             "--no-auto-dialog" => {
                 let (val, consumed) = parse_bool_arg(args, i);
                 flags.no_auto_dialog = val;
@@ -1135,6 +1149,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--content-boundaries",
         "--confirm-interactive",
         "--no-auto-dialog",
+        "--require-daemon",
         "-v",
         "--verbose",
         "-q",
