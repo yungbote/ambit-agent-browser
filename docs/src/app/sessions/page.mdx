@@ -29,7 +29,7 @@ agent-browser session info --json
 
 ## Supervised daemon
 
-Run `agent-browser daemon` under a process supervisor to keep the daemon in the invoking process with its original PID and stderr. It uses ordinary global flags and config files, refuses an occupied session, and publishes its configuration before accepting commands. The browser launches when a client first needs it. `close`, Ctrl+C, and Unix SIGTERM/SIGHUP save configured state, close owned browsers, and remove the session metadata. A released `.lock` file remains so concurrent starters always use the same lock.
+Run `agent-browser daemon` under a process supervisor to keep the daemon in the invoking process with its original PID and stderr. It uses ordinary global flags and config files, refuses an occupied session, and publishes its configuration before accepting commands. The browser launches when a client first needs it. `close` saves configured state, closes owned browsers, and removes session metadata. Ctrl+C and Unix SIGTERM/SIGHUP cancel active commands and maintenance work before closing owned browsers. On a termination signal, state saving gets a one-second grace period; a timeout is reported on stderr and the latest changes may not be saved. A released `.lock` file remains so concurrent starters always use the same lock.
 
 ```bash
 # Supervisor command; stays in the foreground
@@ -46,7 +46,7 @@ The default CLI behavior remains automatic startup and configuration-driven rest
 
 ### Required Chrome sandbox
 
-Use `--require-sandbox` (environment `AGENT_BROWSER_REQUIRE_SANDBOX=1`, config `"requireSandbox": true`) when the host is configured to run sandboxed Chrome. It disables agent-browser's automatic `--no-sandbox` fallback in containers, CI, and root environments, and rejects user or plugin arguments that disable sandboxing or run renderer/GPU work in the browser process. CDP attachments, auto-connect, provider browsers, and other engines are rejected because agent-browser cannot establish this requirement for them. The setting is daemon-owned: use the same value on clients and restart through the supervisor to change it. If Chrome cannot initialize its sandbox, launch fails; there is no unsandboxed retry. The flag preserves the requested launch policy; actual kernel sandbox support must be verified on the deployment host.
+Use `--require-sandbox` (environment `AGENT_BROWSER_REQUIRE_SANDBOX=1`, config `"requireSandbox": true`) when the host is configured to run sandboxed Chrome. It disables agent-browser's automatic `--no-sandbox` fallback in containers, CI, and root environments, and rejects user or plugin arguments that disable sandboxing or run renderer/GPU work in the browser process. `NetworkServiceInProcess` is omitted and cannot be re-enabled by user or plugin feature lists. CDP attachments, auto-connect, provider browsers, and other engines are rejected because agent-browser cannot establish this requirement for them. The setting is daemon-owned: use the same value on clients and restart through the supervisor to change it. If Chrome cannot initialize its sandbox, launch fails; there is no unsandboxed retry. The flag preserves the requested launch policy; actual kernel sandbox support must be verified on the deployment host.
 
 ## Session isolation
 

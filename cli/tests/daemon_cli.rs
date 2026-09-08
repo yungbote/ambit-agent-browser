@@ -379,6 +379,18 @@ fn old_live_socket_without_lock_is_never_unlinked() {
 }
 
 #[test]
+fn stale_pid_reused_by_another_live_process_does_not_block_startup() {
+    let fixture = Fixture::new();
+    fs::write(fixture.path("pid"), std::process::id().to_string()).unwrap();
+    let daemon = fixture.start(&[]);
+    assert_eq!(fixture.pid(), daemon.pid());
+    assert_ne!(fixture.pid(), std::process::id());
+    daemon.signal(libc::SIGTERM);
+    assert!(daemon.finish().status.success());
+    fixture.assert_clean();
+}
+
+#[test]
 fn required_client_does_not_spawn_after_socket_disappears_during_request() {
     let fixture = Fixture::new();
     let daemon = fixture.start(&[]);
@@ -464,4 +476,160 @@ fn required_sandbox_rejects_unsafe_launch_without_replacing_supervisor() {
     daemon.signal(libc::SIGTERM);
     assert!(daemon.finish().status.success());
     fixture.assert_clean();
+}
+
+/// Run in an ephemeral container with Chrome and a sandbox-capable seccomp
+/// policy. The HTTP server is loopback-only and intentionally never responds.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires isolated Chrome runtime; set AGENT_BROWSER_TEST_CHROME"]
+fn foreground_signal_stops_blocked_navigation_and_owned_chrome() {
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+
+    let chrome = std::env::var("AGENT_BROWSER_TEST_CHROME")
+        .expect("set AGENT_BROWSER_TEST_CHROME inside an isolated runtime");
+
+    struct BrowserCleanup(i32);
+    impl Drop for BrowserCleanup {
+        fn drop(&mut self) {
+            // This PID is the owned Chrome process-group leader in the test
+            // container. Even a failed assertion must not leak its children.
+            unsafe {
+                libc::kill(-self.0, libc::SIGKILL);
+            }
+        }
+    }
+
+    for (signal, restore) in [
+        (libc::SIGTERM, false),
+        (libc::SIGHUP, false),
+        (libc::SIGTERM, true),
+    ] {
+        let fixture = Fixture::new();
+        let profile = fixture.0.path().join("profile");
+        let mut config = serde_json::json!({
+            "executablePath": chrome,
+            "profile": profile,
+            "idleTimeout": "0",
+            "requireSandbox": true,
+        });
+        if restore {
+            config["restore"] = serde_json::json!(format!("shutdown-proof-{}", std::process::id()));
+        }
+        fixture.config(&config.to_string());
+        let daemon = fixture.start(&[]);
+        let opened = fixture.run(&[
+            "--json",
+            "--require-daemon",
+            "open",
+            "data:text/html,<title>Ready</title>",
+        ]);
+        assert!(opened.status.success(), "Chrome launch failed: {opened:?}");
+
+        let profile_arg = format!("--user-data-dir={}", profile.display());
+        let browser_pid = fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .find_map(|entry| {
+                let pid = entry.file_name().to_str()?.parse::<i32>().ok()?;
+                let command = fs::read(entry.path().join("cmdline")).ok()?;
+                let args: Vec<_> = command.split(|byte| *byte == 0).collect();
+                (args.contains(&profile_arg.as_bytes())
+                    && !args.iter().any(|arg| arg.starts_with(b"--type=")))
+                .then_some(pid)
+            })
+            .expect("owned Chrome process was not found");
+        let _browser_cleanup = BrowserCleanup(browser_pid);
+
+        let server = TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}/blocked", server.local_addr().unwrap());
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let server_thread = thread::spawn(move || {
+            server.set_nonblocking(true).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let mut stream = loop {
+                match server.accept() {
+                    Ok((stream, _)) => break stream,
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        if Instant::now() >= deadline {
+                            return;
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(error) => panic!("loopback accept failed: {error}"),
+                }
+            };
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            let mut request = String::new();
+            BufReader::new(&mut stream).read_line(&mut request).unwrap();
+            assert!(request.starts_with("GET /blocked "), "{request}");
+            started_tx.send(()).unwrap();
+            let _ = release_rx.recv_timeout(Duration::from_secs(10));
+        });
+        let mut navigation = Process(Some(
+            fixture
+                .command(&["--json", "--require-daemon", "open", &url])
+                .spawn()
+                .unwrap(),
+        ));
+        started_rx
+            .recv_timeout(Duration::from_secs(10))
+            .expect("Chrome did not begin the blocked request");
+        // Let the maintenance tick try to acquire the command-held state lock.
+        thread::sleep(Duration::from_millis(250));
+        assert!(navigation.0.as_mut().unwrap().try_wait().unwrap().is_none());
+        let stopped = Instant::now();
+        daemon.signal(signal);
+        let output = daemon.finish();
+        let elapsed = stopped.elapsed();
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "shutdown took {elapsed:?}"
+        );
+        assert!(!navigation.finish().status.success());
+        fixture.assert_clean();
+        // Child.wait in the driver must reap Chrome before daemon exit.
+        assert_eq!(
+            unsafe { libc::kill(browser_pid, 0) },
+            -1,
+            "Chrome survived its daemon"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().raw_os_error(),
+            Some(libc::ESRCH)
+        );
+        let surviving_helpers: Vec<_> = fs::read_dir("/proc")
+            .unwrap()
+            .flatten()
+            .filter_map(|entry| {
+                let pid = entry.file_name().to_str()?.parse::<i32>().ok()?;
+                let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
+                let fields: Vec<_> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+                (fields.get(2)?.parse::<i32>().ok()? == browser_pid
+                    && !matches!(*fields.first()?, "Z" | "X"))
+                .then_some(pid)
+            })
+            .collect();
+        assert!(
+            surviving_helpers.is_empty(),
+            "Chrome helpers survived: {surviving_helpers:?}"
+        );
+        if restore {
+            assert!(
+                String::from_utf8_lossy(&output.stderr).contains("1s termination grace period"),
+                "{output:?}"
+            );
+        }
+        drop(release_tx);
+        server_thread.join().unwrap();
+        eprintln!(
+            "signal={signal} restore={restore} shutdown_ms={} owned_chrome_reaped=true",
+            elapsed.as_millis()
+        );
+    }
 }

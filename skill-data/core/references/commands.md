@@ -536,6 +536,6 @@ AGENT_BROWSER_PLUGINS='[{"name":"vault","command":"agent-browser-plugin-vault","
 
 ## Foreground daemon
 
-`agent-browser [options] daemon` runs in the invoking process for a host supervisor. Clients use `--require-daemon` with the same session and daemon settings. It never spawns or restarts a missing or incompatible daemon. See [Session management](session-management.md#supervised-daemon) for shutdown, configuration, and MCP behavior.
+`agent-browser [options] daemon` runs in the invoking process for a host supervisor. Clients use `--require-daemon` with the same session and daemon settings. Termination cancels active commands and allows one second for state saving before browser cleanup; a timeout is reported on stderr. It never spawns or restarts a missing or incompatible daemon. See [Session management](session-management.md#supervised-daemon) for shutdown, configuration, and MCP behavior.
 
-`--require-sandbox` requires a locally launched Chrome browser and disables automatic unsandboxed fallback. It rejects sandbox-disabling user and plugin arguments. Use the same setting on the daemon and clients; see [Required Chrome sandbox](session-management.md#required-chrome-sandbox).
+`--require-sandbox` requires a locally launched Chrome browser and disables automatic unsandboxed fallback. It rejects sandbox-disabling user and plugin arguments, including feature lists that enable `NetworkServiceInProcess`. Use the same setting on the daemon and clients; see [Required Chrome sandbox](session-management.md#required-chrome-sandbox).

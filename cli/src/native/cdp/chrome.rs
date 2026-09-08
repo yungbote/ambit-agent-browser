@@ -468,6 +468,17 @@ pub(crate) fn validate_sandbox_options(
         }) {
             return Err(format!("--require-sandbox cannot be combined with '{}'. Remove the sandbox-disabling browser argument.", arg));
         }
+        if switch.is_some_and(|switch| switch.eq_ignore_ascii_case("enable-features"))
+            && arg.split_once('=').is_some_and(|(_, features)| {
+                features.split(',').any(|feature| {
+                    feature.trim().split(['<', ':']).next().is_some_and(|name| {
+                        name.trim_start_matches('*') == "NetworkServiceInProcess"
+                    })
+                })
+            })
+        {
+            return Err("--require-sandbox cannot enable NetworkServiceInProcess because it runs network service work in the unsandboxed browser process".to_string());
+        }
     }
     Ok(())
 }
@@ -476,10 +487,10 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
     validate_sandbox_options(options, Some("chrome"), false)?;
     // Chrome only honors the last --enable-features switch on the command
     // line, so every feature must be collected into a single flag.
-    let mut enable_features: Vec<String> = vec![
-        "NetworkService".to_string(),
-        "NetworkServiceInProcess".to_string(),
-    ];
+    let mut enable_features: Vec<String> = vec!["NetworkService".to_string()];
+    if !options.require_sandbox {
+        enable_features.push("NetworkServiceInProcess".to_string());
+    }
     if options.webmcp {
         enable_features.push("WebMCPTesting".to_string());
         enable_features.push("DevToolsWebMCPSupport".to_string());
@@ -1955,15 +1966,50 @@ mod tests {
         };
         let args = build_chrome_args(&options).unwrap().args;
         assert!(!args.iter().any(|arg| arg == "--no-sandbox"));
+        assert!(!args
+            .iter()
+            .any(|arg| arg.contains("NetworkServiceInProcess")));
         assert!(args.contains(&"--window-size=800,600".to_string()));
         assert!(args.contains(&"--disable-dev-shm-usage".to_string()));
         options.require_sandbox = false;
-        assert!(build_chrome_args(&options)
-            .unwrap()
-            .args
-            .contains(&"--no-sandbox".to_string()));
+        let args = build_chrome_args(&options).unwrap().args;
+        assert!(args.contains(&"--no-sandbox".to_string()));
+        assert!(args
+            .iter()
+            .any(|arg| arg.contains("NetworkServiceInProcess")));
         options.args.push("--no-sandbox".to_string());
         assert!(validate_sandbox_options(&options, Some("lightpanda"), true).is_ok());
+    }
+
+    #[test]
+    fn required_sandbox_rejects_in_process_network_feature_overrides() {
+        for features in [
+            "NetworkServiceInProcess",
+            "Other,NetworkServiceInProcess,Another",
+            "Other, NetworkServiceInProcess<Trial:param/value",
+            "NetworkServiceInProcess:param/value",
+            "*NetworkServiceInProcess",
+        ] {
+            let options = LaunchOptions {
+                require_sandbox: true,
+                args: vec![format!("--enable-features={features}")],
+                ..Default::default()
+            };
+            assert!(validate_sandbox_options(&options, None, false)
+                .unwrap_err()
+                .contains("NetworkServiceInProcess"));
+        }
+        for argument in [
+            "--disable-features=NetworkServiceInProcess",
+            "--enable-features=UnrelatedFeature",
+        ] {
+            let options = LaunchOptions {
+                require_sandbox: true,
+                args: vec![argument.to_string()],
+                ..Default::default()
+            };
+            assert!(validate_sandbox_options(&options, None, false).is_ok());
+        }
     }
 
     #[test]

@@ -9,6 +9,7 @@ use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::signal;
 use tokio::sync::{Notify, RwLock};
+use tokio::task::JoinSet;
 
 use super::actions::{
     auto_save_restore_state, close_all_browser_backends, close_current_browser, execute_command,
@@ -163,7 +164,6 @@ fn autosave_interval_ms_from_env() -> u64 {
         .unwrap_or(30_000)
 }
 
-#[cfg(unix)]
 async fn run_socket_server(
     socket_path: &PathBuf,
     session: &str,
@@ -173,14 +173,35 @@ async fn run_socket_server(
     idle_timeout: Option<IdleTimeout>,
     autosave_interval_ms: u64,
 ) -> Result<(), String> {
-    use tokio::net::UnixListener;
-
     let shutdown = shutdown_signal()?;
     tokio::pin!(shutdown);
     let idle_timeout_ms = idle_timeout.map(|t| t.ms);
 
-    let listener =
-        UnixListener::bind(socket_path).map_err(|e| format!("Failed to bind socket: {}", e))?;
+    #[cfg(unix)]
+    let listener = tokio::net::UnixListener::bind(socket_path)
+        .map_err(|e| format!("Failed to bind socket: {}", e))?;
+    #[cfg(windows)]
+    let listener = {
+        use tokio::net::TcpListener;
+        let preferred_port = get_port_for_session(session);
+        let listener = match TcpListener::bind(format!("127.0.0.1:{}", preferred_port)).await {
+            Ok(listener) => listener,
+            Err(_) => TcpListener::bind("127.0.0.1:0")
+                .await
+                .map_err(|e| format!("Failed to bind TCP: {}", e))?,
+        };
+        let actual_port = listener
+            .local_addr()
+            .map_err(|e| format!("Failed to get local address: {}", e))?
+            .port();
+        let socket_dir = socket_path.parent().unwrap_or(std::path::Path::new("."));
+        fs::write(
+            socket_dir.join(format!("{}.port", session)),
+            actual_port.to_string(),
+        )
+        .map_err(|e| format!("Failed to write daemon port: {}", e))?;
+        listener
+    };
 
     let stream_file: Option<PathBuf> = if stream_server.is_some() {
         let dir = socket_path.parent().unwrap_or(std::path::Path::new("."));
@@ -200,13 +221,15 @@ async fn run_socket_server(
     // destructors and can leave Chrome processes orphaned (issue #1113).
     let close_notify = Arc::new(Notify::new());
 
-    let mut drain_interval = tokio::time::interval(Duration::from_millis(100));
-    drain_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // Every task that can hold daemon state belongs to this session. On
+    // shutdown, cancellation releases those locks before browser teardown.
+    let mut tasks = JoinSet::new();
+    tasks.spawn(maintain_browser(state.clone(), autosave_interval_ms));
 
     let idle_sleep = idle_timeout_ms.map(|ms| tokio::time::sleep(Duration::from_millis(ms)));
     let mut idle_sleep_pin = idle_sleep.map(Box::pin);
 
-    loop {
+    let interrupted = loop {
         tokio::select! {
             accept_result = listener.accept() => {
                 match accept_result {
@@ -215,7 +238,7 @@ async fn run_socket_server(
                         let idle_activity = idle_activity.clone();
                         let sf = stream_file.clone();
                         let cn = close_notify.clone();
-                        tokio::spawn(async move {
+                        tasks.spawn(async move {
                             handle_connection(stream, state, idle_activity, sf, cn).await;
                         });
                     }
@@ -224,34 +247,18 @@ async fn run_socket_server(
                     }
                 }
             }
-            _ = drain_interval.tick() => {
-                let mut s = state.lock().await;
-                let process_exited = s
-                    .browser
-                    .as_mut()
-                    .map(|mgr| mgr.has_process_exited())
-                    .unwrap_or(false);
-                if process_exited {
-                    let _ = close_current_browser(&mut s).await;
-                } else if s.browser.is_some() {
-                    if let Err(error) = s.drain_cdp_events_background().await {
-                        let _ = writeln!(
-                            std::io::stderr(),
-                            "Failed to apply browser network controls: {}",
-                            error
-                        );
-                    } else {
-                        maybe_autosave_restore_state(&mut s, autosave_interval_ms).await;
-                    }
+            result = tasks.join_next(), if !tasks.is_empty() => {
+                if let Some(Err(error)) = result {
+                    let _ = writeln!(std::io::stderr(), "Daemon task failed: {}", error);
                 }
             }
-            _ = async {
+            s = async {
                 match idle_sleep_pin {
                     Some(ref mut s) => s.as_mut().await,
                     None => std::future::pending::<()>().await,
                 }
+                state.lock().await
             }, if idle_timeout_ms.is_some() => {
-                let mut s = state.lock().await;
                 // The timer may have expired while a command held the state
                 // lock. Command completion refreshes the shared activity
                 // clock before releasing that lock, so re-check it here.
@@ -278,9 +285,7 @@ async fn run_socket_server(
                         DEFAULT_IDLE_TIMEOUT_MS / 60_000
                     );
                 }
-                let _ = auto_save_restore_state(&mut s).await;
-                let _ = close_all_browser_backends(&mut s).await;
-                break;
+                break false;
             }
             _ = idle_activity.notified(), if idle_timeout_ms.is_some() => {
                 idle_sleep_pin = idle_timeout_ms
@@ -288,167 +293,78 @@ async fn run_socket_server(
                 continue;
             }
             _ = close_notify.notified() => {
-                // "close" command was handled; browser already closed by
-                // handle_close(). Break to run cleanup and exit gracefully
-                // so destructors fire.
-                break;
+                break false;
             }
-            _ = &mut shutdown => {
-                let mut s = state.lock().await;
-                let _ = auto_save_restore_state(&mut s).await;
-                let _ = close_all_browser_backends(&mut s).await;
-                break;
+            _ = &mut shutdown => break true,
+        }
+    };
+
+    // Stop accepting work before cancelling existing connections. A blocked
+    // navigation or maintenance tick must not hold the state lock through the
+    // supervisor's termination grace period.
+    drop(listener);
+    tasks.shutdown().await;
+    let mut state = state.lock().await;
+    // Normal close/idle saves keep their existing behavior. A termination
+    // signal grants a short best-effort save window, including if it arrives
+    // after idle shutdown began. A blocked renderer must not prevent owned
+    // browser cleanup before a supervisor escalates to killing the daemon.
+    let save_result = {
+        let save = auto_save_restore_state(&mut state);
+        tokio::pin!(save);
+        let grace = Duration::from_secs(1);
+        if interrupted {
+            tokio::time::timeout(grace, &mut save).await
+        } else {
+            tokio::select! {
+                result = &mut save => Ok(result),
+                _ = &mut shutdown => tokio::time::timeout(grace, &mut save).await,
             }
         }
+    };
+    match save_result {
+        Err(_) => {
+            let _ = writeln!(std::io::stderr(), "State save exceeded the 1s termination grace period; closing browser. Latest changes may not be saved.");
+        }
+        Ok(Err(error)) => {
+            let _ = writeln!(
+                std::io::stderr(),
+                "Failed to save browser state during shutdown: {}",
+                error
+            );
+        }
+        Ok(Ok(_)) => {}
     }
-
+    let _ = close_all_browser_backends(&mut state).await;
     Ok(())
 }
 
-#[cfg(windows)]
-async fn run_socket_server(
-    socket_path: &PathBuf,
-    session: &str,
-    stream_client: Option<Arc<RwLock<Option<Arc<CdpClient>>>>>,
-    stream_server: Option<Arc<StreamServer>>,
-    idle_activity: Arc<IdleActivity>,
-    idle_timeout: Option<IdleTimeout>,
-    autosave_interval_ms: u64,
-) -> Result<(), String> {
-    use tokio::net::TcpListener;
-
-    let shutdown = shutdown_signal()?;
-    tokio::pin!(shutdown);
-    let idle_timeout_ms = idle_timeout.map(|t| t.ms);
-
-    let preferred_port = get_port_for_session(session);
-    // Try the hash-derived port first; if it is blocked (e.g. Windows Hyper-V
-    // excluded port range), fall back to an OS-assigned ephemeral port.
-    let listener = match TcpListener::bind(format!("127.0.0.1:{}", preferred_port)).await {
-        Ok(l) => l,
-        Err(_) => TcpListener::bind("127.0.0.1:0")
-            .await
-            .map_err(|e| format!("Failed to bind TCP: {}", e))?,
-    };
-    let actual_port = listener
-        .local_addr()
-        .map_err(|e| format!("Failed to get local address: {}", e))?
-        .port();
-
-    let socket_dir = socket_path.parent().unwrap_or(std::path::Path::new("."));
-    let port_path = socket_dir.join(format!("{}.port", session));
-    let _ = fs::write(&port_path, actual_port.to_string());
-
-    let stream_file: Option<PathBuf> = if stream_server.is_some() {
-        Some(socket_dir.join(format!("{}.stream", session)))
-    } else {
-        None
-    };
-    let state: std::sync::Arc<tokio::sync::Mutex<DaemonState>> =
-        std::sync::Arc::new(tokio::sync::Mutex::new(DaemonState::new_with_stream(
-            stream_client,
-            stream_server,
-            idle_activity.clone(),
-        )));
-
-    let close_notify = Arc::new(Notify::new());
-
-    let idle_sleep = idle_timeout_ms.map(|ms| tokio::time::sleep(Duration::from_millis(ms)));
-    let mut idle_sleep_pin = idle_sleep.map(Box::pin);
-
-    // Mirror the unix loop's background tick: reap a browser the user closed
-    // by hand, and drain CDP events (dialog state in particular) before
-    // autosave so a save never runs against a dialog-blocked renderer.
-    let mut drain_interval = tokio::time::interval(Duration::from_millis(100));
-    drain_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-
+/// Periodic CDP maintenance shares command custody and is cancelled on stop.
+async fn maintain_browser(state: Arc<tokio::sync::Mutex<DaemonState>>, autosave_interval_ms: u64) {
+    let mut interval = tokio::time::interval(Duration::from_millis(100));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
-        tokio::select! {
-            accept_result = listener.accept() => {
-                match accept_result {
-                    Ok((stream, _)) => {
-                        let state = state.clone();
-                        let idle_activity = idle_activity.clone();
-                        let sf = stream_file.clone();
-                        let cn = close_notify.clone();
-                        tokio::spawn(async move {
-                            handle_connection(stream, state, idle_activity, sf, cn).await;
-                        });
-                    }
-                    Err(e) => {
-                        let _ = writeln!(std::io::stderr(), "Accept error: {}", e);
-                    }
-                }
-            }
-            _ = drain_interval.tick() => {
-                let mut s = state.lock().await;
-                let process_exited = s
-                    .browser
-                    .as_mut()
-                    .map(|mgr| mgr.has_process_exited())
-                    .unwrap_or(false);
-                if process_exited {
-                    let _ = close_current_browser(&mut s).await;
-                } else if s.browser.is_some() {
-                    s.drain_cdp_events_background().await;
-                    maybe_autosave_restore_state(&mut s, autosave_interval_ms).await;
-                }
-            }
-            _ = async {
-                match idle_sleep_pin {
-                    Some(ref mut s) => s.as_mut().await,
-                    None => std::future::pending::<()>().await,
-                }
-            }, if idle_timeout_ms.is_some() => {
-                let mut s = state.lock().await;
-                if let Some(remaining) =
-                    remaining_idle_timeout(&idle_activity, idle_timeout_ms.unwrap_or_default())
-                {
-                    idle_sleep_pin = Some(Box::pin(tokio::time::sleep(remaining)));
-                    continue;
-                }
-                // The default timeout is a leak backstop, not a lifecycle
-                // policy: never pull a headed, WebDriver, or attached browser
-                // out from under a human. Re-arm and keep waiting instead.
-                if idle_timeout.is_some_and(|t| t.is_default)
-                    && s.blocks_default_idle_shutdown()
-                {
-                    idle_sleep_pin = idle_timeout_ms
-                        .map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
-                    continue;
-                }
-                if idle_timeout.is_some_and(|t| t.is_default) {
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "Idle for {}m with no commands or dashboard input; saving configured restore state and shutting down (AGENT_BROWSER_IDLE_TIMEOUT_MS=0 disables)",
-                        DEFAULT_IDLE_TIMEOUT_MS / 60_000
-                    );
-                }
-                let _ = auto_save_restore_state(&mut s).await;
-                let _ = close_all_browser_backends(&mut s).await;
-                let _ = fs::remove_file(&port_path);
-                break;
-            }
-            _ = idle_activity.notified(), if idle_timeout_ms.is_some() => {
-                idle_sleep_pin = idle_timeout_ms
-                    .map(|ms| Box::pin(tokio::time::sleep(Duration::from_millis(ms))));
-                continue;
-            }
-            _ = close_notify.notified() => {
-                let _ = fs::remove_file(&port_path);
-                break;
-            }
-            _ = &mut shutdown => {
-                let mut s = state.lock().await;
-                let _ = auto_save_restore_state(&mut s).await;
-                let _ = close_all_browser_backends(&mut s).await;
-                let _ = fs::remove_file(&port_path);
-                break;
+        interval.tick().await;
+        let mut state = state.lock().await;
+        let process_exited = state
+            .browser
+            .as_mut()
+            .map(|manager| manager.has_process_exited())
+            .unwrap_or(false);
+        if process_exited {
+            let _ = close_current_browser(&mut state).await;
+        } else if state.browser.is_some() {
+            if let Err(error) = state.drain_cdp_events_background().await {
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "Failed to apply browser network controls: {}",
+                    error
+                );
+            } else {
+                maybe_autosave_restore_state(&mut state, autosave_interval_ms).await;
             }
         }
     }
-
-    Ok(())
 }
 
 async fn handle_connection<S>(

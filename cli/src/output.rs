@@ -3484,14 +3484,17 @@ Usage: agent-browser [options] daemon
 
 Runs in the invoking process with ordinary global flags and config files.
 Stderr remains attached, including --debug output. Refuses an occupied session.
-The browser launches when a client first needs it. Close or Ctrl+C shuts down;
-on Unix, SIGTERM and SIGHUP also save configured state and clean up.
+The browser launches when a client first needs it. Close saves state and exits.
+Ctrl+C and Unix SIGTERM/SIGHUP cancel active work, allow 1s to save state, then
+close owned browsers. A save timeout is reported on stderr; latest changes may
+not be saved.
 
 Use the same session and daemon options on clients. --require-daemon prevents
 clients from starting or restarting a daemon, including after a connection fails.
 With this option, doctor skips browser probes that would start scratch daemons.
 Use --require-sandbox when the host supports sandboxed Chrome. This prevents
-automatic --no-sandbox fallback and rejects sandbox-disabling user/plugin args.
+automatic --no-sandbox fallback and rejects sandbox-disabling user/plugin args,
+including enabling NetworkServiceInProcess.
 It requires locally launched Chrome; unsupported hosts fail instead of retrying
 without sandboxing. Config: {{"requireSandbox": true}}; environment:
 AGENT_BROWSER_REQUIRE_SANDBOX=1; MCP argument: requireSandbox.

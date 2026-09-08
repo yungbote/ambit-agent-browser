@@ -187,13 +187,10 @@ impl DaemonSession {
             format!("Cannot own session '{}': {}. Another daemon may be starting or running; use another session or stop it through its owner.", session, e)
         })?;
 
-        // Older daemons have no session lock. Never unlink their live socket or
-        // overwrite their PID, including while they are still starting up.
-        let live_pid = fs::read_to_string(get_pid_path(session))
-            .ok()
-            .and_then(|pid| pid.trim().parse::<u32>().ok())
-            .is_some_and(is_pid_alive);
-        if daemon_ready(session) || live_pid {
+        // Older daemons have no session lock, but a reachable socket still
+        // proves ownership. PID files cannot: a stale PID may be reused or
+        // identify an unrelated process in the caller's PID namespace.
+        if daemon_ready(session) {
             return Err(format!(
                 "A daemon already owns session '{}'. Use another session or stop it through its owner.",
                 session

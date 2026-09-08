@@ -9,6 +9,9 @@
 //! command is intentionally omitted: a host supervisor owns its process and
 //! stdio lifetime, which cannot be represented by a bounded MCP tool call.
 //! `requireSandbox` preserves the same daemon-owned Chrome launch policy.
+//! Host termination cancels active tool commands and gives state saving a
+//! one-second grace period before closing owned browsers. Sandbox policy also
+//! keeps NetworkServiceInProcess disabled after plugin launch mutations.
 //! Owned Windows Chrome uses the same private headless desktop and Job Object
 //! lifetime through MCP; headed and external-connection semantics are unchanged.
 

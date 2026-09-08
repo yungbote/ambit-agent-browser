@@ -644,7 +644,7 @@ echo '[
 
 ## Foreground daemon
 
-`agent-browser [options] daemon` runs in the invoking process for a host supervisor and retains stderr. Clients use `--require-daemon` (or `AGENT_BROWSER_REQUIRE_DAEMON=1`, config `requireDaemon`) with matching session and daemon settings. See [Supervised daemon](/sessions#supervised-daemon) for lifecycle and configuration behavior.
+`agent-browser [options] daemon` runs in the invoking process for a host supervisor and retains stderr. Termination cancels active commands and allows one second for state saving before browser cleanup; a timeout is reported on stderr. Clients use `--require-daemon` (or `AGENT_BROWSER_REQUIRE_DAEMON=1`, config `requireDaemon`) with matching session and daemon settings. See [Supervised daemon](/sessions#supervised-daemon) for lifecycle and configuration behavior.
 
 ## MCP server
 
