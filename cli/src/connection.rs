@@ -512,6 +512,8 @@ pub struct DaemonResult {
 pub struct DaemonOptions<'a> {
     /// Client-only policy, excluded from daemon configuration and its fingerprint.
     pub require_existing: bool,
+    /// Immutable launch policy for locally owned Chrome browsers.
+    pub require_sandbox: bool,
     pub headed: bool,
     pub debug: bool,
     pub executable_path: Option<&'a str>,
@@ -555,7 +557,10 @@ pub struct DaemonOptions<'a> {
 /// Absent values clear inherited options so explicit CLI false values remain false.
 fn daemon_environment(session: &str, opts: &DaemonOptions) -> Vec<(&'static str, Option<String>)> {
     vec![
-        ("AGENT_BROWSER_DAEMON", Some("1".to_string())),
+        (
+            "AGENT_BROWSER_REQUIRE_SANDBOX",
+            opts.require_sandbox.then(|| "1".to_string()),
+        ),
         ("AGENT_BROWSER_SESSION", Some(session.to_string())),
         (
             "AGENT_BROWSER_DAEMON_CONFIG",
@@ -677,6 +682,7 @@ fn daemon_environment(session: &str, opts: &DaemonOptions) -> Vec<(&'static str,
 }
 
 fn apply_daemon_env(cmd: &mut Command, session: &str, opts: &DaemonOptions) {
+    cmd.env("AGENT_BROWSER_DAEMON", "1");
     for (key, value) in daemon_environment(session, opts) {
         match value {
             Some(value) => cmd.env(key, value),
@@ -699,6 +705,7 @@ pub fn configure_foreground_daemon(session: &str, opts: &DaemonOptions) {
 fn daemon_config_fingerprint(opts: &DaemonOptions) -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     opts.debug.hash(&mut hasher);
+    opts.require_sandbox.hash(&mut hasher);
     opts.action_policy.hash(&mut hasher);
     opts.confirm_actions.hash(&mut hasher);
     opts.idle_timeout.hash(&mut hasher);
@@ -1009,7 +1016,6 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
         use std::os::unix::process::CommandExt;
 
         let mut cmd = Command::new(&exe_path);
-        cmd.env("AGENT_BROWSER_DAEMON", "1");
         apply_daemon_env(&mut cmd, session, opts);
 
         unsafe {
@@ -1033,7 +1039,6 @@ pub fn ensure_daemon(session: &str, opts: &DaemonOptions) -> Result<DaemonResult
         use std::os::windows::process::CommandExt;
 
         let mut cmd = Command::new(&exe_path);
-        cmd.env("AGENT_BROWSER_DAEMON", "1");
         apply_daemon_env(&mut cmd, session, opts);
 
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x00000200;
@@ -1375,6 +1380,7 @@ mod tests {
     ) -> DaemonOptions<'a> {
         DaemonOptions {
             require_existing: false,
+            require_sandbox: false,
             headed: false,
             debug: false,
             executable_path: None,

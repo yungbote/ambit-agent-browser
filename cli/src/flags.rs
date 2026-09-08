@@ -103,6 +103,7 @@ pub struct Config {
     pub screenshot_format: Option<String>,
     pub idle_timeout: Option<String>,
     pub require_daemon: Option<bool>,
+    pub require_sandbox: Option<bool>,
     pub no_auto_dialog: Option<bool>,
     pub model: Option<String>,
     pub plugins: Option<Vec<PluginConfig>>,
@@ -187,6 +188,7 @@ impl Config {
             screenshot_format: other.screenshot_format.or(self.screenshot_format),
             idle_timeout: other.idle_timeout.or(self.idle_timeout),
             require_daemon: other.require_daemon.or(self.require_daemon),
+            require_sandbox: other.require_sandbox.or(self.require_sandbox),
             no_auto_dialog: other.no_auto_dialog.or(self.no_auto_dialog),
             model: other.model.or(self.model),
             plugins: match (self.plugins, other.plugins) {
@@ -417,6 +419,8 @@ pub struct Flags {
     pub idle_timeout: Option<String>, // Canonical milliseconds string for AGENT_BROWSER_IDLE_TIMEOUT_MS
     /// Require an existing compatible daemon; never spawn or restart one.
     pub require_daemon: bool,
+    /// Preserve Chrome sandboxing and reject unsupported launch modes.
+    pub require_sandbox: bool,
     pub default_timeout: Option<u64>, // AGENT_BROWSER_DEFAULT_TIMEOUT in ms
     pub no_auto_dialog: bool,
     pub model: Option<String>,
@@ -650,6 +654,9 @@ pub fn parse_flags(args: &[String]) -> Flags {
             "AGENT_BROWSER_IDLE_TIMEOUT_MS",
         )
         .or(config.idle_timeout),
+        require_sandbox: env_var_bool("AGENT_BROWSER_REQUIRE_SANDBOX")
+            .or(config.require_sandbox)
+            .unwrap_or(false),
         require_daemon: env_var_bool("AGENT_BROWSER_REQUIRE_DAEMON")
             .or(config.require_daemon)
             .unwrap_or(false),
@@ -1086,6 +1093,13 @@ pub fn parse_flags(args: &[String]) -> Flags {
                     i += 1;
                 }
             }
+            "--require-sandbox" => {
+                let (val, consumed) = parse_bool_arg(args, i);
+                flags.require_sandbox = val;
+                if consumed {
+                    i += 1;
+                }
+            }
             "--require-daemon" => {
                 let (val, consumed) = parse_bool_arg(args, i);
                 flags.require_daemon = val;
@@ -1150,6 +1164,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--confirm-interactive",
         "--no-auto-dialog",
         "--require-daemon",
+        "--require-sandbox",
         "-v",
         "--verbose",
         "-q",

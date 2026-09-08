@@ -8,6 +8,7 @@
 //! `requireDaemon` delegates to --require-daemon. The foreground `daemon`
 //! command is intentionally omitted: a host supervisor owns its process and
 //! stdio lifetime, which cannot be represented by a bounded MCP tool call.
+//! `requireSandbox` preserves the same daemon-owned Chrome launch policy.
 //! Owned Windows Chrome uses the same private headless desktop and Job Object
 //! lifetime through MCP; headed and external-connection semantics are unchanged.
 
@@ -2023,6 +2024,13 @@ fn tool(name: &str, title: &str, description: &str, properties: Value, required:
         }),
     );
     props.insert(
+        "requireSandbox".to_string(),
+        json!({
+            "type": "boolean",
+            "description": "Require locally launched Chrome sandboxing. Disable automatic unsandboxed fallback and reject sandbox-disabling browser arguments."
+        }),
+    );
+    props.insert(
         "extraArgs".to_string(),
         json!({
             "type": "array",
@@ -3736,6 +3744,10 @@ fn append_common_global_args(
         args.push("--require-daemon".to_string());
         args.push(require_daemon.to_string());
     }
+    if let Some(require_sandbox) = optional_bool(arguments, "requireSandbox")? {
+        args.push("--require-sandbox".to_string());
+        args.push(require_sandbox.to_string());
+    }
 
     if let Some(idle_timeout) = optional_string(arguments, "idleTimeout")? {
         args.push("--idle-timeout".to_string());
@@ -4544,6 +4556,29 @@ mod tests {
         for tool in tools() {
             assert_eq!(
                 tool["inputSchema"]["properties"]["requireDaemon"]["type"],
+                "boolean"
+            );
+        }
+    }
+
+    #[test]
+    fn common_require_sandbox_uses_canonical_parser() {
+        let guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_REQUIRE_SANDBOX"]);
+        guard.set("AGENT_BROWSER_REQUIRE_SANDBOX", "1");
+        for required in [true, false] {
+            let args = cli_tool_args(
+                &json!({ "requireSandbox": required }),
+                vec!["open".to_string()],
+                None,
+            )
+            .unwrap();
+            assert_eq!(crate::flags::parse_flags(&args).require_sandbox, required);
+            assert_eq!(crate::flags::clean_args(&args), ["open"]);
+        }
+        assert!(cli_tool_args(&json!({ "requireSandbox": "true" }), vec![], None).is_err());
+        for tool in tools() {
+            assert_eq!(
+                tool["inputSchema"]["properties"]["requireSandbox"]["type"],
                 "boolean"
             );
         }

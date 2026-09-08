@@ -565,9 +565,13 @@ agent-browser --session worker --idle-timeout 0 --require-daemon open example.co
 agent-browser --session worker --idle-timeout 0 --require-daemon close
 ```
 
-`--require-daemon` (environment `AGENT_BROWSER_REQUIRE_DAEMON=1`, config `"requireDaemon": true`) fails if the daemon is unavailable or its version or daemon configuration differs. It never starts, stops, or restarts a daemon, including after a connection fails. Matching ordinary clients can also reuse a foreground daemon, but cannot automatically restart it on a mismatch. Restart it through its supervisor. Daemon configuration includes debug logging, action policy, confirmation categories, idle timeout, default timeout, and automatic dialog handling; use the same settings for daemon and clients. Browser launch options retain their existing per-command behavior. Explicit `close` still closes the session.
+`--require-daemon` (environment `AGENT_BROWSER_REQUIRE_DAEMON=1`, config `"requireDaemon": true`) fails if the daemon is unavailable or its version or daemon configuration differs. It never starts, stops, or restarts a daemon, including after a connection fails. Matching ordinary clients can also reuse a foreground daemon, but cannot automatically restart it on a mismatch. Restart it through its supervisor. Daemon configuration includes debug logging, action policy, confirmation categories, idle timeout, default timeout, required sandboxing, and automatic dialog handling; use the same settings for daemon and clients. Browser launch options retain their existing per-command behavior. Explicit `close` still closes the session. Under `--require-daemon`, `doctor` skips browser probes that would start scratch daemons.
 
 The default CLI behavior remains automatic startup and configuration-driven restart for background daemons. MCP tools expose the common `requireDaemon` boolean through the normal CLI parser. The `daemon` command has no MCP tool because its foreground process and stdio belong to the host supervisor.
+
+#### Required Chrome sandbox
+
+Use `--require-sandbox` (environment `AGENT_BROWSER_REQUIRE_SANDBOX=1`, config `"requireSandbox": true`) when the host is configured to run sandboxed Chrome. It disables agent-browser's automatic `--no-sandbox` fallback in containers, CI, and root environments, and rejects user or plugin arguments that disable sandboxing or run renderer/GPU work in the browser process. CDP attachments, auto-connect, provider browsers, and other engines are rejected because agent-browser cannot establish this requirement for them. The setting is daemon-owned: use the same value on clients and restart through the supervisor to change it. If Chrome cannot initialize its sandbox, launch fails; there is no unsandboxed retry. The flag preserves the requested launch policy; actual kernel sandbox support must be verified on the deployment host.
 
 ### MCP Server
 
@@ -1035,6 +1039,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--confirm-actions <list>` | Action categories requiring confirmation (or `AGENT_BROWSER_CONFIRM_ACTIONS` env) |
 | `--confirm-interactive` | Interactive confirmation prompts; auto-denies if stdin is not a TTY (or `AGENT_BROWSER_CONFIRM_INTERACTIVE` env) |
 | `--engine <name>` | Browser engine: `chrome` (default), `lightpanda` (or `AGENT_BROWSER_ENGINE` env) |
+| `--require-sandbox` | Require sandboxed local Chrome without automatic fallback; reject sandbox-disabling arguments (or `AGENT_BROWSER_REQUIRE_SANDBOX` env; config `requireSandbox`) |
 | `--require-daemon` | Require an existing compatible daemon without starting or restarting it (or `AGENT_BROWSER_REQUIRE_DAEMON` env; config `requireDaemon`) |
 | `--idle-timeout <time>` | Shut down the daemon after inactivity (`10s`, `3m`, `1h`, or raw ms). Defaults to `1h`; use `0` to disable (or `AGENT_BROWSER_IDLE_TIMEOUT_MS` env) |
 | `--no-auto-dialog` | Disable automatic dismissal of `alert`/`beforeunload` dialogs (or `AGENT_BROWSER_NO_AUTO_DIALOG` env) |

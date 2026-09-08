@@ -328,6 +328,8 @@ fn maybe_start_xvfb(options: &LaunchOptions) -> Option<XvfbServer> {
 #[derive(Clone)]
 pub struct LaunchOptions {
     pub headless: bool,
+    /// Require Chrome sandboxing; disable environment-based sandbox fallback.
+    pub require_sandbox: bool,
     pub executable_path: Option<String>,
     pub proxy: Option<String>,
     pub proxy_bypass: Option<String>,
@@ -380,11 +382,7 @@ impl LaunchOptions {
     /// Extensions force headed mode because Chrome does not inject their
     /// content scripts under `--headless=new`.
     pub(crate) fn effectively_headless(&self) -> bool {
-        self.headless
-            && !self
-                .extensions
-                .as_ref()
-                .is_some_and(|exts| !exts.is_empty())
+        self.headless && self.extensions.as_ref().is_none_or(|exts| exts.is_empty())
     }
 }
 
@@ -392,6 +390,7 @@ impl Default for LaunchOptions {
     fn default() -> Self {
         Self {
             headless: true,
+            require_sandbox: false,
             executable_path: None,
             proxy: None,
             proxy_bypass: None,
@@ -427,7 +426,54 @@ struct ChromeArgs {
     temp_user_data_dir: Option<PathBuf>,
 }
 
+/// Validate the sandbox requirement before local launch and after plugin
+/// mutations. Attached browsers and other engines cannot satisfy this policy.
+pub(crate) fn validate_sandbox_options(
+    options: &LaunchOptions,
+    engine: Option<&str>,
+    external_launch: bool,
+) -> Result<(), String> {
+    if !options.require_sandbox {
+        return Ok(());
+    }
+    if external_launch || engine.is_some_and(|value| !value.eq_ignore_ascii_case("chrome")) {
+        return Err("--require-sandbox requires locally launched Chrome; sandboxing cannot be verified for attached browsers, providers, or other engines".to_string());
+    }
+    for arg in &options.args {
+        let switch = arg.split('=').next().unwrap_or(arg);
+        let switch = switch
+            .strip_prefix("--")
+            .or_else(|| switch.strip_prefix('-'))
+            .or_else(|| {
+                if cfg!(windows) {
+                    switch.strip_prefix('/')
+                } else {
+                    None
+                }
+            });
+        if switch.is_some_and(|switch| {
+            matches!(
+                switch.to_ascii_lowercase().as_str(),
+                "no-sandbox"
+                    | "disable-gpu-sandbox"
+                    | "disable-setuid-sandbox"
+                    | "disable-seccomp-filter-sandbox"
+                    | "disable-namespace-sandbox"
+                    | "disable-landlock-sandbox"
+                    | "no-zygote-sandbox"
+                    | "no-zygote"
+                    | "single-process"
+                    | "in-process-gpu"
+            )
+        }) {
+            return Err(format!("--require-sandbox cannot be combined with '{}'. Remove the sandbox-disabling browser argument.", arg));
+        }
+    }
+    Ok(())
+}
+
 fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
+    validate_sandbox_options(options, Some("chrome"), false)?;
     // Chrome only honors the last --enable-features switch on the command
     // line, so every feature must be collected into a single flag.
     let mut enable_features: Vec<String> = vec![
@@ -579,7 +625,7 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         args.push("--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_string());
     }
 
-    if should_disable_sandbox(&args) {
+    if !options.require_sandbox && should_disable_sandbox(&args) {
         args.push("--no-sandbox".to_string());
     }
 
@@ -709,6 +755,8 @@ fn terminate_launched_chrome(child: &mut Child) {
 }
 
 pub fn launch_chrome(options: &LaunchOptions) -> Result<ChromeProcess, String> {
+    // Reject deterministic policy conflicts before touching profiles or retrying.
+    validate_sandbox_options(options, Some("chrome"), false)?;
     let chrome_path = match &options.executable_path {
         Some(p) => PathBuf::from(p),
         None => find_chrome().ok_or_else(|| {
@@ -889,7 +937,7 @@ fn try_launch_chrome(chrome_path: &Path, options: &LaunchOptions) -> Result<Chro
                 "Failed to capture Chrome stderr".to_string()
             })?;
             let reader = BufReader::new(stderr);
-            match wait_for_ws_url_until(reader, deadline) {
+            match wait_for_ws_url_until(reader, deadline, options.require_sandbox) {
                 Ok(url) => url,
                 Err(fallback_err) => {
                     terminate_launched_chrome(&mut child);
@@ -958,6 +1006,7 @@ fn wait_for_devtools_active_port(
 fn wait_for_ws_url_until(
     reader: impl BufRead,
     deadline: std::time::Instant,
+    require_sandbox: bool,
 ) -> Result<String, String> {
     let prefix = "DevTools listening on ";
     let mut stderr_lines: Vec<String> = Vec::new();
@@ -967,6 +1016,7 @@ fn wait_for_ws_url_until(
             return Err(chrome_launch_error(
                 "Timeout waiting for Chrome DevTools URL",
                 &stderr_lines,
+                require_sandbox,
             ));
         }
         let line = line.map_err(|e| format!("Failed to read Chrome stderr: {}", e))?;
@@ -979,10 +1029,16 @@ fn wait_for_ws_url_until(
     Err(chrome_launch_error(
         "Chrome exited before providing DevTools URL",
         &stderr_lines,
+        require_sandbox,
     ))
 }
 
-fn chrome_launch_error(message: &str, stderr_lines: &[String]) -> String {
+fn chrome_launch_error(message: &str, stderr_lines: &[String], require_sandbox: bool) -> String {
+    let sandbox_hint = if require_sandbox {
+        "\nChrome sandboxing is required. Configure host user namespaces and sandbox permissions; automatic unsandboxed fallback is disabled."
+    } else {
+        "\nHint: try --args \"--no-sandbox\" (required in containers, VMs, and some Linux setups)"
+    };
     let relevant: Vec<&String> = stderr_lines
         .iter()
         .filter(|l| {
@@ -1000,10 +1056,7 @@ fn chrome_launch_error(message: &str, stderr_lines: &[String]) -> String {
 
     if relevant.is_empty() {
         if stderr_lines.is_empty() {
-            return format!(
-                "{} (no stderr output from Chrome)\nHint: try passing --args \"--no-sandbox\" if Chrome crashes silently in your environment",
-                message
-            );
+            return format!("{} (no stderr output from Chrome){}", message, sandbox_hint);
         }
         let last_lines: Vec<&String> = stderr_lines.iter().rev().take(5).collect();
         return format!(
@@ -1023,7 +1076,7 @@ fn chrome_launch_error(message: &str, stderr_lines: &[String]) -> String {
         let lower = l.to_lowercase();
         lower.contains("sandbox") || lower.contains("namespace")
     }) {
-        "\nHint: try --args \"--no-sandbox\" (required in containers, VMs, and some Linux setups)"
+        sandbox_hint
     } else {
         ""
     };
@@ -1848,8 +1901,98 @@ mod tests {
     }
 
     #[test]
+    fn required_sandbox_rejects_disabling_switches_before_launch() {
+        for switch in [
+            "no-sandbox",
+            "disable-gpu-sandbox",
+            "disable-setuid-sandbox",
+            "disable-seccomp-filter-sandbox",
+            "disable-namespace-sandbox",
+            "disable-landlock-sandbox",
+            "no-zygote-sandbox",
+            "no-zygote",
+            "single-process",
+            "in-process-gpu",
+        ] {
+            for spelling in [
+                format!("--{switch}"),
+                format!("--{switch}=false"),
+                format!("-{switch}"),
+            ] {
+                let options = LaunchOptions {
+                    require_sandbox: true,
+                    executable_path: Some("/does-not-exist/chrome".to_string()),
+                    args: vec![spelling.clone()],
+                    ..Default::default()
+                };
+                let error = validate_sandbox_options(&options, None, false).unwrap_err();
+                assert!(error.contains(&spelling), "{error}");
+                assert!(build_chrome_args(&options)
+                    .err()
+                    .unwrap()
+                    .contains("--require-sandbox"));
+                assert!(launch_chrome(&options)
+                    .err()
+                    .unwrap()
+                    .contains("--require-sandbox"));
+            }
+        }
+    }
+
+    #[test]
+    fn required_sandbox_suppresses_fallback_and_preserves_other_arguments() {
+        let guard = crate::test_utils::EnvGuard::new(&["CI"]);
+        guard.set("CI", "1");
+        let profile = tempfile::tempdir().unwrap();
+        let mut options = LaunchOptions {
+            require_sandbox: true,
+            profile: Some(profile.path().display().to_string()),
+            args: vec![
+                "--window-size=800,600".to_string(),
+                "--disable-dev-shm-usage".to_string(),
+            ],
+            ..Default::default()
+        };
+        let args = build_chrome_args(&options).unwrap().args;
+        assert!(!args.iter().any(|arg| arg == "--no-sandbox"));
+        assert!(args.contains(&"--window-size=800,600".to_string()));
+        assert!(args.contains(&"--disable-dev-shm-usage".to_string()));
+        options.require_sandbox = false;
+        assert!(build_chrome_args(&options)
+            .unwrap()
+            .args
+            .contains(&"--no-sandbox".to_string()));
+        options.args.push("--no-sandbox".to_string());
+        assert!(validate_sandbox_options(&options, Some("lightpanda"), true).is_ok());
+    }
+
+    #[test]
+    fn required_sandbox_rejects_unverifiable_launch_modes() {
+        let options = LaunchOptions {
+            require_sandbox: true,
+            ..Default::default()
+        };
+        assert!(validate_sandbox_options(&options, None, false).is_ok());
+        assert!(validate_sandbox_options(&options, Some("Chrome"), false).is_ok());
+        assert!(validate_sandbox_options(&options, Some("lightpanda"), false).is_err());
+        assert!(validate_sandbox_options(&options, None, true).is_err());
+    }
+
+    #[test]
+    fn required_sandbox_error_never_suggests_disabling_it() {
+        for lines in [
+            vec![],
+            vec!["Failed to create sandbox namespace".to_string()],
+        ] {
+            let error = chrome_launch_error("Chrome exited", &lines, true);
+            assert!(error.contains("Chrome sandboxing is required"));
+            assert!(!error.contains("--no-sandbox"));
+        }
+    }
+
+    #[test]
     fn test_chrome_launch_error_no_stderr() {
-        let msg = chrome_launch_error("Chrome exited", &[]);
+        let msg = chrome_launch_error("Chrome exited", &[], false);
         assert!(msg.contains("no stderr output"));
         assert!(msg.contains("Hint:"));
         assert!(msg.contains("--no-sandbox"));
@@ -1861,7 +2004,7 @@ mod tests {
             "some log line".to_string(),
             "Failed to move to new namespace: sandbox error".to_string(),
         ];
-        let msg = chrome_launch_error("Chrome exited", &lines);
+        let msg = chrome_launch_error("Chrome exited", &lines, false);
         assert!(msg.contains("sandbox error"));
         assert!(msg.contains("Hint:"));
         assert!(msg.contains("--no-sandbox"));
@@ -1870,7 +2013,7 @@ mod tests {
     #[test]
     fn test_chrome_launch_error_generic() {
         let lines = vec!["info line".to_string(), "another info line".to_string()];
-        let msg = chrome_launch_error("Chrome exited", &lines);
+        let msg = chrome_launch_error("Chrome exited", &lines, false);
         assert!(msg.contains("last 2 lines"));
     }
 

@@ -158,6 +158,18 @@ fn is_valid_restore_save_policy(policy: &str) -> bool {
 }
 
 fn incompatible_launch_mode_error(flags: &Flags) -> Option<&'static str> {
+    if flags.require_sandbox
+        && (flags.cdp.is_some()
+            || flags.auto_connect
+            || flags.provider.is_some()
+            || flags
+                .engine
+                .as_deref()
+                .is_some_and(|engine| !engine.eq_ignore_ascii_case("chrome")))
+    {
+        return Some("--require-sandbox requires locally launched Chrome; sandboxing cannot be verified for CDP, auto-connect, providers, or other engines");
+    }
+
     if flags.cdp.is_some() && flags.provider.is_some() {
         return Some("Cannot use --cdp and -p/--provider together");
     }
@@ -1339,6 +1351,9 @@ fn main() {
 
     // Native daemon mode: when AGENT_BROWSER_DAEMON is set, run as the daemon process
     if env::var("AGENT_BROWSER_DAEMON").is_ok() {
+        // The private startup marker must not turn plugin/CLI subprocesses
+        // into competing daemons. Consume it before starting runtime threads.
+        env::remove_var("AGENT_BROWSER_DAEMON");
         // Ignore SIGPIPE so the daemon isn't killed when the parent drops
         // the piped stderr handle after confirming the daemon is ready.
         #[cfg(unix)]
@@ -1376,6 +1391,16 @@ fn main() {
     if let Some(ref namespace) = flags.namespace {
         env::set_var("AGENT_BROWSER_NAMESPACE", namespace);
     }
+    // Host commands such as MCP and chat invoke CLI subprocesses. Preserve
+    // these process policies there; explicit tool flags still override them.
+    env::set_var(
+        "AGENT_BROWSER_REQUIRE_DAEMON",
+        if flags.require_daemon { "1" } else { "0" },
+    );
+    env::set_var(
+        "AGENT_BROWSER_REQUIRE_SANDBOX",
+        if flags.require_sandbox { "1" } else { "0" },
+    );
     let clean = clean_args(&args);
 
     let has_help = args.iter().any(|a| a == "--help" || a == "-h");
@@ -1418,6 +1443,8 @@ fn main() {
     // session for the live launch test).
     if clean.first().map(|s| s.as_str()) == Some("doctor") {
         let opts = doctor::DoctorOptions {
+            require_daemon: flags.require_daemon,
+            require_sandbox: flags.require_sandbox,
             offline: args.iter().any(|a| a == "--offline"),
             quick: args.iter().any(|a| a == "--quick"),
             fix: args.iter().any(|a| a == "--fix"),
@@ -1690,6 +1717,7 @@ fn main() {
         serde_json::to_string(&flags.plugins).unwrap_or_else(|_| "[]".to_string());
     let daemon_opts = DaemonOptions {
         require_existing: flags.require_daemon,
+        require_sandbox: flags.require_sandbox,
         headed: flags.headed,
         debug: flags.debug,
         executable_path: flags.executable_path.as_deref(),

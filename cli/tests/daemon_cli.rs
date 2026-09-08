@@ -3,7 +3,7 @@
 //! Real CLI processes and Unix sockets verify supervisor custody without Chrome.
 use serde_json::Value;
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::process::{Child, Command, Output, Stdio};
@@ -169,6 +169,57 @@ fn absent_required_daemon_never_creates_session_files() {
         fixture.assert_clean();
         assert!(!fixture.path("lock").exists());
     }
+}
+
+#[test]
+fn mcp_server_forwards_required_daemon_policy_to_real_tool_processes() {
+    let fixture = Fixture::new();
+    let mut command = fixture.command(&["--require-daemon", "mcp", "--tools", "all"]);
+    command.stdin(Stdio::piped());
+    let mut process = Process(Some(command.spawn().unwrap()));
+    let mut stdin = process.0.as_mut().unwrap().stdin.take().unwrap();
+    for request in [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"supervision-test","version":"1"}}}),
+        serde_json::json!({"jsonrpc":"2.0","method":"notifications/initialized"}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"agent_browser_inspect","arguments":{"session":SESSION}}}),
+    ] {
+        writeln!(stdin, "{request}").unwrap();
+    }
+    drop(stdin);
+    let output = process.finish();
+    assert!(output.status.success(), "{output:?}");
+    let responses: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let tool = responses.iter().find(|value| value["id"] == 2).unwrap();
+    assert_eq!(tool["result"]["isError"], true, "{tool}");
+    assert!(tool.to_string().contains("Required daemon"), "{tool}");
+    fixture.assert_clean();
+    assert!(!fixture.path("lock").exists());
+}
+
+#[test]
+fn required_daemon_doctor_skips_scratch_browser_probes() {
+    let fixture = Fixture::new();
+    let output = fixture.run(&[
+        "--json",
+        "--require-daemon",
+        "doctor",
+        "--offline",
+        "--webgpu",
+    ]);
+    let result = response(&output);
+    assert!(
+        result["checks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|check| check["id"] == "launch.skipped.required_daemon"),
+        "{result}"
+    );
+    assert_eq!(fs::read_dir(fixture.0.path()).unwrap().count(), 1);
+    fixture.assert_clean();
 }
 
 #[test]
@@ -379,6 +430,36 @@ fn batch_cannot_dispatch_the_host_daemon_command() {
         .as_str()
         .unwrap()
         .contains("standalone foreground process"));
+    assert_eq!(fixture.pid(), daemon.pid());
+    daemon.signal(libc::SIGTERM);
+    assert!(daemon.finish().status.success());
+    fixture.assert_clean();
+}
+
+#[test]
+fn required_sandbox_rejects_unsafe_launch_without_replacing_supervisor() {
+    let fixture = Fixture::new();
+    fixture.config(r#"{"requireSandbox":true,"executablePath":"/does-not-exist/chrome","args":"--no-sandbox"}"#);
+    let daemon = fixture.start(&[]);
+    let output = fixture.run(&["--json", "--require-daemon", "open"]);
+    assert!(!output.status.success(), "{output:?}");
+    assert!(response(&output)["error"]
+        .as_str()
+        .unwrap()
+        .contains("--require-sandbox cannot be combined"));
+    assert_eq!(fixture.pid(), daemon.pid());
+    let relaxed = fixture.run(&[
+        "--json",
+        "--require-daemon",
+        "--require-sandbox",
+        "false",
+        "inspect",
+    ]);
+    assert!(!relaxed.status.success());
+    assert!(response(&relaxed)["error"]
+        .as_str()
+        .unwrap()
+        .contains("configuration"));
     assert_eq!(fixture.pid(), daemon.pid());
     daemon.signal(libc::SIGTERM);
     assert!(daemon.finish().status.success());

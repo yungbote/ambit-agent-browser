@@ -210,6 +210,11 @@
       "enum": ["png", "jpeg"],
       "description": "Screenshot format."
     },
+    "requireSandbox": {
+      "type": "boolean",
+      "description": "Require locally launched Chrome sandboxing and reject automatic or explicit sandbox disabling.",
+      "default": false
+    },
     "requireDaemon": {
       "type": "boolean",
       "description": "Require an existing compatible daemon without starting or restarting one.",

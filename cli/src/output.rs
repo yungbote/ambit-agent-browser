@@ -3489,6 +3489,13 @@ on Unix, SIGTERM and SIGHUP also save configured state and clean up.
 
 Use the same session and daemon options on clients. --require-daemon prevents
 clients from starting or restarting a daemon, including after a connection fails.
+With this option, doctor skips browser probes that would start scratch daemons.
+Use --require-sandbox when the host supports sandboxed Chrome. This prevents
+automatic --no-sandbox fallback and rejects sandbox-disabling user/plugin args.
+It requires locally launched Chrome; unsupported hosts fail instead of retrying
+without sandboxing. Config: {{"requireSandbox": true}}; environment:
+AGENT_BROWSER_REQUIRE_SANDBOX=1; MCP argument: requireSandbox.
+
 Foreground daemons also refuse automatic restarts by ordinary clients when
 configuration or versions differ. Restart them through the owning supervisor.
 
@@ -3956,6 +3963,7 @@ Options:
   --engine <name>            Browser engine: chrome (default), lightpanda (or AGENT_BROWSER_ENGINE)
   --idle-timeout <time>      Shut down daemon after inactivity: 10s, 3m, 1h, or raw ms
                              (default: 1h; 0 disables; dashboard input resets the timer)
+  --require-sandbox          Require sandboxed local Chrome; reject disabling flags/fallback
   --require-daemon           Require an existing compatible daemon; never start or restart
   --no-auto-dialog           Disable automatic dismissal of alert/beforeunload dialogs (or AGENT_BROWSER_NO_AUTO_DIALOG)
   --model <name>             AI model for chat (or AI_GATEWAY_MODEL env)
@@ -3993,6 +4001,7 @@ Configuration:
     {{"plugins":[{{"name":"vault","command":"agent-browser-plugin-vault","capabilities":["credential.read"]}},{{"name":"stealth","command":"agent-browser-plugin-stealth","capabilities":["launch.mutate"]}}]}}
 
 Environment:
+  AGENT_BROWSER_REQUIRE_SANDBOX  Require sandboxed local Chrome (1 or true)
   AGENT_BROWSER_REQUIRE_DAEMON   Require an existing compatible daemon (1 or true)
   AGENT_BROWSER_CONFIG           Path to config file (or use --config)
   AGENT_BROWSER_SESSION          Session name (default: "default")

@@ -3451,6 +3451,7 @@ mod tests {
     fn default_flags() -> Flags {
         Flags {
             require_daemon: false,
+            require_sandbox: false,
             session: "test".to_string(),
             json: false,
             headed: false,

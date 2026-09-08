@@ -27,6 +27,10 @@ use crate::color;
 
 #[derive(Default, Clone, Copy)]
 pub struct DoctorOptions {
+    /// Do not launch scratch daemons when the caller requires supervised custody.
+    pub require_daemon: bool,
+    /// Preserve the configured sandbox requirement in live browser probes.
+    pub require_sandbox: bool,
     pub offline: bool,
     pub quick: bool,
     pub fix: bool,
@@ -119,12 +123,20 @@ pub fn run_doctor(opts: DoctorOptions) -> i32 {
         network::check(&mut checks);
     }
 
-    if !opts.quick {
-        launch::check(&mut checks, &opts);
-    }
-
-    if opts.webgpu {
-        webgpu::check(&mut checks, &opts);
+    if opts.require_daemon && (!opts.quick || opts.webgpu) {
+        checks.push(Check::new(
+            "launch.skipped.required_daemon",
+            "Launch test",
+            Status::Info,
+            "Skipped browser probes because --require-daemon forbids starting scratch daemons",
+        ));
+    } else {
+        if !opts.quick {
+            launch::check(&mut checks, &opts);
+        }
+        if opts.webgpu {
+            webgpu::check(&mut checks, &opts);
+        }
     }
 
     if opts.fix {

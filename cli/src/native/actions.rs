@@ -282,6 +282,7 @@ fn launch_hash(
     connection_kind.hash(&mut h);
     connection_target.hash(&mut h);
     opts.headless.hash(&mut h);
+    opts.require_sandbox.hash(&mut h);
     opts.extensions.hash(&mut h);
     opts.profile.hash(&mut h);
     opts.executable_path.hash(&mut h);
@@ -335,11 +336,12 @@ fn launch_connection_is_external(
     launch_connection_identity(cdp_url, cdp_port, auto_connect, provider_name).0 != "local"
 }
 
-fn validate_ca_cert_launch_mode(
+fn validate_local_launch_options(
     options: &LaunchOptions,
     engine: Option<&str>,
     external_launch: bool,
 ) -> Result<(), String> {
+    super::cdp::chrome::validate_sandbox_options(options, engine, external_launch)?;
     if options.ca_cert.is_none() {
         return Ok(());
     }
@@ -3821,7 +3823,7 @@ async fn auto_launch(
     let cdp = env::var("AGENT_BROWSER_CDP").ok();
     let auto_connect = env::var("AGENT_BROWSER_AUTO_CONNECT").is_ok();
     let provider = env::var("AGENT_BROWSER_PROVIDER").ok();
-    validate_ca_cert_launch_mode(
+    validate_local_launch_options(
         &options,
         engine.as_deref(),
         cdp.is_some() || auto_connect || provider.is_some(),
@@ -4017,7 +4019,7 @@ async fn auto_launch(
     })?;
 
     apply_launch_mutator_plugins(state, &mut options, plugins).await?;
-    validate_ca_cert_launch_mode(&options, engine.as_deref(), false)?;
+    validate_local_launch_options(&options, engine.as_deref(), false)?;
     ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
         allowed_domains: &allowed_domains,
         cdp_url: None,
@@ -4209,6 +4211,13 @@ async fn apply_launch_mutator_plugins(
     Ok(())
 }
 
+fn require_sandbox_from_env() -> bool {
+    matches!(
+        env::var("AGENT_BROWSER_REQUIRE_SANDBOX").as_deref(),
+        Ok("1" | "true")
+    )
+}
+
 fn launch_options_from_env() -> LaunchOptions {
     let headed = headed_from_env();
 
@@ -4221,6 +4230,7 @@ fn launch_options_from_env() -> LaunchOptions {
 
     LaunchOptions {
         headless: !headed,
+        require_sandbox: require_sandbox_from_env(),
         executable_path: env::var("AGENT_BROWSER_EXECUTABLE_PATH").ok(),
         proxy: env::var("AGENT_BROWSER_PROXY").ok(),
         proxy_bypass: env::var("AGENT_BROWSER_PROXY_BYPASS").ok(),
@@ -4664,6 +4674,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 
     let mut launch_options = LaunchOptions {
         headless,
+        require_sandbox: require_sandbox_from_env(),
         executable_path: cmd
             .get("executablePath")
             .and_then(|v| v.as_str())
@@ -4741,7 +4752,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 
     let external_launch =
         cdp_url.is_some() || cdp_port.is_some() || auto_connect || provider_name.is_some();
-    validate_ca_cert_launch_mode(&launch_options, engine.as_deref(), external_launch)?;
+    validate_local_launch_options(&launch_options, engine.as_deref(), external_launch)?;
 
     state.plugin_init_scripts.clear();
     let local_launch =
@@ -4749,7 +4760,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     if local_launch {
         apply_launch_mutator_plugins(state, &mut launch_options, plugins_from_command_or_env(cmd))
             .await?;
-        validate_ca_cert_launch_mode(&launch_options, engine.as_deref(), false)?;
+        validate_local_launch_options(&launch_options, engine.as_deref(), false)?;
     }
     ensure_allowed_domains_supported_for_launch(AllowedDomainsLaunchSupport {
         allowed_domains: &allowed_domains,
@@ -14628,14 +14639,14 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         let mut retained_options = LaunchOptions::default();
         apply_effective_ca_cert(&mut retained_options, &retained);
         let error =
-            validate_ca_cert_launch_mode(&retained_options, Some("chrome"), true).unwrap_err();
+            validate_local_launch_options(&retained_options, Some("chrome"), true).unwrap_err();
         assert!(error.contains("CA trust is active for this session"));
         assert!(error.contains("--no-ca-cert"));
 
         let cleared = resolve_effective_ca_cert(&json!({ "clearCaCert": true }), &state).unwrap();
         let mut cleared_options = LaunchOptions::default();
         apply_effective_ca_cert(&mut cleared_options, &cleared);
-        assert!(validate_ca_cert_launch_mode(&cleared_options, Some("chrome"), true).is_ok());
+        assert!(validate_local_launch_options(&cleared_options, Some("chrome"), true).is_ok());
     }
 
     #[test]
@@ -14688,22 +14699,22 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             ca_cert: Some("/tmp/proxy-ca.pem".to_string()),
             ..Default::default()
         };
-        assert!(validate_ca_cert_launch_mode(&ca, Some("chrome"), true).is_err());
-        assert!(validate_ca_cert_launch_mode(&ca, Some("lightpanda"), false).is_err());
+        assert!(validate_local_launch_options(&ca, Some("chrome"), true).is_err());
+        assert!(validate_local_launch_options(&ca, Some("lightpanda"), false).is_err());
 
         let ignored = LaunchOptions {
             ca_cert: Some("/tmp/proxy-ca.pem".to_string()),
             ignore_https_errors: true,
             ..Default::default()
         };
-        assert!(validate_ca_cert_launch_mode(&ignored, Some("chrome"), false).is_err());
+        assert!(validate_local_launch_options(&ignored, Some("chrome"), false).is_err());
 
         let profile = LaunchOptions {
             ca_cert: Some("/tmp/proxy-ca.pem".to_string()),
             profile: Some("/tmp/profile".to_string()),
             ..Default::default()
         };
-        assert!(validate_ca_cert_launch_mode(&profile, Some("chrome"), false).is_err());
+        assert!(validate_local_launch_options(&profile, Some("chrome"), false).is_err());
     }
 
     #[test]
