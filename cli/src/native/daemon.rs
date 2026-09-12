@@ -336,6 +336,12 @@ async fn run_socket_server(
         Ok(Ok(_)) => {}
     }
     let _ = close_all_browser_backends(&mut state).await;
+    // The process can remain alive while its browser finishes closing. End
+    // the visual stream explicitly before runtime teardown drops its tasks.
+    if let Some(server) = state.stream_server.take() {
+        server.shutdown().await;
+        state.stream_client = None;
+    }
     Ok(())
 }
 

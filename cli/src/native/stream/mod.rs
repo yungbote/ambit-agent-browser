@@ -289,7 +289,8 @@ impl StreamServer {
         self.broadcast_status(connected, sc, vw, vh, engine).await;
     }
 
-    /// Shut down the accept loop and background CDP listener, releasing the bound port.
+    /// End this stream explicitly, then stop its listener and owned tasks.
+    /// Responsive viewers receive `finished` before the WebSocket closes.
     pub async fn shutdown(&self) {
         let _ = self.shutdown_tx.send(true);
 
@@ -882,6 +883,48 @@ mod tests {
             1,
             "a per-connection task outlived shutdown and still holds the activity clock"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn test_shutdown_reports_finished_before_websocket_close() {
+        let (server, _slot) = StreamServer::start_without_client(
+            0,
+            "finished".to_string(),
+            true,
+            Arc::new(IdleActivity::new()),
+        )
+        .await
+        .expect("server start");
+        server.broadcast_frame(r#"{"type":"frame","seq":1,"data":"last"}"#);
+        let mut ws = connect_client_to(server.port(), "/?pacing=ack").await;
+        assert_eq!(next_frame(&mut ws).await["data"], "last");
+
+        // The last frame remains unacknowledged: terminal delivery must not
+        // depend on receiving another frame acknowledgement from the viewer.
+        server.shutdown().await;
+        let mut finished = false;
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                .await
+                .expect("terminal delivery timed out")
+                .expect("stream ended without close")
+                .expect("shutdown lost its terminal record");
+            match message {
+                Message::Text(text) => {
+                    let body: Value = serde_json::from_str(&text).expect("valid record");
+                    if body["type"] == "finished" {
+                        assert!(!finished, "terminal record repeated");
+                        assert_eq!(body, json!({"type":"finished"}));
+                        finished = true;
+                    }
+                }
+                Message::Close(_) => {
+                    assert!(finished, "close arrived without explicit finished");
+                    break;
+                }
+                _ => {}
+            }
+        }
     }
 
     /// The cached opening frame is charged against the cap like any other

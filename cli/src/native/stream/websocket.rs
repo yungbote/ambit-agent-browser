@@ -19,6 +19,10 @@ use super::{is_allowed_origin, timestamp_ms, IdleActivity, StreamFrame};
 /// Highest per-client frame rate a client may request via the `config` message.
 const MAX_CONFIGURABLE_FPS: u32 = 120;
 
+// One bounded drain for all viewers, not a delay per connection. Responsive
+// viewers receive the terminal record; a stalled socket cannot hold shutdown.
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Per-connection delivery settings, set by the client's `config` message.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 struct ClientConfig {
@@ -145,9 +149,8 @@ pub(super) async fn accept_loop(
 ) {
     let session_name: Arc<str> = Arc::from(session_name);
     // Invariant: every per-connection task is owned here, never detached, so
-    // awaiting this loop proves none survives. Teardown aborts rather than
-    // drains, because a writer parked in `ws_tx.send()` against a client that
-    // stopped reading would hold a graceful drain open forever.
+    // awaiting this loop proves none survives. Teardown first lets responsive
+    // writers report the stream's explicit end, then aborts any blocked peer.
     let mut connections = tokio::task::JoinSet::new();
     loop {
         tokio::select! {
@@ -203,7 +206,15 @@ pub(super) async fn accept_loop(
             }
         }
     }
-    connections.shutdown().await;
+    drop(listener);
+    if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, async {
+        while connections.join_next().await.is_some() {}
+    })
+    .await
+    .is_err()
+    {
+        connections.shutdown().await;
+    }
 }
 
 fn is_websocket_upgrade(request: &str) -> bool {
@@ -402,6 +413,9 @@ async fn handle_ws_client(
         tokio::select! {
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
+                    // Shutdown is an explicit lifecycle event. An unlabelled
+                    // EOF also occurs on transport loss and is not equivalent.
+                    let _ = ws_tx.send(Message::Text(r#"{"type":"finished"}"#.into())).await;
                     let _ = ws_tx.send(Message::Close(None)).await;
                     break;
                 }

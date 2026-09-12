@@ -3202,6 +3202,8 @@ available localhost port automatically and reports it back.
 Notes:
   - 'stream enable' creates the WebSocket server.
   - WebSocket clients trigger frame streaming automatically.
+  - Orderly close or stream disable emits {"type":"finished"} before closing
+    the WebSocket. An unlabelled disconnect does not establish completion.
   - On Chrome, URL messages follow full-document, History API, and fragment
     navigation in the active tab's main frame. Child-frame and background-tab
     navigation does not emit URL messages.

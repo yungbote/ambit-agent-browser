@@ -967,7 +967,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_CLOSE,
             "Close browser",
-            "Close the current browser session.",
+            "Close the current browser session and finish its live stream.",
             json!({
                 "all": { "type": "boolean", "default": false, "description": "Close all active sessions." }
             }),
@@ -1721,7 +1721,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_STREAM_DISABLE,
             "Stream disable",
-            "Disable streaming.",
+            "Disable streaming and finish the current live stream.",
             json!({}),
             &[],
         ),
