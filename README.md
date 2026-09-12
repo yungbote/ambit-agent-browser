@@ -1536,11 +1536,11 @@ Stream the browser viewport via WebSocket for live preview or "pair browsing" wh
 
 Every session automatically starts a WebSocket stream server on an OS-assigned port. Use `stream status` to see the bound port and connection state:
 
-Orderly session closure or `stream disable` sends `{"type":"finished"}` before closing responsive WebSocket connections. A disconnected socket without this record may be a transport failure; it does not prove the browser finished. Shutdown has a bounded drain so a stalled viewer cannot keep the daemon alive.
-
 ```bash
 agent-browser stream status
 ```
+
+Orderly session closure or `stream disable` sends `{"type":"finished"}` before closing responsive WebSocket connections. A disconnected socket without this record may be a transport failure; it does not prove the browser finished. Shutdown has a bounded drain so a stalled viewer cannot keep the daemon alive.
 
 To bind to a specific port, set `AGENT_BROWSER_STREAM_PORT`:
 
