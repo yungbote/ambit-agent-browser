@@ -15,6 +15,10 @@
 //! keeps NetworkServiceInProcess disabled after plugin launch mutations.
 //! Command delivery uses the same CLI transport: once sending is attempted,
 //! lost/invalid responses report an unknown outcome without automatic replay.
+//! Human browser custody is enforced by the same daemon for CLI and MCP.
+//! Internal ambit_browser_control is intentionally not an MCP tool: the host
+//! must authorize the paused interaction and user before obtaining custody.
+//! Ordinary tools preserve browser_controlled_by_user and unknown outcomes.
 //! Owned Windows Chrome uses the same private headless desktop and Job Object
 //! lifetime through MCP; headed and external-connection semantics are unchanged.
 
@@ -4233,6 +4237,17 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), tools.len());
+    }
+
+    #[test]
+    fn browser_control_remains_an_internal_host_protocol() {
+        assert!(tools().iter().all(|tool| !tool["name"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("browser_control")));
+        let args = vec![crate::native::browser_control::ACTION.to_string()];
+        let flags = crate::flags::parse_flags(&args);
+        assert!(crate::commands::parse_command(&args, &flags).is_err());
     }
 
     #[test]

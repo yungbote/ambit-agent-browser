@@ -79,6 +79,38 @@ struct PendingGuard {
     done: bool,
 }
 
+/// An enqueued command whose browser acknowledgment remains observable.
+/// Stream input retains these receipts while continuing to enqueue events, so
+/// taking control can drain prior input without adding a round trip per move.
+pub(crate) struct PendingCommand {
+    response: oneshot::Receiver<CdpMessage>,
+    guard: PendingGuard,
+}
+
+impl PendingCommand {
+    pub(crate) async fn acknowledgment(&mut self) -> Result<CdpMessage, String> {
+        let result = (&mut self.response)
+            .await
+            .map_err(|_| "CDP response channel closed".to_string());
+        self.guard.done = true;
+        result
+    }
+
+    pub(crate) fn try_acknowledgment(&mut self) -> Result<Option<CdpMessage>, String> {
+        match self.response.try_recv() {
+            Ok(response) => {
+                self.guard.done = true;
+                Ok(Some(response))
+            }
+            Err(oneshot::error::TryRecvError::Empty) => Ok(None),
+            Err(oneshot::error::TryRecvError::Closed) => {
+                self.guard.done = true;
+                Err("CDP response channel closed".to_string())
+            }
+        }
+    }
+}
+
 impl Drop for PendingGuard {
     fn drop(&mut self) {
         if self.done {
@@ -279,6 +311,23 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
+        let mut pending = self.enqueue_command(method, params, session_id).await?;
+        let response =
+            tokio::time::timeout(std::time::Duration::from_secs(30), pending.acknowledgment())
+                .await
+                .map_err(|_| format!("CDP command timed out: {}", method))??;
+        if let Some(error) = response.error {
+            return Err(format!("CDP error ({}): {}", method, error));
+        }
+        Ok(response.result.unwrap_or(Value::Null))
+    }
+
+    pub(crate) async fn enqueue_command(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+    ) -> Result<PendingCommand, String> {
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let cmd = CdpCommand {
@@ -299,7 +348,7 @@ impl CdpClient {
         }
 
         // Cleans up the pending entry if this future is cancelled mid-await (#1528).
-        let mut guard = PendingGuard {
+        let guard = PendingGuard {
             pending: self.pending.clone(),
             id,
             done: false,
@@ -313,27 +362,10 @@ impl CdpClient {
                 .map_err(|e| format!("Failed to send CDP command: {}", e))?;
         }
 
-        let response = match tokio::time::timeout(std::time::Duration::from_secs(30), rx).await {
-            Ok(Ok(resp)) => {
-                guard.done = true;
-                resp
-            }
-            Ok(Err(_)) => {
-                guard.done = true;
-                return Err("CDP response channel closed".to_string());
-            }
-            Err(_) => {
-                guard.done = true;
-                self.pending.lock().await.remove(&id);
-                return Err(format!("CDP command timed out: {}", method));
-            }
-        };
-
-        if let Some(error) = response.error {
-            return Err(format!("CDP error ({}): {}", method, error));
-        }
-
-        Ok(response.result.unwrap_or(Value::Null))
+        Ok(PendingCommand {
+            response: rx,
+            guard,
+        })
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {

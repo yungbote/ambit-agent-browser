@@ -352,6 +352,9 @@ async fn maintain_browser(state: Arc<tokio::sync::Mutex<DaemonState>>, autosave_
     loop {
         interval.tick().await;
         let mut state = state.lock().await;
+        if let Err(error) = state.expire_browser_control().await {
+            let _ = writeln!(std::io::stderr(), "{}: {}", error.code, error.message);
+        }
         let process_exited = state
             .browser
             .as_mut()

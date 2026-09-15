@@ -15,6 +15,7 @@ use crate::validation::{is_valid_session_name, session_name_error};
 use super::a11y;
 use super::auth;
 use super::browser::{should_track_target, BrowserManager, WaitUntil};
+use super::browser_control::{self, BrowserControl, ControlRequest};
 use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
@@ -25,6 +26,7 @@ use super::cdp::types::{
 use super::cookies;
 use super::diff;
 use super::element::RefMap;
+use super::input::{mouse_button_mask, primary_button_from_mask};
 use super::inspect_server::InspectServer;
 use super::interaction;
 use super::network::{self, DomainFilter, EventTracker};
@@ -603,6 +605,9 @@ pub struct DaemonState {
     pub stream_server: Option<Arc<StreamServer>>,
     /// Daemon-owned activity clock shared by commands and stream servers.
     pub idle_activity: Arc<IdleActivity>,
+    /// Shared only with the stream input reader; daemon commands retain their
+    /// existing outer mutex. Never broadcast controller credentials.
+    pub(crate) browser_control: Arc<tokio::sync::Mutex<BrowserControl>>,
     /// Hash of launch options used for the current browser, for relaunch detection.
     launch_hash: Option<u64>,
     effective_ca_cert: Option<EffectiveCaCert>,
@@ -647,6 +652,16 @@ fn default_idle_shutdown_is_blocked(
 }
 
 impl DaemonState {
+    pub(crate) async fn expire_browser_control(&self) -> Result<(), browser_control::ControlError> {
+        let browser = self.browser.as_ref().and_then(|manager| {
+            manager
+                .active_session_id()
+                .ok()
+                .map(|session| (manager.client.as_ref(), session))
+        });
+        self.browser_control.lock().await.expire(browser).await
+    }
+
     pub fn new() -> Self {
         let session_id =
             env::var("AGENT_BROWSER_SESSION").unwrap_or_else(|_| "default".to_string());
@@ -724,6 +739,7 @@ impl DaemonState {
             stream_client: None,
             stream_server: None,
             idle_activity: Arc::new(IdleActivity::new()),
+            browser_control: Arc::new(tokio::sync::Mutex::new(BrowserControl::default())),
             launch_hash: None,
             effective_ca_cert: None,
             network_auto_attach_installed: false,
@@ -784,6 +800,9 @@ impl DaemonState {
         let mut s = Self::new();
         if stream_server.is_some() {
             s.request_tracking = true;
+        }
+        if let Some(server) = stream_server.as_ref() {
+            s.browser_control = server.browser_control.clone();
         }
         s.stream_client = stream_client;
         s.stream_server = stream_server;
@@ -1049,6 +1068,9 @@ impl DaemonState {
 
     /// Update the stream server's CDP client slot when browser is set or cleared.
     pub async fn update_stream_client(&self) {
+        if self.browser.is_none() {
+            self.browser_control.lock().await.reset_browser();
+        }
         if let Some(ref slot) = self.stream_client {
             let mut guard = slot.write().await;
             *guard = self.browser.as_ref().map(|m| Arc::clone(&m.client));
@@ -2506,6 +2528,50 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         .to_string();
 
     let cmd_start = std::time::Instant::now();
+
+    // Product custody is checked before any ordinary command side effect or
+    // stream broadcast. The supervisor keeps its existing termination path.
+    if action == browser_control::ACTION {
+        let request = match ControlRequest::parse(cmd) {
+            Ok(request) => request,
+            Err(error) => {
+                return json!({ "id": id, "success": false, "code": error.code, "error": error.message })
+            }
+        };
+        let browser = state.browser.as_ref().and_then(|manager| {
+            manager
+                .active_session_id()
+                .ok()
+                .map(|session| (manager.client.as_ref(), session))
+        });
+        let result = state
+            .browser_control
+            .lock()
+            .await
+            .execute(request, browser)
+            .await;
+        if result
+            .as_ref()
+            .is_ok_and(|data| data["status"] == "controlled" && cmd["op"] == "acquire")
+        {
+            state.reset_input_state();
+        }
+        state.last_command_finished = Some(std::time::Instant::now());
+        return match result {
+            Ok(data) => success_response(&id, data),
+            Err(error) => {
+                json!({ "id": id, "success": false, "code": error.code, "error": error.message })
+            }
+        };
+    }
+    if action != INTERNAL_DAEMON_SHUTDOWN_ACTION {
+        if let Err(error) = state.expire_browser_control().await {
+            return json!({ "id": id, "success": false, "code": error.code, "error": error.message });
+        }
+        if let Some(error) = state.browser_control.lock().await.agent_error() {
+            return json!({ "id": id, "success": false, "code": error.code, "error": error.message });
+        }
+    }
 
     if let Err(err) = validate_restore_config_from_command(cmd) {
         return error_response(&id, &err);
@@ -8622,11 +8688,12 @@ async fn handle_stream_enable(cmd: &Value, state: &mut DaemonState) -> Result<Va
         None => 0,
     };
 
-    let (server, client_slot) = StreamServer::start_without_client(
+    let (server, client_slot) = StreamServer::start_with_control(
         requested_port,
         state.session_id.clone(),
         false,
         state.idle_activity.clone(),
+        state.browser_control.clone(),
     )
     .await?;
     let port = server.port();
@@ -11998,33 +12065,6 @@ async fn handle_device_list() -> Result<Value, String> {
 // Input event handlers
 // ---------------------------------------------------------------------------
 
-fn mouse_button_mask(button: &str) -> i32 {
-    match button {
-        "left" => 1,
-        "right" => 2,
-        "middle" => 4,
-        "back" => 8,
-        "forward" => 16,
-        _ => 0,
-    }
-}
-
-fn primary_button_from_mask(buttons: i32) -> &'static str {
-    if buttons & 1 != 0 {
-        "left"
-    } else if buttons & 2 != 0 {
-        "right"
-    } else if buttons & 4 != 0 {
-        "middle"
-    } else if buttons & 8 != 0 {
-        "back"
-    } else if buttons & 16 != 0 {
-        "forward"
-    } else {
-        "none"
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn build_mouse_event_params(
     mouse_state: &mut MouseState,
@@ -12100,8 +12140,16 @@ async fn handle_input_mouse(cmd: &Value, state: &mut DaemonState) -> Result<Valu
             .map(|v| v as i32),
     );
 
-    mgr.client
-        .send_command_typed::<_, Value>("Input.dispatchMouseEvent", &params, Some(&session_id))
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_input(
+            "input_mouse",
+            serde_json::to_value(&params).map_err(|error| error.to_string())?,
+            &mgr.client,
+            &session_id,
+        )
         .await?;
     Ok(json!({ "dispatched": event_type }))
 }
@@ -12121,8 +12169,11 @@ async fn handle_input_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value
         }
     }
 
-    mgr.client
-        .send_command("Input.dispatchKeyEvent", Some(params), Some(&session_id))
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_input("input_keyboard", params, &mgr.client, &session_id)
         .await?;
     Ok(json!({ "dispatched": event_type }))
 }
@@ -12135,14 +12186,17 @@ async fn handle_input_touch(cmd: &Value, state: &DaemonState) -> Result<Value, S
         .and_then(|v| v.as_str())
         .unwrap_or("touchStart");
 
-    mgr.client
-        .send_command(
-            "Input.dispatchTouchEvent",
-            Some(json!({
-                "type": event_type,
-                "touchPoints": cmd.get("touchPoints").unwrap_or(&json!([])),
-            })),
-            Some(&session_id),
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_input(
+            "input_touch",
+            json!({
+                "type": event_type, "touchPoints": cmd.get("touchPoints").unwrap_or(&json!([])),
+            }),
+            &mgr.client,
+            &session_id,
         )
         .await?;
     Ok(json!({ "dispatched": event_type }))
@@ -12156,11 +12210,15 @@ async fn handle_keydown(cmd: &Value, state: &DaemonState) -> Result<Value, Strin
         .and_then(|v| v.as_str())
         .ok_or("Missing 'key' parameter")?;
 
-    mgr.client
-        .send_command(
-            "Input.dispatchKeyEvent",
-            Some(json!({ "type": "keyDown", "key": key })),
-            Some(&session_id),
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_input(
+            "input_keyboard",
+            json!({ "type": "keyDown", "key": key }),
+            &mgr.client,
+            &session_id,
         )
         .await?;
     Ok(json!({ "keydown": key }))
@@ -12174,11 +12232,15 @@ async fn handle_keyup(cmd: &Value, state: &DaemonState) -> Result<Value, String>
         .and_then(|v| v.as_str())
         .ok_or("Missing 'key' parameter")?;
 
-    mgr.client
-        .send_command(
-            "Input.dispatchKeyEvent",
-            Some(json!({ "type": "keyUp", "key": key })),
-            Some(&session_id),
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_input(
+            "input_keyboard",
+            json!({ "type": "keyUp", "key": key }),
+            &mgr.client,
+            &session_id,
         )
         .await?;
     Ok(json!({ "keyup": key }))
@@ -12220,8 +12282,16 @@ async fn handle_mousemove(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         None,
     );
 
-    mgr.client
-        .send_command_typed::<_, Value>("Input.dispatchMouseEvent", &params, Some(&session_id))
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_input(
+            "input_mouse",
+            serde_json::to_value(&params).map_err(|error| error.to_string())?,
+            &mgr.client,
+            &session_id,
+        )
         .await?;
     Ok(json!({ "moved": true }))
 }
@@ -12243,8 +12313,16 @@ async fn handle_mousedown(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         None,
     );
 
-    mgr.client
-        .send_command_typed::<_, Value>("Input.dispatchMouseEvent", &params, Some(&session_id))
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_input(
+            "input_mouse",
+            serde_json::to_value(&params).map_err(|error| error.to_string())?,
+            &mgr.client,
+            &session_id,
+        )
         .await?;
     Ok(json!({ "pressed": true }))
 }
@@ -12266,8 +12344,16 @@ async fn handle_mouseup(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         None,
     );
 
-    mgr.client
-        .send_command_typed::<_, Value>("Input.dispatchMouseEvent", &params, Some(&session_id))
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_input(
+            "input_mouse",
+            serde_json::to_value(&params).map_err(|error| error.to_string())?,
+            &mgr.client,
+            &session_id,
+        )
         .await?;
     Ok(json!({ "released": true }))
 }

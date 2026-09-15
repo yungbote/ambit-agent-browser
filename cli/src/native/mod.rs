@@ -6,6 +6,7 @@ pub mod actions;
 pub mod auth;
 #[allow(dead_code)]
 pub mod browser;
+pub(crate) mod browser_control;
 #[allow(dead_code)]
 pub mod cdp;
 #[allow(dead_code)]
@@ -16,6 +17,7 @@ pub mod daemon;
 pub mod diff;
 #[allow(dead_code)]
 pub mod element;
+pub(crate) mod input;
 #[allow(dead_code)]
 pub mod inspect_server;
 #[allow(dead_code)]

@@ -3502,6 +3502,11 @@ It requires locally launched Chrome; unsupported hosts fail instead of retrying
 without sandboxing. Config: {{"requireSandbox": true}}; environment:
 AGENT_BROWSER_REQUIRE_SANDBOX=1; MCP argument: requireSandbox.
 
+During host-mediated human control, CLI and MCP commands report
+browser_controlled_by_user. Wait for release or lease expiry before continuing.
+An unknown input outcome must not be replayed. Supervisor termination remains
+available; human control is not a CLI command or MCP tool.
+
 Foreground daemons also refuse automatic restarts by ordinary clients when
 configuration or versions differ. Restart them through the owning supervisor.
 
