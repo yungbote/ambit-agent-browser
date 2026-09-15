@@ -3227,6 +3227,11 @@ Notes:
     (width/height: integer CSS pixels, 1-32768), preserving scale and emulation.
     Acquisition waits at most 2s for an active command, then refuses as
     browser_control_unavailable; no custody is created by that refusal.
+  - Host navigation uses the same input sequence (navigate/back/forward/reload).
+    URL records include observed canGoBack/canGoForward when available.
+  - Explicit host copy reads selected text from the focused page/input/frame,
+    never the system clipboard. Maximum 1 MiB UTF-8, no truncation; masked
+    password fields have no copyable text. Copy does not advance input sequence.
   - 'screencast_start' and 'screencast_stop' still control explicit CDP screencasts.
   - Streaming is always enabled. Set AGENT_BROWSER_STREAM_PORT to bind to a
     specific port instead of the default OS-assigned port.

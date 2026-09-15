@@ -192,6 +192,42 @@ fn controller_viewport_is_a_bounded_css_geometry_event() {
     .is_err());
 }
 
+#[test]
+fn controller_navigation_and_copy_keep_their_declared_fields() {
+    for action in ["back", "forward", "reload"] {
+        assert!(validate_event(&json!({ "type": "navigation", "action": action })).is_ok());
+        assert!(validate_event(
+            &json!({ "type": "navigation", "action": action, "url": "https://example.test/" })
+        )
+        .is_err());
+    }
+    for url in [
+        "https://example.test/",
+        "example.test",
+        "about:blank",
+        "data:text/plain,local",
+    ] {
+        assert!(
+            validate_event(&json!({ "type": "navigation", "action": "navigate", "url": url }))
+                .is_ok()
+        );
+    }
+    for url in [json!(""), json!("https://"), json!(false), Value::Null] {
+        assert!(
+            validate_event(&json!({ "type": "navigation", "action": "navigate", "url": url }))
+                .is_err()
+        );
+    }
+    assert!(validate_event(
+        &json!({ "type": "navigation", "action": "script", "url": "https://example.test/" })
+    )
+    .is_err());
+    assert!(ControlRequest::parse(&command("copy", OWNER)).is_ok());
+    let mut copy = command("copy", OWNER);
+    copy["sequence"] = json!(1);
+    assert!(ControlRequest::parse(&copy).is_err());
+}
+
 #[tokio::test]
 async fn native_activity_follows_browser_acknowledgements_and_page_identity() {
     let mut browser = Browser::new().await;

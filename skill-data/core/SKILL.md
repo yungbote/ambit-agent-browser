@@ -60,7 +60,7 @@ The browser stays running across commands so these feel like a single session. B
 
 If a command returns `browser_controlled_by_user`, wait for the user to release browser control before continuing. If it returns `browser_control_outcome_unknown`, do not replay the input; inspect the current page after control is released. The existing workflow remains paused until the host resumes it. A host-bound `browser_observation_required` result supplies fresh feedback after human control; inspect it and choose the next action instead of repeating the blocked action.
 
-Host-authorized control can resize the viewport within the same sequenced input batch. Native activity shows acknowledged actions against matching page frames. See `references/commands.md#host-control-and-native-activity` for the integration contract.
+Host-authorized control can navigate or resize the viewport within the same sequenced input batch, and explicitly copy selected text. Native activity shows acknowledged actions against matching page frames. See `references/commands.md#host-control-and-native-activity` for the integration contract.
 
 ## MCP integration
 

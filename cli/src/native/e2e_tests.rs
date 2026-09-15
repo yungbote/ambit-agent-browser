@@ -49,6 +49,207 @@ async fn control_test_command(command: &Value, state: &mut DaemonState) -> Value
     Box::pin(execute_command(command, state)).await
 }
 
+#[tokio::test]
+#[ignore]
+async fn e2e_browser_control_copy_uses_actual_focus_and_exact_unicode() {
+    let mut state = DaemonState::new();
+    assert_success(&control_test_command(&json!({ "action": "navigate", "url": "data:text/html,<title>Copy selection</title><body></body>" }), &mut state).await);
+    let cases = [
+        ("document.body.innerHTML='<p id=p>Selected page text</p>';const range=document.createRange();range.selectNodeContents(p);getSelection().removeAllRanges();getSelection().addRange(range)", "Selected page text".to_string()),
+        ("document.body.innerHTML='<input id=field>';field.value='before selected after';field.focus();field.setSelectionRange(7,15)", "selected".to_string()),
+        ("document.body.innerHTML='<textarea id=field></textarea>';field.value='copy 漢𝄞é\\n'.repeat(10000);field.focus();field.select()", "copy 漢𝄞é\n".repeat(10000)),
+        ("document.body.innerHTML='<div id=field contenteditable>Editable selection</div>';field.focus();const range=document.createRange();range.selectNodeContents(field);getSelection().removeAllRanges();getSelection().addRange(range)", "Editable selection".to_string()),
+        ("document.body.innerHTML='<div id=host></div>';const root=host.attachShadow({mode:'open'});root.innerHTML='<input>';const field=root.querySelector('input');field.value='Open shadow input';field.focus();field.select()", "Open shadow input".to_string()),
+        ("document.body.innerHTML='<div id=host></div>';const root=host.attachShadow({mode:'closed'});root.innerHTML='<input>';const field=root.querySelector('input');field.value='Closed shadow input';field.focus();field.select()", "Closed shadow input".to_string()),
+    ];
+    for (script, expected) in cases {
+        assert_success(
+            &control_test_command(
+                &json!({ "action": "evaluate", "script": format!("(()=>{{{script}}})()") }),
+                &mut state,
+            )
+            .await,
+        );
+        let owner = uuid::Uuid::new_v4().to_string();
+        assert_success(
+            &control_test_command(
+                &json!({ "action": "ambit_browser_control", "op": "acquire", "controllerId": owner,
+            "expiresAt": super::stream::timestamp_ms()+25000 }),
+                &mut state,
+            )
+            .await,
+        );
+        let copied = control_test_command(
+            &json!({ "action": "ambit_browser_control", "op": "copy", "controllerId": owner }),
+            &mut state,
+        )
+        .await;
+        assert_success(&copied);
+        assert_eq!(
+            copied["data"]["clipboard"],
+            json!({ "text": expected, "bytes": expected.len(), "complete": true })
+        );
+        assert_eq!(copied["data"]["lastSequence"], 0);
+        assert_success(&control_test_command(&json!({ "action": "ambit_browser_control", "op": "release", "controllerId": owner }), &mut state).await);
+    }
+    assert_success(&control_test_command(&json!({ "action": "evaluate", "script": "document.body.innerHTML='<textarea id=field></textarea>';field.value='x'.repeat(1048577);field.focus();field.select()" }), &mut state).await);
+    let owner = uuid::Uuid::new_v4().to_string();
+    assert_success(
+        &control_test_command(
+            &json!({ "action": "ambit_browser_control", "op": "acquire", "controllerId": owner,
+        "expiresAt": super::stream::timestamp_ms()+25000 }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_error_code(
+        &control_test_command(
+            &json!({ "action": "ambit_browser_control", "op": "copy", "controllerId": owner }),
+            &mut state,
+        )
+        .await,
+        "browser_control_copy_too_large",
+    );
+    assert_success(
+        &control_test_command(
+            &json!({ "action": "ambit_browser_control", "op": "release", "controllerId": owner }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(&control_test_command(&json!({ "action": "close" }), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_browser_control_copy_follows_cross_origin_frame_focus() {
+    let (url, server) = start_stream_navigation_server().await;
+    let mut state = DaemonState::new();
+    assert_success(
+        &control_test_command(&json!({ "action": "navigate", "url": url }), &mut state).await,
+    );
+    let child = format!("{}/child", url.replace("127.0.0.1", "localhost"));
+    assert_success(&control_test_command(&json!({ "action": "evaluate", "script": format!("document.querySelector('iframe').src={}", serde_json::to_string(&child).unwrap()) }), &mut state).await);
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    state.drain_cdp_events_background().await.unwrap();
+    let child_session = state
+        .iframe_sessions
+        .values()
+        .next()
+        .expect("cross-origin frame should have a native CDP session")
+        .clone();
+    state.browser.as_ref().unwrap().client.send_command("Runtime.evaluate", Some(json!({
+        "expression": "document.body.tabIndex=0;document.body.focus();const range=document.createRange();range.selectNodeContents(document.getElementById('child'));getSelection().removeAllRanges();getSelection().addRange(range)",
+        "returnByValue": true,
+    })), Some(&child_session)).await.unwrap();
+    let owner = uuid::Uuid::new_v4().to_string();
+    assert_success(
+        &control_test_command(
+            &json!({ "action": "ambit_browser_control", "op": "acquire", "controllerId": owner,
+        "expiresAt": super::stream::timestamp_ms()+25000 }),
+            &mut state,
+        )
+        .await,
+    );
+    let copied = control_test_command(
+        &json!({ "action": "ambit_browser_control", "op": "copy", "controllerId": owner }),
+        &mut state,
+    )
+    .await;
+    assert_success(&copied);
+    assert_eq!(copied["data"]["clipboard"]["text"], "child");
+    assert_success(
+        &control_test_command(
+            &json!({ "action": "ambit_browser_control", "op": "release", "controllerId": owner }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(&control_test_command(&json!({ "action": "close" }), &mut state).await);
+    server.abort();
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_browser_control_copy_preserves_masked_password_behavior() {
+    let (url, server) = start_stream_navigation_server().await;
+    let mut state = DaemonState::new();
+    assert_success(
+        &control_test_command(&json!({ "action": "navigate", "url": url }), &mut state).await,
+    );
+    // Test-only clipboard permission measures Chromium's normal Copy result.
+    // The controller's selection implementation never requests this permission.
+    state
+        .browser
+        .as_ref()
+        .unwrap()
+        .grant_permissions(&[
+            "clipboardReadWrite".into(),
+            "clipboardSanitizedWrite".into(),
+        ])
+        .await
+        .unwrap();
+    for (kind, normal, selected) in [
+        ("text", "fake-local-selection", "fake-local-selection"),
+        ("password", "copy-sentinel", ""),
+    ] {
+        assert_success(
+            &control_test_command(
+                &json!({ "action": "clipboard", "operation": "write", "text": "copy-sentinel" }),
+                &mut state,
+            )
+            .await,
+        );
+        let script = format!("document.body.innerHTML='<input id=field type={kind}>';field.value='fake-local-selection';field.focus();field.select()");
+        assert_success(
+            &control_test_command(
+                &json!({ "action": "evaluate", "script": script }),
+                &mut state,
+            )
+            .await,
+        );
+        assert_success(
+            &control_test_command(
+                &json!({ "action": "clipboard", "operation": "copy" }),
+                &mut state,
+            )
+            .await,
+        );
+        let native = control_test_command(
+            &json!({ "action": "clipboard", "operation": "read" }),
+            &mut state,
+        )
+        .await;
+        assert_success(&native);
+        assert_eq!(
+            native["data"]["text"], normal,
+            "normal Chromium Copy for {kind}"
+        );
+        let owner = uuid::Uuid::new_v4().to_string();
+        assert_success(
+            &control_test_command(
+                &json!({ "action": "ambit_browser_control", "op": "acquire", "controllerId": owner,
+            "expiresAt": super::stream::timestamp_ms()+25000 }),
+                &mut state,
+            )
+            .await,
+        );
+        let copied = control_test_command(
+            &json!({ "action": "ambit_browser_control", "op": "copy", "controllerId": owner }),
+            &mut state,
+        )
+        .await;
+        assert_success(&copied);
+        assert_eq!(
+            copied["data"]["clipboard"]["text"], selected,
+            "controller Copy for {kind}"
+        );
+        assert_success(&control_test_command(&json!({ "action": "ambit_browser_control", "op": "release", "controllerId": owner }), &mut state).await);
+    }
+    assert_success(&control_test_command(&json!({ "action": "close" }), &mut state).await);
+    server.abort();
+}
+
 /// Exercises the Product protocol against real Chromium, including the
 /// independent stream viewer that must lose input authority during custody.
 #[tokio::test]

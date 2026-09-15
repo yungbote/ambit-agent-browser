@@ -73,7 +73,7 @@ pub fn gen_id() -> String {
 
 /// Normalize browser navigation inputs while preserving schemes Chrome can
 /// open directly. Bare hostnames use HTTPS, matching the `open` command.
-fn normalize_navigation_url(url: &str) -> String {
+pub(crate) fn normalize_navigation_url(url: &str) -> String {
     let url_lower = url.to_lowercase();
     if url_lower.starts_with("http://")
         || url_lower.starts_with("https://")

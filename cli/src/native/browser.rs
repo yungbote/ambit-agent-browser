@@ -1089,11 +1089,15 @@ impl BrowserManager {
         }
     }
 
-    pub async fn navigate(&mut self, url: &str, wait_until: WaitUntil) -> Result<Value, String> {
+    /// Acknowledges the browser's navigation request without waiting for page
+    /// loading. Browser error pages are still admitted navigations; callers
+    /// that require a successful load interpret error_text in the normal path.
+    pub(crate) async fn begin_navigation(
+        &mut self,
+        url: &str,
+    ) -> Result<PageNavigateResult, String> {
         let session_id = self.active_session_id()?.to_string();
-        let mut lifecycle_rx = self.client.subscribe();
-
-        let nav_result: PageNavigateResult = self
+        let result = self
             .client
             .send_command_typed(
                 "Page.navigate",
@@ -1104,6 +1108,20 @@ impl BrowserManager {
                 Some(&session_id),
             )
             .await?;
+        if let Ok(parsed) = url::Url::parse(url) {
+            let origin = parsed.origin().ascii_serialization();
+            if origin != "null" {
+                self.visited_origins.insert(origin);
+            }
+        }
+        Ok(result)
+    }
+
+    pub async fn navigate(&mut self, url: &str, wait_until: WaitUntil) -> Result<Value, String> {
+        let session_id = self.active_session_id()?.to_string();
+        let mut lifecycle_rx = self.client.subscribe();
+
+        let nav_result = self.begin_navigation(url).await?;
 
         if let Some(ref error_text) = nav_result.error_text {
             return Err(format!("Navigation failed: {}", error_text));
