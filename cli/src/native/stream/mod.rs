@@ -3,6 +3,7 @@ pub(crate) mod chat;
 mod dashboard;
 mod discovery;
 mod http;
+pub(crate) mod presentation;
 mod websocket;
 
 pub use cdp_loop::{ack_screencast_frame, start_screencast, stop_screencast};
@@ -182,6 +183,7 @@ impl Default for FrameMetadata {
 
 pub struct StreamServer {
     pub(crate) browser_control: Arc<Mutex<BrowserControl>>,
+    pub(crate) presentation: Arc<presentation::Presentation>,
     port: u16,
     session_name: String,
     frame_tx: broadcast::Sender<String>,
@@ -353,6 +355,7 @@ impl StreamServer {
             .map_err(|e| format!("Failed to get stream address: {}", e))?;
         let port = actual_addr.port();
 
+        let presentation = Arc::new(presentation::Presentation::new());
         let (frame_tx, _) = broadcast::channel::<String>(64);
         let (frame_watch_tx, frame_watch_rx) = watch::channel::<Option<Arc<StreamFrame>>>(None);
         let screencast_config = Arc::new(ScreencastConfig::from_env());
@@ -373,6 +376,7 @@ impl StreamServer {
         let notify_clone = client_notify.clone();
         let idle_activity_clone = idle_activity.clone();
         let browser_control_clone = browser_control.clone();
+        let presentation_clone = presentation.clone();
         let screencasting_clone = screencasting.clone();
         let cdp_session_clone = cdp_session_id.clone();
 
@@ -394,6 +398,7 @@ impl StreamServer {
                 notify_clone,
                 idle_activity_clone,
                 browser_control_clone,
+                presentation_clone,
                 screencasting_clone,
                 cdp_session_clone,
                 vw_clone,
@@ -443,6 +448,7 @@ impl StreamServer {
         Ok((
             Self {
                 browser_control,
+                presentation,
                 port,
                 session_name: session_id,
                 frame_tx,

@@ -17,6 +17,7 @@ use crate::native::cdp::client::CdpClient;
 use crate::native::input::keyboard_params;
 
 use super::http::handle_http_request;
+use super::presentation::{Presentation, PresentationConfig};
 use super::{is_allowed_origin, timestamp_ms, IdleActivity, StreamFrame};
 
 /// Highest per-client frame rate a client may request via the `config` message.
@@ -37,6 +38,7 @@ struct ClientConfig {
     /// handed to the transport are delivered in order, so only an ack proves the
     /// client kept up. Mirrors CDP's own `Page.screencastFrameAck`.
     ack_pacing: bool,
+    presentation: Option<PresentationConfig>,
 }
 
 /// Parse a client `config` message into the settings it changes, leaving the
@@ -91,12 +93,16 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
         return cfg;
     };
 
+    let mut width = None;
+    let mut height = None;
     for (key, value) in query
         .split('&')
         .filter_map(|pair| pair.split_once('='))
         .map(|(k, v)| (k.trim(), v.trim()))
     {
         match key {
+            "width" => width = Some(value),
+            "height" => height = Some(value),
             "maxFps" => {
                 if let Ok(fps) = value.parse::<u64>() {
                     cfg.max_fps = fps.min(MAX_CONFIGURABLE_FPS as u64) as u32;
@@ -110,6 +116,17 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
             _ => {}
         }
     }
+    let viewer = request
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .find(|(name, _)| name.eq_ignore_ascii_case("X-Ambit-Browser-Viewer"))
+        .map(|(_, value)| value.trim());
+    cfg.presentation = match (viewer, width, height) {
+        (Some(viewer), Some(width), Some(height)) => {
+            PresentationConfig::parse(viewer, width, height)
+        }
+        _ => None,
+    };
     cfg
 }
 
@@ -141,6 +158,7 @@ pub(super) async fn accept_loop(
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
     browser_control: Arc<Mutex<BrowserControl>>,
+    presentation: Arc<Presentation>,
     screencasting: Arc<Mutex<bool>>,
     cdp_session_id: Arc<RwLock<Option<String>>>,
     viewport_width: Arc<Mutex<u32>>,
@@ -176,6 +194,7 @@ pub(super) async fn accept_loop(
                 let client_notify = client_notify.clone();
                 let idle_activity = idle_activity.clone();
                 let browser_control = browser_control.clone();
+                let presentation = presentation.clone();
                 let screencasting = screencasting.clone();
                 let cdp_session_id = cdp_session_id.clone();
                 let vw = viewport_width.clone();
@@ -197,6 +216,7 @@ pub(super) async fn accept_loop(
                         client_notify,
                         idle_activity,
                         browser_control,
+                        presentation,
                         screencasting,
                         cdp_session_id,
                         vw,
@@ -246,6 +266,7 @@ async fn handle_connection(
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
     browser_control: Arc<Mutex<BrowserControl>>,
+    presentation: Arc<Presentation>,
     screencasting: Arc<Mutex<bool>>,
     cdp_session_id: Arc<RwLock<Option<String>>>,
     viewport_width: Arc<Mutex<u32>>,
@@ -277,6 +298,7 @@ async fn handle_connection(
             client_notify,
             idle_activity,
             browser_control,
+            presentation,
             screencasting,
             cdp_session_id,
             viewport_width,
@@ -308,6 +330,7 @@ async fn handle_ws_client(
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
     browser_control: Arc<Mutex<BrowserControl>>,
+    presentation: Arc<Presentation>,
     screencasting: Arc<Mutex<bool>>,
     cdp_session_id: Arc<RwLock<Option<String>>>,
     viewport_width: Arc<Mutex<u32>>,
@@ -341,6 +364,14 @@ async fn handle_ws_client(
         Err(_) => return,
     };
 
+    let connection_id = uuid::Uuid::new_v4();
+    let _presentation_connection = presentation.connection(connection_id);
+    let mut presentation_rx = presentation.subscribe();
+    if let Some(config) = initial_config.presentation {
+        presentation.configure(connection_id, config);
+        idle_activity.mark();
+    }
+
     {
         let mut count = client_count.lock().await;
         *count += 1;
@@ -366,6 +397,17 @@ async fn handle_ws_client(
         browser_control,
         input_error_tx,
     )));
+
+    if let Some(config) = initial_config.presentation {
+        let _ = ws_tx
+            .send(Message::Text(
+                presentation
+                    .acknowledgment(connection_id, config)
+                    .to_string(),
+            ))
+            .await;
+        presentation_rx.borrow_and_update();
+    }
 
     {
         let guard = client_slot.read().await;
@@ -453,6 +495,13 @@ async fn handle_ws_client(
                     break;
                 }
                 pending_frame = true;
+            }
+            changed = presentation_rx.changed(), if initial_config.presentation.is_some() => {
+                if changed.is_err() { break; }
+                let config = initial_config.presentation.unwrap();
+                presentation.claim_if_available(connection_id, config);
+                presentation_rx.borrow_and_update();
+                if ws_tx.send(Message::Text(presentation.acknowledgment(connection_id, config).to_string())).await.is_err() { break; }
             }
             changed = config_rx.changed() => {
                 // The sender lives as long as the reader, so an error here
