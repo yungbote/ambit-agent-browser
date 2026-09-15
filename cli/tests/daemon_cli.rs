@@ -145,6 +145,75 @@ fn response(output: &Output) -> Value {
 }
 
 #[test]
+fn daemon_setup_preserves_structured_failures_through_cli_and_mcp() {
+    let cases: &[&[&str]] = &[
+        &["--headed", "true", "get", "title"],
+        &["--auto-connect", "get", "title"],
+        &["--cdp", "9222", "get", "title"],
+        &["--provider", "browserbase", "get", "title"],
+        &["mcp"],
+    ];
+    for args in cases {
+        let fixture = Fixture::new();
+        let daemon = fixture.start(&[]);
+        let config = fs::read(fixture.path("config")).unwrap();
+        daemon.signal(libc::SIGTERM);
+        assert!(daemon.finish().status.success());
+        fs::write(fixture.path("config"), config).unwrap();
+        fs::write(fixture.path("version"), env!("CARGO_PKG_VERSION")).unwrap();
+        let listener = UnixListener::bind(fixture.path("sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let expected = serde_json::json!({ "success": false, "error": "Host policy refused setup", "code": "fixture_setup_refused", "data": { "reason": "policy" }, "warning": "Fixture warning" });
+        let reply = expected.to_string();
+        let server = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while Instant::now() < deadline {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        stream
+                            .set_read_timeout(Some(Duration::from_secs(2)))
+                            .unwrap();
+                        let mut line = String::new();
+                        if BufReader::new(&stream).read_line(&mut line).unwrap_or(0) == 0 {
+                            continue;
+                        }
+                        let request: Value = serde_json::from_str(&line).unwrap();
+                        assert_eq!(request["action"], "launch");
+                        writeln!(stream, "{reply}").unwrap();
+                        return;
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                        thread::sleep(Duration::from_millis(10))
+                    }
+                    Err(error) => panic!("fixture accept failed: {error}"),
+                }
+            }
+            panic!("client never sent its setup command");
+        });
+        if args[0] == "mcp" {
+            let mut command = fixture.command(&["--require-daemon", "mcp"]);
+            command.stdin(Stdio::piped());
+            let mut process = Process(Some(command.spawn().unwrap()));
+            let mut stdin = process.0.as_mut().unwrap().stdin.take().unwrap();
+            writeln!(stdin, "{}", serde_json::json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": { "name": "agent_browser_open", "arguments": { "headed": true, "requireDaemon": true, "session": SESSION } } })).unwrap();
+            drop(stdin);
+            let output = process.finish();
+            assert!(output.status.success(), "{output:?}");
+            let result = response(&output);
+            assert_eq!(result["result"]["structuredContent"]["response"], expected);
+            assert_eq!(result["result"]["isError"], true);
+        } else {
+            let mut command = fixture.command(&["--json", "--require-daemon"]);
+            command.args(*args);
+            let output = Process(Some(command.spawn().unwrap())).finish();
+            assert!(!output.status.success(), "{output:?}");
+            assert_eq!(response(&output), expected, "{args:?}");
+        }
+        server.join().unwrap();
+    }
+}
+
+#[test]
 fn foreground_keeps_pid_process_group_and_configured_client_reuses_it() {
     let fixture = Fixture::new();
     fixture.config(r#"{"idleTimeout":"0","noAutoDialog":true,"requireDaemon":true}"#);

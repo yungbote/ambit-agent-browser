@@ -68,6 +68,22 @@ fn print_json_error_with_type(message: impl AsRef<str>, error_type: &str) {
     }));
 }
 
+/// Setup is a daemon command too. Preserve its structured failure exactly as
+/// for the requested action, including code, data, and warning through MCP.
+fn report_daemon_setup(result: Result<Response, String>, fallback: &str, flags: &Flags) -> bool {
+    let mut response = match result {
+        Ok(response) if response.success => return true,
+        Ok(response) => response,
+        Err(error) => Response {
+            error: Some(error),
+            ..Response::default()
+        },
+    };
+    response.error.get_or_insert_with(|| fallback.to_string());
+    print_response_with_opts(&response, None, &OutputOptions::from_flags(flags));
+    false
+}
+
 fn should_send_hide_scrollbars_launch_option(
     cli_hide_scrollbars: bool,
     hide_scrollbars: bool,
@@ -1814,21 +1830,11 @@ fn main() {
             launch_cmd["downloadPath"] = json!(dp);
         }
 
-        let err = match send_command(launch_cmd, &flags.session) {
-            Ok(resp) if resp.success => None,
-            Ok(resp) => Some(
-                resp.error
-                    .unwrap_or_else(|| "Auto-connect failed".to_string()),
-            ),
-            Err(e) => Some(e.to_string()),
-        };
-
-        if let Some(msg) = err {
-            if flags.json {
-                print_json_error(msg);
-            } else {
-                eprintln!("{} {}", color::error_indicator(), msg);
-            }
+        if !report_daemon_setup(
+            send_command(launch_cmd, &flags.session),
+            "Auto-connect failed",
+            &flags,
+        ) {
             exit(1);
         }
     }
@@ -1915,21 +1921,11 @@ fn main() {
             launch_cmd["downloadPath"] = json!(dp);
         }
 
-        let err = match send_command(launch_cmd, &flags.session) {
-            Ok(resp) if resp.success => None,
-            Ok(resp) => Some(
-                resp.error
-                    .unwrap_or_else(|| "CDP connection failed".to_string()),
-            ),
-            Err(e) => Some(e.to_string()),
-        };
-
-        if let Some(msg) = err {
-            if flags.json {
-                print_json_error(msg);
-            } else {
-                eprintln!("{} {}", color::error_indicator(), msg);
-            }
+        if !report_daemon_setup(
+            send_command(launch_cmd, &flags.session),
+            "CDP connection failed",
+            &flags,
+        ) {
             exit(1);
         }
     }
@@ -1938,21 +1934,11 @@ fn main() {
     if let Some(ref provider) = flags.provider {
         let launch_cmd = build_provider_launch_command(provider, &flags);
 
-        let err = match send_command(launch_cmd, &flags.session) {
-            Ok(resp) if resp.success => None,
-            Ok(resp) => Some(
-                resp.error
-                    .unwrap_or_else(|| "Provider connection failed".to_string()),
-            ),
-            Err(e) => Some(e.to_string()),
-        };
-
-        if let Some(msg) = err {
-            if flags.json {
-                print_json_error(msg);
-            } else {
-                eprintln!("{} {}", color::error_indicator(), msg);
-            }
+        if !report_daemon_setup(
+            send_command(launch_cmd, &flags.session),
+            "Provider connection failed",
+            &flags,
+        ) {
             exit(1);
         }
     }
@@ -2075,34 +2061,12 @@ fn main() {
             launch_cmd["engine"] = json!(engine);
         }
 
-        match send_command(launch_cmd, &flags.session) {
-            Ok(resp) if !resp.success => {
-                // Launch command failed (e.g., invalid state file, profile error)
-                let error_msg = resp
-                    .error
-                    .unwrap_or_else(|| "Browser launch failed".to_string());
-                if flags.json {
-                    print_json_error(error_msg);
-                } else {
-                    eprintln!("{} {}", color::error_indicator(), error_msg);
-                }
-                exit(1);
-            }
-            Err(e) => {
-                if flags.json {
-                    print_json_error(e);
-                } else {
-                    eprintln!(
-                        "{} Could not configure browser: {}",
-                        color::error_indicator(),
-                        e
-                    );
-                }
-                exit(1);
-            }
-            Ok(_) => {
-                // Launch succeeded
-            }
+        if !report_daemon_setup(
+            send_command(launch_cmd, &flags.session),
+            "Browser launch failed",
+            &flags,
+        ) {
+            exit(1);
         }
     }
 
