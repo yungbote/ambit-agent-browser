@@ -94,6 +94,22 @@ impl Host {
         reply["result"].clone()
     }
 
+    #[cfg(unix)]
+    fn control(&self, mut request: Value) -> Value {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
+        request["action"] = json!("ambit_browser_control");
+        let mut socket =
+            UnixStream::connect(self.path("sockets/namespaces/host-mcp-test/run/browser.sock"))
+                .unwrap();
+        writeln!(socket, "{request}").unwrap();
+        let mut line = String::new();
+        BufReader::new(socket).read_line(&mut line).unwrap();
+        let response: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(response["success"], true, "{response}");
+        response
+    }
+
     fn capture(&self, result: &Value) -> Value {
         let browser = &result["structuredContent"]["browser"];
         assert_eq!(browser["namespace"], "host-mcp-test");
@@ -201,7 +217,7 @@ fn host_real_chromium_outcomes_pixels_and_coordinate_identity() {
     assert_eq!(failed["isError"], true);
     host.capture(&failed);
     let observation = json!({ "targetId": browser["page"]["targetId"],
-        "loaderId": browser["page"]["loaderId"],
+        "loaderId": browser["page"]["loaderId"], "pageGeneration": browser["page"]["pageGeneration"],
         "geometrySha256": browser["capture"]["coordinateSpace"]["geometrySha256"] });
     host.configure(Some(observation));
     let current = host.call("agent_browser_mouse_move", json!({ "x": 10, "y": 10 }));
@@ -223,5 +239,70 @@ fn host_real_chromium_outcomes_pixels_and_coordinate_identity() {
     assert_eq!(
         closed["structuredContent"]["browser"]["capture"]["status"],
         "unavailable"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+#[ignore = "requires AMBIT_TEST_CHROME_EXECUTABLE with working Chrome sandbox"]
+fn host_human_handoff_requires_fresh_observation_and_rejects_old_image_coordinates() {
+    let host = Host::new();
+    let opened = host.call("agent_browser_open", json!({ "url": "data:text/html,<style>input,button{display:block;height:40px;width:200px}</style><input id=field><button onclick='window.clicks++'>Count</button><script>window.clicks=0</script>" }));
+    let before = host.capture(&opened);
+    let owner = uuid::Uuid::new_v4().to_string();
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 25000;
+    host.control(json!({ "op": "acquire", "controllerId": owner, "expiresAt": expires }));
+    let blocked = host.call("agent_browser_click", json!({ "selector": "button" }));
+    assert_eq!(
+        blocked["structuredContent"]["response"]["code"],
+        "browser_controlled_by_user"
+    );
+    host.control(json!({ "op": "input", "controllerId": owner, "sequence": 1, "events": [
+        { "type": "input_mouse", "eventType": "mousePressed", "x": 20, "y": 20, "button": "left", "buttons": 1, "clickCount": 1 },
+        { "type": "input_mouse", "eventType": "mouseReleased", "x": 20, "y": 20, "button": "left", "buttons": 0, "clickCount": 1 },
+        { "type": "input_keyboard", "eventType": "insertText", "text": "Human changed this" }
+    ] }));
+    host.control(json!({ "op": "release", "controllerId": owner }));
+    let resumed = host.call("agent_browser_click", json!({ "selector": "button" }));
+    assert_eq!(
+        resumed["structuredContent"]["response"]["code"],
+        "browser_observation_required"
+    );
+    let current = host.capture(&resumed);
+    assert_ne!(
+        current["page"]["pageGeneration"],
+        before["page"]["pageGeneration"]
+    );
+    let count = host.call("agent_browser_eval", json!({ "script": "window.clicks" }));
+    assert_eq!(count["structuredContent"]["response"]["data"]["result"], 0);
+    host.configure(Some(
+        json!({ "targetId": before["page"]["targetId"], "loaderId": before["page"]["loaderId"],
+        "pageGeneration": before["page"]["pageGeneration"],
+        "geometrySha256": before["capture"]["coordinateSpace"]["geometrySha256"] }),
+    ));
+    let stale = host.call("agent_browser_mouse_move", json!({ "x": 20, "y": 20 }));
+    assert_eq!(
+        stale["structuredContent"]["response"]["code"],
+        "browser_observation_stale"
+    );
+    host.configure(None);
+    let value = host.call("agent_browser_get_value", json!({ "selector": "#field" }));
+    assert_eq!(
+        value["structuredContent"]["response"]["data"]["value"],
+        "Human changed this"
+    );
+    assert_eq!(
+        host.call("agent_browser_click", json!({ "selector": "button" }))["isError"],
+        false
+    );
+    let count = host.call("agent_browser_eval", json!({ "script": "window.clicks" }));
+    assert_eq!(count["structuredContent"]["response"]["data"]["result"], 1);
+    assert_eq!(
+        host.call("agent_browser_close", json!({}))["isError"],
+        false
     );
 }

@@ -620,10 +620,25 @@ impl StreamServer {
         session_id: Option<String>,
         tabs: &[Value],
     ) {
+        let client = self.client_slot.read().await.clone();
+        let history = if let Some(client) = client {
+            history_availability(&client, session_id.as_deref()).await
+        } else {
+            None
+        };
+        let mut tabs = tabs.to_vec();
+        if let Some((back, forward)) = history {
+            for tab in &mut tabs {
+                if tab["active"] == true {
+                    tab["canGoBack"] = json!(back);
+                    tab["canGoForward"] = json!(forward);
+                }
+            }
+        }
         let mut session_guard = self.cdp_session_id.write().await;
         let mut tabs_guard = self.last_tabs.write().await;
         *session_guard = session_id;
-        *tabs_guard = tabs.to_vec();
+        *tabs_guard = tabs.clone();
         let msg = json!({
             "type": "tabs",
             "tabs": tabs,
@@ -634,6 +649,24 @@ impl StreamServer {
         drop(session_guard);
         self.client_notify.notify_one();
     }
+}
+
+/// History availability is observed only on navigation and attachment, never
+/// on pointer input or on each frame. Only booleans leave the native driver.
+pub(super) async fn history_availability(
+    client: &CdpClient,
+    session: Option<&str>,
+) -> Option<(bool, bool)> {
+    let history = tokio::time::timeout(
+        Duration::from_millis(250),
+        client.send_command_no_params("Page.getNavigationHistory", session),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    let index = history["currentIndex"].as_u64()? as usize;
+    let length = history["entries"].as_array()?.len();
+    (index < length).then_some((index > 0, index + 1 < length))
 }
 
 pub(crate) fn timestamp_ms() -> u64 {

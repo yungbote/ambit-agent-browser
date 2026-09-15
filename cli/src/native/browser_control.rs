@@ -68,6 +68,7 @@ enum Operation {
     Renew,
     Release,
     Input,
+    Copy,
 }
 
 impl ControlRequest {
@@ -85,7 +86,7 @@ impl ControlRequest {
             Operation::Acquire | Operation::Renew => {
                 &["id", "action", "op", "controllerId", "expiresAt"]
             }
-            Operation::Release => &["id", "action", "op", "controllerId"],
+            Operation::Release | Operation::Copy => &["id", "action", "op", "controllerId"],
             Operation::Input => &["id", "action", "op", "controllerId", "sequence", "events"],
         };
         fields(value, allowed)?;
@@ -122,12 +123,14 @@ impl ControlRequest {
                     ));
                 }
             }
-            Operation::Release => {
+            Operation::Release | Operation::Copy => {
                 if request.expires_at.is_some()
                     || request.sequence.is_some()
                     || request.events.is_some()
                 {
-                    return Err(ControlError::invalid("Release requires only controllerId."));
+                    return Err(ControlError::invalid(
+                        "Release and copy require only controllerId.",
+                    ));
                 }
             }
             Operation::Input => {
@@ -198,6 +201,7 @@ impl Lease {
 #[derive(Default)]
 pub(crate) struct BrowserControl {
     lease: Option<Lease>,
+    needs_observation: bool,
     last_released: Option<Lease>,
     pending_stream: VecDeque<PendingStreamInput>,
     stream_held: HeldInputs,
@@ -238,31 +242,14 @@ async fn neutralize_held(client: &CdpClient, held: &mut HeldInputs) -> Result<()
     }
 }
 
-/// Borrow the existing viewport owners only while a sequenced controller batch
-/// executes. Browser emulation and stream geometry keep their canonical paths.
-pub(crate) struct ControlViewport<'a> {
-    pub manager: &'a super::browser::BrowserManager,
-    pub geometry: &'a mut Option<(i32, i32, f64, bool)>,
-    pub stream: Option<&'a super::stream::StreamServer>,
-}
-
-impl ControlViewport<'_> {
-    async fn resize(&mut self, event: &Value) -> Result<(), String> {
-        let width = event["width"].as_i64().unwrap() as i32;
-        let height = event["height"].as_i64().unwrap() as i32;
-        let (_, _, scale, mobile) = self.geometry.unwrap_or((1280, 720, 1.0, false));
-        self.manager
-            .set_viewport(width, height, scale, mobile)
-            .await?;
-        *self.geometry = Some((width, height, scale, mobile));
-        if let Some(stream) = self.stream {
-            stream.set_viewport(width as u32, height as u32).await;
-        }
-        Ok(())
-    }
-}
-
 impl BrowserControl {
+    pub(crate) fn needs_observation(&self) -> bool {
+        self.needs_observation
+    }
+    pub(crate) fn observed(&mut self) {
+        self.needs_observation = false;
+    }
+
     /// Stateful low-level agent input shares custody and held-input tracking
     /// with dashboard input. Complete gestures keep their interaction helpers.
     pub(crate) async fn agent_input(
@@ -352,6 +339,7 @@ impl BrowserControl {
     }
 
     pub(crate) fn reset_browser(&mut self) {
+        self.needs_observation = false;
         self.pending_stream.clear();
         self.stream_held = HeldInputs::default();
         self.stream_outcome_unknown = false;
@@ -473,14 +461,14 @@ impl BrowserControl {
         request: ControlRequest,
         browser: Option<(&CdpClient, &str)>,
     ) -> Result<Value, ControlError> {
-        self.execute_with_viewport(request, browser, None).await
+        self.execute_with_page(request, browser, None).await
     }
 
-    pub(crate) async fn execute_with_viewport(
+    pub(crate) async fn execute_with_page(
         &mut self,
         request: ControlRequest,
         browser: Option<(&CdpClient, &str)>,
-        mut viewport: Option<ControlViewport<'_>>,
+        mut page: Option<super::actions::ControlPage<'_>>,
     ) -> Result<Value, ControlError> {
         let now = Instant::now();
         match request.op {
@@ -531,6 +519,10 @@ impl BrowserControl {
                     outcome_unknown: false,
                     held: HeldInputs::default(),
                 });
+                self.needs_observation = true;
+                if let Some((client, session)) = browser {
+                    client.rotate_page_generation(session);
+                }
                 Ok(self.lease.as_ref().unwrap().response("controlled"))
             }
             Operation::Renew => {
@@ -564,6 +556,38 @@ impl BrowserControl {
                         )
                     })
             }
+            Operation::Copy => {
+                let deadline = self
+                    .require_owner(&request.controller_id)?
+                    .deadline
+                    .min(Instant::now() + ACK_TIMEOUT);
+                let selected =
+                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                        page.as_mut()
+                            .ok_or(super::selection::SelectionError::Unavailable)?
+                            .selected_text()
+                            .await
+                    })
+                    .await;
+                let lease = self.require_owner(&request.controller_id)?;
+                let text = match selected {
+                    Ok(Ok(text)) => text,
+                    Ok(Err(super::selection::SelectionError::TooLarge)) => {
+                        return Err(ControlError::new(
+                            "browser_control_copy_too_large",
+                            "Select at most 1 MiB of text to copy.",
+                        ))
+                    }
+                    _ => return Err(ControlError::new(
+                        "browser_control_unavailable",
+                        "The browser selection could not be read. Select the text again and retry.",
+                    )),
+                };
+                let mut response = lease.response("copied");
+                response["clipboard"] =
+                    json!({ "bytes": text.len(), "text": text, "complete": true });
+                Ok(response)
+            }
             Operation::Input => {
                 self.require_owner(&request.controller_id)?;
                 let sequence = request.sequence.unwrap();
@@ -595,6 +619,11 @@ impl BrowserControl {
                         "At most 256 inputs may be held at once.",
                     ));
                 }
+                if let Some(page) = page.as_ref() {
+                    page.validate_events(request.events.as_ref().unwrap())
+                        .await
+                        .map_err(ControlError::invalid)?;
+                }
                 // Reserve before the first await. A cancelled command or a lost
                 // reply must never leave the sequence available for replay.
                 lease.outcome_unknown = true;
@@ -605,11 +634,10 @@ impl BrowserControl {
                             if Instant::now() >= deadline {
                                 return Err("Input deadline elapsed".to_string());
                             }
-                            if event["type"] == "viewport" {
-                                viewport
-                                    .as_mut()
-                                    .ok_or("Viewport control is unavailable")?
-                                    .resize(&event)
+                            if matches!(event["type"].as_str(), Some("viewport" | "navigation")) {
+                                page.as_mut()
+                                    .ok_or("Browser page control is unavailable")?
+                                    .apply(&event)
                                     .await?;
                                 continue;
                             }
@@ -708,6 +736,26 @@ fn number(
 
 fn validate_event(event: &Value) -> Result<(), ControlError> {
     match event.get("type").and_then(Value::as_str) {
+        Some("navigation") => {
+            fields(event, &["type", "action", "url"])?;
+            one_of(
+                event,
+                "action",
+                &["navigate", "back", "forward", "reload"],
+                true,
+            )?;
+            if event["action"] == "navigate" {
+                let url = event["url"]
+                    .as_str()
+                    .filter(|url| !url.trim().is_empty())
+                    .ok_or_else(|| ControlError::invalid("Navigation requires a URL."))?;
+                url::Url::parse(&crate::commands::normalize_navigation_url(url))
+                    .map_err(|_| ControlError::invalid("The navigation URL is invalid."))?;
+            } else if event.get("url").is_some() {
+                return Err(ControlError::invalid("Only navigate accepts a URL."));
+            }
+            return Ok(());
+        }
         Some("viewport") => {
             fields(event, &["type", "width", "height"])?;
             number(event, "width", 1.0, 32768.0, true, true)?;

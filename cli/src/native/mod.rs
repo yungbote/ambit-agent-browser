@@ -36,6 +36,7 @@ pub mod react;
 pub mod recording;
 #[allow(dead_code)]
 pub mod screenshot;
+pub(crate) mod selection;
 #[allow(dead_code)]
 pub mod snapshot;
 #[allow(dead_code)]

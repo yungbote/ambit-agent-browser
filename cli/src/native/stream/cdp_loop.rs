@@ -61,12 +61,14 @@ async fn seed_main_frame_id(
 }
 
 async fn publish_url(
+    client: &CdpClient,
     frame_tx: &broadcast::Sender<String>,
     last_tabs: &RwLock<Vec<Value>>,
     cdp_session_id: &RwLock<Option<String>>,
     event_session_id: Option<&str>,
     url: &str,
 ) {
+    let history = super::history_availability(client, event_session_id).await;
     let active_session = cdp_session_id.read().await;
     if !session_matches(active_session.as_deref(), event_session_id) {
         return;
@@ -77,15 +79,25 @@ async fn publish_url(
             if tab.get("active").and_then(Value::as_bool).unwrap_or(false) {
                 if let Some(tab) = tab.as_object_mut() {
                     tab.insert("url".to_string(), json!(url));
+                    tab.remove("canGoBack");
+                    tab.remove("canGoForward");
+                    if let Some((back, forward)) = history {
+                        tab.insert("canGoBack".into(), json!(back));
+                        tab.insert("canGoForward".into(), json!(forward));
+                    }
                 }
             }
         }
     }
-    let message = json!({
+    let mut message = json!({
         "type": "url",
         "url": url,
         "timestamp": timestamp_ms(),
     });
+    if let Some((back, forward)) = history {
+        message["canGoBack"] = json!(back);
+        message["canGoForward"] = json!(forward);
+    }
     let _ = frame_tx.send(message.to_string());
 }
 
@@ -208,6 +220,7 @@ pub(super) async fn cdp_event_loop(
                                 {
                                     if frame_id == main_frame_id {
                                         publish_url(
+                                            &client_arc,
                                             &frame_tx,
                                             &last_tabs,
                                             &cdp_session_id,
@@ -270,6 +283,7 @@ pub(super) async fn cdp_event_loop(
                                                 }
                                                 if let Some(url) = frame.get("url").and_then(|v| v.as_str()) {
                                                     publish_url(
+                                                        &client_arc,
                                                         &frame_tx,
                                                         &last_tabs,
                                                         &cdp_session_id,
@@ -317,6 +331,7 @@ pub(super) async fn cdp_event_loop(
                                                     == active_main_frame_id.as_deref()
                                                 {
                                                     publish_url(
+                                                        &client_arc,
                                                         &frame_tx,
                                                         &last_tabs,
                                                         &cdp_session_id,

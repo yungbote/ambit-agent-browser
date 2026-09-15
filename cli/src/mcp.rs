@@ -17,11 +17,13 @@
 //! lost/invalid responses report an unknown outcome without automatic replay.
 //! Human browser custody is enforced by the same daemon for CLI and MCP.
 //! Internal ambit_browser_control is intentionally not an MCP tool: the host
-//! must authorize the paused interaction and user before obtaining custody.
+//! must authorize the current user and browser resource before obtaining custody.
 //! Ordinary tools preserve browser_controlled_by_user and unknown outcomes.
 //! Native acknowledged pointer and typing/scrolling activity is streamed with
 //! the observed page identity; it never includes tool input text. Host viewport
 //! resize uses the same controller batch and sequence as human pointer input.
+//! Host navigation shares that sequence; explicit selected-text copy is a
+//! separate authorized read. These host controls remain outside the MCP catalog.
 //! Owned Windows Chrome uses the same private headless desktop and Job Object
 //! lifetime through MCP; headed and external-connection semantics are unchanged.
 

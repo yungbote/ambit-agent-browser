@@ -2536,9 +2536,15 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         .as_object_mut()
         .unwrap()
         .remove(super::feedback::REQUEST_FIELD);
-    let controlled = state.browser_control.lock().await.agent_error();
+    let expiry_error = state.expire_browser_control().await.err();
+    let controlled = expiry_error.or(state.browser_control.lock().await.agent_error());
+    let requires_observation = state.browser_control.lock().await.needs_observation();
     let mut response = if let Some(error) = controlled {
         json!({ "id": command["id"], "success": false, "code": error.code, "error": error.message })
+    } else if requires_observation {
+        state.ref_map.clear();
+        state.active_frame_id = None;
+        json!({ "id": command["id"], "success": false, "code": "browser_observation_required", "error": "Browser control returned from the user. Inspect this fresh observation and choose the next action." })
     } else if !super::feedback::matches_expected(&request, state).await {
         json!({ "id": command["id"], "success": false, "code": "browser_observation_stale", "error": "The browser page or viewport changed since this image. Inspect the fresh observation before sending coordinates." })
     } else {
@@ -2581,22 +2587,20 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
             manager
                 .active_session_id()
                 .ok()
-                .map(|session| (manager.client.as_ref(), session))
+                .map(|session| (manager.client.clone(), session.to_string()))
         });
-        let viewport = state
-            .browser
-            .as_ref()
-            .map(|manager| browser_control::ControlViewport {
-                manager,
-                geometry: &mut state.viewport,
-                stream: state.stream_server.as_deref(),
-            });
+        let control = state.browser_control.clone();
         let operation = async {
-            state
-                .browser_control
+            control
                 .lock()
                 .await
-                .execute_with_viewport(request, browser, viewport)
+                .execute_with_page(
+                    request,
+                    browser
+                        .as_ref()
+                        .map(|(client, session)| (client.as_ref(), session.as_str())),
+                    Some(ControlPage(state)),
+                )
                 .await
         };
         // One budget covers the stream gate, draining and held-input cleanup.
@@ -2615,6 +2619,9 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
             .is_ok_and(|data| data["status"] == "controlled" && cmd["op"] == "acquire")
         {
             state.reset_input_state();
+            if let Some(server) = state.stream_server.as_ref() {
+                server.notify_client_changed();
+            }
         }
         state.last_command_finished = Some(std::time::Instant::now());
         return match result {
@@ -5344,11 +5351,7 @@ async fn handle_navigate(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
 /// being replaced: element refs, frame scope, and WebMCP page state. Every
 /// command that replaces the active document must go through here, or a
 /// stale `@e3` from the previous page keeps resolving.
-async fn navigate_active_page(
-    state: &mut DaemonState,
-    url: &str,
-    wait_until: WaitUntil,
-) -> Result<Value, String> {
+async fn clear_active_page_context(state: &mut DaemonState) {
     if let Some(session_id) = state
         .browser
         .as_ref()
@@ -5375,6 +5378,14 @@ async fn navigate_active_page(
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
     state.active_frame_id = None;
+}
+
+async fn navigate_active_page(
+    state: &mut DaemonState,
+    url: &str,
+    wait_until: WaitUntil,
+) -> Result<Value, String> {
+    clear_active_page_context(state).await;
     let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
     let result = mgr.navigate(url, wait_until).await?;
     state.refresh_active_iframe_sessions().await;
@@ -6275,38 +6286,78 @@ async fn handle_ischecked(cmd: &Value, state: &mut DaemonState) -> Result<Value,
 }
 
 async fn handle_back(state: &mut DaemonState) -> Result<Value, String> {
-    if let Some(ref wb) = state.webdriver_backend {
-        if state.browser.is_none() {
-            wb.back().await?;
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            let url = wb.get_url().await.unwrap_or_default();
-            state.ref_map.clear();
-            return Ok(json!({ "url": url }));
-        }
-    }
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    mgr.evaluate("history.back()", None).await?;
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    let url = mgr.get_url().await.unwrap_or_default();
-    state.ref_map.clear();
-    Ok(json!({ "url": url }))
+    history_navigation(state, -1, true).await
 }
 
 async fn handle_forward(state: &mut DaemonState) -> Result<Value, String> {
-    if let Some(ref wb) = state.webdriver_backend {
-        if state.browser.is_none() {
+    history_navigation(state, 1, true).await
+}
+
+async fn history_navigation(
+    state: &mut DaemonState,
+    delta: i64,
+    wait: bool,
+) -> Result<Value, String> {
+    if let Some(wb) = state
+        .webdriver_backend
+        .as_ref()
+        .filter(|_| state.browser.is_none())
+    {
+        if delta < 0 {
+            wb.back().await?;
+        } else {
             wb.forward().await?;
-            tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-            let url = wb.get_url().await.unwrap_or_default();
-            state.ref_map.clear();
-            return Ok(json!({ "url": url }));
         }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        let url = wb.get_url().await.unwrap_or_default();
+        state.ref_map.clear();
+        return Ok(json!({ "url": url }));
     }
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    mgr.evaluate("history.forward()", None).await?;
-    tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
-    let url = mgr.get_url().await.unwrap_or_default();
-    state.ref_map.clear();
+    let client = mgr.client.clone();
+    let session = mgr.active_session_id()?.to_string();
+    let history = client
+        .send_command_no_params("Page.getNavigationHistory", Some(&session))
+        .await?;
+    let index = history["currentIndex"]
+        .as_i64()
+        .ok_or("Browser history is unavailable")?
+        + delta;
+    let entry = history["entries"].as_array().and_then(|entries| {
+        usize::try_from(index)
+            .ok()
+            .and_then(|index| entries.get(index))
+    });
+    if let Some(entry) = entry {
+        if let Some(filter) = state.domain_filter.read().await.as_ref() {
+            filter.check_url(
+                entry["url"]
+                    .as_str()
+                    .ok_or("Browser history is unavailable")?,
+            )?;
+        }
+        let entry_id = entry["id"]
+            .as_i64()
+            .ok_or("Browser history is unavailable")?;
+        clear_active_page_context(state).await;
+        client
+            .send_command(
+                "Page.navigateToHistoryEntry",
+                Some(json!({ "entryId": entry_id })),
+                Some(&session),
+            )
+            .await?;
+        if wait {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
+    }
+    let url = state
+        .browser
+        .as_ref()
+        .ok_or("Browser not launched")?
+        .get_url()
+        .await
+        .unwrap_or_default();
     Ok(json!({ "url": url }))
 }
 
@@ -7156,6 +7207,79 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     state.active_frame_id = None;
     state.refresh_active_iframe_sessions().await;
     Ok(result)
+}
+
+/// The controller borrows canonical page operations under existing command
+/// custody. Navigation and viewport changes share the same state owners as CLI.
+pub(crate) struct ControlPage<'a>(&'a mut DaemonState);
+
+impl ControlPage<'_> {
+    pub(crate) async fn validate_events(&self, events: &[Value]) -> Result<(), String> {
+        let filter = self.0.domain_filter.read().await;
+        for event in events {
+            if event["type"] == "navigation" && event["action"] == "navigate" {
+                let url = crate::commands::normalize_navigation_url(event["url"].as_str().unwrap());
+                if let Some(filter) = filter.as_ref() {
+                    filter.check_url(&url)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn apply(&mut self, event: &Value) -> Result<(), String> {
+        if event["type"] == "viewport" {
+            let (_, _, scale, mobile) = self.0.viewport.unwrap_or((1280, 720, 1.0, false));
+            handle_viewport(
+                &json!({ "width": event["width"], "height": event["height"],
+                "deviceScaleFactor": scale, "mobile": mobile }),
+                self.0,
+            )
+            .await?;
+        } else {
+            match event["action"].as_str().unwrap() {
+                "navigate" => {
+                    let url =
+                        crate::commands::normalize_navigation_url(event["url"].as_str().unwrap());
+                    clear_active_page_context(self.0).await;
+                    self.0
+                        .browser
+                        .as_mut()
+                        .ok_or("Browser not launched")?
+                        .begin_navigation(&url)
+                        .await?;
+                }
+                "back" => {
+                    history_navigation(self.0, -1, false).await?;
+                }
+                "forward" => {
+                    history_navigation(self.0, 1, false).await?;
+                }
+                "reload" => {
+                    clear_active_page_context(self.0).await;
+                    let mgr = self.0.browser.as_ref().ok_or("Browser not launched")?;
+                    mgr.client
+                        .send_command_no_params("Page.reload", Some(mgr.active_session_id()?))
+                        .await?;
+                }
+                _ => return Err("Unsupported browser navigation".into()),
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn selected_text(
+        &mut self,
+    ) -> Result<String, super::selection::SelectionError> {
+        self.0.drain_cdp_events_background().await?;
+        let mgr = self
+            .0
+            .browser
+            .as_ref()
+            .ok_or(super::selection::SelectionError::Unavailable)?;
+        let session = mgr.active_session_id()?;
+        super::selection::selected_text(&mgr.client, session, &self.0.iframe_sessions).await
+    }
 }
 
 async fn handle_viewport(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {

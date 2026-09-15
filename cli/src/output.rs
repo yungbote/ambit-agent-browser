@@ -3227,6 +3227,11 @@ Notes:
     (width/height: integer CSS pixels, 1-32768), preserving scale and emulation.
     Acquisition waits at most 2s for an active command, then refuses as
     browser_control_unavailable; no custody is created by that refusal.
+  - Host navigation uses the same input sequence (navigate/back/forward/reload).
+    URL records include observed canGoBack/canGoForward when available.
+  - Explicit host copy reads selected text from the focused page/input/frame,
+    never the system clipboard. Maximum 1 MiB UTF-8, no truncation; masked
+    password fields have no copyable text. Copy does not advance input sequence.
   - 'screencast_start' and 'screencast_stop' still control explicit CDP screencasts.
   - Streaming is always enabled. Set AGENT_BROWSER_STREAM_PORT to bind to a
     specific port instead of the default OS-assigned port.
@@ -3541,13 +3546,15 @@ Usage: agent-browser mcp [--tools <profiles>]
 
 Host-bound mode reads version 1 JSON with namespace, session, requireSandbox
 (true), an existing absolute captureDirectory, and optional expectedObservation
-(targetId, loaderId, geometrySha256). It pins ambit-host-bound-v1 and publishes
+(targetId, loaderId, pageGeneration, geometrySha256). It pins ambit-host-bound-v1 and publishes
 its descriptor in experimental io.ambit/browser. Per-call host overrides and
 process-management tools are excluded. Browser auth and state stay available.
 Operations include a native viewport JPEG reference when capture succeeds;
 capture failure never replaces the primary outcome. The host owns admission
 of the file bytes. --describe-host-bound prints the full catalog without
 starting a browser. Host-bound calls are limited to 120000 milliseconds.
+After human control, browser_observation_required returns fresh feedback
+before another host-bound action. Earlier image pageGeneration values are stale.
 
 
 Starts a Model Context Protocol server over stdio. MCP clients launch this
