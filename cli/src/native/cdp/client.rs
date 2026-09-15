@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
@@ -15,8 +15,31 @@ use crate::native::activity::{self, ActivityObservation, InputSource};
 
 struct PendingResponse {
     sender: oneshot::Sender<CdpMessage>,
+    response: Option<CdpMessage>,
     activity: Option<ActivityObservation>,
     reset_page: Option<String>,
+    _pointer_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+}
+
+impl PendingResponse {
+    fn complete(
+        self,
+        response: CdpMessage,
+        pages: &PageGenerations,
+        events: &broadcast::Sender<CdpEvent>,
+    ) {
+        if response.error.is_none() {
+            if let Some(session) = self.reset_page.as_deref() {
+                reset_page(pages, events, session);
+            }
+            if let Some(observation) = self.activity {
+                observation.acknowledged();
+            }
+        } else if let Some(observation) = self.activity {
+            observation.refused();
+        }
+        let _ = self.sender.send(response);
+    }
 }
 
 type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
@@ -92,6 +115,8 @@ pub struct CdpClient {
     event_tx: broadcast::Sender<CdpEvent>,
     raw_tx: broadcast::Sender<RawCdpMessage>,
     private_sessions: PrivateSessions,
+    native_pointer_enabled: Arc<AtomicBool>,
+    native_pointer_lock: Arc<Mutex<()>>,
     _reader_handle: tokio::task::JoinHandle<()>,
     _keepalive_handle: tokio::task::JoinHandle<()>,
 }
@@ -265,18 +290,84 @@ impl CdpClient {
                 if let Some(id) = parsed.id {
                     // Response to a command
                     let mut pending = pending_clone.lock().await;
-                    if let Some(request) = pending.remove(&id) {
-                        if parsed.error.is_none() {
-                            if let Some(session) = request.reset_page.as_deref() {
-                                reset_page(&pages_clone, &event_tx_clone, session);
-                            }
-                            if let Some(observation) = request.activity {
-                                observation.acknowledged();
-                            }
+                    if let Some(mut request) = pending.remove(&id) {
+                        if parsed.error.is_none()
+                            && request
+                                .activity
+                                .as_ref()
+                                .is_some_and(ActivityObservation::awaits_native_event)
+                        {
+                            // Chrome may acknowledge input just before the
+                            // trusted renderer event reaches this connection.
+                            // Join both receipts in the existing command entry;
+                            // retain the pointer-order guard until it settles.
+                            request.response = Some(parsed);
+                            pending.insert(id, request);
+                            let pending = pending_clone.clone();
+                            let pages = pages_clone.clone();
+                            let events = event_tx_clone.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                if let Some(mut request) = pending.lock().await.remove(&id) {
+                                    if let Some(observation) = request.activity.as_ref() {
+                                        // An unmatched event must never later
+                                        // acquire a subsequent command's token.
+                                        observation.abandon_native_attribution();
+                                    }
+                                    let response = request.response.take().unwrap();
+                                    request.complete(response, &pages, &events);
+                                }
+                            });
+                        } else {
+                            request.complete(parsed, &pages_clone, &event_tx_clone);
                         }
-                        let _ = request.sender.send(parsed);
                     }
                 } else if let Some(ref method) = parsed.method {
+                    if method == "Runtime.bindingCalled" {
+                        if let (Some(params), Some(session)) =
+                            (parsed.params.as_ref(), parsed.session_id.as_deref())
+                        {
+                            if params["name"] == activity::POINTER_BINDING {
+                                if let Some(payload) = params["payload"]
+                                    .as_str()
+                                    .filter(|payload| payload.len() <= 1024)
+                                {
+                                    if let Ok(payload) = serde_json::from_str::<Value>(payload) {
+                                        if let Some(token) = payload["token"]
+                                            .as_str()
+                                            .and_then(|token| token.parse::<u64>().ok())
+                                        {
+                                            let mut pending = pending_clone.lock().await;
+                                            let complete = if let Some(request) =
+                                                pending.get_mut(&token)
+                                            {
+                                                if let Some(observation) = request.activity.as_mut()
+                                                {
+                                                    observation.native_event(session, &payload);
+                                                    request.response.is_some()
+                                                        && !observation.awaits_native_event()
+                                                } else {
+                                                    false
+                                                }
+                                            } else {
+                                                false
+                                            };
+                                            if complete {
+                                                let mut request = pending.remove(&token).unwrap();
+                                                let response = request.response.take().unwrap();
+                                                request.complete(
+                                                    response,
+                                                    &pages_clone,
+                                                    &event_tx_clone,
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
+                                continue;
+                            }
+                        }
+                    }
                     // Event
                     let mut event = CdpEvent {
                         method: method.clone(),
@@ -359,6 +450,8 @@ impl CdpClient {
             event_tx,
             raw_tx,
             private_sessions,
+            native_pointer_enabled: Arc::new(AtomicBool::new(false)),
+            native_pointer_lock: Arc::new(Mutex::new(())),
             _reader_handle: reader_handle,
             _keepalive_handle: keepalive_handle,
         })
@@ -411,7 +504,7 @@ impl CdpClient {
         session_id: Option<&str>,
         source: InputSource,
     ) -> Result<PendingCommand, String> {
-        let observation = session_id.and_then(|session| {
+        let mut observation = session_id.and_then(|session| {
             activity::from_command(method, params.as_ref()?)
                 .map(|value| self.observe_activity(value, session, source))
         });
@@ -420,6 +513,25 @@ impl CdpClient {
             .then(|| session_id.map(String::from))
             .flatten();
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let pointer_guard = if method == "Input.dispatchMouseEvent"
+            && self.native_pointer_enabled.load(Ordering::Acquire)
+        {
+            let guard = self.native_pointer_lock.clone().lock_owned().await;
+            if self.native_pointer_enabled.load(Ordering::Acquire) {
+                if let Some(session) = session_id {
+                    if Box::pin(self.prepare_native_pointer(session, id)).await {
+                        if let Some(observation) = observation.as_mut() {
+                            observation.track_native(self.native_pointer_enabled.clone());
+                        }
+                    } else {
+                        self.native_pointer_enabled.store(false, Ordering::Release);
+                    }
+                }
+            }
+            Some(guard)
+        } else {
+            None
+        };
 
         let cmd = CdpCommand {
             id,
@@ -439,8 +551,10 @@ impl CdpClient {
                 id,
                 PendingResponse {
                     sender: tx,
+                    response: None,
                     activity: observation,
                     reset_page,
+                    _pointer_guard: pointer_guard,
                 },
             );
         }
@@ -470,8 +584,87 @@ impl CdpClient {
         page_generation(&self.page_generations, session)
     }
 
+    pub(crate) fn enable_window_pointer(&self) {
+        self.native_pointer_enabled.store(true, Ordering::Release);
+    }
+
+    async fn prepare_native_pointer(&self, session: &str, token: u64) -> bool {
+        let prepare = async {
+            let tree = self
+                .send_command_no_params("Page.getFrameTree", Some(session))
+                .await?;
+            let frame = tree["frameTree"]["frame"]["id"]
+                .as_str()
+                .ok_or("Page frame is unavailable")?;
+            let world = self
+                .send_command(
+                    "Page.createIsolatedWorld",
+                    Some(serde_json::json!({
+                        "frameId": frame, "worldName": activity::POINTER_WORLD,
+                    })),
+                    Some(session),
+                )
+                .await?;
+            let context = world["executionContextId"]
+                .as_i64()
+                .ok_or("Pointer observation realm is unavailable")?;
+            self.send_command("Runtime.addBinding", Some(serde_json::json!({
+                "name": activity::POINTER_BINDING, "executionContextName": activity::POINTER_WORLD,
+            })), Some(session)).await?;
+            let token =
+                serde_json::to_string(&token.to_string()).map_err(|error| error.to_string())?;
+            let expression = format!(
+                r#"(() => {{
+                globalThis.__ambitPointerToken = {token};
+                if (typeof globalThis.__ambitWindowPointer !== 'function') return false;
+                if (!globalThis.__ambitPointerInstalled) {{
+                    globalThis.__ambitPointerInstalled = true;
+                    for (const [name, eventType] of [['pointermove','move'],['pointerdown','press'],['pointerup','release'],['wheel','scroll']]) {{
+                        addEventListener(name, event => {{
+                            if (!event.isTrusted) return;
+                            globalThis.__ambitWindowPointer(JSON.stringify({{
+                                token: globalThis.__ambitPointerToken, eventType,
+                                clientX: event.clientX, clientY: event.clientY,
+                                screenX: event.screenX, screenY: event.screenY,
+                            }}));
+                        }}, {{capture:true, passive:true}});
+                    }}
+                }}
+                return true;
+            }})()"#
+            );
+            let value = self
+                .send_command(
+                    "Runtime.evaluate",
+                    Some(serde_json::json!({
+                        "expression": expression, "contextId": context, "returnByValue": true,
+                    })),
+                    Some(session),
+                )
+                .await?;
+            Ok::<bool, String>(value["result"]["value"] == true)
+        };
+        matches!(
+            tokio::time::timeout(std::time::Duration::from_millis(500), prepare).await,
+            Ok(Ok(true))
+        )
+    }
+
     pub(crate) fn rotate_page_generation(&self, session: &str) {
         reset_page(&self.page_generations, &self.event_tx, session);
+    }
+
+    pub(crate) fn rotate_all_page_generations(&self) {
+        let sessions: Vec<_> = self
+            .page_generations
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        for session in sessions {
+            self.rotate_page_generation(&session);
+        }
     }
 
     pub(crate) fn observe_activity(
@@ -659,6 +852,75 @@ fn enable_tcp_keepalive(stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::T
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn native_pointer_joins_a_later_event_and_never_relabels_an_unmatched_event() {
+        use serde_json::json;
+        for matched in [true, false] {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let mut first_input = None;
+                while let Some(Ok(Message::Text(text))) = ws.next().await {
+                    let command: Value = serde_json::from_str(&text).unwrap();
+                    let result = match command["method"].as_str().unwrap() {
+                        "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"frame"}}}),
+                        "Page.createIsolatedWorld" => json!({"executionContextId":1}),
+                        "Runtime.evaluate" => json!({"result":{"value":true}}),
+                        _ => json!({}),
+                    };
+                    ws.send(Message::Text(
+                        json!({"id":command["id"],"result":result}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                    if command["method"] == "Input.dispatchMouseEvent" {
+                        let previous = first_input.replace(command["id"].as_u64().unwrap());
+                        if matched || previous.is_some() {
+                            // The binding follows the primary acknowledgment.
+                            // In the unmatched case, deliver the OLD command's
+                            // late event only after the next input is admitted.
+                            let token = previous.unwrap_or(first_input.unwrap());
+                            ws.send(Message::Text(json!({"method":"Runtime.bindingCalled","sessionId":"page","params":{
+                                "name":activity::POINTER_BINDING,"payload":json!({"token":token.to_string(),"eventType":"move",
+                                    "clientX":12,"clientY":34,"screenX":56,"screenY":78}).to_string()
+                            }}).to_string())).await.unwrap();
+                        }
+                    }
+                }
+            });
+            let client = CdpClient::connect(&format!("ws://{address}"))
+                .await
+                .unwrap();
+            client.enable_window_pointer();
+            let mut events = client.subscribe();
+            for index in 0..if matched { 1 } else { 2 } {
+                client
+                    .send_command(
+                        "Input.dispatchMouseEvent",
+                        Some(json!({"type":"mouseMoved","x":12,"y":34})),
+                        Some("page"),
+                    )
+                    .await
+                    .unwrap();
+                let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(event.method, activity::EVENT);
+                assert_eq!(event.params.get("screenX"), matched.then_some(&json!(56)));
+                assert_eq!(
+                    client.native_pointer_enabled.load(Ordering::Acquire),
+                    matched,
+                    "command {index}"
+                );
+            }
+            assert!(client.pending.lock().await.is_empty());
+            server.abort();
+        }
+    }
     use tokio::sync::oneshot;
 
     #[test]

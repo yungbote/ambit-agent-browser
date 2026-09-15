@@ -16,6 +16,9 @@ use super::a11y;
 use super::auth;
 use super::browser::{should_track_target, BrowserManager, WaitUntil};
 use super::browser_control::{self, BrowserControl, ControlRequest};
+
+#[path = "window_actions.rs"]
+mod window_actions;
 use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
@@ -284,6 +287,7 @@ fn launch_hash(
     connection_kind.hash(&mut h);
     connection_target.hash(&mut h);
     opts.headless.hash(&mut h);
+    opts.window_stream.hash(&mut h);
     opts.require_sandbox.hash(&mut h);
     opts.extensions.hash(&mut h);
     opts.profile.hash(&mut h);
@@ -621,6 +625,7 @@ pub struct DaemonState {
     /// Last viewport settings (width, height, deviceScaleFactor, mobile),
     /// re-applied to new contexts (e.g., recording).
     pub viewport: Option<(i32, i32, f64, bool)>,
+    pub(crate) window_page_error: Option<&'static str>,
     /// Session-scoped setup applied to the active page, re-applied to tabs the
     /// daemon creates. See [`SessionSetup`].
     pub session_setup: SessionSetup,
@@ -752,6 +757,7 @@ impl DaemonState {
                 .and_then(|s| s.parse::<u64>().ok())
                 .unwrap_or(25_000),
             viewport: None,
+            window_page_error: None,
             session_setup: SessionSetup::default(),
             plugin_init_scripts: Vec::new(),
             active_provider_session: None,
@@ -837,6 +843,7 @@ impl DaemonState {
         let origin_headers = self.origin_headers.clone();
         let proxy_credentials = self.proxy_credentials.clone();
         let capture_session = self.recording_state.capture_session.clone();
+        let include_browser_ui = browser.display_client().is_some();
 
         self.fetch_handler_task = Some(tokio::spawn(async move {
             loop {
@@ -901,9 +908,9 @@ impl DaemonState {
                         if is_recorder_session {
                             continue;
                         }
-                        let target_needs_controls = target_info
-                            .as_ref()
-                            .is_some_and(target_supports_network_controls);
+                        let target_needs_controls = target_info.as_ref().is_some_and(|target| {
+                            target_supports_network_controls(target, include_browser_ui)
+                        });
 
                         let df = domain_filter.read().await.clone();
                         let has_proxy_creds = proxy_credentials.read().await.is_some();
@@ -1025,6 +1032,7 @@ impl DaemonState {
 
         let client = browser.client.clone();
         let mut rx = browser.client.subscribe();
+        let custody = self.browser_control.clone();
 
         self.dialog_handler_task = Some(tokio::spawn(async move {
             loop {
@@ -1036,6 +1044,10 @@ impl DaemonState {
                             .and_then(|v| v.as_str())
                             .unwrap_or("");
                         if matches!(dialog_type, "beforeunload" | "alert") {
+                            let control = custody.lock().await;
+                            if control.agent_error().is_some() {
+                                continue;
+                            }
                             let message = event
                                 .params
                                 .get("message")
@@ -1068,6 +1080,11 @@ impl DaemonState {
 
     /// Update the stream server's CDP client slot when browser is set or cleared.
     pub async fn update_stream_client(&self) {
+        self.browser_control.lock().await.set_display(
+            self.browser
+                .as_ref()
+                .and_then(|browser| browser.display_client()),
+        );
         if self.browser.is_none() {
             self.browser_control.lock().await.reset_browser();
         }
@@ -1076,6 +1093,13 @@ impl DaemonState {
             *guard = self.browser.as_ref().map(|m| Arc::clone(&m.client));
         }
         if let Some(ref server) = self.stream_server {
+            server
+                .set_display(
+                    self.browser
+                        .as_ref()
+                        .and_then(|browser| browser.display_client()),
+                )
+                .await;
             // Update the CDP page session ID so screencast commands target the right page
             let session_id = self
                 .browser
@@ -1551,6 +1575,10 @@ impl DaemonState {
     }
 
     fn drain_cdp_events(&mut self) -> DrainedEvents {
+        let include_browser_ui = self
+            .browser
+            .as_ref()
+            .is_some_and(|browser| browser.display_client().is_some());
         let rx = match self.event_rx.as_mut() {
             Some(rx) => rx,
             None => return DrainedEvents::default(),
@@ -1578,7 +1606,7 @@ impl DaemonState {
                             if let Ok(te) =
                                 serde_json::from_value::<TargetCreatedEvent>(event.params.clone())
                             {
-                                if should_track_target(&te.target_info) {
+                                if should_track_target(&te.target_info, include_browser_ui) {
                                     let already_tracked = self
                                         .browser
                                         .as_ref()
@@ -1595,7 +1623,7 @@ impl DaemonState {
                             if let Ok(te) = serde_json::from_value::<TargetInfoChangedEvent>(
                                 event.params.clone(),
                             ) {
-                                if should_track_target(&te.target_info) {
+                                if should_track_target(&te.target_info, include_browser_ui) {
                                     // If this target is not yet tracked (e.g. it was
                                     // initially filtered because its URL was
                                     // chrome://newtab/), promote it to a new target
@@ -1668,7 +1696,12 @@ impl DaemonState {
                                         attached_iframe_sessions
                                             .push((target_info.target_id, sid.to_string()));
                                     }
-                                    Ok(target_info) if should_track_target(&target_info) => {
+                                    Ok(target_info)
+                                        if should_track_target(
+                                            &target_info,
+                                            include_browser_ui,
+                                        ) =>
+                                    {
                                         attached_page_target_ids
                                             .insert(target_info.target_id.clone());
                                         attached_page_sessions.push((target_info, sid.to_string()));
@@ -2071,6 +2104,10 @@ impl DaemonState {
                                 // dialogs are handled by the background dialog_handler_task.
                                 // Skip tracking them to avoid a stale warning.
                                 let auto_handled = self.auto_dialog
+                                    && self
+                                        .browser
+                                        .as_ref()
+                                        .is_none_or(|browser| browser.display_client().is_none())
                                     && matches!(
                                         dialog_event.dialog_type.as_str(),
                                         "beforeunload" | "alert"
@@ -2522,8 +2559,32 @@ fn policy_actions_for_command(
 /// The optional host observation stays inside the caller's command mutex.
 /// It cannot turn a known primary outcome into a capture failure.
 pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
+    execute_command_received(cmd, state, std::time::Instant::now()).await
+}
+
+pub(crate) async fn execute_command_received(
+    cmd: &Value,
+    state: &mut DaemonState,
+    received_at: std::time::Instant,
+) -> Value {
+    if let Err((code, message)) = state.prepare_window_command(cmd, received_at).await {
+        let mut response =
+            json!({ "id": cmd["id"], "success": false, "code": code, "error": message });
+        if let Some(value) = cmd.get(super::feedback::REQUEST_FIELD) {
+            if let Ok(request) = super::feedback::FeedbackRequest::parse(value, state) {
+                super::feedback::attach(&request, &mut response, state).await;
+            }
+        }
+        return response;
+    }
     let Some(value) = cmd.get(super::feedback::REQUEST_FIELD) else {
-        return Box::pin(execute_command_inner(cmd, state)).await;
+        let response = Box::pin(execute_command_inner(cmd, state)).await;
+        if response["success"] == true
+            && matches!(cmd["action"].as_str(), Some("snapshot" | "screenshot"))
+        {
+            state.browser_control.lock().await.observed();
+        }
+        return response;
     };
     let request = match super::feedback::FeedbackRequest::parse(value, state) {
         Ok(request) => request,
@@ -2548,9 +2609,24 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
     } else if !super::feedback::matches_expected(&request, state).await {
         json!({ "id": command["id"], "success": false, "code": "browser_observation_stale", "error": "The browser page or viewport changed since this image. Inspect the fresh observation before sending coordinates." })
     } else {
+        let operation = async {
+            if let Some(launch) = request
+                .launch
+                .as_ref()
+                .filter(|_| !skip_launch_action(command["action"].as_str().unwrap_or_default()))
+            {
+                let mut launch = launch.clone();
+                launch["id"] = command["id"].clone();
+                let response = Box::pin(execute_command_inner(&launch, state)).await;
+                if response["success"] != true {
+                    return response;
+                }
+            }
+            Box::pin(execute_command_inner(&command, state)).await
+        };
         match tokio::time::timeout(
             std::time::Duration::from_millis(request.timeout_ms),
-            Box::pin(execute_command_inner(&command, state)),
+            operation,
         )
         .await
         {
@@ -2560,6 +2636,7 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
             }
         }
     };
+    state.apply_pending_window_layout().await;
     super::feedback::attach(&request, &mut response, state).await;
     response
 }
@@ -2590,10 +2667,28 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
                 .map(|session| (manager.client.clone(), session.to_string()))
         });
         let control = state.browser_control.clone();
+        let display = state
+            .browser
+            .as_ref()
+            .and_then(|browser| browser.display_client());
+        let resizes_window = display.is_some()
+            && cmd["events"]
+                .as_array()
+                .is_some_and(|events| events.iter().any(|event| event["type"] == "viewport"));
         let operation = async {
+            if resizes_window {
+                // Observe the exact existing dialog owner before deciding
+                // whether a renderer readback can participate in readiness.
+                state.drain_cdp_events_background().await.map_err(|_| {
+                    browser_control::ControlError {
+                        code: "browser_control_unavailable",
+                        message: "The browser window could not be observed before resizing.".into(),
+                    }
+                })?;
+            }
+            let mut control = control.lock().await;
+            control.set_display(display);
             control
-                .lock()
-                .await
                 .execute_with_page(
                     request,
                     browser
@@ -2606,7 +2701,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         // One budget covers the stream gate, draining and held-input cleanup.
         // Acquisition cannot outlive the ten-second relay after the daemon's
         // separate two-second wait for current command custody.
-        let result = if cmd["op"] == "acquire" {
+        let result = if cmd["op"] == "acquire" || resizes_window {
             tokio::time::timeout(std::time::Duration::from_secs(5), operation)
                 .await
                 .unwrap_or_else(|_| Err(browser_control::ControlError::unknown()))
@@ -2621,6 +2716,15 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
             state.reset_input_state();
             if let Some(server) = state.stream_server.as_ref() {
                 server.notify_client_changed();
+            }
+        }
+        if let Some(display) = state
+            .browser
+            .as_ref()
+            .and_then(|browser| browser.display_client())
+        {
+            if let Some(server) = state.stream_server.as_ref() {
+                server.presentation.update_surface(&display.surface());
             }
         }
         state.last_command_finished = Some(std::time::Instant::now());
@@ -3667,8 +3771,10 @@ fn target_supports_worker_fetch_controls(target: &TargetInfo) -> bool {
     target.target_type == "service_worker"
 }
 
-fn target_supports_network_controls(target: &TargetInfo) -> bool {
-    target.target_type == "iframe" || should_track_target(target) || target_is_worker_like(target)
+fn target_supports_network_controls(target: &TargetInfo, include_browser_ui: bool) -> bool {
+    target.target_type == "iframe"
+        || should_track_target(target, include_browser_ui)
+        || target_is_worker_like(target)
 }
 
 async fn prepare_network_control_target_session(
@@ -4313,7 +4419,7 @@ async fn apply_launch_mutator_plugins(
     let request = json!({
         "session": state.session_id,
         "launchOptions": {
-            "headless": options.headless,
+            "headless": options.effectively_headless(),
             "engine": env::var("AGENT_BROWSER_ENGINE").unwrap_or_else(|_| "chrome".to_string()),
             "args": options.args.clone(),
             "extensions": options.extensions.clone(),
@@ -4363,6 +4469,7 @@ fn launch_options_from_env() -> LaunchOptions {
 
     LaunchOptions {
         headless: !headed,
+        window_stream: super::display::enabled(),
         require_sandbox: require_sandbox_from_env(),
         executable_path: env::var("AGENT_BROWSER_EXECUTABLE_PATH").ok(),
         proxy: env::var("AGENT_BROWSER_PROXY").ok(),
@@ -4807,6 +4914,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 
     let mut launch_options = LaunchOptions {
         headless,
+        window_stream: super::display::enabled(),
         require_sandbox: require_sandbox_from_env(),
         executable_path: cmd
             .get("executablePath")
@@ -7217,6 +7325,22 @@ impl ControlPage<'_> {
     pub(crate) async fn validate_events(&self, events: &[Value]) -> Result<(), String> {
         let filter = self.0.domain_filter.read().await;
         for event in events {
+            if self
+                .0
+                .browser
+                .as_ref()
+                .is_some_and(|browser| browser.display_client().is_some())
+            {
+                if event["type"] == "input_touch" {
+                    return Err("Window input uses native mouse and wheel gestures; direct touch input requires a page viewport".into());
+                }
+                if event["type"] == "viewport"
+                    && (event["width"].as_u64().unwrap() > 2048
+                        || event["height"].as_u64().unwrap() > 2048)
+                {
+                    return Err("Window dimensions must be at most 2048 CSS pixels".into());
+                }
+            }
             if event["type"] == "navigation" && event["action"] == "navigate" {
                 let url = crate::commands::normalize_navigation_url(event["url"].as_str().unwrap());
                 if let Some(filter) = filter.as_ref() {
@@ -7229,6 +7353,20 @@ impl ControlPage<'_> {
 
     pub(crate) async fn apply(&mut self, event: &Value) -> Result<(), String> {
         if event["type"] == "viewport" {
+            if self
+                .0
+                .browser
+                .as_ref()
+                .is_some_and(|browser| browser.display_client().is_some())
+            {
+                self.0
+                    .apply_window_layout(
+                        event["width"].as_u64().unwrap() as u32,
+                        event["height"].as_u64().unwrap() as u32,
+                    )
+                    .await?;
+                return Ok(());
+            }
             let (_, _, scale, mobile) = self.0.viewport.unwrap_or((1280, 720, 1.0, false));
             handle_viewport(
                 &json!({ "width": event["width"], "height": event["height"],
@@ -7271,6 +7409,33 @@ impl ControlPage<'_> {
     pub(crate) async fn selected_text(
         &mut self,
     ) -> Result<String, super::selection::SelectionError> {
+        if let Some(display) = self
+            .0
+            .browser
+            .as_ref()
+            .and_then(|browser| browser.display_client())
+        {
+            let result = display
+                .request(json!({"op":"copy"}))
+                .await
+                .map_err(|error| {
+                    if error.code == "display_copy_too_large" {
+                        super::selection::SelectionError::TooLarge
+                    } else {
+                        super::selection::SelectionError::Unavailable
+                    }
+                })?;
+            let text = result["text"]
+                .as_str()
+                .ok_or(super::selection::SelectionError::Unavailable)?;
+            if text.len() > super::selection::MAX_COPY_BYTES
+                || result["bytes"].as_u64() != Some(text.len() as u64)
+                || result["complete"] != true
+            {
+                return Err(super::selection::SelectionError::Unavailable);
+            }
+            return Ok(text.to_string());
+        }
         self.0.drain_cdp_events_background().await?;
         let mgr = self
             .0

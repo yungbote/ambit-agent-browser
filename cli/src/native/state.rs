@@ -950,6 +950,11 @@ mod tests {
 
     #[test]
     fn test_state_list_returns_json() {
+        let guard = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_NAMESPACE"]);
+        guard.set(
+            "AGENT_BROWSER_NAMESPACE",
+            &format!("state-list-{}", uuid::Uuid::new_v4()),
+        );
         let result = state_list().unwrap();
         assert!(result.get("files").is_some());
         assert!(result.get("directory").is_some());

@@ -16,6 +16,7 @@ pub mod cookies;
 pub mod daemon;
 #[allow(dead_code)]
 pub mod diff;
+pub(crate) mod display;
 #[allow(dead_code)]
 pub mod element;
 pub(crate) mod feedback;

@@ -3,6 +3,7 @@ pub(crate) mod chat;
 mod dashboard;
 mod discovery;
 mod http;
+pub(crate) mod presentation;
 mod websocket;
 
 pub use cdp_loop::{ack_screencast_frame, start_screencast, stop_screencast};
@@ -182,6 +183,7 @@ impl Default for FrameMetadata {
 
 pub struct StreamServer {
     pub(crate) browser_control: Arc<Mutex<BrowserControl>>,
+    pub(crate) presentation: Arc<presentation::Presentation>,
     port: u16,
     session_name: String,
     frame_tx: broadcast::Sender<String>,
@@ -191,6 +193,7 @@ pub struct StreamServer {
     frame_watch: watch::Sender<Option<Arc<StreamFrame>>>,
     client_count: Arc<Mutex<usize>>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
+    display_slot: Arc<RwLock<Option<Arc<super::display::DisplayClient>>>>,
     /// The active CDP page session ID (from Target.attachToTarget).
     cdp_session_id: Arc<RwLock<Option<String>>>,
     client_notify: Arc<Notify>,
@@ -353,6 +356,7 @@ impl StreamServer {
             .map_err(|e| format!("Failed to get stream address: {}", e))?;
         let port = actual_addr.port();
 
+        let presentation = Arc::new(presentation::Presentation::new());
         let (frame_tx, _) = broadcast::channel::<String>(64);
         let (frame_watch_tx, frame_watch_rx) = watch::channel::<Option<Arc<StreamFrame>>>(None);
         let screencast_config = Arc::new(ScreencastConfig::from_env());
@@ -365,6 +369,7 @@ impl StreamServer {
         let last_tabs = Arc::new(RwLock::new(Vec::<Value>::new()));
         let last_engine = Arc::new(RwLock::new("chrome".to_string()));
         let recording = Arc::new(Mutex::new(false));
+        let display_slot = Arc::new(RwLock::new(None));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
 
         let frame_tx_clone = frame_tx.clone();
@@ -373,6 +378,7 @@ impl StreamServer {
         let notify_clone = client_notify.clone();
         let idle_activity_clone = idle_activity.clone();
         let browser_control_clone = browser_control.clone();
+        let presentation_clone = presentation.clone();
         let screencasting_clone = screencasting.clone();
         let cdp_session_clone = cdp_session_id.clone();
 
@@ -394,6 +400,7 @@ impl StreamServer {
                 notify_clone,
                 idle_activity_clone,
                 browser_control_clone,
+                presentation_clone,
                 screencasting_clone,
                 cdp_session_clone,
                 vw_clone,
@@ -409,6 +416,7 @@ impl StreamServer {
 
         let frame_tx_bg = frame_tx.clone();
         let client_slot_bg = client_slot.clone();
+        let display_slot_bg = display_slot.clone();
         let client_notify_bg = client_notify.clone();
         let screencasting_bg = screencasting.clone();
         let client_count_bg = client_count.clone();
@@ -426,6 +434,7 @@ impl StreamServer {
                 frame_watch_bg,
                 screencast_cfg_bg,
                 client_slot_bg,
+                display_slot_bg,
                 client_notify_bg,
                 screencasting_bg,
                 client_count_bg,
@@ -443,6 +452,7 @@ impl StreamServer {
         Ok((
             Self {
                 browser_control,
+                presentation,
                 port,
                 session_name: session_id,
                 frame_tx,
@@ -450,6 +460,7 @@ impl StreamServer {
                 screencast_config,
                 client_count,
                 client_slot: client_slot.clone(),
+                display_slot,
                 cdp_session_id,
                 client_notify,
                 idle_activity,
@@ -469,6 +480,24 @@ impl StreamServer {
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    pub(crate) async fn set_display(&self, display: Option<Arc<super::display::DisplayClient>>) {
+        let mut slot = self.display_slot.write().await;
+        let changed = match (&*slot, &display) {
+            (Some(current), Some(next)) => !Arc::ptr_eq(current, next),
+            (None, None) => false,
+            _ => true,
+        };
+        if changed {
+            *slot = display;
+            self.frame_watch.send_replace(None);
+            self.client_notify.notify_one();
+        }
+    }
+
+    pub(crate) fn clear_frame(&self) {
+        self.frame_watch.send_replace(None);
     }
 
     /// Broadcast a raw frame string (legacy). The caller owns the payload, so

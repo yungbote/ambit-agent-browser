@@ -27,6 +27,53 @@ fn parse(value: Value) -> ControlRequest {
     ControlRequest::parse(&value).unwrap()
 }
 
+#[tokio::test]
+async fn expired_native_input_retains_custody_until_reset_is_proven() {
+    let mut control = BrowserControl {
+        lease: Some(Lease {
+            controller_id: OWNER.into(),
+            expires_at: 0,
+            deadline: Instant::now() - Duration::from_millis(1),
+            last_sequence: 1,
+            outcome_unknown: false,
+            held: HeldInputs::default(),
+            native_input_pending: true,
+        }),
+        ..BrowserControl::default()
+    };
+    assert!(control.agent_error().is_some());
+    // A lost helper cannot acknowledge release of a possibly held input.
+    assert_eq!(
+        control.expire(None).await.unwrap_err().code,
+        "browser_control_outcome_unknown"
+    );
+    assert_eq!(
+        control.agent_error().unwrap().code,
+        "browser_control_outcome_unknown"
+    );
+    assert_eq!(
+        control
+            .execute(parse(command("release", OWNER)), None)
+            .await
+            .unwrap_err()
+            .code,
+        "browser_control_outcome_unknown"
+    );
+    assert_eq!(
+        control
+            .execute(parse(command("acquire", OTHER)), None)
+            .await
+            .unwrap_err()
+            .code,
+        "browser_control_outcome_unknown"
+    );
+    assert_eq!(control.lease.as_ref().unwrap().controller_id, OWNER);
+    // The existing successful-reset path clears this pending state before
+    // expired custody is released. Retiring Chrome also removes the lease.
+    control.reset_browser();
+    assert!(control.agent_error().is_none());
+}
+
 fn input(sequence: u64) -> ControlRequest {
     parse(
         json!({ "action": ACTION, "op": "input", "controllerId": OWNER, "sequence": sequence,

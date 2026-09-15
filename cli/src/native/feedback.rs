@@ -35,6 +35,7 @@ pub(crate) struct FeedbackRequest {
     pub capture_directory: PathBuf,
     pub timeout_ms: u64,
     pub expected_observation: Option<ObservationId>,
+    pub launch: Option<Value>,
 }
 
 impl FeedbackRequest {
@@ -47,6 +48,13 @@ impl FeedbackRequest {
             || request.namespace != std::env::var("AGENT_BROWSER_NAMESPACE").unwrap_or_default()
         {
             return Err("Browser feedback does not match the host session or limits.".to_string());
+        }
+        if request.launch.as_ref().is_some_and(|launch| {
+            !launch.is_object()
+                || launch["action"] != "launch"
+                || launch.get(REQUEST_FIELD).is_some()
+        }) {
+            return Err("Invalid host browser launch settings.".into());
         }
         Ok(request)
     }
@@ -79,6 +87,9 @@ fn digest(bytes: &[u8]) -> String {
 }
 
 async fn observe(state: &DaemonState) -> Result<Observation, &'static str> {
+    if let Some(error) = state.window_page_error {
+        return Err(error);
+    }
     let browser = state.browser.as_ref().ok_or("no_active_page")?;
     let session_id = browser.active_session_id().map_err(|_| "no_active_page")?;
     let target_id = browser.active_target_id().map_err(|_| "no_active_page")?;
