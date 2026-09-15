@@ -364,6 +364,7 @@ pub fn load_config(args: &[String]) -> Result<Config, String> {
     })
 }
 
+#[derive(Debug, Clone)]
 pub struct Flags {
     pub json: bool,
     pub headed: bool,
@@ -461,6 +462,10 @@ pub fn parse_flags(args: &[String]) -> Flags {
         std::process::exit(1);
     });
 
+    parse_flags_from_config(args, config)
+}
+
+pub(crate) fn parse_flags_from_config(args: &[String], config: Config) -> Flags {
     let extensions_env = env::var("AGENT_BROWSER_EXTENSIONS")
         .ok()
         .map(|s| {
@@ -691,6 +696,12 @@ pub fn parse_flags(args: &[String]) -> Flags {
         cli_pin_tab: false,
     };
 
+    apply_cli_flags(args, &mut flags);
+    flags
+}
+
+/// Apply only explicitly prepared option arguments to an existing snapshot.
+pub(crate) fn apply_cli_flags(args: &[String], flags: &mut Flags) {
     let mut i = 0;
     let mut seen_command = false;
     while i < args.len() {
@@ -1134,7 +1145,6 @@ pub fn parse_flags(args: &[String]) -> Flags {
         }
         i += 1;
     }
-    flags
 }
 
 fn looks_like_command(value: &str) -> bool {

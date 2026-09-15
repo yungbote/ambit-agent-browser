@@ -2519,7 +2519,46 @@ fn policy_actions_for_command(
     actions
 }
 
+/// The optional host observation stays inside the caller's command mutex.
+/// It cannot turn a known primary outcome into a capture failure.
 pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
+    let Some(value) = cmd.get(super::feedback::REQUEST_FIELD) else {
+        return Box::pin(execute_command_inner(cmd, state)).await;
+    };
+    let request = match super::feedback::FeedbackRequest::parse(value, state) {
+        Ok(request) => request,
+        Err(error) => {
+            return json!({ "id": cmd["id"], "success": false, "code": "browser_feedback_invalid", "error": error })
+        }
+    };
+    let mut command = cmd.clone();
+    command
+        .as_object_mut()
+        .unwrap()
+        .remove(super::feedback::REQUEST_FIELD);
+    let controlled = state.browser_control.lock().await.agent_error();
+    let mut response = if let Some(error) = controlled {
+        json!({ "id": command["id"], "success": false, "code": error.code, "error": error.message })
+    } else if !super::feedback::matches_expected(&request, state).await {
+        json!({ "id": command["id"], "success": false, "code": "browser_observation_stale", "error": "The browser page or viewport changed since this image. Inspect the fresh observation before sending coordinates." })
+    } else {
+        match tokio::time::timeout(
+            std::time::Duration::from_millis(request.timeout_ms),
+            Box::pin(execute_command_inner(&command, state)),
+        )
+        .await
+        {
+            Ok(response) => response,
+            Err(_) => {
+                json!({ "id": command["id"], "success": false, "code": "command_outcome_unknown", "error": "The browser command exceeded its host deadline. It may have executed; inspect the current page before retrying." })
+            }
+        }
+    };
+    super::feedback::attach(&request, &mut response, state).await;
+    response
+}
+
+async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
     let action = cmd.get("action").and_then(|v| v.as_str()).unwrap_or("");
     let id = cmd
         .get("id")

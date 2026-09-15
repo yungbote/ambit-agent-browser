@@ -41,6 +41,9 @@ pub struct Response {
     pub code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub warning: Option<String>,
+    /// Native observation attached under the same command custody.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browser: Option<Value>,
 }
 
 #[allow(dead_code)]
@@ -506,6 +509,7 @@ pub struct DaemonResult {
 /// Note: `confirm_interactive` is intentionally absent -- it is a CLI-side
 /// UX concern (prompting the user on stdin) and not a daemon configuration.
 /// The daemon only needs `confirm_actions` to gate action categories.
+#[derive(Default)]
 pub struct DaemonOptions<'a> {
     /// Client-only policy, excluded from daemon configuration and its fingerprint.
     pub require_existing: bool,
@@ -1173,11 +1177,22 @@ impl CommandAttemptError {
 /// Retry only temporary connection failures that occurred before sending.
 /// A lost response never triggers automatic replay, for any command or client.
 pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
+    send_command_detailed(cmd, session).map_err(|error| error.message)
+}
+
+pub(crate) struct CommandFailure {
+    pub outcome_unknown: bool,
+    pub message: String,
+}
+
+pub(crate) fn send_command_detailed(cmd: Value, session: &str) -> Result<Response, CommandFailure> {
     const MAX_CONNECT_ATTEMPTS: u32 = 5;
     const RETRY_DELAY_MS: u64 = 200;
 
-    let mut request = serde_json::to_vec(&cmd)
-        .map_err(|error| format!("Command was not sent: failed to encode request: {}", error))?;
+    let mut request = serde_json::to_vec(&cmd).map_err(|error| CommandFailure {
+        outcome_unknown: false,
+        message: format!("Command was not sent: failed to encode request: {}", error),
+    })?;
     request.push(b'\n');
     let read_timeout = read_timeout_for(&cmd);
     let mut last_error = String::new();
@@ -1190,13 +1205,21 @@ pub fn send_command(cmd: Value, session: &str) -> Result<Response, String> {
             Err(error) if error.can_retry_connection() => {
                 last_error = error.into_message();
             }
-            Err(error) => return Err(error.into_message()),
+            Err(error) => {
+                return Err(CommandFailure {
+                    outcome_unknown: matches!(error, CommandAttemptError::OutcomeUnknown(_)),
+                    message: error.into_message(),
+                })
+            }
         }
     }
-    Err(format!(
-        "{} (after {} connection attempts; no command was sent)",
-        last_error, MAX_CONNECT_ATTEMPTS
-    ))
+    Err(CommandFailure {
+        outcome_unknown: false,
+        message: format!(
+            "{} (after {} connection attempts; no command was sent)",
+            last_error, MAX_CONNECT_ATTEMPTS
+        ),
+    })
 }
 
 /// Only connection-stage failures may trigger daemon recovery. An unknown
@@ -1220,7 +1243,17 @@ pub fn daemon_unreachable(error: &str) -> bool {
 /// the extended budget, and that field is set client-side per invocation,
 /// avoiding the daemon's spawn-time env snapshot drifting from the client.
 fn read_timeout_for(cmd: &Value) -> Duration {
-    let op_ms = cmd.get("timeout").and_then(|v| v.as_u64()).unwrap_or(0);
+    let op_ms = cmd
+        .get("timeout")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .max(
+            cmd.get(crate::native::feedback::REQUEST_FIELD)
+                .and_then(|feedback| feedback.get("timeoutMs"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                .saturating_add(10_000),
+        );
     Duration::from_millis(op_ms.saturating_add(10_000).max(30_000))
 }
 

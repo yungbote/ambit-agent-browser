@@ -330,7 +330,29 @@ fn parse_cookie_header(header: &str) -> Result<Vec<Value>, String> {
 }
 
 pub fn parse_command(args: &[String], flags: &Flags) -> Result<Value, ParseError> {
-    let mut result = parse_command_inner(args, flags)?;
+    parse_command_with_input(args, flags, None)
+}
+
+/// Parse command data independently from global host options and process stdin.
+pub(crate) fn parse_command_with_input(
+    args: &[String],
+    flags: &Flags,
+    input: Option<&str>,
+) -> Result<Value, ParseError> {
+    let mut result = parse_command_inner(args, flags, input)?;
+    if result["action"] == "auth_save" && result["passwordStdin"] == true {
+        if let Some(input) = input {
+            let password = input.lines().next().unwrap_or_default();
+            if password.is_empty() {
+                return Err(ParseError::InvalidValue {
+                    message: "Password from stdin is empty".to_string(),
+                    usage: "auth save <name> --password-stdin",
+                });
+            }
+            result["password"] = json!(password);
+            result.as_object_mut().unwrap().remove("passwordStdin");
+        }
+    }
 
     // Inject AGENT_BROWSER_DEFAULT_TIMEOUT into any wait-family command that
     // doesn't already carry an explicit timeout. Centralised here so that new
@@ -359,7 +381,11 @@ pub fn attach_ca_cert_to_launch_command(cmd: &mut Value, flags: &Flags) {
     }
 }
 
-fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseError> {
+fn parse_command_inner(
+    args: &[String],
+    flags: &Flags,
+    input: Option<&str>,
+) -> Result<Value, ParseError> {
     if args.is_empty() {
         return Err(ParseError::MissingArguments {
             context: "".to_string(),
@@ -942,14 +968,17 @@ fn parse_command_inner(args: &[String], flags: &Flags) -> Result<Value, ParseErr
                 };
 
             let script = if is_stdin {
-                // Read script from stdin
-                let stdin = io::stdin();
-                let lines: Vec<String> = stdin
-                    .lock()
-                    .lines()
-                    .map(|l| l.unwrap_or_default())
-                    .collect();
-                lines.join("\n")
+                if let Some(input) = input {
+                    input.lines().collect::<Vec<_>>().join("\n")
+                } else {
+                    let stdin = io::stdin();
+                    let lines: Vec<String> = stdin
+                        .lock()
+                        .lines()
+                        .map(|line| line.unwrap_or_default())
+                        .collect();
+                    lines.join("\n")
+                }
             } else {
                 let raw_script = script_parts.join(" ");
                 if is_base64 {

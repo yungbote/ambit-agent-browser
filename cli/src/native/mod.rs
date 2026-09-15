@@ -17,6 +17,7 @@ pub mod daemon;
 pub mod diff;
 #[allow(dead_code)]
 pub mod element;
+pub(crate) mod feedback;
 pub(crate) mod input;
 #[allow(dead_code)]
 pub mod inspect_server;
