@@ -2583,12 +2583,33 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
                 .ok()
                 .map(|session| (manager.client.as_ref(), session))
         });
-        let result = state
-            .browser_control
-            .lock()
-            .await
-            .execute(request, browser)
-            .await;
+        let viewport = state
+            .browser
+            .as_ref()
+            .map(|manager| browser_control::ControlViewport {
+                manager,
+                geometry: &mut state.viewport,
+                stream: state.stream_server.as_deref(),
+            });
+        let operation = async {
+            state
+                .browser_control
+                .lock()
+                .await
+                .execute_with_viewport(request, browser, viewport)
+                .await
+        };
+        // One budget covers the stream gate, draining and held-input cleanup.
+        // Acquisition cannot outlive the ten-second relay after the daemon's
+        // separate two-second wait for current command custody.
+        let result = if cmd["op"] == "acquire" {
+            tokio::time::timeout(std::time::Duration::from_secs(5), operation)
+                .await
+                .unwrap_or_else(|_| Err(browser_control::ControlError::unknown()))
+        } else {
+            operation.await
+        };
+
         if result
             .as_ref()
             .is_ok_and(|data| data["status"] == "controlled" && cmd["op"] == "acquire")
@@ -12620,6 +12641,25 @@ mod tests {
     /// plain text, not generated from `FIND_ACTIONS`; this pins their
     /// wording to the actual accepted set so an edit to one without the
     /// others fails here instead of drifting silently again.
+    #[tokio::test]
+    async fn browser_acquire_budget_includes_waiting_for_stream_input() {
+        let mut state = DaemonState::new();
+        let gate = state.browser_control.clone();
+        let held = gate.lock().await;
+        let response = Box::pin(execute_command(
+            &json!({
+                "action": browser_control::ACTION, "op": "acquire",
+                "controllerId": "aabbccdd-1111-4222-8333-123456789abc",
+                "expiresAt": super::super::stream::timestamp_ms() + 25000,
+            }),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(response["code"], "browser_control_outcome_unknown");
+        drop(held);
+        assert!(gate.lock().await.agent_error().is_none());
+    }
+
     #[test]
     fn find_actions_help_text_matches_the_accepted_set() {
         assert_eq!(FIND_ACTIONS.join(", "), "click, fill, check, hover, text");

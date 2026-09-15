@@ -3220,6 +3220,13 @@ Notes:
     frames already handed to the transport are delivered in order.
   - Both settings can be declared on the URL instead, which is the only way
     to cover the opening frame: ws://127.0.0.1:<port>/?pacing=ack&maxFps=10
+  - Native frames carry pageGeneration. Acknowledged pointer records share it;
+    typing/scrolling activity contains no input text. Navigation and viewport
+    changes reset the identity. Display activity only on its matching frame.
+  - Host controller batches can resize the viewport with a viewport event
+    (width/height: integer CSS pixels, 1-32768), preserving scale and emulation.
+    Acquisition waits at most 2s for an active command, then refuses as
+    browser_control_unavailable; no custody is created by that refusal.
   - 'screencast_start' and 'screencast_stop' still control explicit CDP screencasts.
   - Streaming is always enabled. Set AGENT_BROWSER_STREAM_PORT to bind to a
     specific port instead of the default OS-assigned port.

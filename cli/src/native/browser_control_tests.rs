@@ -164,6 +164,93 @@ fn control_requests_enforce_bounds_and_reject_untrusted_fields() {
 }
 
 #[test]
+fn controller_viewport_is_a_bounded_css_geometry_event() {
+    for (width, height) in [(1, 1), (640, 480), (32768, 32768)] {
+        assert!(
+            validate_event(&json!({ "type": "viewport", "width": width, "height": height }))
+                .is_ok()
+        );
+    }
+    for value in [
+        json!(0),
+        json!(-1),
+        json!(1.5),
+        json!(32769),
+        json!("640"),
+        Value::Null,
+    ] {
+        assert!(
+            validate_event(&json!({ "type": "viewport", "width": value, "height": 480 })).is_err()
+        );
+        assert!(
+            validate_event(&json!({ "type": "viewport", "width": 640, "height": value })).is_err()
+        );
+    }
+    assert!(validate_event(
+        &json!({ "type": "viewport", "width": 640, "height": 480, "deviceScaleFactor": 1 })
+    )
+    .is_err());
+}
+
+#[tokio::test]
+async fn native_activity_follows_browser_acknowledgements_and_page_identity() {
+    let mut browser = Browser::new().await;
+    let mut events = browser.client.subscribe();
+    let params = json!({ "type": "mouseMoved", "x": 20, "y": 30 });
+    let mut pending = browser
+        .client
+        .enqueue_command(
+            "Input.dispatchMouseEvent",
+            Some(params.clone()),
+            Some("page"),
+        )
+        .await
+        .unwrap();
+    let sent = browser.next().await;
+    assert!(
+        events.try_recv().is_err(),
+        "unacknowledged input became visible"
+    );
+    browser
+        .responses
+        .send(json!({ "id": sent["id"], "error": { "code": -1, "message": "refused" }}))
+        .await
+        .unwrap();
+    assert!(pending.acknowledgment().await.unwrap().error.is_some());
+    assert!(events.try_recv().is_err(), "refused input became visible");
+    let mut pending = browser
+        .client
+        .enqueue_command_from(
+            "Input.dispatchMouseEvent",
+            Some(params),
+            Some("page"),
+            InputSource::Human,
+        )
+        .await
+        .unwrap();
+    let sent = browser.next().await;
+    browser.ack(&sent).await;
+    pending.acknowledgment().await.unwrap();
+    let observed = events.recv().await.unwrap();
+    assert_eq!(observed.method, super::super::activity::EVENT);
+    assert_eq!(observed.params["source"], "human");
+    browser.responses.send(json!({ "method": "Page.frameNavigated", "sessionId": "page", "params": { "frame": { "id": "main", "loaderId": "new" } } })).await.unwrap();
+    let reset = events.recv().await.unwrap();
+    assert_eq!(reset.params["eventType"], "reset");
+    assert_ne!(
+        reset.params["pageGeneration"],
+        observed.params["pageGeneration"]
+    );
+    events.recv().await.unwrap(); // Original navigation event remains available.
+    browser.responses.send(json!({ "method": "Page.screencastFrame", "sessionId": "page", "params": { "data": "frame", "sessionId": 1 } })).await.unwrap();
+    let frame = events.recv().await.unwrap();
+    assert_eq!(
+        frame.params[super::super::activity::FRAME_GENERATION],
+        reset.params["pageGeneration"]
+    );
+}
+
+#[test]
 fn control_keyboard_and_touch_validation_covers_optional_types_and_multi_touch() {
     let mut insertion =
         json!({ "type": "input_keyboard", "eventType": "insertText", "text": "Human input" });

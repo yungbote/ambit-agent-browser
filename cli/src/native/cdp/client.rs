@@ -11,8 +11,34 @@ use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::tungstenite::Message;
 
 use super::types::{CdpCommand, CdpEvent, CdpMessage};
+use crate::native::activity::{self, ActivityObservation, InputSource};
 
-type PendingMap = Arc<Mutex<HashMap<u64, oneshot::Sender<CdpMessage>>>>;
+struct PendingResponse {
+    sender: oneshot::Sender<CdpMessage>,
+    activity: Option<ActivityObservation>,
+    reset_page: Option<String>,
+}
+
+type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
+type PageGenerations = Arc<std::sync::Mutex<HashMap<String, String>>>;
+
+fn page_generation(pages: &PageGenerations, session: &str) -> String {
+    pages
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .entry(session.into())
+        .or_insert_with(|| uuid::Uuid::new_v4().to_string())
+        .clone()
+}
+
+fn reset_page(pages: &PageGenerations, sender: &broadcast::Sender<CdpEvent>, session: &str) {
+    let generation = uuid::Uuid::new_v4().to_string();
+    pages
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .insert(session.into(), generation.clone());
+    let _ = sender.send(activity::reset(session, &generation));
+}
 
 /// Sessions whose events go to one private receiver instead of the broadcast.
 type PrivateSessions = Arc<std::sync::Mutex<HashMap<String, mpsc::Sender<CdpEvent>>>>;
@@ -62,6 +88,7 @@ pub struct CdpClient {
     >,
     next_id: AtomicU64,
     pending: PendingMap,
+    page_generations: PageGenerations,
     event_tx: broadcast::Sender<CdpEvent>,
     raw_tx: broadcast::Sender<RawCdpMessage>,
     private_sessions: PrivateSessions,
@@ -175,6 +202,8 @@ impl CdpClient {
 
         let private_sessions: PrivateSessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
+        let page_generations: PageGenerations = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let pages_clone = page_generations.clone();
         let pending_clone = pending.clone();
         let event_tx_clone = event_tx.clone();
         let raw_tx_clone = raw_tx.clone();
@@ -236,16 +265,45 @@ impl CdpClient {
                 if let Some(id) = parsed.id {
                     // Response to a command
                     let mut pending = pending_clone.lock().await;
-                    if let Some(tx) = pending.remove(&id) {
-                        let _ = tx.send(parsed);
+                    if let Some(request) = pending.remove(&id) {
+                        if parsed.error.is_none() {
+                            if let Some(session) = request.reset_page.as_deref() {
+                                reset_page(&pages_clone, &event_tx_clone, session);
+                            }
+                            if let Some(observation) = request.activity {
+                                observation.acknowledged();
+                            }
+                        }
+                        let _ = request.sender.send(parsed);
                     }
                 } else if let Some(ref method) = parsed.method {
                     // Event
-                    let event = CdpEvent {
+                    let mut event = CdpEvent {
                         method: method.clone(),
                         params: parsed.params.clone().unwrap_or(Value::Null),
                         session_id: parsed.session_id.clone(),
                     };
+                    if let Some(session) = event.session_id.as_deref() {
+                        if method == "Page.frameNavigated"
+                            && event.params["frame"]["parentId"]
+                                .as_str()
+                                .is_none_or(str::is_empty)
+                        {
+                            reset_page(&pages_clone, &event_tx_clone, session);
+                        }
+                        if method == "Page.screencastFrame" {
+                            event.params[activity::FRAME_GENERATION] =
+                                serde_json::json!(page_generation(&pages_clone, session));
+                        }
+                    }
+                    if method == "Target.detachedFromTarget" {
+                        if let Some(session) = event.params["sessionId"].as_str() {
+                            pages_clone
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .remove(session);
+                        }
+                    }
                     let routed = event.session_id.as_deref().is_some_and(|sid| {
                         let mut routes = private_clone.lock().unwrap_or_else(|e| e.into_inner());
                         match routes.get(sid) {
@@ -297,6 +355,7 @@ impl CdpClient {
             ws_tx,
             next_id: AtomicU64::new(1),
             pending,
+            page_generations,
             event_tx,
             raw_tx,
             private_sessions,
@@ -311,7 +370,20 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<Value, String> {
-        let mut pending = self.enqueue_command(method, params, session_id).await?;
+        self.send_command_from(method, params, session_id, InputSource::Agent)
+            .await
+    }
+
+    pub(crate) async fn send_command_from(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        source: InputSource,
+    ) -> Result<Value, String> {
+        let mut pending = self
+            .enqueue_command_from(method, params, session_id, source)
+            .await?;
         let response =
             tokio::time::timeout(std::time::Duration::from_secs(30), pending.acknowledgment())
                 .await
@@ -328,6 +400,25 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<PendingCommand, String> {
+        self.enqueue_command_from(method, params, session_id, InputSource::Agent)
+            .await
+    }
+
+    pub(crate) async fn enqueue_command_from(
+        &self,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        source: InputSource,
+    ) -> Result<PendingCommand, String> {
+        let observation = session_id.and_then(|session| {
+            activity::from_command(method, params.as_ref()?)
+                .map(|value| self.observe_activity(value, session, source))
+        });
+        let reset_page = (method == "Emulation.setDeviceMetricsOverride"
+            || method == "Emulation.clearDeviceMetricsOverride")
+            .then(|| session_id.map(String::from))
+            .flatten();
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
 
         let cmd = CdpCommand {
@@ -344,7 +435,14 @@ impl CdpClient {
 
         {
             let mut pending = self.pending.lock().await;
-            pending.insert(id, tx);
+            pending.insert(
+                id,
+                PendingResponse {
+                    sender: tx,
+                    activity: observation,
+                    reset_page,
+                },
+            );
         }
 
         // Cleans up the pending entry if this future is cancelled mid-await (#1528).
@@ -366,6 +464,21 @@ impl CdpClient {
             response: rx,
             guard,
         })
+    }
+
+    pub(crate) fn observe_activity(
+        &self,
+        value: Value,
+        session: &str,
+        source: InputSource,
+    ) -> ActivityObservation {
+        ActivityObservation::new(
+            value,
+            session,
+            page_generation(&self.page_generations, session),
+            source,
+            self.event_tx.clone(),
+        )
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {

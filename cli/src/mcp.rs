@@ -19,6 +19,9 @@
 //! Internal ambit_browser_control is intentionally not an MCP tool: the host
 //! must authorize the paused interaction and user before obtaining custody.
 //! Ordinary tools preserve browser_controlled_by_user and unknown outcomes.
+//! Native acknowledged pointer and typing/scrolling activity is streamed with
+//! the observed page identity; it never includes tool input text. Host viewport
+//! resize uses the same controller batch and sequence as human pointer input.
 //! Owned Windows Chrome uses the same private headless desktop and Job Object
 //! lifetime through MCP; headed and external-connection semantics are unchanged.
 

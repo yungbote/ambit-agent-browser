@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::activity::InputSource;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -40,7 +41,7 @@ impl ControlError {
         Self::new("browser_control_invalid", message)
     }
 
-    fn unknown() -> Self {
+    pub(crate) fn unknown() -> Self {
         Self::new("browser_control_outcome_unknown", "The browser did not acknowledge all input. Inspect the browser before releasing control; do not replay the input.")
     }
 }
@@ -224,7 +225,7 @@ async fn neutralize_held(client: &CdpClient, held: &mut HeldInputs) -> Result<()
             held.before_send(&session_id, &event);
             let (method, params) = input_command(event["type"].as_str().unwrap(), &event).unwrap();
             client
-                .send_command(method, Some(params), Some(&session_id))
+                .send_command_from(method, Some(params), Some(&session_id), InputSource::Human)
                 .await?;
         }
         Ok::<_, String>(())
@@ -234,6 +235,30 @@ async fn neutralize_held(client: &CdpClient, held: &mut HeldInputs) -> Result<()
         Ok(())
     } else {
         Err(ControlError::unknown())
+    }
+}
+
+/// Borrow the existing viewport owners only while a sequenced controller batch
+/// executes. Browser emulation and stream geometry keep their canonical paths.
+pub(crate) struct ControlViewport<'a> {
+    pub manager: &'a super::browser::BrowserManager,
+    pub geometry: &'a mut Option<(i32, i32, f64, bool)>,
+    pub stream: Option<&'a super::stream::StreamServer>,
+}
+
+impl ControlViewport<'_> {
+    async fn resize(&mut self, event: &Value) -> Result<(), String> {
+        let width = event["width"].as_i64().unwrap() as i32;
+        let height = event["height"].as_i64().unwrap() as i32;
+        let (_, _, scale, mobile) = self.geometry.unwrap_or((1280, 720, 1.0, false));
+        self.manager
+            .set_viewport(width, height, scale, mobile)
+            .await?;
+        *self.geometry = Some((width, height, scale, mobile));
+        if let Some(stream) = self.stream {
+            stream.set_viewport(width as u32, height as u32).await;
+        }
+        Ok(())
     }
 }
 
@@ -407,7 +432,7 @@ impl BrowserControl {
         self.stream_outcome_unknown = true;
         let pending = tokio::time::timeout(
             ACK_TIMEOUT,
-            client.enqueue_command(method, Some(params), session_id),
+            client.enqueue_command_from(method, Some(params), session_id, InputSource::Human),
         )
         .await
         .map_err(|_| ControlError::unknown())?
@@ -442,10 +467,20 @@ impl BrowserControl {
         .map_err(|_| ControlError::unknown())?
     }
 
+    #[cfg(test)]
     pub(crate) async fn execute(
         &mut self,
         request: ControlRequest,
         browser: Option<(&CdpClient, &str)>,
+    ) -> Result<Value, ControlError> {
+        self.execute_with_viewport(request, browser, None).await
+    }
+
+    pub(crate) async fn execute_with_viewport(
+        &mut self,
+        request: ControlRequest,
+        browser: Option<(&CdpClient, &str)>,
+        mut viewport: Option<ControlViewport<'_>>,
     ) -> Result<Value, ControlError> {
         let now = Instant::now();
         match request.op {
@@ -570,13 +605,26 @@ impl BrowserControl {
                             if Instant::now() >= deadline {
                                 return Err("Input deadline elapsed".to_string());
                             }
+                            if event["type"] == "viewport" {
+                                viewport
+                                    .as_mut()
+                                    .ok_or("Viewport control is unavailable")?
+                                    .resize(&event)
+                                    .await?;
+                                continue;
+                            }
                             lease.held.before_send(session_id, &event);
                             let (method, params) = lease
                                 .held
                                 .command(session_id, event["type"].as_str().unwrap(), &event, None)
                                 .unwrap();
                             client
-                                .send_command(method, Some(params), Some(session_id))
+                                .send_command_from(
+                                    method,
+                                    Some(params),
+                                    Some(session_id),
+                                    InputSource::Human,
+                                )
                                 .await?;
                             lease.held.acknowledged(session_id, &event);
                         }
@@ -660,6 +708,12 @@ fn number(
 
 fn validate_event(event: &Value) -> Result<(), ControlError> {
     match event.get("type").and_then(Value::as_str) {
+        Some("viewport") => {
+            fields(event, &["type", "width", "height"])?;
+            number(event, "width", 1.0, 32768.0, true, true)?;
+            number(event, "height", 1.0, 32768.0, true, true)?;
+            return Ok(());
+        }
         Some("input_mouse") => {
             fields(
                 event,
