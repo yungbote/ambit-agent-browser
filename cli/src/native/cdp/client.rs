@@ -470,8 +470,18 @@ impl CdpClient {
         page_generation(&self.page_generations, session)
     }
 
-    pub(crate) fn rotate_page_generation(&self, session: &str) {
-        reset_page(&self.page_generations, &self.event_tx, session);
+    pub(crate) fn rotate_observed_pages(&self, active_session: &str) {
+        let sessions = {
+            let mut pages = self
+                .page_generations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            pages.entry(active_session.to_string()).or_default();
+            pages.keys().cloned().collect::<Vec<_>>()
+        };
+        for session in sessions {
+            reset_page(&self.page_generations, &self.event_tx, &session);
+        }
     }
 
     pub(crate) fn observe_activity(

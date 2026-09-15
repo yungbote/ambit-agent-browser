@@ -521,7 +521,7 @@ impl BrowserControl {
                 });
                 self.needs_observation = true;
                 if let Some((client, session)) = browser {
-                    client.rotate_page_generation(session);
+                    client.rotate_observed_pages(session);
                 }
                 Ok(self.lease.as_ref().unwrap().response("controlled"))
             }
@@ -601,12 +601,17 @@ impl BrowserControl {
                         format!("Expected input sequence {}.", lease.last_sequence + 1),
                     ));
                 }
-                let (client, session_id) = browser.ok_or_else(|| {
-                    ControlError::new(
-                        "browser_control_unavailable",
-                        "The controlled browser is no longer connected.",
-                    )
-                })?;
+                let page_client = page.as_ref().and_then(|page| page.client());
+                let client = page_client
+                    .as_deref()
+                    .or(browser.map(|(client, _)| client))
+                    .ok_or_else(|| {
+                        ControlError::new(
+                            "browser_control_unavailable",
+                            "The controlled browser is no longer connected.",
+                        )
+                    })?;
+                let session_id = browser.map(|(_, session)| session).unwrap_or_default();
                 if !lease.held.accepts(
                     request
                         .events
@@ -619,7 +624,7 @@ impl BrowserControl {
                         "At most 256 inputs may be held at once.",
                     ));
                 }
-                if let Some(page) = page.as_ref() {
+                if let Some(page) = page.as_mut() {
                     page.validate_events(request.events.as_ref().unwrap())
                         .await
                         .map_err(ControlError::invalid)?;
@@ -634,12 +639,32 @@ impl BrowserControl {
                             if Instant::now() >= deadline {
                                 return Err("Input deadline elapsed".to_string());
                             }
-                            if matches!(event["type"].as_str(), Some("viewport" | "navigation")) {
+                            if matches!(
+                                event["type"].as_str(),
+                                Some("viewport" | "navigation" | "tab")
+                            ) {
+                                if event["type"] == "tab" {
+                                    neutralize_held(client, &mut lease.held)
+                                        .await
+                                        .map_err(|error| error.message)?;
+                                }
                                 page.as_mut()
                                     .ok_or("Browser page control is unavailable")?
                                     .apply(&event)
                                     .await?;
                                 continue;
+                            }
+                            let target = page.as_ref().and_then(|page| page.target());
+                            let (client, session_id) = if page.is_some() {
+                                target
+                                    .as_ref()
+                                    .map(|(client, session)| (client.as_ref(), session.as_str()))
+                                    .ok_or("The browser has no active page")?
+                            } else {
+                                (client, session_id)
+                            };
+                            if !lease.held.accepts(std::iter::once((session_id, &event))) {
+                                return Err("At most 256 inputs may be held at once.".to_string());
                             }
                             lease.held.before_send(session_id, &event);
                             let (method, params) = lease
@@ -736,6 +761,29 @@ fn number(
 
 fn validate_event(event: &Value) -> Result<(), ControlError> {
     match event.get("type").and_then(Value::as_str) {
+        Some("tab") => {
+            fields(event, &["type", "action", "tabId"])?;
+            one_of(event, "action", &["new", "select", "close"], true)?;
+            if event["action"] == "new" {
+                if event.get("tabId").is_some() {
+                    return Err(ControlError::invalid("A new tab has no prior tabId."));
+                }
+            } else {
+                let id = event["tabId"].as_str().ok_or_else(|| {
+                    ControlError::invalid("Tab selection and close require tabId.")
+                })?;
+                let number = id
+                    .strip_prefix('t')
+                    .and_then(|value| value.parse::<u32>().ok())
+                    .filter(|value| *value > 0);
+                if number.is_none_or(|value| format!("t{value}") != id) {
+                    return Err(ControlError::invalid(
+                        "tabId must be a stable t<N> identifier.",
+                    ));
+                }
+            }
+            return Ok(());
+        }
         Some("navigation") => {
             fields(event, &["type", "action", "url"])?;
             one_of(

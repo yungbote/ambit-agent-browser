@@ -99,6 +99,9 @@ async fn publish_url(
         message["canGoForward"] = json!(forward);
     }
     let _ = frame_tx.send(message.to_string());
+    let tabs = last_tabs.read().await.clone();
+    let _ = frame_tx
+        .send(json!({ "type": "tabs", "tabs": tabs, "timestamp": timestamp_ms() }).to_string());
 }
 
 /// Subscribes to the active page's CDP events and broadcasts stream updates.

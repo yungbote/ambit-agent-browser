@@ -1071,6 +1071,10 @@ impl DaemonState {
         if self.browser.is_none() {
             self.browser_control.lock().await.reset_browser();
         }
+        self.publish_stream_browser().await;
+    }
+
+    async fn publish_stream_browser(&self) {
         if let Some(ref slot) = self.stream_client {
             let mut guard = slot.write().await;
             *guard = self.browser.as_ref().map(|m| Arc::clone(&m.client));
@@ -1194,6 +1198,12 @@ impl DaemonState {
     }
 
     async fn apply_drained_events(&mut self, drained: DrainedEvents) -> Result<(), String> {
+        let observe_tabs = !drained.new_targets.is_empty()
+            || !drained.changed_targets.is_empty()
+            || !drained.destroyed_targets.is_empty()
+            || !drained.attached_page_sessions.is_empty();
+        let before_tabs =
+            observe_tabs.then(|| self.browser.as_ref().map(|browser| browser.tab_list()));
         // Popups and externally closed pages can change the active top-level
         // target without changing iframe topology. Refresh after either kind
         // of event so network capture stays scoped to the active page.
@@ -1545,6 +1555,11 @@ impl DaemonState {
 
         if active_frame_scope_changed {
             self.refresh_active_iframe_sessions().await;
+        }
+        if before_tabs
+            .is_some_and(|before| before != self.browser.as_ref().map(|browser| browser.tab_list()))
+        {
+            self.publish_stream_browser().await;
         }
 
         Ok(())
@@ -7214,9 +7229,58 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
 pub(crate) struct ControlPage<'a>(&'a mut DaemonState);
 
 impl ControlPage<'_> {
-    pub(crate) async fn validate_events(&self, events: &[Value]) -> Result<(), String> {
+    pub(crate) fn client(&self) -> Option<Arc<super::cdp::client::CdpClient>> {
+        self.0
+            .browser
+            .as_ref()
+            .map(|browser| browser.client.clone())
+    }
+
+    pub(crate) fn target(&self) -> Option<(Arc<super::cdp::client::CdpClient>, String)> {
+        let browser = self.0.browser.as_ref()?;
+        Some((
+            browser.client.clone(),
+            browser.active_session_id().ok()?.to_string(),
+        ))
+    }
+
+    pub(crate) async fn validate_events(&mut self, events: &[Value]) -> Result<(), String> {
+        self.0.drain_cdp_events_background().await?;
+        let mut tabs: HashSet<String> = self
+            .0
+            .browser
+            .as_ref()
+            .map(|browser| {
+                browser
+                    .tab_list()
+                    .iter()
+                    .filter_map(|tab| tab["tabId"].as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let mut created = 0usize;
         let filter = self.0.domain_filter.read().await;
         for event in events {
+            if event["type"] == "tab" {
+                match event["action"].as_str().unwrap() {
+                    "new" => created += 1,
+                    "select" => {
+                        if !tabs.contains(event["tabId"].as_str().unwrap()) {
+                            return Err("This browser tab is no longer open.".into());
+                        }
+                    }
+                    "close" => {
+                        if !tabs.contains(event["tabId"].as_str().unwrap()) {
+                            return Err("This browser tab is no longer open.".into());
+                        }
+                        if tabs.len() + created <= 1 {
+                            return Err("Cannot close the last tab".into());
+                        }
+                        tabs.remove(event["tabId"].as_str().unwrap());
+                    }
+                    _ => unreachable!(),
+                }
+            }
             if event["type"] == "navigation" && event["action"] == "navigate" {
                 let url = crate::commands::normalize_navigation_url(event["url"].as_str().unwrap());
                 if let Some(filter) = filter.as_ref() {
@@ -7228,7 +7292,32 @@ impl ControlPage<'_> {
     }
 
     pub(crate) async fn apply(&mut self, event: &Value) -> Result<(), String> {
-        if event["type"] == "viewport" {
+        if event["type"] == "tab" {
+            let before = self.target().map(|(_, session)| session);
+            match event["action"].as_str().unwrap() {
+                "new" => {
+                    handle_tab_new(&json!({}), self.0).await?;
+                }
+                "select" => {
+                    handle_tab_switch(&json!({ "tabId": event["tabId"] }), self.0).await?;
+                }
+                "close" => {
+                    handle_tab_close(&json!({ "tabId": event["tabId"] }), self.0).await?;
+                }
+                _ => unreachable!(),
+            }
+            if self.target().map(|(_, session)| session) != before {
+                if let Some((width, height, scale, mobile)) = self.0.viewport {
+                    handle_viewport(
+                        &json!({ "width": width, "height": height,
+                        "deviceScaleFactor": scale, "mobile": mobile }),
+                        self.0,
+                    )
+                    .await?;
+                }
+            }
+            self.0.publish_stream_browser().await;
+        } else if event["type"] == "viewport" {
             let (_, _, scale, mobile) = self.0.viewport.unwrap_or((1280, 720, 1.0, false));
             handle_viewport(
                 &json!({ "width": event["width"], "height": event["height"],

@@ -1725,22 +1725,24 @@ impl BrowserManager {
             return Err("Cannot close the last tab".to_string());
         }
 
+        let target_id = self.pages[target_index].target_id.clone();
+        let closed = self
+            .client
+            .send_command_typed::<_, Value>(
+                "Target.closeTarget",
+                &CloseTargetParams { target_id },
+                None,
+            )
+            .await?;
+        if closed.get("success").and_then(Value::as_bool) == Some(false) {
+            return Err("The browser did not close the requested tab".to_string());
+        }
         let page = self.pages.remove(target_index);
         self.update_active_page_after_removal(target_index);
         let closed_tab_id = page.tab_id;
         let closed_label = page.label.clone();
         let closed_target_id = page.target_id.clone();
         self.handle_bound_target_removed(&page.target_id, &page.url);
-        let _ = self
-            .client
-            .send_command_typed::<_, Value>(
-                "Target.closeTarget",
-                &CloseTargetParams {
-                    target_id: page.target_id,
-                },
-                None,
-            )
-            .await;
 
         let mut result = json!({
             "tabId": format_tab_id(closed_tab_id),

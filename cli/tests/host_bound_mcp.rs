@@ -306,3 +306,65 @@ fn host_human_handoff_requires_fresh_observation_and_rejects_old_image_coordinat
         false
     );
 }
+
+#[test]
+#[cfg(unix)]
+#[ignore = "requires AMBIT_TEST_CHROME_EXECUTABLE with working Chrome sandbox"]
+fn host_takeover_invalidates_previously_observed_background_tabs() {
+    let host = Host::new();
+    host.call(
+        "agent_browser_open",
+        json!({ "url": "data:text/html,<title>First tab</title>" }),
+    );
+    let second = host.call(
+        "agent_browser_tab_new",
+        json!({ "url": "data:text/html,<input id=field style=height:40px>" }),
+    );
+    let prior = host.capture(&second);
+    let second_id = second["structuredContent"]["response"]["data"]["tabId"].clone();
+    host.call("agent_browser_tab_switch", json!({ "tab": "t1" }));
+    let owner = uuid::Uuid::new_v4().to_string();
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 25000;
+    host.control(json!({ "op": "acquire", "controllerId": owner, "expiresAt": expires }));
+    host.control(json!({ "op": "input", "controllerId": owner, "sequence": 1, "events": [
+        { "type": "tab", "action": "select", "tabId": second_id },
+        { "type": "input_mouse", "eventType": "mousePressed", "x": 20, "y": 20, "button": "left", "buttons": 1, "clickCount": 1 },
+        { "type": "input_mouse", "eventType": "mouseReleased", "x": 20, "y": 20, "button": "left", "buttons": 0, "clickCount": 1 },
+        { "type": "input_keyboard", "eventType": "insertText", "text": "Changed second tab" }
+    ] }));
+    host.control(json!({ "op": "release", "controllerId": owner }));
+    let refresh = host.call("agent_browser_get_title", json!({}));
+    assert_eq!(
+        refresh["structuredContent"]["response"]["code"],
+        "browser_observation_required"
+    );
+    let current = host.capture(&refresh);
+    assert_eq!(current["page"]["targetId"], prior["page"]["targetId"]);
+    assert_eq!(current["page"]["loaderId"], prior["page"]["loaderId"]);
+    assert_eq!(
+        current["capture"]["coordinateSpace"]["geometrySha256"],
+        prior["capture"]["coordinateSpace"]["geometrySha256"]
+    );
+    assert_ne!(
+        current["page"]["pageGeneration"],
+        prior["page"]["pageGeneration"]
+    );
+    host.configure(Some(json!({ "targetId": prior["page"]["targetId"], "loaderId": prior["page"]["loaderId"],
+        "pageGeneration": prior["page"]["pageGeneration"], "geometrySha256": prior["capture"]["coordinateSpace"]["geometrySha256"] })));
+    let stale = host.call("agent_browser_mouse_move", json!({ "x": 20, "y": 20 }));
+    assert_eq!(
+        stale["structuredContent"]["response"]["code"],
+        "browser_observation_stale"
+    );
+    host.configure(None);
+    let read = host.call("agent_browser_get_value", json!({ "selector": "#field" }));
+    assert_eq!(
+        read["structuredContent"]["response"]["data"]["value"],
+        "Changed second tab"
+    );
+    host.call("agent_browser_close", json!({}));
+}

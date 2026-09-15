@@ -620,8 +620,24 @@ impl StreamServer {
         session_id: Option<String>,
         tabs: &[Value],
     ) {
+        let session_changed = *self.cdp_session_id.read().await != session_id;
+        if !session_changed {
+            let previous = self.last_tabs.read().await;
+            let same = previous.len() == tabs.len()
+                && previous.iter().zip(tabs).all(|(old, current)| {
+                    let mut old = old.clone();
+                    if let Some(fields) = old.as_object_mut() {
+                        fields.remove("canGoBack");
+                        fields.remove("canGoForward");
+                    }
+                    old == *current
+                });
+            if same {
+                return;
+            }
+        }
         let client = self.client_slot.read().await.clone();
-        let history = if let Some(client) = client {
+        let history = if let Some(client) = client.as_ref() {
             history_availability(&client, session_id.as_deref()).await
         } else {
             None
@@ -647,7 +663,17 @@ impl StreamServer {
         let _ = self.frame_tx.send(msg.to_string());
         drop(tabs_guard);
         drop(session_guard);
-        self.client_notify.notify_one();
+        if session_changed {
+            self.frame_watch.send_replace(None);
+            if let (Some(client), Some(session)) =
+                (client.as_ref(), self.cdp_session_id.read().await.as_deref())
+            {
+                let reset =
+                    crate::native::activity::reset(session, &client.page_generation(session));
+                let _ = self.frame_tx.send(reset.params.to_string());
+            }
+            self.client_notify.notify_one();
+        }
     }
 }
 
