@@ -198,6 +198,7 @@ impl Lease {
 #[derive(Default)]
 pub(crate) struct BrowserControl {
     lease: Option<Lease>,
+    needs_observation: bool,
     last_released: Option<Lease>,
     pending_stream: VecDeque<PendingStreamInput>,
     stream_held: HeldInputs,
@@ -263,6 +264,13 @@ impl ControlViewport<'_> {
 }
 
 impl BrowserControl {
+    pub(crate) fn needs_observation(&self) -> bool {
+        self.needs_observation
+    }
+    pub(crate) fn observed(&mut self) {
+        self.needs_observation = false;
+    }
+
     /// Stateful low-level agent input shares custody and held-input tracking
     /// with dashboard input. Complete gestures keep their interaction helpers.
     pub(crate) async fn agent_input(
@@ -352,6 +360,7 @@ impl BrowserControl {
     }
 
     pub(crate) fn reset_browser(&mut self) {
+        self.needs_observation = false;
         self.pending_stream.clear();
         self.stream_held = HeldInputs::default();
         self.stream_outcome_unknown = false;
@@ -531,6 +540,10 @@ impl BrowserControl {
                     outcome_unknown: false,
                     held: HeldInputs::default(),
                 });
+                self.needs_observation = true;
+                if let Some((client, session)) = browser {
+                    client.rotate_page_generation(session);
+                }
                 Ok(self.lease.as_ref().unwrap().response("controlled"))
             }
             Operation::Renew => {

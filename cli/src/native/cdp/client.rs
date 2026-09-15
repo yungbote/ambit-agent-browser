@@ -466,6 +466,14 @@ impl CdpClient {
         })
     }
 
+    pub(crate) fn page_generation(&self, session: &str) -> String {
+        page_generation(&self.page_generations, session)
+    }
+
+    pub(crate) fn rotate_page_generation(&self, session: &str) {
+        reset_page(&self.page_generations, &self.event_tx, session);
+    }
+
     pub(crate) fn observe_activity(
         &self,
         value: Value,

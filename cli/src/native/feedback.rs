@@ -23,6 +23,7 @@ const MAX_CAPTURE_PIXELS: u64 = 40_000_000;
 pub(crate) struct ObservationId {
     pub target_id: String,
     pub loader_id: String,
+    pub page_generation: String,
     pub geometry_sha256: String,
 }
 
@@ -81,6 +82,7 @@ async fn observe(state: &DaemonState) -> Result<Observation, &'static str> {
     let browser = state.browser.as_ref().ok_or("no_active_page")?;
     let session_id = browser.active_session_id().map_err(|_| "no_active_page")?;
     let target_id = browser.active_target_id().map_err(|_| "no_active_page")?;
+    let page_generation = browser.client.page_generation(session_id);
     let tree = browser
         .client
         .send_command_no_params("Page.getFrameTree", Some(session_id))
@@ -144,9 +146,10 @@ async fn observe(state: &DaemonState) -> Result<Observation, &'static str> {
         id: ObservationId {
             target_id: target_id.to_string(),
             loader_id: loader_id.to_string(),
+            page_generation: page_generation.clone(),
             geometry_sha256,
         },
-        page: json!({ "targetId": target_id, "loaderId": loader_id, "url": url,
+        page: json!({ "targetId": target_id, "loaderId": loader_id, "pageGeneration": page_generation, "url": url,
             "title": details["title"].as_str().unwrap_or_default() }),
         css_width,
         css_height,
@@ -265,4 +268,8 @@ pub(crate) async fn attach(request: &FeedbackRequest, response: &mut Value, stat
             Err(_) => request.unavailable("capture_timeout"),
         }
     };
+    let capture = &response["browser"]["capture"];
+    if capture.get("path").is_some() || capture["code"] == "no_active_page" {
+        state.browser_control.lock().await.observed();
+    }
 }

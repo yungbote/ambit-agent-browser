@@ -3541,13 +3541,15 @@ Usage: agent-browser mcp [--tools <profiles>]
 
 Host-bound mode reads version 1 JSON with namespace, session, requireSandbox
 (true), an existing absolute captureDirectory, and optional expectedObservation
-(targetId, loaderId, geometrySha256). It pins ambit-host-bound-v1 and publishes
+(targetId, loaderId, pageGeneration, geometrySha256). It pins ambit-host-bound-v1 and publishes
 its descriptor in experimental io.ambit/browser. Per-call host overrides and
 process-management tools are excluded. Browser auth and state stay available.
 Operations include a native viewport JPEG reference when capture succeeds;
 capture failure never replaces the primary outcome. The host owns admission
 of the file bytes. --describe-host-bound prints the full catalog without
 starting a browser. Host-bound calls are limited to 120000 milliseconds.
+After human control, browser_observation_required returns fresh feedback
+before another host-bound action. Earlier image pageGeneration values are stale.
 
 
 Starts a Model Context Protocol server over stdio. MCP clients launch this

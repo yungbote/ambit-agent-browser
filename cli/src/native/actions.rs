@@ -2536,9 +2536,15 @@ pub async fn execute_command(cmd: &Value, state: &mut DaemonState) -> Value {
         .as_object_mut()
         .unwrap()
         .remove(super::feedback::REQUEST_FIELD);
-    let controlled = state.browser_control.lock().await.agent_error();
+    let expiry_error = state.expire_browser_control().await.err();
+    let controlled = expiry_error.or(state.browser_control.lock().await.agent_error());
+    let requires_observation = state.browser_control.lock().await.needs_observation();
     let mut response = if let Some(error) = controlled {
         json!({ "id": command["id"], "success": false, "code": error.code, "error": error.message })
+    } else if requires_observation {
+        state.ref_map.clear();
+        state.active_frame_id = None;
+        json!({ "id": command["id"], "success": false, "code": "browser_observation_required", "error": "Browser control returned from the user. Inspect this fresh observation and choose the next action." })
     } else if !super::feedback::matches_expected(&request, state).await {
         json!({ "id": command["id"], "success": false, "code": "browser_observation_stale", "error": "The browser page or viewport changed since this image. Inspect the fresh observation before sending coordinates." })
     } else {
@@ -2615,6 +2621,9 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
             .is_ok_and(|data| data["status"] == "controlled" && cmd["op"] == "acquire")
         {
             state.reset_input_state();
+            if let Some(server) = state.stream_server.as_ref() {
+                server.notify_client_changed();
+            }
         }
         state.last_command_finished = Some(std::time::Instant::now());
         return match result {
