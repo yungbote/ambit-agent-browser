@@ -168,7 +168,7 @@ pub async fn take_screenshot(
     })
 }
 
-async fn capture_screenshot_base64(
+pub(crate) async fn capture_screenshot_base64(
     client: &CdpClient,
     session_id: &str,
     ref_map: &RefMap,
@@ -184,7 +184,7 @@ async fn capture_screenshot_base64(
         },
         clip: None,
         from_surface: Some(true),
-        capture_beyond_viewport: if options.full_page { Some(true) } else { None },
+        capture_beyond_viewport: Some(options.full_page),
     };
 
     if options.full_page {

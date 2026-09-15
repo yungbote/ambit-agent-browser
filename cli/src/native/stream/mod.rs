@@ -17,6 +17,7 @@ use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::sync::{broadcast, watch, Mutex, Notify, RwLock};
 
+use super::browser_control::BrowserControl;
 use super::cdp::client::CdpClient;
 
 /// Screencast encoding for the live stream, from `AGENT_BROWSER_STREAM_*`.
@@ -180,6 +181,7 @@ impl Default for FrameMetadata {
 }
 
 pub struct StreamServer {
+    pub(crate) browser_control: Arc<Mutex<BrowserControl>>,
     port: u16,
     session_name: String,
     frame_tx: broadcast::Sender<String>,
@@ -213,8 +215,15 @@ impl StreamServer {
     ) -> Result<Self, String> {
         let client_slot = Arc::new(RwLock::new(Some(client)));
         let idle_activity = Arc::new(IdleActivity::new());
-        let (server, _) =
-            Self::start_inner(preferred_port, client_slot, session_id, true, idle_activity).await?;
+        let (server, _) = Self::start_inner(
+            preferred_port,
+            client_slot,
+            session_id,
+            true,
+            idle_activity,
+            Arc::new(Mutex::new(BrowserControl::default())),
+        )
+        .await?;
         Ok(server)
     }
 
@@ -231,6 +240,23 @@ impl StreamServer {
         allow_port_fallback: bool,
         idle_activity: Arc<IdleActivity>,
     ) -> Result<(Self, Arc<RwLock<Option<Arc<CdpClient>>>>), String> {
+        Self::start_with_control(
+            preferred_port,
+            session_id,
+            allow_port_fallback,
+            idle_activity,
+            Arc::new(Mutex::new(BrowserControl::default())),
+        )
+        .await
+    }
+
+    pub(crate) async fn start_with_control(
+        preferred_port: u16,
+        session_id: String,
+        allow_port_fallback: bool,
+        idle_activity: Arc<IdleActivity>,
+        browser_control: Arc<Mutex<BrowserControl>>,
+    ) -> Result<(Self, Arc<RwLock<Option<Arc<CdpClient>>>>), String> {
         let client_slot = Arc::new(RwLock::new(None::<Arc<CdpClient>>));
         Self::start_inner(
             preferred_port,
@@ -238,6 +264,7 @@ impl StreamServer {
             session_id,
             allow_port_fallback,
             idle_activity,
+            browser_control,
         )
         .await
     }
@@ -308,6 +335,7 @@ impl StreamServer {
         session_id: String,
         allow_port_fallback: bool,
         idle_activity: Arc<IdleActivity>,
+        browser_control: Arc<Mutex<BrowserControl>>,
     ) -> Result<(Self, Arc<RwLock<Option<Arc<CdpClient>>>>), String> {
         let addr = format!("127.0.0.1:{}", preferred_port);
         let listener = match TcpListener::bind(&addr).await {
@@ -344,6 +372,7 @@ impl StreamServer {
         let client_slot_clone = client_slot.clone();
         let notify_clone = client_notify.clone();
         let idle_activity_clone = idle_activity.clone();
+        let browser_control_clone = browser_control.clone();
         let screencasting_clone = screencasting.clone();
         let cdp_session_clone = cdp_session_id.clone();
 
@@ -364,6 +393,7 @@ impl StreamServer {
                 client_slot_clone,
                 notify_clone,
                 idle_activity_clone,
+                browser_control_clone,
                 screencasting_clone,
                 cdp_session_clone,
                 vw_clone,
@@ -412,6 +442,7 @@ impl StreamServer {
 
         Ok((
             Self {
+                browser_control,
                 port,
                 session_name: session_id,
                 frame_tx,

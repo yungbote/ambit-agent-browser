@@ -15,8 +15,17 @@
 //! keeps NetworkServiceInProcess disabled after plugin launch mutations.
 //! Command delivery uses the same CLI transport: once sending is attempted,
 //! lost/invalid responses report an unknown outcome without automatic replay.
+//! Human browser custody is enforced by the same daemon for CLI and MCP.
+//! Internal ambit_browser_control is intentionally not an MCP tool: the host
+//! must authorize the paused interaction and user before obtaining custody.
+//! Ordinary tools preserve browser_controlled_by_user and unknown outcomes.
+//! Native acknowledged pointer and typing/scrolling activity is streamed with
+//! the observed page identity; it never includes tool input text. Host viewport
+//! resize uses the same controller batch and sequence as human pointer input.
 //! Owned Windows Chrome uses the same private headless desktop and Job Object
 //! lifetime through MCP; headed and external-connection semantics are unchanged.
+
+mod host_bound;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
@@ -214,6 +223,17 @@ impl ProtocolError {
     }
 }
 
+/// Argument preparation is separate from execution so host binding can act at
+/// one boundary without passing mutable authority through every tool helper.
+#[derive(Debug)]
+struct CliInvocation {
+    cli_args: Vec<String>,
+    command_args: Vec<String>,
+    global_args: Vec<String>,
+    stdin_body: Option<String>,
+    timeout_ms: u64,
+}
+
 #[derive(Debug)]
 struct CliRun {
     exit_code: Option<i32>,
@@ -225,6 +245,7 @@ struct CliRun {
 struct McpConfig {
     profiles: Vec<ToolProfile>,
     enabled_tools: Option<BTreeSet<&'static str>>,
+    host: Option<host_bound::HostBinding>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,6 +326,7 @@ impl McpConfig {
             return Self {
                 profiles: vec![ToolProfile::All],
                 enabled_tools: None,
+                host: None,
             };
         }
 
@@ -316,6 +338,7 @@ impl McpConfig {
         Self {
             profiles,
             enabled_tools: Some(enabled_tools),
+            host: None,
         }
     }
 
@@ -329,6 +352,9 @@ impl McpConfig {
     }
 
     fn allows(&self, name: &str) -> bool {
+        if self.host.is_some() {
+            return host_bound::allows(name);
+        }
         match &self.enabled_tools {
             Some(enabled_tools) => enabled_tools.contains(name),
             None => true,
@@ -336,6 +362,9 @@ impl McpConfig {
     }
 
     fn profile_names(&self) -> Vec<&'static str> {
+        if self.host.is_some() {
+            return vec![host_bound::PROFILE];
+        }
         self.profiles.iter().map(|profile| profile.name()).collect()
     }
 }
@@ -518,7 +547,22 @@ const MOBILE_PROFILE_TOOLS: &[&str] = &[
 /// Run the MCP stdio server until stdin closes or a `shutdown` request is
 /// received.
 pub fn run_mcp(args: &[String]) -> Result<(), String> {
-    let config = parse_mcp_config(args)?;
+    if args == ["--describe-host-bound"] {
+        write_json_line(&mut io::stdout(), &host_bound::descriptor())
+            .map_err(|error| error.to_string())?;
+        return Ok(());
+    }
+    let config = if args.first().is_some_and(|arg| arg == "--host-bound-config") {
+        if args.len() != 2 {
+            return Err("Usage: agent-browser mcp --host-bound-config <path>".to_string());
+        }
+        McpConfig {
+            host: Some(host_bound::HostBinding::load(&args[1])?),
+            ..McpConfig::default()
+        }
+    } else {
+        parse_mcp_config(args)?
+    };
     let stdin = io::stdin();
     let mut stdout = io::stdout();
 
@@ -694,7 +738,7 @@ fn initialize_result(params: Option<&Value>, config: &McpConfig) -> Value {
         PROTOCOL_VERSION
     };
 
-    json!({
+    let mut result = json!({
         "protocolVersion": protocol_version,
         "capabilities": {
             "tools": {}
@@ -708,10 +752,20 @@ fn initialize_result(params: Option<&Value>, config: &McpConfig) -> Value {
             "Use the typed agent_browser_* tools to control a browser. Active MCP tools profile(s): {}. Prefer agent_browser_snapshot after navigation to obtain stable element refs before clicking or typing. Use agent_browser_tools_profiles to see available startup profiles.",
             config.profile_names().join(", ")
         )
-    })
+    });
+    if config.host.is_some() {
+        let mut descriptor = host_bound::descriptor();
+        descriptor.as_object_mut().unwrap().remove("tools");
+        result["capabilities"]["experimental"] = json!({ "io.ambit/browser": descriptor });
+        result["instructions"] = json!("Use the typed browser tools in the host-assigned browser session. Each operation returns its outcome and a current viewport capture when available. Coordinates use viewport CSS pixels. Human control temporarily prevents agent operations.");
+    }
+    result
 }
 
 fn tools_for_config(config: &McpConfig) -> Vec<Value> {
+    if config.host.is_some() {
+        return host_bound::tools();
+    }
     tools()
         .into_iter()
         .filter(|tool| {
@@ -2205,8 +2259,26 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
         )));
     }
 
+    if let Some(host) = config.host.as_ref() {
+        return host.call(name, arguments);
+    }
+    if name == TOOL_TOOLS_PROFILES {
+        return call_tools_profiles(config);
+    }
+    let invocation = prepare_tool(name, arguments)?;
+    let run = run_cli(
+        &invocation.cli_args,
+        invocation.stdin_body,
+        invocation.timeout_ms,
+    )
+    .map_err(|error| {
+        ProtocolError::invalid_params(format!("Failed to run agent-browser: {}", error))
+    })?;
+    Ok(tool_result_from_run(run))
+}
+
+fn prepare_tool(name: &str, arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     match name {
-        TOOL_TOOLS_PROFILES => call_tools_profiles(config),
         TOOL_OPEN => call_open(arguments),
         TOOL_READ => call_read(arguments),
         TOOL_SNAPSHOT => call_snapshot(arguments),
@@ -2427,18 +2499,35 @@ fn call_cli_tool(
     arguments: &Value,
     command_args: Vec<String>,
     stdin_body: Option<String>,
-) -> Result<Value, ProtocolError> {
+) -> Result<CliInvocation, ProtocolError> {
+    prepare_cli_tool(arguments, Vec::new(), command_args, stdin_body)
+}
+
+fn prepare_cli_tool(
+    arguments: &Value,
+    command_globals: Vec<String>,
+    command_args: Vec<String>,
+    stdin_body: Option<String>,
+) -> Result<CliInvocation, ProtocolError> {
     validate_arguments_object(arguments)?;
     let session = optional_string(arguments, "session")?;
     let timeout_ms = optional_timeout(arguments)?;
-    let cli_args = cli_tool_args(arguments, command_args, session.as_deref())?;
-
-    let run = run_cli(&cli_args, stdin_body, timeout_ms).map_err(|e| {
-        ProtocolError::invalid_params(format!("Failed to run agent-browser: {}", e))
-    })?;
-    Ok(tool_result_from_run(run))
+    let mut global_args = vec!["--json".to_string()];
+    append_common_global_args(&mut global_args, arguments, session.as_deref())?;
+    global_args.extend(command_globals);
+    let mut cli_args = global_args.clone();
+    cli_args.extend(command_args.clone());
+    cli_args.extend(optional_string_array(arguments, "extraArgs")?.unwrap_or_default());
+    Ok(CliInvocation {
+        cli_args,
+        command_args,
+        global_args,
+        stdin_body,
+        timeout_ms,
+    })
 }
 
+#[cfg(test)]
 fn cli_tool_args(
     arguments: &Value,
     command_args: Vec<String>,
@@ -2459,7 +2548,7 @@ fn command_parts(command: &str) -> Vec<String> {
         .collect()
 }
 
-fn call_literal(arguments: &Value, parts: &[&str]) -> Result<Value, ProtocolError> {
+fn call_literal(arguments: &Value, parts: &[&str]) -> Result<CliInvocation, ProtocolError> {
     call_cli_tool(
         arguments,
         parts.iter().map(|s| s.to_string()).collect(),
@@ -2467,13 +2556,17 @@ fn call_literal(arguments: &Value, parts: &[&str]) -> Result<Value, ProtocolErro
     )
 }
 
-fn call_one_string(arguments: &Value, command: &str, key: &str) -> Result<Value, ProtocolError> {
+fn call_one_string(
+    arguments: &Value,
+    command: &str,
+    key: &str,
+) -> Result<CliInvocation, ProtocolError> {
     let mut args = command_parts(command);
     args.push(required_string(arguments, key)?);
     call_cli_tool(arguments, args, None)
 }
 
-fn call_connect(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_connect(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["connect".to_string()];
     args.push(required_string(arguments, "target")?);
     match arguments.get("pinTab").and_then(|v| v.as_bool()) {
@@ -2484,7 +2577,11 @@ fn call_connect(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_optional_one(arguments: &Value, parts: &[&str], key: &str) -> Result<Value, ProtocolError> {
+fn call_optional_one(
+    arguments: &Value,
+    parts: &[&str],
+    key: &str,
+) -> Result<CliInvocation, ProtocolError> {
     let mut args: Vec<String> = parts.iter().map(|s| s.to_string()).collect();
     if let Some(value) = optional_string(arguments, key)? {
         if !value.is_empty() {
@@ -2494,12 +2591,12 @@ fn call_optional_one(arguments: &Value, parts: &[&str], key: &str) -> Result<Val
     call_cli_tool(arguments, args, None)
 }
 
-fn call_key_command(arguments: &Value, command: &str) -> Result<Value, ProtocolError> {
+fn call_key_command(arguments: &Value, command: &str) -> Result<CliInvocation, ProtocolError> {
     let key = required_string(arguments, "key")?;
     call_cli_tool(arguments, vec![command.to_string(), key], None)
 }
 
-fn call_keyboard(arguments: &Value, subcommand: &str) -> Result<Value, ProtocolError> {
+fn call_keyboard(arguments: &Value, subcommand: &str) -> Result<CliInvocation, ProtocolError> {
     let text = required_string(arguments, "text")?;
     call_cli_tool(
         arguments,
@@ -2535,12 +2632,17 @@ fn open_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     Ok(args)
 }
 
-fn call_open(arguments: &Value) -> Result<Value, ProtocolError> {
-    let args = open_args(arguments)?;
-    call_cli_tool(arguments, args, None)
+fn call_open(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
+    let mut args = open_args(arguments)?;
+    let command_index = args
+        .iter()
+        .position(|arg| arg == "open")
+        .expect("open_args always emits its command token after boolean flags");
+    let command_args = args.split_off(command_index);
+    prepare_cli_tool(arguments, args, command_args, None)
 }
 
-fn call_webmcp_invoke(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_webmcp_invoke(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     call_cli_tool(arguments, webmcp_invoke_args(arguments)?, None)
 }
 
@@ -2568,7 +2670,7 @@ fn webmcp_invoke_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     Ok(args)
 }
 
-fn call_webmcp_result(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_webmcp_result(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     call_cli_tool(arguments, webmcp_result_args(arguments)?, None)
 }
 
@@ -2582,7 +2684,7 @@ fn webmcp_result_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     Ok(args)
 }
 
-fn call_read(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_read(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["read".to_string()];
     if optional_bool(arguments, "raw")?.unwrap_or(false) {
         args.push("--raw".to_string());
@@ -2611,7 +2713,7 @@ fn call_read(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_snapshot(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_snapshot(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["snapshot".to_string()];
     if optional_bool(arguments, "interactive")?.unwrap_or(true) {
         args.push("-i".to_string());
@@ -2634,7 +2736,7 @@ fn call_snapshot(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_simple_selector(arguments: &Value, command: &str) -> Result<Value, ProtocolError> {
+fn call_simple_selector(arguments: &Value, command: &str) -> Result<CliInvocation, ProtocolError> {
     let selector = required_string(arguments, "selector")?;
     call_cli_tool(arguments, vec![command.to_string(), selector], None)
 }
@@ -2648,17 +2750,17 @@ fn click_command_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     Ok(args)
 }
 
-fn call_click(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_click(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     call_cli_tool(arguments, click_command_args(arguments)?, None)
 }
 
-fn call_fill(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_fill(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let selector = required_string(arguments, "selector")?;
     let text = required_string(arguments, "text")?;
     call_cli_tool(arguments, vec!["fill".to_string(), selector, text], None)
 }
 
-fn call_type(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_type(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let selector = required_string(arguments, "selector")?;
     let text = required_string(arguments, "text")?;
     let mut args = vec!["type".to_string(), selector, text];
@@ -2672,18 +2774,18 @@ fn call_type(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_press(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_press(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let key = required_string(arguments, "key")?;
     call_cli_tool(arguments, vec!["press".to_string(), key], None)
 }
 
-fn call_drag(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_drag(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let source = required_string(arguments, "source")?;
     let target = required_string(arguments, "target")?;
     call_cli_tool(arguments, vec!["drag".to_string(), source, target], None)
 }
 
-fn call_upload(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_upload(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let selector = required_string(arguments, "selector")?;
     let files = required_string_array(arguments, "files")?;
     let mut args = vec!["upload".to_string(), selector];
@@ -2691,7 +2793,7 @@ fn call_upload(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_download(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_download(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let selector = required_string(arguments, "selector")?;
     let path = required_string(arguments, "path")?;
     call_cli_tool(
@@ -2701,7 +2803,7 @@ fn call_download(arguments: &Value) -> Result<Value, ProtocolError> {
     )
 }
 
-fn call_select(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_select(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let selector = required_string(arguments, "selector")?;
     let values = required_string_array(arguments, "values")?;
     let mut args = vec!["select".to_string(), selector];
@@ -2709,7 +2811,7 @@ fn call_select(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_scroll(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_scroll(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let direction = optional_string(arguments, "direction")?.unwrap_or_else(|| "down".to_string());
     let amount = optional_i64(arguments, "amount")?.unwrap_or(300);
     let mut args = vec!["scroll".to_string(), direction, amount.to_string()];
@@ -2720,7 +2822,7 @@ fn call_scroll(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_wait_ms(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_wait_ms(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let ms = required_u64(arguments, "ms")?;
     call_cli_tool(arguments, vec!["wait".to_string(), ms.to_string()], None)
 }
@@ -2729,7 +2831,7 @@ fn call_wait_flag(
     arguments: &Value,
     flag: Option<&str>,
     value_key: &str,
-) -> Result<Value, ProtocolError> {
+) -> Result<CliInvocation, ProtocolError> {
     let value = required_string(arguments, value_key)?;
     let mut args = vec!["wait".to_string()];
     if let Some(flag) = flag {
@@ -2745,7 +2847,7 @@ fn call_wait_flag(
     call_cli_tool(arguments, args, None)
 }
 
-fn call_wait_download(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_wait_download(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["wait".to_string(), "--download".to_string()];
     if let Some(path) = optional_string(arguments, "path")? {
         args.push(path);
@@ -2757,25 +2859,25 @@ fn call_wait_download(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_screenshot(arguments: &Value) -> Result<Value, ProtocolError> {
-    let mut args = Vec::new();
+fn call_screenshot(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
+    let mut global_args = Vec::new();
     if optional_bool(arguments, "annotate")?.unwrap_or(false) {
-        args.push("--annotate".to_string());
+        global_args.push("--annotate".to_string());
     }
     if let Some(format) = optional_string(arguments, "format")? {
-        args.push("--screenshot-format".to_string());
-        args.push(format);
+        global_args.push("--screenshot-format".to_string());
+        global_args.push(format);
     }
     if let Some(quality) = optional_u64(arguments, "quality")? {
-        args.push("--screenshot-quality".to_string());
-        args.push(quality.to_string());
+        global_args.push("--screenshot-quality".to_string());
+        global_args.push(quality.to_string());
     }
     if let Some(dir) = optional_string(arguments, "screenshotDir")? {
-        args.push("--screenshot-dir".to_string());
-        args.push(dir);
+        global_args.push("--screenshot-dir".to_string());
+        global_args.push(dir);
     }
 
-    args.push("screenshot".to_string());
+    let mut args = vec!["screenshot".to_string()];
     if let Some(selector) = optional_string(arguments, "selector")? {
         args.push(selector);
     }
@@ -2785,10 +2887,10 @@ fn call_screenshot(arguments: &Value) -> Result<Value, ProtocolError> {
     if optional_bool(arguments, "fullPage")?.unwrap_or(false) {
         args.push("--full".to_string());
     }
-    call_cli_tool(arguments, args, None)
+    prepare_cli_tool(arguments, global_args, args, None)
 }
 
-fn call_get_selector(arguments: &Value, what: &str) -> Result<Value, ProtocolError> {
+fn call_get_selector(arguments: &Value, what: &str) -> Result<CliInvocation, ProtocolError> {
     let selector = required_string(arguments, "selector")?;
     call_cli_tool(
         arguments,
@@ -2797,7 +2899,7 @@ fn call_get_selector(arguments: &Value, what: &str) -> Result<Value, ProtocolErr
     )
 }
 
-fn call_get_attr(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_get_attr(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let selector = required_string(arguments, "selector")?;
     let name = required_string(arguments, "name")?;
     call_cli_tool(
@@ -2807,7 +2909,7 @@ fn call_get_attr(arguments: &Value) -> Result<Value, ProtocolError> {
     )
 }
 
-fn call_is(arguments: &Value, what: &str) -> Result<Value, ProtocolError> {
+fn call_is(arguments: &Value, what: &str) -> Result<CliInvocation, ProtocolError> {
     let selector = required_string(arguments, "selector")?;
     call_cli_tool(
         arguments,
@@ -2816,7 +2918,7 @@ fn call_is(arguments: &Value, what: &str) -> Result<Value, ProtocolError> {
     )
 }
 
-fn call_find(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_find(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let locator = required_string(arguments, "locator")?;
     let value = required_string(arguments, "value")?;
     let mut args = vec!["find".to_string(), locator.clone()];
@@ -2847,7 +2949,7 @@ fn call_find(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_mouse_move(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_mouse_move(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let x = required_number_string(arguments, "x")?;
     let y = required_number_string(arguments, "y")?;
     call_cli_tool(
@@ -2857,7 +2959,7 @@ fn call_mouse_move(arguments: &Value) -> Result<Value, ProtocolError> {
     )
 }
 
-fn call_mouse_button(arguments: &Value, action: &str) -> Result<Value, ProtocolError> {
+fn call_mouse_button(arguments: &Value, action: &str) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["mouse".to_string(), action.to_string()];
     if let Some(button) = optional_string(arguments, "button")? {
         args.push(button);
@@ -2865,7 +2967,7 @@ fn call_mouse_button(arguments: &Value, action: &str) -> Result<Value, ProtocolE
     call_cli_tool(arguments, args, None)
 }
 
-fn call_mouse_wheel(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_mouse_wheel(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let dy = required_number_string(arguments, "dy")?;
     let dx = optional_number_string(arguments, "dx")?;
     let mut args = vec!["mouse".to_string(), "wheel".to_string(), dy];
@@ -2875,7 +2977,7 @@ fn call_mouse_wheel(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_set_viewport(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_set_viewport(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let width = required_u64(arguments, "width")?;
     let height = required_u64(arguments, "height")?;
     let mut args = vec![
@@ -2890,7 +2992,7 @@ fn call_set_viewport(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_set_geo(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_set_geo(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let latitude = required_number_string(arguments, "latitude")?;
     let longitude = required_number_string(arguments, "longitude")?;
     call_cli_tool(
@@ -2900,7 +3002,11 @@ fn call_set_geo(arguments: &Value) -> Result<Value, ProtocolError> {
     )
 }
 
-fn call_set_bool(arguments: &Value, setting: &str, key: &str) -> Result<Value, ProtocolError> {
+fn call_set_bool(
+    arguments: &Value,
+    setting: &str,
+    key: &str,
+) -> Result<CliInvocation, ProtocolError> {
     let enabled = optional_bool(arguments, key)?.unwrap_or(true);
     call_cli_tool(
         arguments,
@@ -2913,7 +3019,7 @@ fn call_set_bool(arguments: &Value, setting: &str, key: &str) -> Result<Value, P
     )
 }
 
-fn call_set_headers(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_set_headers(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let headers = optional_value(arguments, "headers")?
         .ok_or_else(|| ProtocolError::invalid_params("headers must be an object"))?;
     let headers_json = serde_json::to_string(headers)
@@ -2925,7 +3031,7 @@ fn call_set_headers(arguments: &Value) -> Result<Value, ProtocolError> {
     )
 }
 
-fn call_set_credentials(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_set_credentials(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let username = required_string(arguments, "username")?;
     let password = required_string(arguments, "password")?;
     call_cli_tool(
@@ -2940,7 +3046,7 @@ fn call_set_credentials(arguments: &Value) -> Result<Value, ProtocolError> {
     )
 }
 
-fn call_set_media(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_set_media(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     call_cli_tool(arguments, set_media_args(arguments)?, None)
 }
 
@@ -2971,7 +3077,7 @@ fn set_media_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     Ok(args)
 }
 
-fn call_network_route(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_network_route(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let url = required_string(arguments, "url")?;
     let mut args = vec!["network".to_string(), "route".to_string(), url];
     if optional_bool(arguments, "abort")?.unwrap_or(false) {
@@ -2988,7 +3094,7 @@ fn call_network_route(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_network_requests(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_network_requests(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["network".to_string(), "requests".to_string()];
     if optional_bool(arguments, "clear")?.unwrap_or(false) {
         args.push("--clear".to_string());
@@ -3007,7 +3113,7 @@ fn call_network_requests(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_storage_get(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_storage_get(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let storage_type = required_string(arguments, "storageType")?;
     let mut args = vec!["storage".to_string(), storage_type, "get".to_string()];
     if let Some(key) = optional_string(arguments, "key")? {
@@ -3016,7 +3122,7 @@ fn call_storage_get(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_storage_set(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_storage_set(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let storage_type = required_string(arguments, "storageType")?;
     let key = required_string(arguments, "key")?;
     let value = required_string(arguments, "value")?;
@@ -3033,7 +3139,7 @@ fn call_storage_set(arguments: &Value) -> Result<Value, ProtocolError> {
     )
 }
 
-fn call_storage_clear(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_storage_clear(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let storage_type = required_string(arguments, "storageType")?;
     call_cli_tool(
         arguments,
@@ -3042,7 +3148,7 @@ fn call_storage_clear(arguments: &Value) -> Result<Value, ProtocolError> {
     )
 }
 
-fn call_cookies_set(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_cookies_set(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let name = required_string(arguments, "name")?;
     let value = required_string(arguments, "value")?;
     let mut args = vec!["cookies".to_string(), "set".to_string(), name, value];
@@ -3070,7 +3176,7 @@ fn call_cookies_set(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_cookies_set_curl(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_cookies_set_curl(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let file = required_string(arguments, "file")?;
     let mut args = vec![
         "cookies".to_string(),
@@ -3089,7 +3195,7 @@ fn call_cookies_set_curl(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_tab_new(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_tab_new(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["tab".to_string(), "new".to_string()];
     if let Some(url) = optional_string(arguments, "url")? {
         args.push(url);
@@ -3101,7 +3207,7 @@ fn call_tab_new(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_profiler_start(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_profiler_start(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["profiler".to_string(), "start".to_string()];
     if let Some(categories) = optional_string(arguments, "categories")? {
         args.push("--categories".to_string());
@@ -3123,12 +3229,12 @@ fn record_command_args(arguments: &Value, action: &str) -> Result<Vec<String>, P
     Ok(args)
 }
 
-fn call_record_start(arguments: &Value, action: &str) -> Result<Value, ProtocolError> {
+fn call_record_start(arguments: &Value, action: &str) -> Result<CliInvocation, ProtocolError> {
     let args = record_command_args(arguments, action)?;
     call_cli_tool(arguments, args, None)
 }
 
-fn call_clearable(arguments: &Value, command: &str) -> Result<Value, ProtocolError> {
+fn call_clearable(arguments: &Value, command: &str) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec![command.to_string()];
     if optional_bool(arguments, "clear")?.unwrap_or(false) {
         args.push("--clear".to_string());
@@ -3136,7 +3242,7 @@ fn call_clearable(arguments: &Value, command: &str) -> Result<Value, ProtocolErr
     call_cli_tool(arguments, args, None)
 }
 
-fn call_auth_save(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_auth_save(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let name = required_string(arguments, "name")?;
     let url = required_string(arguments, "url")?;
     let username = required_string(arguments, "username")?;
@@ -3163,7 +3269,7 @@ fn call_auth_save(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, Some(password))
 }
 
-fn call_state_clear(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_state_clear(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["state".to_string(), "clear".to_string()];
     if optional_bool(arguments, "all")?.unwrap_or(false) {
         args.push("--all".to_string());
@@ -3174,7 +3280,7 @@ fn call_state_clear(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_state_clean(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_state_clean(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let days = required_u64(arguments, "olderThanDays")?;
     call_cli_tool(
         arguments,
@@ -3188,7 +3294,7 @@ fn call_state_clean(arguments: &Value) -> Result<Value, ProtocolError> {
     )
 }
 
-fn call_state_rename(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_state_rename(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let old_name = required_string(arguments, "oldName")?;
     let new_name = required_string(arguments, "newName")?;
     call_cli_tool(
@@ -3203,7 +3309,7 @@ fn call_state_rename(arguments: &Value) -> Result<Value, ProtocolError> {
     )
 }
 
-fn call_session_id(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_session_id(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec![
         "session".to_string(),
         "id".to_string(),
@@ -3220,7 +3326,7 @@ fn call_session_id(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_swipe(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_swipe(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let direction = required_string(arguments, "direction")?;
     let mut args = vec!["swipe".to_string(), direction];
     if let Some(amount) = optional_u64(arguments, "amount")? {
@@ -3229,13 +3335,13 @@ fn call_swipe(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_device(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_device(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let action = optional_string(arguments, "action")?.unwrap_or_else(|| "list".to_string());
     let args = vec!["device".to_string(), action];
     call_cli_tool(arguments, args, None)
 }
 
-fn call_diff_snapshot(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_diff_snapshot(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["diff".to_string(), "snapshot".to_string()];
     if let Some(baseline) = optional_string(arguments, "baseline")? {
         args.push("--baseline".to_string());
@@ -3255,7 +3361,7 @@ fn call_diff_snapshot(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_diff_screenshot(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_diff_screenshot(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["diff".to_string(), "screenshot".to_string()];
     for (key, flag) in [
         ("baseline", "--baseline"),
@@ -3277,7 +3383,7 @@ fn call_diff_screenshot(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_diff_url(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_diff_url(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let url1 = required_string(arguments, "url1")?;
     let url2 = required_string(arguments, "url2")?;
     let mut args = vec!["diff".to_string(), "url".to_string(), url1, url2];
@@ -3305,7 +3411,7 @@ fn call_diff_url(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_batch(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_batch(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let commands_value = optional_value(arguments, "commands")?
         .ok_or_else(|| ProtocolError::invalid_params("commands must be an array"))?;
     let commands = commands_value
@@ -3340,20 +3446,20 @@ fn call_batch(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, Some(stdin))
 }
 
-fn call_react_tree(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_react_tree(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["react".to_string(), "tree".to_string()];
     append_react_raw_json_arg(arguments, &mut args)?;
     call_cli_tool(arguments, args, None)
 }
 
-fn call_react_inspect(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_react_inspect(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let id = required_u64(arguments, "id")?;
     let mut args = vec!["react".to_string(), "inspect".to_string(), id.to_string()];
     append_react_raw_json_arg(arguments, &mut args)?;
     call_cli_tool(arguments, args, None)
 }
 
-fn call_react_renders_start(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_react_renders_start(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec![
         "react".to_string(),
         "renders".to_string(),
@@ -3363,7 +3469,7 @@ fn call_react_renders_start(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_react_renders_stop(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_react_renders_stop(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec![
         "react".to_string(),
         "renders".to_string(),
@@ -3373,7 +3479,7 @@ fn call_react_renders_stop(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_react_suspense(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_react_suspense(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["react".to_string(), "suspense".to_string()];
     if optional_bool(arguments, "onlyDynamic")?.unwrap_or(false) {
         args.push("--only-dynamic".to_string());
@@ -3392,7 +3498,7 @@ fn append_react_raw_json_arg(
     Ok(())
 }
 
-fn call_vitals(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_vitals(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["vitals".to_string()];
     if optional_bool(arguments, "json")?.unwrap_or(false) {
         args.push("--json".to_string());
@@ -3403,7 +3509,7 @@ fn call_vitals(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_a11y(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_a11y(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["a11y".to_string()];
     if let Some(url) = optional_string(arguments, "url")? {
         args.push(url);
@@ -3422,7 +3528,7 @@ fn call_a11y(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_stream_enable(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_stream_enable(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["stream".to_string(), "enable".to_string()];
     if let Some(port) = optional_u64(arguments, "port")? {
         args.push("--port".to_string());
@@ -3431,7 +3537,7 @@ fn call_stream_enable(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_skills_get(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_skills_get(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["skills".to_string(), "get".to_string()];
     if optional_bool(arguments, "all")?.unwrap_or(false) {
         args.push("--all".to_string());
@@ -3445,7 +3551,7 @@ fn call_skills_get(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_plugin_add(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_plugin_add(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     call_cli_tool(arguments, plugin_add_args(arguments)?, None)
 }
 
@@ -3471,7 +3577,7 @@ fn plugin_add_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     Ok(args)
 }
 
-fn call_plugin_run(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_plugin_run(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     call_cli_tool(arguments, plugin_run_args(arguments)?, None)
 }
 
@@ -3516,7 +3622,7 @@ fn doctor_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     Ok(args)
 }
 
-fn call_doctor(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_doctor(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let args = doctor_args(arguments)?;
     call_cli_tool(arguments, args, None)
 }
@@ -3534,11 +3640,11 @@ fn dashboard_start_args(arguments: &Value) -> Result<Vec<String>, ProtocolError>
     Ok(args)
 }
 
-fn call_dashboard_start(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_dashboard_start(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     call_cli_tool(arguments, dashboard_start_args(arguments)?, None)
 }
 
-fn call_install(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_install(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["install".to_string()];
     if optional_bool(arguments, "withDeps")?.unwrap_or(false) {
         args.push("--with-deps".to_string());
@@ -3546,7 +3652,7 @@ fn call_install(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_chat(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_chat(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let message = required_string(arguments, "message")?;
     let mut args = Vec::new();
     if let Some(model) = optional_string(arguments, "model")? {
@@ -3564,7 +3670,7 @@ fn call_chat(arguments: &Value) -> Result<Value, ProtocolError> {
     call_cli_tool(arguments, args, None)
 }
 
-fn call_eval(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_eval(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let script = required_string(arguments, "script")?;
     call_cli_tool(
         arguments,
@@ -3573,7 +3679,7 @@ fn call_eval(arguments: &Value) -> Result<Value, ProtocolError> {
     )
 }
 
-fn call_close(arguments: &Value) -> Result<Value, ProtocolError> {
+fn call_close(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let mut args = vec!["close".to_string()];
     if optional_bool(arguments, "all")?.unwrap_or(false) {
         args.push("--all".to_string());
@@ -4233,6 +4339,17 @@ mod tests {
         names.sort_unstable();
         names.dedup();
         assert_eq!(names.len(), tools.len());
+    }
+
+    #[test]
+    fn browser_control_remains_an_internal_host_protocol() {
+        assert!(tools().iter().all(|tool| !tool["name"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("browser_control")));
+        let args = vec![crate::native::browser_control::ACTION.to_string()];
+        let flags = crate::flags::parse_flags(&args);
+        assert!(crate::commands::parse_command(&args, &flags).is_err());
     }
 
     #[test]

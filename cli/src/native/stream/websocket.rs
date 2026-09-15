@@ -11,7 +11,10 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
+use crate::native::browser_control::BrowserControl;
 use crate::native::cdp::client::CdpClient;
+#[cfg(test)]
+use crate::native::input::keyboard_params;
 
 use super::http::handle_http_request;
 use super::{is_allowed_origin, timestamp_ms, IdleActivity, StreamFrame};
@@ -137,6 +140,7 @@ pub(super) async fn accept_loop(
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
+    browser_control: Arc<Mutex<BrowserControl>>,
     screencasting: Arc<Mutex<bool>>,
     cdp_session_id: Arc<RwLock<Option<String>>>,
     viewport_width: Arc<Mutex<u32>>,
@@ -171,6 +175,7 @@ pub(super) async fn accept_loop(
                 let client_slot = client_slot.clone();
                 let client_notify = client_notify.clone();
                 let idle_activity = idle_activity.clone();
+                let browser_control = browser_control.clone();
                 let screencasting = screencasting.clone();
                 let cdp_session_id = cdp_session_id.clone();
                 let vw = viewport_width.clone();
@@ -191,6 +196,7 @@ pub(super) async fn accept_loop(
                         client_slot,
                         client_notify,
                         idle_activity,
+                        browser_control,
                         screencasting,
                         cdp_session_id,
                         vw,
@@ -239,6 +245,7 @@ async fn handle_connection(
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
+    browser_control: Arc<Mutex<BrowserControl>>,
     screencasting: Arc<Mutex<bool>>,
     cdp_session_id: Arc<RwLock<Option<String>>>,
     viewport_width: Arc<Mutex<u32>>,
@@ -269,6 +276,7 @@ async fn handle_connection(
             client_slot,
             client_notify,
             idle_activity,
+            browser_control,
             screencasting,
             cdp_session_id,
             viewport_width,
@@ -299,6 +307,7 @@ async fn handle_ws_client(
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
+    browser_control: Arc<Mutex<BrowserControl>>,
     screencasting: Arc<Mutex<bool>>,
     cdp_session_id: Arc<RwLock<Option<String>>>,
     viewport_width: Arc<Mutex<u32>>,
@@ -343,6 +352,7 @@ async fn handle_ws_client(
     // select! below instead of leaving it asleep on a stale deadline.
     let (config_tx, mut config_rx) = watch::channel::<ClientConfig>(initial_config);
     let (ack_tx, mut ack_rx) = watch::channel::<u64>(0);
+    let (input_error_tx, mut input_error_rx) = watch::channel::<Option<Value>>(None);
     // Spawned before the status, tabs and seed writes below: those are
     // unbounded sends, and a full receive queue would otherwise hold input
     // behind the whole handshake.
@@ -353,6 +363,8 @@ async fn handle_ws_client(
         config_tx,
         ack_tx,
         idle_activity.clone(),
+        browser_control,
+        input_error_tx,
     )));
 
     {
@@ -458,6 +470,13 @@ async fn handle_ws_client(
                     awaiting_ack = None;
                 }
             }
+            changed = input_error_rx.changed() => {
+                if changed.is_err() { break; }
+                let error = input_error_rx.borrow_and_update().clone();
+                if let Some(error) = error {
+                    if ws_tx.send(Message::Text(error.to_string())).await.is_err() { break; }
+                }
+            }
             changed = ack_rx.changed() => {
                 if changed.is_err() {
                     break;
@@ -509,6 +528,7 @@ async fn handle_ws_client(
 /// Reads client messages and dispatches them without waiting on frame
 /// delivery. Input reaches CDP sequentially: mouse move, press and release
 /// must not be reordered.
+#[allow(clippy::too_many_arguments)]
 async fn reader_loop(
     mut ws_rx: SplitStream<WebSocketStream<TcpStream>>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
@@ -516,6 +536,8 @@ async fn reader_loop(
     config: watch::Sender<ClientConfig>,
     ack: watch::Sender<u64>,
     idle_activity: Arc<IdleActivity>,
+    browser_control: Arc<Mutex<BrowserControl>>,
+    input_errors: watch::Sender<Option<Value>>,
 ) {
     while let Some(msg) = ws_rx.next().await {
         match msg {
@@ -553,15 +575,24 @@ async fn reader_loop(
                     }
                     continue;
                 }
+                if !is_user_input_message_type(msg_type) {
+                    continue;
+                }
+                let mut control = browser_control.lock().await;
                 let guard = client_slot.read().await;
                 if let Some(ref client) = *guard {
-                    // Marked inside the guard: only input that reaches CDP
-                    // counts as activity.
-                    if is_user_input_message_type(msg_type) {
-                        idle_activity.mark();
-                    }
                     let sid = cdp_session_id.read().await;
-                    dispatch_input(msg_type, &parsed, client.as_ref(), sid.as_deref()).await;
+                    match control
+                        .stream_input(msg_type, &parsed, client.as_ref(), sid.as_deref())
+                        .await
+                    {
+                        Ok(()) => idle_activity.mark(),
+                        Err(error) => {
+                            input_errors.send_replace(Some(json!({
+                                "type": "input_error", "code": error.code, "error": error.message,
+                            })));
+                        }
+                    }
                 }
             }
             Ok(Message::Close(_)) | Err(_) => break,
@@ -580,102 +611,6 @@ struct AbortOnDrop(tokio::task::JoinHandle<()>);
 impl Drop for AbortOnDrop {
     fn drop(&mut self) {
         self.0.abort();
-    }
-}
-
-/// `Input.dispatchKeyEvent` params for a client `input_keyboard` message.
-///
-/// Invariant: an omitted optional string is left out, never sent as `null`.
-/// CDP rejects the whole command on a null string and the caller discards the
-/// error, so one null silently drops the keystroke. `""` is not a substitute:
-/// `text: ""` on a printable key inserts no character.
-fn keyboard_params(parsed: &Value) -> Value {
-    let mut params = serde_json::Map::new();
-    params.insert(
-        "type".into(),
-        json!(parsed
-            .get("eventType")
-            .and_then(|v| v.as_str())
-            .unwrap_or("keyDown")),
-    );
-    for field in ["key", "code", "text"] {
-        if let Some(value) = parsed.get(field).and_then(|v| v.as_str()) {
-            params.insert(field.into(), json!(value));
-        }
-    }
-    params.insert(
-        "windowsVirtualKeyCode".into(),
-        json!(parsed
-            .get("windowsVirtualKeyCode")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)),
-    );
-    params.insert(
-        "modifiers".into(),
-        json!(parsed
-            .get("modifiers")
-            .and_then(|v| v.as_i64())
-            .unwrap_or(0)),
-    );
-    Value::Object(params)
-}
-
-/// Dispatches one client input event to CDP.
-///
-/// Invariant: sends without awaiting Chrome's reply. The reply carries nothing
-/// this path uses, and awaiting it serializes the whole reader behind one round
-/// trip per event, so a mouse sweep delays the click behind it. Ordering still
-/// holds: every send takes the same socket mutex and this task calls them in
-/// order, so press never overtakes move.
-async fn dispatch_input(
-    msg_type: &str,
-    parsed: &Value,
-    client: &CdpClient,
-    session_id: Option<&str>,
-) {
-    match msg_type {
-        "input_mouse" => {
-            let _ = client
-                .send_command_no_wait(
-                    "Input.dispatchMouseEvent",
-                    Some(json!({
-                        "type": parsed.get("eventType").and_then(|v| v.as_str()).unwrap_or("mouseMoved"),
-                        "x": parsed.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                        "y": parsed.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                        "button": parsed.get("button").and_then(|v| v.as_str()).unwrap_or("none"),
-                        "clickCount": parsed.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(0),
-                        "deltaX": parsed.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                        "deltaY": parsed.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                        "modifiers": parsed.get("modifiers").and_then(|v| v.as_i64()).unwrap_or(0),
-                    })),
-                    session_id,
-                )
-                .await;
-        }
-        "input_keyboard" => {
-            let _ = client
-                .send_command_no_wait(
-                    "Input.dispatchKeyEvent",
-                    Some(keyboard_params(parsed)),
-                    session_id,
-                )
-                .await;
-        }
-        "input_touch" => {
-            let _ = client
-                .send_command_no_wait(
-                    "Input.dispatchTouchEvent",
-                    Some(json!({
-                        "type": parsed.get("eventType").and_then(|v| v.as_str()).unwrap_or("touchStart"),
-                        "touchPoints": parsed.get("touchPoints").unwrap_or(&json!([])),
-                        "modifiers": parsed.get("modifiers").and_then(|v| v.as_i64()).unwrap_or(0),
-                    })),
-                    session_id,
-                )
-                .await;
-        }
-        "status" => {}
-        _ => {}
     }
 }
 
@@ -877,9 +812,13 @@ mod tests {
                 json!({ "eventType": "keyDown", "key": "a", "text": "a" }),
             ),
         ];
+        let mut control = BrowserControl::default();
         let dispatched = tokio::time::timeout(Duration::from_secs(5), async {
             for (kind, payload) in &events {
-                dispatch_input(kind, payload, &client, None).await;
+                control
+                    .stream_input(kind, payload, &client, None)
+                    .await
+                    .unwrap();
             }
         })
         .await;
@@ -906,7 +845,16 @@ mod tests {
             "input should reach CDP in dispatch order"
         );
 
-        // Nothing was registered as awaiting a reply, so no orphan can accumulate.
+        // Bounded receipts retain custody evidence without slowing the sender.
+        assert_eq!(client.pending_len().await, 3);
+        drop(control);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while client.pending_len().await != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropped receipts must clear the pending map");
         assert_eq!(client.pending_len().await, 0);
     }
 

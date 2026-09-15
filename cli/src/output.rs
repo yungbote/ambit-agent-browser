@@ -3220,6 +3220,13 @@ Notes:
     frames already handed to the transport are delivered in order.
   - Both settings can be declared on the URL instead, which is the only way
     to cover the opening frame: ws://127.0.0.1:<port>/?pacing=ack&maxFps=10
+  - Native frames carry pageGeneration. Acknowledged pointer records share it;
+    typing/scrolling activity contains no input text. Navigation and viewport
+    changes reset the identity. Display activity only on its matching frame.
+  - Host controller batches can resize the viewport with a viewport event
+    (width/height: integer CSS pixels, 1-32768), preserving scale and emulation.
+    Acquisition waits at most 2s for an active command, then refuses as
+    browser_control_unavailable; no custody is created by that refusal.
   - 'screencast_start' and 'screencast_stop' still control explicit CDP screencasts.
   - Streaming is always enabled. Set AGENT_BROWSER_STREAM_PORT to bind to a
     specific port instead of the default OS-assigned port.
@@ -3502,6 +3509,11 @@ It requires locally launched Chrome; unsupported hosts fail instead of retrying
 without sandboxing. Config: {{"requireSandbox": true}}; environment:
 AGENT_BROWSER_REQUIRE_SANDBOX=1; MCP argument: requireSandbox.
 
+During host-mediated human control, CLI and MCP commands report
+browser_controlled_by_user. Wait for release or lease expiry before continuing.
+An unknown input outcome must not be replayed. Supervisor termination remains
+available; human control is not a CLI command or MCP tool.
+
 Foreground daemons also refuse automatic restarts by ordinary clients when
 configuration or versions differ. Restart them through the owning supervisor.
 
@@ -3524,6 +3536,19 @@ argument; starting the foreground daemon belongs to the host supervisor.
 agent-browser mcp - Start an MCP stdio server
 
 Usage: agent-browser mcp [--tools <profiles>]
+       agent-browser mcp --host-bound-config <path>
+       agent-browser mcp --describe-host-bound
+
+Host-bound mode reads version 1 JSON with namespace, session, requireSandbox
+(true), an existing absolute captureDirectory, and optional expectedObservation
+(targetId, loaderId, geometrySha256). It pins ambit-host-bound-v1 and publishes
+its descriptor in experimental io.ambit/browser. Per-call host overrides and
+process-management tools are excluded. Browser auth and state stay available.
+Operations include a native viewport JPEG reference when capture succeeds;
+capture failure never replaces the primary outcome. The host owns admission
+of the file bytes. --describe-host-bound prints the full catalog without
+starting a browser. Host-bound calls are limited to 120000 milliseconds.
+
 
 Starts a Model Context Protocol server over stdio. MCP clients launch this
 command as a subprocess and communicate with newline-delimited JSON-RPC.

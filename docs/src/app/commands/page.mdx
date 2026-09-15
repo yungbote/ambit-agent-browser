@@ -654,6 +654,10 @@ agent-browser mcp --tools all
 agent-browser mcp --tools core,network,react
 ```
 
+Host integrations can start `agent-browser mcp --host-bound-config /absolute/config.json`. The version 1 configuration requires `namespace`, `session`, `requireSandbox: true`, and an existing absolute `captureDirectory`; optional `expectedObservation` contains `targetId`, `loaderId`, and `geometrySha256` from an earlier capture. It binds the session and launch environment once, exposes the `ambit-host-bound-v1` browser tool profile, and rejects per-call host overrides. Browser auth, state, navigation, interaction, and viewport tools retain their CLI semantics. Host process management, cross-session discovery, raw connections, and batch CLI parsing are excluded. `agent-browser mcp --describe-host-bound` prints the complete pinned descriptor without starting a browser. Initialization advertises its version and schema digest in `capabilities.experimental["io.ambit/browser"]`.
+
+Every host-bound operation returns its primary result in `structuredContent.response` and optional native feedback in `structuredContent.browser`: the session, page identity, and a JPEG file with digest, byte count, dimensions, and viewport CSS coordinate mapping. A failed capture reports `capture.status: "unavailable"` without replacing the operation outcome. The host admits those bytes from its workspace. Commands accept at most 120,000 milliseconds and unknown delivery is never automatically replayed. Image-coordinate tools declare their argument pairs in `_meta["io.ambit/browser"]`; a changed page or viewport rejects a supplied observation before input.
+
 Starts a Model Context Protocol server over stdio. MCP clients launch this command as a subprocess and exchange newline-delimited JSON-RPC on stdin and stdout. The server defaults to MCP protocol 2025-11-25 and accepts older supported client protocol versions during initialization.
 
 The default tools profile is `core`, which keeps MCP context small for everyday browser automation. Use `--tools all` for the full typed CLI parity surface, or combine profiles with commas, such as `--tools core,network,react`.

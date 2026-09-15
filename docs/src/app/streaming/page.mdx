@@ -63,6 +63,7 @@ The server sends frame messages with base64-encoded images:
 {
   "type": "frame",
   "seq": 41,
+  "pageGeneration": "opaque-page-generation",
   "data": "<base64-encoded-jpeg>",
   "metadata": {
     "deviceWidth": 1280,
@@ -167,9 +168,17 @@ ws://127.0.0.1:<port>/?pacing=ack&maxFps=10
 
 A `config` message sent later still wins. An unrecognized or unparsable value on the URL is ignored rather than failing the connection.
 
+## Native activity and host control
+
+Host controller input batches also accept `{ "type": "viewport", "width": 640, "height": 480 }`, with integer CSS dimensions from 1 through 32768. Resizing uses the same sequence and acknowledgement as pointer or keyboard input, preserves the current device scale and mobile emulation, and updates stream geometry before the next event in that batch. An acquisition waits at most two seconds for an active agent command, then reports `browser_control_unavailable` if it is still busy; no controller is created by that refusal. A shared five-second preparation deadline covers the stream-input gate, prior acknowledgements, and held-input cleanup.
+
+Native stream frames include an opaque `pageGeneration`. Acknowledged CDP mouse input emits `pointer` records with that identity, `source` (`agent` or `human`), `eventType` (`move`, `press`, `release`, `scroll`), viewport CSS `x`/`y`, buttons, modifiers and an epoch-millisecond timestamp. Typing and programmatic scrolling emit `activity` records with `kind: "typing"` or `kind: "scrolling"`, identity, source and timestamp only. Neither record includes typed text, keys, selectors or controller identities. Main-page navigation and acknowledged viewport changes emit a pointer `reset` with a new generation. Display activity only against a frame carrying the same generation; unknown or rejected input produces no activity claim.
+
 ## Input injection
 
 Send input events to control the browser remotely. Mouse, keyboard, and touch input reset the daemon idle timer, so an actively controlled dashboard or streaming session is not shut down by the default timeout.
+
+An integrating product can temporarily hold exclusive input custody. During that lease, stream viewers continue receiving frames, but input returns a private `input_error` with code `browser_controlled_by_user`. A viewer cannot acquire authority by adding a controller ID to a stream message. Input already enqueued before takeover must be acknowledged by the browser before the host can report successful acquisition.
 
 ### Mouse events
 
@@ -247,6 +256,8 @@ Send input events to control the browser remotely. Mouse, keyboard, and touch in
   "modifiers": 2
 }
 ```
+
+For pasted or composed text, send `{ "type": "input_keyboard", "eventType": "insertText", "text": "Your text" }`. Physical key events retain their key and modifier semantics; their text must fit the browser's three UTF-16 code-unit limit.
 
 ### Touch events
 

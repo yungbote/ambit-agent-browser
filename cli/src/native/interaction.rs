@@ -378,6 +378,11 @@ pub async fn scroll(
     delta_y: f64,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<(), String> {
+    let observation = client.observe_activity(
+        serde_json::json!({ "type": "activity", "kind": "scrolling" }),
+        session_id,
+        super::activity::InputSource::Agent,
+    );
     if let Some(sel) = selector_or_ref {
         let (object_id, effective_session_id) =
             resolve_element_object_id(client, session_id, ref_map, sel, iframe_sessions).await?;
@@ -418,6 +423,7 @@ pub async fn scroll(
             )
             .await?;
     }
+    observation.acknowledged();
     Ok(())
 }
 

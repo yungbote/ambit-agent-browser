@@ -352,6 +352,9 @@ async fn maintain_browser(state: Arc<tokio::sync::Mutex<DaemonState>>, autosave_
     loop {
         interval.tick().await;
         let mut state = state.lock().await;
+        if let Err(error) = state.expire_browser_control().await {
+            let _ = writeln!(std::io::stderr(), "{}: {}", error.code, error.message);
+        }
         let process_exited = state
             .browser
             .as_mut()
@@ -422,14 +425,14 @@ async fn handle_connection<S>(
                     .unwrap_or_default()
                     .to_string();
 
-                let response = {
-                    let mut s = state.lock().await;
-                    let response = execute_command(&cmd, &mut s).await;
-                    // Refresh while the state lock is still held. An idle
-                    // timer waiting on this command will observe the updated
-                    // clock as soon as it acquires the lock.
-                    idle_activity.mark();
-                    response
+                let response = match command_state(&state, &cmd).await {
+                    Ok(mut s) => {
+                        let response = execute_command(&cmd, &mut s).await;
+                        // Refresh while command custody is still held.
+                        idle_activity.mark();
+                        response
+                    }
+                    Err(response) => response,
                 };
 
                 let mut resp = serde_json::to_string(&response).unwrap_or_default();
@@ -460,6 +463,23 @@ fn looks_like_http(line: &str) -> bool {
         "GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS ", "CONNECT ", "TRACE ",
     ];
     prefixes.iter().any(|p| line.starts_with(p))
+}
+
+/// A user takeover must settle inside the existing ten-second relay request.
+/// Waiting two seconds for current command custody leaves five seconds for
+/// already-admitted stream input to drain. A busy refusal never claims control.
+async fn command_state<'a>(
+    state: &'a tokio::sync::Mutex<DaemonState>,
+    command: &Value,
+) -> Result<tokio::sync::MutexGuard<'a, DaemonState>, Value> {
+    if command["action"] == super::browser_control::ACTION && command["op"] == "acquire" {
+        tokio::time::timeout(Duration::from_secs(2), state.lock()).await.map_err(|_| serde_json::json!({
+            "id": command["id"], "success": false, "code": "browser_control_unavailable",
+            "error": "The browser is finishing its current operation. Try taking control again when it finishes.",
+        }))
+    } else {
+        Ok(state.lock().await)
+    }
 }
 
 fn close_completed_response(action: &str, response: &Value) -> bool {
@@ -572,6 +592,29 @@ mod tests {
 
         state.backend_type = crate::native::actions::BackendType::WebDriver;
         assert!(state.blocks_default_idle_shutdown());
+    }
+
+    #[tokio::test]
+    async fn acquire_busy_refuses_without_late_custody() {
+        let state = tokio::sync::Mutex::new(DaemonState::new());
+        let held = state.lock().await;
+        let command =
+            serde_json::json!({ "action": super::super::browser_control::ACTION, "op": "acquire" });
+        let response = match command_state(&state, &command).await {
+            Ok(_) => panic!("acquisition passed an active command"),
+            Err(response) => response,
+        };
+        assert_eq!(response["code"], "browser_control_unavailable");
+        drop(held);
+        assert!(command_state(&state, &command).await.is_ok());
+        assert!(state
+            .lock()
+            .await
+            .browser_control
+            .lock()
+            .await
+            .agent_error()
+            .is_none());
     }
 
     #[tokio::test]

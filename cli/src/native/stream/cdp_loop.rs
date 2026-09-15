@@ -246,7 +246,11 @@ pub(super) async fn cdp_event_loop(
                         event = event_rx.recv() => {
                             match event {
                                 Ok(evt) => {
-                                    if evt.method == "Page.frameNavigated" {
+                                    if evt.method == crate::native::activity::EVENT {
+                                        if session_matches(session_id.as_deref(), evt.session_id.as_deref()) {
+                                            let _ = frame_tx.send(evt.params.to_string());
+                                        }
+                                    } else if evt.method == "Page.frameNavigated" {
                                         if let Some(frame) = evt.params.get("frame") {
                                             let is_main = frame
                                                 .get("parentId")
@@ -339,6 +343,7 @@ pub(super) async fn cdp_event_loop(
                                                 "type": "frame",
                                                 "seq": seq,
                                                 "data": data,
+                                                "pageGeneration": evt.params[crate::native::activity::FRAME_GENERATION],
                                                 "metadata": {
                                                     "offsetTop": meta.and_then(|m| m.get("offsetTop")).and_then(|v| v.as_f64()).unwrap_or(0.0),
                                                     "pageScaleFactor": meta.and_then(|m| m.get("pageScaleFactor")).and_then(|v| v.as_f64()).unwrap_or(1.0),

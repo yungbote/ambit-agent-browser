@@ -42,6 +42,300 @@ fn assert_error_code(resp: &Value, code: &str) {
     assert_eq!(resp.get("code").and_then(Value::as_str), Some(code));
 }
 
+// Keep the large daemon command future off the test thread's small stack.
+// This journey has many sequential commands; the real daemon already spawns
+// its connection task onto the runtime and retains one command at a time.
+async fn control_test_command(command: &Value, state: &mut DaemonState) -> Value {
+    Box::pin(execute_command(command, state)).await
+}
+
+/// Exercises the Product protocol against real Chromium, including the
+/// independent stream viewer that must lose input authority during custody.
+#[tokio::test]
+#[ignore]
+async fn e2e_browser_control_mouse_keyboard_touch_and_command_custody() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::Message;
+    let env = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
+    let socket_dir = tempfile::tempdir().unwrap();
+    env.set(
+        "AGENT_BROWSER_SOCKET_DIR",
+        socket_dir.path().to_str().unwrap(),
+    );
+    env.set("AGENT_BROWSER_SESSION", "e2e-browser-control");
+    let mut state = DaemonState::new();
+    let stream =
+        control_test_command(&json!({ "action": "stream_enable", "port": 0 }), &mut state).await;
+    assert_success(&stream);
+    let port = get_data(&stream)["port"].as_u64().unwrap();
+    let html = r#"<!doctype html><html lang="en"><meta charset="utf-8"><title>Browser control test</title>
+        <style>body{font:20px system-ui;margin:40px}input,button{font:inherit;padding:12px;margin:12px 0;display:block}</style>
+        <h1>Browser control test</h1><label for="message">Message</label><input id="message">
+        <button id="save">Save</button><p id="result">No clicks</p>
+        <div id="drag" style="position:absolute;left:450px;top:40px;width:220px;height:160px;background:#ddd">Drag target</div><script>
+        window.clicks=0;window.touches=0;window.wheels=0;
+        window.heldKeys=[];window.pointerHeld=false;window.pointerId=0;window.pointerEvents=[];
+        for(const type of ['pointerdown','pointerup','pointermove','pointercancel','gotpointercapture','lostpointercapture','mouseup','mousedown']) document.addEventListener(type,e=>pointerEvents.push({type,target:e.target.id,buttons:e.buttons,button:e.button}));
+        document.addEventListener('keydown',e=>{if(!heldKeys.includes(e.key))heldKeys.push(e.key)});
+        document.addEventListener('keyup',e=>{window.heldKeys=heldKeys.filter(key=>key!==e.key)});
+        drag.onpointerdown=e=>{e.preventDefault();window.pointerHeld=true;window.pointerId=e.pointerId;drag.setPointerCapture(e.pointerId)};
+        drag.onpointercancel=()=>window.pointerHeld=false;
+        drag.onpointerup=()=>window.pointerHeld=false;
+        save.onclick=()=>{result.textContent='Clicks: '+(++window.clicks)};
+        document.addEventListener('touchstart',()=>window.touches++);
+        document.addEventListener('wheel',()=>window.wheels++);
+        </script></html>"#;
+    assert_success(&control_test_command(&json!({ "action": "navigate", "url": format!("data:text/html,{}", urlencoding::encode(html)) }), &mut state).await);
+    let geometry = control_test_command(&json!({ "action": "evaluate", "script": "Object.fromEntries(['message','save','drag'].map(id=>{const r=document.getElementById(id).getBoundingClientRect();return [id,{x:r.x+r.width/2,y:r.y+r.height/2}]}))" }), &mut state).await;
+    assert_success(&geometry);
+    let positions = get_data(&geometry)["result"].clone();
+    let (mut viewer, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}"))
+        .await
+        .unwrap();
+    viewer.next().await.unwrap().unwrap();
+    for event in [
+        json!({ "type": "input_keyboard", "eventType": "keyDown", "key": "Shift", "code": "ShiftLeft", "modifiers": 8 }),
+        json!({ "type": "input_mouse", "eventType": "mousePressed", "x": positions["drag"]["x"], "y": positions["drag"]["y"], "button": "left", "buttons": 1, "clickCount": 1 }),
+    ] {
+        viewer.send(Message::Text(event.to_string())).await.unwrap();
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let observed = control_test_command(&json!({ "action": "evaluate", "script": "pointerHeld && heldKeys.includes('Shift')" }), &mut state).await;
+            if get_data(&observed)["result"] == true { break; }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }).await.expect("legacy input should be held before takeover");
+    let owner = uuid::Uuid::new_v4().to_string();
+    let other = uuid::Uuid::new_v4().to_string();
+    let expires_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 25_000;
+    let control = |op: &str, id: &str| json!({ "action": "ambit_browser_control", "op": op, "controllerId": id });
+    let mut acquire = control("acquire", &owner);
+    acquire["expiresAt"] = json!(expires_at);
+    assert_success(&control_test_command(&acquire, &mut state).await);
+    let inspect = control_test_command(
+        &json!({ "action": "ambit_browser_control", "op": "inspect" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(
+        get_data(&inspect),
+        &json!({ "supported": true, "controlled": true })
+    );
+    for action in [
+        "evaluate",
+        "close",
+        "launch",
+        "navigate",
+        "input_keyboard",
+        "confirm",
+        "state_clear",
+    ] {
+        assert_error_code(
+            &control_test_command(&json!({ "action": action }), &mut state).await,
+            "browser_controlled_by_user",
+        );
+    }
+    let mut competing = control("acquire", &other);
+    competing["expiresAt"] = json!(expires_at);
+    assert_error_code(
+        &control_test_command(&competing, &mut state).await,
+        "browser_control_conflict",
+    );
+    viewer
+        .send(Message::Text(
+            json!({ "type": "input_keyboard", "eventType": "char", "text": "UNAUTHORIZED" })
+                .to_string(),
+        ))
+        .await
+        .unwrap();
+    let refusal = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let message = viewer.next().await.unwrap().unwrap();
+            if let Message::Text(text) = message {
+                assert!(
+                    !text.contains(&owner),
+                    "controller identity leaked to viewer"
+                );
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["type"] == "input_error" {
+                    break value;
+                }
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(refusal["code"], "browser_controlled_by_user");
+    let mouse = |event: &str, target: &str| {
+        json!({ "type": "input_mouse", "eventType": event,
+        "x": positions[target]["x"], "y": positions[target]["y"], "button": "left", "clickCount": 1 })
+    };
+    let events = json!([
+        mouse("mousePressed", "message"), mouse("mouseReleased", "message"),
+        { "type": "input_keyboard", "eventType": "insertText", "text": "Human input" },
+        { "type": "input_keyboard", "eventType": "keyDown", "key": "End", "code": "End", "windowsVirtualKeyCode": 35 },
+        { "type": "input_keyboard", "eventType": "keyUp", "key": "End", "code": "End", "windowsVirtualKeyCode": 35 },
+        mouse("mousePressed", "save"), mouse("mouseReleased", "save"),
+        { "type": "input_touch", "eventType": "touchStart", "touchPoints": [{ "id": 0, "x": 600, "y": 400 }] },
+        { "type": "input_touch", "eventType": "touchEnd", "touchPoints": [] },
+        { "type": "input_mouse", "eventType": "mouseWheel", "x": 600, "y": 400, "deltaY": 10 }
+    ]);
+    let mut input = control("input", &owner);
+    input["sequence"] = json!(1);
+    input["events"] = events;
+    let applied = control_test_command(&input, &mut state).await;
+    assert_success(&applied);
+    assert_eq!(get_data(&applied)["status"], "applied");
+    let duplicate = control_test_command(&input, &mut state).await;
+    assert_success(&duplicate);
+    assert_eq!(get_data(&duplicate)["status"], "duplicate");
+    input["sequence"] = json!(3);
+    assert_error_code(
+        &control_test_command(&input, &mut state).await,
+        "browser_control_sequence_gap",
+    );
+    assert_success(&control_test_command(&control("release", &owner), &mut state).await);
+    assert_success(&control_test_command(&control("release", &owner), &mut state).await);
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let observed = control_test_command(
+                &json!({ "action": "evaluate", "script": "window.wheels" }),
+                &mut state,
+            )
+            .await;
+            if get_data(&observed)["result"] == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("wheel event should reach the renderer");
+    let result = control_test_command(&json!({ "action": "evaluate", "script": "({message:message.value,clicks:window.clicks,touches:window.touches,wheels:window.wheels,held:heldKeys,down:pointerHeld})" }), &mut state).await;
+    assert_success(&result);
+    assert_eq!(
+        get_data(&result)["result"],
+        json!({ "message": "Human input", "clicks": 1, "touches": 1, "wheels": 1, "held": [], "down": false })
+    );
+    // Existing stateful CLI input must transfer through the same mechanism.
+    for command in [
+        json!({ "action": "mousemove", "x": positions["drag"]["x"], "y": positions["drag"]["y"] }),
+        json!({ "action": "mousedown", "button": "left" }),
+        json!({ "action": "keydown", "key": "Shift" }),
+    ] {
+        assert_success(&control_test_command(&command, &mut state).await);
+    }
+    let raw_owner = uuid::Uuid::new_v4().to_string();
+    let mut raw_acquire = control("acquire", &raw_owner);
+    raw_acquire["expiresAt"] = json!(expires_at);
+    assert_success(&control_test_command(&raw_acquire, &mut state).await);
+    assert_eq!(state.mouse_state.buttons, 0);
+    assert_success(&control_test_command(&control("release", &raw_owner), &mut state).await);
+    let raw_released = control_test_command(
+        &json!({ "action": "evaluate", "script": "({held:heldKeys,down:pointerHeld})" }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(
+        get_data(&raw_released)["result"],
+        json!({ "held": [], "down": false })
+    );
+    // Interrupted, acknowledged presses are neutralized during explicit
+    // release and expiry before the next ordinary command reaches the page.
+    // Ending an acknowledged press can complete its click; it is never an undo.
+    for (expire, target, expected_clicks) in
+        [(false, "drag", 1), (true, "drag", 1), (false, "save", 2)]
+    {
+        let held_owner = uuid::Uuid::new_v4().to_string();
+        let mut held_acquire = control("acquire", &held_owner);
+        held_acquire["expiresAt"] = json!(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+                + 20_000
+        );
+        assert_success(&control_test_command(&held_acquire, &mut state).await);
+        let mut held_input = control("input", &held_owner);
+        held_input["sequence"] = json!(1);
+        held_input["events"] = json!([
+            { "type": "input_keyboard", "eventType": "keyDown", "key": "Shift", "code": "ShiftLeft", "windowsVirtualKeyCode": 16, "modifiers": 8 },
+            mouse("mousePressed", target)
+        ]);
+        if target == "drag" {
+            held_input["events"].as_array_mut().unwrap().push(json!({ "type": "input_mouse", "eventType": "mouseMoved", "x": 710, "y": 220, "buttons": 1, "modifiers": 8 }));
+        }
+        assert_success(&control_test_command(&held_input, &mut state).await);
+        if expire {
+            let mut renew = control("renew", &held_owner);
+            renew["expiresAt"] = json!(
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_millis() as u64
+                    + 300
+            );
+            assert_success(&control_test_command(&renew, &mut state).await);
+            tokio::time::sleep(std::time::Duration::from_millis(350)).await;
+        } else {
+            assert_success(
+                &control_test_command(&control("release", &held_owner), &mut state).await,
+            );
+        }
+        let released = control_test_command(&json!({ "action": "evaluate", "script": "({held:heldKeys,down:pointerHeld,captured:drag.hasPointerCapture(pointerId),clicks:window.clicks})" }), &mut state).await;
+        assert_success(&released);
+        if get_data(&released)["result"]["down"] != false {
+            let events = control_test_command(
+                &json!({ "action": "evaluate", "script": "pointerEvents" }),
+                &mut state,
+            )
+            .await;
+            eprintln!(
+                "Interrupted pointer events: {}",
+                get_data(&events)["result"]
+            );
+        }
+        assert_eq!(
+            get_data(&released)["result"],
+            json!({ "held": [], "down": false, "captured": false, "clicks": expected_clicks }),
+            "interrupted input after expire={expire}"
+        );
+    }
+    // A fresh owner can take over; a late release cannot clear that custody.
+    competing["expiresAt"] = json!(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 20_000
+    );
+    assert_success(&control_test_command(&competing, &mut state).await);
+    assert_error_code(
+        &control_test_command(&control("release", &owner), &mut state).await,
+        "browser_control_stale",
+    );
+    assert_error_code(
+        &control_test_command(&json!({ "action": "snapshot" }), &mut state).await,
+        "browser_controlled_by_user",
+    );
+    assert_success(
+        &control_test_command(
+            &json!({ "action": crate::connection::INTERNAL_DAEMON_SHUTDOWN_ACTION }),
+            &mut state,
+        )
+        .await,
+    );
+    assert!(state.browser.is_none());
+    if let Some(server) = state.stream_server.take() {
+        server.shutdown().await;
+    }
+}
+
 fn native_test_fixture_html(name: &str) -> &'static str {
     match name {
         "drag_probe" => include_str!("test_fixtures/drag_probe.html"),

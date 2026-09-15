@@ -68,6 +68,215 @@ fn print_json_error_with_type(message: impl AsRef<str>, error_type: &str) {
     }));
 }
 
+/// Setup is a daemon command too. Preserve its structured failure exactly as
+/// for the requested action, including code, data, and warning through MCP.
+fn report_daemon_setup(result: Result<Response, String>, fallback: &str, flags: &Flags) -> bool {
+    let mut response = match result {
+        Ok(response) if response.success => return true,
+        Ok(response) => response,
+        Err(error) => Response {
+            error: Some(error),
+            ..Response::default()
+        },
+    };
+    response.error.get_or_insert_with(|| fallback.to_string());
+    print_response_with_opts(&response, None, &OutputOptions::from_flags(flags));
+    false
+}
+
+/// Shared immutable daemon launch projection for CLI and host-bound MCP.
+struct DaemonSetup {
+    proxy_server: Option<String>,
+    proxy_username: Option<String>,
+    proxy_password: Option<String>,
+    plugins: String,
+}
+
+impl DaemonSetup {
+    fn new(flags: &Flags) -> Self {
+        let (proxy_server, proxy_username, proxy_password) = flags
+            .proxy
+            .as_ref()
+            .map(|value| {
+                let proxy = parse_proxy(value);
+                (Some(proxy.server), proxy.username, proxy.password)
+            })
+            .unwrap_or_default();
+        Self {
+            proxy_server,
+            proxy_username,
+            proxy_password,
+            plugins: serde_json::to_string(&flags.plugins)
+                .expect("plugin configuration serializes"),
+        }
+    }
+
+    fn options<'a>(&'a self, flags: &'a Flags) -> DaemonOptions<'a> {
+        DaemonOptions {
+            require_existing: flags.require_daemon,
+            require_sandbox: flags.require_sandbox,
+            headed: flags.headed,
+            debug: flags.debug,
+            executable_path: flags.executable_path.as_deref(),
+            extensions: &flags.extensions,
+            init_scripts: &flags.init_scripts,
+            enable: &flags.enable,
+            args: flags.args.as_deref(),
+            user_agent: flags.user_agent.as_deref(),
+            proxy: self.proxy_server.as_deref(),
+            proxy_bypass: flags.proxy_bypass.as_deref(),
+            proxy_username: self.proxy_username.as_deref(),
+            proxy_password: self.proxy_password.as_deref(),
+            ignore_https_errors: flags.ignore_https_errors,
+            allow_file_access: flags.allow_file_access,
+            hide_scrollbars: flags.hide_scrollbars,
+            webgpu: flags.webgpu,
+            profile: flags.profile.as_deref(),
+            state: flags.state.as_deref(),
+            provider: flags.provider.as_deref(),
+            device: flags.device.as_deref(),
+            session_name: restore_key_from_flags(flags),
+            restore_save: flags.restore_save.as_deref(),
+            restore_check_url: flags.restore_check_url.as_deref(),
+            restore_check_text: flags.restore_check_text.as_deref(),
+            restore_check_fn: flags.restore_check_fn.as_deref(),
+            download_path: flags.download_path.as_deref(),
+            allowed_domains: flags.allowed_domains.as_deref(),
+            action_policy: flags.action_policy.as_deref(),
+            confirm_actions: flags.confirm_actions.as_deref(),
+            engine: flags.engine.as_deref(),
+            auto_connect: flags.auto_connect,
+            pin_tab: flags.pin_tab,
+            idle_timeout: flags.idle_timeout.as_deref(),
+            default_timeout: flags.default_timeout,
+            cdp: flags.cdp.as_deref(),
+            no_auto_dialog: flags.no_auto_dialog,
+            plugins: Some(self.plugins.as_str()),
+        }
+    }
+}
+
+/// Shared CLI/native-MCP projection of immutable host launch settings.
+fn build_local_launch_command(flags: &Flags) -> serde_json::Value {
+    let mut launch_cmd = json!({
+        "id": gen_id(),
+        "action": "launch",
+    });
+    // Only send headless when the user set it on this invocation. When
+    // absent, the daemon falls back to its spawn-time AGENT_BROWSER_HEADED
+    // env, so a follow-up command without --headed (common when env vars
+    // like AGENT_BROWSER_ARGS force a launch command on every call) does
+    // not flip a headed session back to headless and relaunch the browser
+    // onto about:blank.
+    if flags.headed || flags.cli_headed {
+        launch_cmd["headless"] = json!(!flags.headed);
+    }
+    launch_cmd["plugins"] = json!(flags.plugins.clone());
+    attach_restore_config_to_command(&mut launch_cmd, flags);
+
+    let cmd_obj = launch_cmd
+        .as_object_mut()
+        .expect("json! macro guarantees object type");
+
+    // Add executable path if specified
+    if let Some(ref exec_path) = flags.executable_path {
+        cmd_obj.insert("executablePath".to_string(), json!(exec_path));
+    }
+
+    // Add profile path if specified
+    if let Some(ref profile_path) = flags.profile {
+        cmd_obj.insert("profile".to_string(), json!(profile_path));
+    }
+
+    // Add state path if specified
+    if let Some(ref state_path) = flags.state {
+        cmd_obj.insert("storageState".to_string(), json!(state_path));
+    }
+
+    if let Some(ref proxy_str) = flags.proxy {
+        let parsed = parse_proxy(proxy_str);
+        let mut proxy_obj = json!({ "server": parsed.server });
+        if let Some(ref username) = parsed.username {
+            proxy_obj["username"] = json!(username);
+        }
+        if let Some(ref password) = parsed.password {
+            proxy_obj["password"] = json!(password);
+        }
+        if let Some(ref bypass) = flags.proxy_bypass {
+            proxy_obj["bypass"] = json!(bypass);
+        }
+        cmd_obj.insert("proxy".to_string(), proxy_obj);
+    }
+
+    if let Some(ref ua) = flags.user_agent {
+        cmd_obj.insert("userAgent".to_string(), json!(ua));
+    }
+
+    if let Some(ref a) = flags.args {
+        // Parse args (comma or newline separated)
+        let args_vec: Vec<String> = a
+            .split(&[',', '\n'][..])
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .collect();
+        cmd_obj.insert("args".to_string(), json!(args_vec));
+    }
+
+    if !flags.extensions.is_empty() {
+        cmd_obj.insert("extensions".to_string(), json!(&flags.extensions));
+    }
+
+    if !flags.init_scripts.is_empty() {
+        cmd_obj.insert("initScripts".to_string(), json!(&flags.init_scripts));
+    }
+
+    if !flags.enable.is_empty() {
+        cmd_obj.insert("enable".to_string(), json!(&flags.enable));
+    }
+
+    if flags.ignore_https_errors {
+        launch_cmd["ignoreHTTPSErrors"] = json!(true);
+    }
+
+    attach_ca_cert_to_launch_command(&mut launch_cmd, flags);
+
+    if flags.allow_file_access {
+        launch_cmd["allowFileAccess"] = json!(true);
+    }
+
+    apply_hide_scrollbars_launch_option(
+        &mut launch_cmd,
+        flags.cli_hide_scrollbars,
+        flags.hide_scrollbars,
+    );
+
+    if flags.webgpu || flags.cli_webgpu {
+        launch_cmd["webgpu"] = json!(flags.webgpu);
+    }
+    attach_webmcp_launch_option(&mut launch_cmd, flags);
+
+    // Env-only opt-out for automatic Xvfb; always stamped from the CLI's
+    // fresh environment so both setting and unsetting the var take effect
+    // on daemons spawned before the change.
+    launch_cmd["noXvfb"] = json!(flags.no_xvfb);
+
+    if let Some(ref cs) = flags.color_scheme {
+        launch_cmd["colorScheme"] = json!(cs);
+    }
+
+    if let Some(ref dp) = flags.download_path {
+        launch_cmd["downloadPath"] = json!(dp);
+    }
+
+    attach_allowed_domains_to_launch_command(&mut launch_cmd, flags);
+
+    if let Some(ref engine) = flags.engine {
+        launch_cmd["engine"] = json!(engine);
+    }
+
+    launch_cmd
+}
+
 fn should_send_hide_scrollbars_launch_option(
     cli_hide_scrollbars: bool,
     hide_scrollbars: bool,
@@ -1663,6 +1872,7 @@ fn main() {
                 error: None,
                 code: None,
                 warning: None,
+                browser: None,
             },
             Err(e) => connection::Response {
                 success: false,
@@ -1670,6 +1880,7 @@ fn main() {
                 error: Some(e),
                 code: None,
                 warning: None,
+                browser: None,
             },
         };
         let output_opts = OutputOptions::from_flags(&flags);
@@ -1704,58 +1915,8 @@ fn main() {
         flags.ca_cert = Some(canonical.display().to_string());
     }
 
-    let restore_key = restore_key_from_flags(&flags);
-
-    // Parse proxy URL to separate server from credentials for the daemon.
-    let (proxy_server, proxy_username, proxy_password) = if let Some(ref proxy_str) = flags.proxy {
-        let parsed = parse_proxy(proxy_str);
-        (Some(parsed.server), parsed.username, parsed.password)
-    } else {
-        (None, None, None)
-    };
-    let plugin_registry_json =
-        serde_json::to_string(&flags.plugins).unwrap_or_else(|_| "[]".to_string());
-    let daemon_opts = DaemonOptions {
-        require_existing: flags.require_daemon,
-        require_sandbox: flags.require_sandbox,
-        headed: flags.headed,
-        debug: flags.debug,
-        executable_path: flags.executable_path.as_deref(),
-        extensions: &flags.extensions,
-        init_scripts: &flags.init_scripts,
-        enable: &flags.enable,
-        args: flags.args.as_deref(),
-        user_agent: flags.user_agent.as_deref(),
-        proxy: proxy_server.as_deref(),
-        proxy_bypass: flags.proxy_bypass.as_deref(),
-        proxy_username: proxy_username.as_deref(),
-        proxy_password: proxy_password.as_deref(),
-        ignore_https_errors: flags.ignore_https_errors,
-        allow_file_access: flags.allow_file_access,
-        hide_scrollbars: flags.hide_scrollbars,
-        webgpu: flags.webgpu,
-        profile: flags.profile.as_deref(),
-        state: flags.state.as_deref(),
-        provider: flags.provider.as_deref(),
-        device: flags.device.as_deref(),
-        session_name: restore_key,
-        restore_save: flags.restore_save.as_deref(),
-        restore_check_url: flags.restore_check_url.as_deref(),
-        restore_check_text: flags.restore_check_text.as_deref(),
-        restore_check_fn: flags.restore_check_fn.as_deref(),
-        download_path: flags.download_path.as_deref(),
-        allowed_domains: flags.allowed_domains.as_deref(),
-        action_policy: flags.action_policy.as_deref(),
-        confirm_actions: flags.confirm_actions.as_deref(),
-        engine: flags.engine.as_deref(),
-        auto_connect: flags.auto_connect,
-        pin_tab: flags.pin_tab,
-        idle_timeout: flags.idle_timeout.as_deref(),
-        default_timeout: flags.default_timeout,
-        cdp: flags.cdp.as_deref(),
-        no_auto_dialog: flags.no_auto_dialog,
-        plugins: Some(plugin_registry_json.as_str()),
-    };
+    let daemon_setup = DaemonSetup::new(&flags);
+    let daemon_opts = daemon_setup.options(&flags);
 
     if cmd.get("action").and_then(serde_json::Value::as_str) == Some("daemon") {
         // Apply the same parsed options as detached startup, before the runtime
@@ -1814,21 +1975,11 @@ fn main() {
             launch_cmd["downloadPath"] = json!(dp);
         }
 
-        let err = match send_command(launch_cmd, &flags.session) {
-            Ok(resp) if resp.success => None,
-            Ok(resp) => Some(
-                resp.error
-                    .unwrap_or_else(|| "Auto-connect failed".to_string()),
-            ),
-            Err(e) => Some(e.to_string()),
-        };
-
-        if let Some(msg) = err {
-            if flags.json {
-                print_json_error(msg);
-            } else {
-                eprintln!("{} {}", color::error_indicator(), msg);
-            }
+        if !report_daemon_setup(
+            send_command(launch_cmd, &flags.session),
+            "Auto-connect failed",
+            &flags,
+        ) {
             exit(1);
         }
     }
@@ -1915,21 +2066,11 @@ fn main() {
             launch_cmd["downloadPath"] = json!(dp);
         }
 
-        let err = match send_command(launch_cmd, &flags.session) {
-            Ok(resp) if resp.success => None,
-            Ok(resp) => Some(
-                resp.error
-                    .unwrap_or_else(|| "CDP connection failed".to_string()),
-            ),
-            Err(e) => Some(e.to_string()),
-        };
-
-        if let Some(msg) = err {
-            if flags.json {
-                print_json_error(msg);
-            } else {
-                eprintln!("{} {}", color::error_indicator(), msg);
-            }
+        if !report_daemon_setup(
+            send_command(launch_cmd, &flags.session),
+            "CDP connection failed",
+            &flags,
+        ) {
             exit(1);
         }
     }
@@ -1938,171 +2079,25 @@ fn main() {
     if let Some(ref provider) = flags.provider {
         let launch_cmd = build_provider_launch_command(provider, &flags);
 
-        let err = match send_command(launch_cmd, &flags.session) {
-            Ok(resp) if resp.success => None,
-            Ok(resp) => Some(
-                resp.error
-                    .unwrap_or_else(|| "Provider connection failed".to_string()),
-            ),
-            Err(e) => Some(e.to_string()),
-        };
-
-        if let Some(msg) = err {
-            if flags.json {
-                print_json_error(msg);
-            } else {
-                eprintln!("{} {}", color::error_indicator(), msg);
-            }
+        if !report_daemon_setup(
+            send_command(launch_cmd, &flags.session),
+            "Provider connection failed",
+            &flags,
+        ) {
             exit(1);
         }
     }
 
     // Launch headed browser or configure browser options (without CDP or provider)
     if should_send_local_launch_config(&flags, &cmd) {
-        let mut launch_cmd = json!({
-            "id": gen_id(),
-            "action": "launch",
-        });
-        // Only send headless when the user set it on this invocation. When
-        // absent, the daemon falls back to its spawn-time AGENT_BROWSER_HEADED
-        // env, so a follow-up command without --headed (common when env vars
-        // like AGENT_BROWSER_ARGS force a launch command on every call) does
-        // not flip a headed session back to headless and relaunch the browser
-        // onto about:blank.
-        if flags.headed || flags.cli_headed {
-            launch_cmd["headless"] = json!(!flags.headed);
-        }
-        launch_cmd["plugins"] = json!(flags.plugins.clone());
-        attach_restore_config_to_command(&mut launch_cmd, &flags);
+        let launch_cmd = build_local_launch_command(&flags);
 
-        let cmd_obj = launch_cmd
-            .as_object_mut()
-            .expect("json! macro guarantees object type");
-
-        // Add executable path if specified
-        if let Some(ref exec_path) = flags.executable_path {
-            cmd_obj.insert("executablePath".to_string(), json!(exec_path));
-        }
-
-        // Add profile path if specified
-        if let Some(ref profile_path) = flags.profile {
-            cmd_obj.insert("profile".to_string(), json!(profile_path));
-        }
-
-        // Add state path if specified
-        if let Some(ref state_path) = flags.state {
-            cmd_obj.insert("storageState".to_string(), json!(state_path));
-        }
-
-        if let Some(ref proxy_str) = flags.proxy {
-            let parsed = parse_proxy(proxy_str);
-            let mut proxy_obj = json!({ "server": parsed.server });
-            if let Some(ref username) = parsed.username {
-                proxy_obj["username"] = json!(username);
-            }
-            if let Some(ref password) = parsed.password {
-                proxy_obj["password"] = json!(password);
-            }
-            if let Some(ref bypass) = flags.proxy_bypass {
-                proxy_obj["bypass"] = json!(bypass);
-            }
-            cmd_obj.insert("proxy".to_string(), proxy_obj);
-        }
-
-        if let Some(ref ua) = flags.user_agent {
-            cmd_obj.insert("userAgent".to_string(), json!(ua));
-        }
-
-        if let Some(ref a) = flags.args {
-            // Parse args (comma or newline separated)
-            let args_vec: Vec<String> = a
-                .split(&[',', '\n'][..])
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            cmd_obj.insert("args".to_string(), json!(args_vec));
-        }
-
-        if !flags.extensions.is_empty() {
-            cmd_obj.insert("extensions".to_string(), json!(&flags.extensions));
-        }
-
-        if !flags.init_scripts.is_empty() {
-            cmd_obj.insert("initScripts".to_string(), json!(&flags.init_scripts));
-        }
-
-        if !flags.enable.is_empty() {
-            cmd_obj.insert("enable".to_string(), json!(&flags.enable));
-        }
-
-        if flags.ignore_https_errors {
-            launch_cmd["ignoreHTTPSErrors"] = json!(true);
-        }
-
-        attach_ca_cert_to_launch_command(&mut launch_cmd, &flags);
-
-        if flags.allow_file_access {
-            launch_cmd["allowFileAccess"] = json!(true);
-        }
-
-        apply_hide_scrollbars_launch_option(
-            &mut launch_cmd,
-            flags.cli_hide_scrollbars,
-            flags.hide_scrollbars,
-        );
-
-        if flags.webgpu || flags.cli_webgpu {
-            launch_cmd["webgpu"] = json!(flags.webgpu);
-        }
-        attach_webmcp_launch_option(&mut launch_cmd, &flags);
-
-        // Env-only opt-out for automatic Xvfb; always stamped from the CLI's
-        // fresh environment so both setting and unsetting the var take effect
-        // on daemons spawned before the change.
-        launch_cmd["noXvfb"] = json!(flags.no_xvfb);
-
-        if let Some(ref cs) = flags.color_scheme {
-            launch_cmd["colorScheme"] = json!(cs);
-        }
-
-        if let Some(ref dp) = flags.download_path {
-            launch_cmd["downloadPath"] = json!(dp);
-        }
-
-        attach_allowed_domains_to_launch_command(&mut launch_cmd, &flags);
-
-        if let Some(ref engine) = flags.engine {
-            launch_cmd["engine"] = json!(engine);
-        }
-
-        match send_command(launch_cmd, &flags.session) {
-            Ok(resp) if !resp.success => {
-                // Launch command failed (e.g., invalid state file, profile error)
-                let error_msg = resp
-                    .error
-                    .unwrap_or_else(|| "Browser launch failed".to_string());
-                if flags.json {
-                    print_json_error(error_msg);
-                } else {
-                    eprintln!("{} {}", color::error_indicator(), error_msg);
-                }
-                exit(1);
-            }
-            Err(e) => {
-                if flags.json {
-                    print_json_error(e);
-                } else {
-                    eprintln!(
-                        "{} Could not configure browser: {}",
-                        color::error_indicator(),
-                        e
-                    );
-                }
-                exit(1);
-            }
-            Ok(_) => {
-                // Launch succeeded
-            }
+        if !report_daemon_setup(
+            send_command(launch_cmd, &flags.session),
+            "Browser launch failed",
+            &flags,
+        ) {
+            exit(1);
         }
     }
 
@@ -3018,6 +3013,7 @@ mod tests {
             })),
             error: None,
             warning: None,
+            browser: None,
         };
 
         let prompt = confirmation_prompt_from_response(&resp).unwrap();
