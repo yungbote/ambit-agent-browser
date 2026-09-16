@@ -424,6 +424,17 @@ async fn check_node_interception(
     let Some(object_id) = resolved.object.object_id else {
         return Ok(());
     };
+    check_object_interception(client, session_id, &object_id, target, x, y).await
+}
+
+async fn check_object_interception(
+    client: &CdpClient,
+    session_id: &str,
+    object_id: &str,
+    target: &str,
+    x: f64,
+    y: f64,
+) -> Result<(), String> {
     // Box-model coordinates are in the top-level viewport space, so the
     // hit-test starts from the top document. For an OOPIF node the
     // frameElement walk stops at the process boundary, where the frame's own
@@ -460,6 +471,37 @@ async fn check_node_interception(
         }
     }
     Ok(())
+}
+
+/// Resolve an already-selected DOM node through the same geometry and hit
+/// testing used for references. No temporary selector or DOM marker is needed.
+pub(crate) async fn resolve_object_center(
+    client: &CdpClient,
+    session_id: &str,
+    object_id: &str,
+    target: &str,
+) -> Result<(f64, f64), String> {
+    client
+        .send_command(
+            "DOM.scrollIntoViewIfNeeded",
+            Some(serde_json::json!({"objectId":object_id})),
+            Some(session_id),
+        )
+        .await?;
+    let result: DomGetBoxModelResult = client
+        .send_command_typed(
+            "DOM.getBoxModel",
+            &DomGetBoxModelParams {
+                backend_node_id: None,
+                node_id: None,
+                object_id: Some(object_id.into()),
+            },
+            Some(session_id),
+        )
+        .await?;
+    let (x, y) = box_model_center(&result.model);
+    check_object_interception(client, session_id, object_id, target, x, y).await?;
+    Ok((x, y))
 }
 
 /// Coordinates from DOM.getBoxModel are viewport-relative, and input events
@@ -994,6 +1036,16 @@ pub async fn is_element_enabled(
         .unwrap_or(true))
 }
 
+/// One retargeting rule for both observing and setting checkbox state.
+pub(crate) const CHECKED_TARGET_JS: &str = r#"el => {
+    const nativeInput = node => node?.matches?.('input[type="checkbox"],input[type="radio"]') ? node : null;
+    const own = nativeInput(el);
+    const label = el.closest?.('label');
+    const input = own || nativeInput(label?.control) || el.querySelector?.('input[type="checkbox"],input[type="radio"]');
+    const aria = ['checkbox','radio','switch','menuitemcheckbox','menuitemradio','option','treeitem'].includes(el.getAttribute?.('role'));
+    return {input, aria, checked:()=>own ? own.checked : aria ? el.getAttribute('aria-checked') === 'true' : input ? input.checked : false};
+}"#;
+
 pub async fn is_element_checked(
     client: &CdpClient,
     session_id: &str,
@@ -1019,35 +1071,9 @@ pub async fn is_element_checked(
         .send_command_typed(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
-                function_declaration: r#"function() {
-                    var el = this;
-                    // Native checkbox/radio input
-                    var tag = el.tagName && el.tagName.toUpperCase();
-                    if (tag === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio')) {
-                        return el.checked;
-                    }
-                    // ARIA role-based checked state
-                    var role = el.getAttribute && el.getAttribute('role');
-                    var ariaCheckedRoles = ['checkbox','radio','switch','menuitemcheckbox','menuitemradio','option','treeitem'];
-                    if (role && ariaCheckedRoles.indexOf(role) !== -1) {
-                        return el.getAttribute('aria-checked') === 'true';
-                    }
-                    // Follow label association (Playwright follow-label retarget)
-                    var label = el;
-                    if (tag !== 'LABEL') {
-                        label = el.closest && el.closest('label');
-                    }
-                    if (label && label.tagName && label.tagName.toUpperCase() === 'LABEL' && label.control) {
-                        var ctrl = label.control;
-                        if (ctrl.type === 'checkbox' || ctrl.type === 'radio') {
-                            return ctrl.checked;
-                        }
-                    }
-                    // Check for nested native input
-                    var input = el.querySelector && el.querySelector('input[type="checkbox"], input[type="radio"]');
-                    if (input) return input.checked;
-                    return false;
-                }"#.to_string(),
+                function_declaration: format!(
+                    "function() {{ return ({CHECKED_TARGET_JS})(this).checked(); }}"
+                ),
                 object_id: Some(object_id),
                 arguments: None,
                 return_by_value: Some(true),

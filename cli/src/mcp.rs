@@ -762,7 +762,7 @@ fn initialize_result(params: Option<&Value>, config: &McpConfig) -> Value {
         let mut descriptor = host_bound::descriptor();
         descriptor.as_object_mut().unwrap().remove("tools");
         result["capabilities"]["experimental"] = json!({ "io.ambit/browser": descriptor });
-        result["instructions"] = json!("Use the typed browser tools in the host-assigned browser session. Each operation returns its outcome and a current viewport capture when available. Coordinates use viewport CSS pixels. Human control temporarily prevents agent operations.");
+        result["instructions"] = json!("Use the typed browser tools in the host-assigned browser session. Each operation returns its outcome and a current viewport capture when available. Coordinates use viewport CSS pixels. Owned-window mouse tools move the native cursor through the display input owner. Human control temporarily prevents agent operations.");
     }
     result
 }
@@ -958,8 +958,8 @@ fn tools() -> Vec<Value> {
         ),
         tool(TOOL_HOVER, "Hover element", "Hover an element.", json!({ "selector": selector_schema() }), &["selector"]),
         tool(TOOL_FOCUS, "Focus element", "Focus an element.", json!({ "selector": selector_schema() }), &["selector"]),
-        tool(TOOL_CHECK, "Check element", "Check a checkbox or switch.", json!({ "selector": selector_schema() }), &["selector"]),
-        tool(TOOL_UNCHECK, "Uncheck element", "Uncheck a checkbox or switch.", json!({ "selector": selector_schema() }), &["selector"]),
+        tool(TOOL_CHECK, "Check element", "Check a checkbox or switch with one verified activation. Returns the actual native, CDP, DOM, or unchanged method.", json!({ "selector": selector_schema() }), &["selector"]),
+        tool(TOOL_UNCHECK, "Uncheck element", "Uncheck a checkbox or switch with one verified activation. Returns the actual native, CDP, DOM, or unchanged method.", json!({ "selector": selector_schema() }), &["selector"]),
         tool(
             TOOL_SELECT,
             "Select options",
@@ -4046,6 +4046,11 @@ fn tool_result_from_run(run: CliRun) -> Value {
         },
         "isError": !success,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn native_error_result_for_test(error: &str) -> Value {
+    host_bound::native_error_result_for_test(error)
 }
 
 fn tool_text(parsed: Option<&Value>, stdout: &str, stderr: &str) -> String {

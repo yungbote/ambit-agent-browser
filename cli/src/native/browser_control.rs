@@ -15,6 +15,8 @@ use serde_json::{json, Value};
 use super::cdp::client::{CdpClient, PendingCommand};
 use super::input::{input_command, stream_event, HeldInputs};
 
+mod mouse;
+
 pub(crate) const ACTION: &str = "ambit_browser_control";
 const MAX_LEASE_MS: u64 = 30_000;
 const MAX_REQUEST_BYTES: usize = 65_536;
@@ -327,6 +329,7 @@ pub(crate) struct BrowserControl {
     /// Set before enqueueing so cancellation cannot lose an uncertain send.
     stream_outcome_unknown: bool,
     display: Option<std::sync::Arc<super::display::DisplayClient>>,
+    native_mouse: mouse::NativeMouse,
 }
 
 struct PendingStreamInput {
@@ -367,7 +370,105 @@ impl BrowserControl {
         &mut self,
         display: Option<std::sync::Arc<super::display::DisplayClient>>,
     ) {
+        if self.display.as_ref().map(|value| value.identity())
+            != display.as_ref().map(|value| value.identity())
+        {
+            self.native_mouse.reset();
+        }
         self.display = display;
+    }
+
+    pub(crate) fn begin_agent_command(&mut self) {
+        self.native_mouse.begin_command();
+    }
+
+    pub(crate) fn has_native_mouse(&self) -> bool {
+        self.display.is_some()
+    }
+
+    /// A modal may navigate or replace the page when dismissed. Release at
+    /// the display owner, without replaying stale page coordinates or buttons.
+    pub(crate) async fn finish_native_dialog(&mut self) -> Result<(), String> {
+        if let Some(display) = self.display.as_ref() {
+            if let Err(error) = self.native_mouse.release(display).await {
+                self.needs_observation = true;
+                return Err(error);
+            }
+        }
+        Ok(())
+    }
+
+    /// The host can cancel a gesture future after a native press was already
+    /// acknowledged. Its deadline owner uses the same native cleanup before
+    /// reporting the original command's uncertain outcome.
+    pub(crate) async fn cancel_native_input(&mut self) -> Result<(), String> {
+        self.needs_observation = true;
+        if self.agent_error().is_none() && self.native_mouse.needs_release() {
+            if let Some(display) = self.display.as_ref() {
+                self.native_mouse.release(display).await?;
+            }
+        }
+        Ok(())
+    }
+
+    fn observe_native_result(&mut self, result: &Result<bool, String>) {
+        if result
+            .as_ref()
+            .is_err_and(|error| error.starts_with("browser_control_outcome_unknown: "))
+        {
+            self.needs_observation = true;
+        }
+    }
+
+    /// Returns a dialog observation separately from the real helper receipt.
+    /// Callers must never retry through CDP after entering this transport.
+    pub(crate) async fn agent_native_mouse(
+        &mut self,
+        params: Value,
+        client: &CdpClient,
+        session: &str,
+        dialog_sessions: &[&str],
+    ) -> Result<bool, String> {
+        if let Some(error) = self.agent_error() {
+            return Err(format!("{}: {}", error.code, error.message));
+        }
+        let result = self
+            .native_mouse
+            .dispatch(
+                params,
+                client,
+                session,
+                self.display.as_ref().ok_or("No owned browser display")?,
+                dialog_sessions,
+                false,
+            )
+            .await;
+        self.observe_native_result(&result);
+        result
+    }
+
+    pub(crate) async fn agent_native_drag(
+        &mut self,
+        client: &CdpClient,
+        page_session: &str,
+        source: (&str, f64, f64),
+        target: (&str, f64, f64),
+    ) -> Result<bool, String> {
+        if let Some(error) = self.agent_error() {
+            return Err(format!("{}: {}", error.code, error.message));
+        }
+        let result = self
+            .native_mouse
+            .drag(
+                client,
+                self.display.as_ref().ok_or("No owned browser display")?,
+                page_session,
+                source,
+                target,
+            )
+            .await;
+        self.observe_native_result(&result);
+        result
     }
 
     pub(crate) fn require_observation(&mut self) {
@@ -394,6 +495,14 @@ impl BrowserControl {
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
         if let Some(error) = self.agent_error() {
             return Err(format!("{}: {}", error.code, error.message));
+        }
+        if let ("input_mouse", Some(display)) = (kind, self.display.as_ref()) {
+            let result = self
+                .native_mouse
+                .dispatch(params, client, session_id, display, &[session_id], true)
+                .await;
+            self.observe_native_result(&result);
+            return result.map(|_| ());
         }
         let event = stream_event(kind, &params);
         if !self
@@ -486,6 +595,7 @@ impl BrowserControl {
         self.pending_stream.clear();
         self.stream_held = HeldInputs::default();
         self.stream_outcome_unknown = false;
+        self.native_mouse.reset();
         if let Some(lease) = self.lease.take() {
             self.last_released = Some(lease);
         }
@@ -702,6 +812,7 @@ impl BrowserControl {
                 }
                 if let Some(display) = self.display.as_ref() {
                     display.reset().await.map_err(|_| ControlError::unknown())?;
+                    self.native_mouse.reset();
                     display.invalidate().await;
                 }
                 self.stream_outcome_unknown = false;

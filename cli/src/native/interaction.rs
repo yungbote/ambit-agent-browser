@@ -2,9 +2,11 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use super::browser_control::BrowserControl;
 use super::cdp::client::CdpClient;
 use super::cdp::types::*;
 use super::element::{resolve_element_center, resolve_element_object_id, RefMap};
+use tokio::sync::Mutex;
 
 /// Outcome of a click. `dialog_opened` is true if a JavaScript dialog opened
 /// mid-sequence (the page is then blocked until `dialog accept`/`dismiss`).
@@ -25,8 +27,10 @@ pub struct PendingRelease {
     pub button: String,
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn click(
     client: &CdpClient,
+    control: &Mutex<BrowserControl>,
     session_id: &str,
     ref_map: &RefMap,
     selector_or_ref: &str,
@@ -42,11 +46,31 @@ pub async fn click(
         iframe_sessions,
     )
     .await?;
+    if control.lock().await.has_native_mouse() && click_count > 1 {
+        for _ in 0..click_count {
+            let result = dispatch_click(
+                client,
+                control,
+                &effective_session_id,
+                &[effective_session_id.as_str(), session_id],
+                x,
+                y,
+                button,
+                1,
+            )
+            .await?;
+            if result.dialog_opened {
+                return Ok(result);
+            }
+        }
+        return Ok(ClickResult::default());
+    }
     // A click-triggered dialog can fire on the frame's own session (OOPIF) or
     // on the top-level page session; both count as "ours". A dialog on any
     // other session belongs to a background tab and must not abort this click.
     dispatch_click(
         client,
+        control,
         &effective_session_id,
         &[effective_session_id.as_str(), session_id],
         x,
@@ -59,6 +83,7 @@ pub async fn click(
 
 pub async fn dblclick(
     client: &CdpClient,
+    control: &Mutex<BrowserControl>,
     session_id: &str,
     ref_map: &RefMap,
     selector_or_ref: &str,
@@ -66,6 +91,7 @@ pub async fn dblclick(
 ) -> Result<ClickResult, String> {
     click(
         client,
+        control,
         session_id,
         ref_map,
         selector_or_ref,
@@ -78,6 +104,7 @@ pub async fn dblclick(
 
 pub async fn hover(
     client: &CdpClient,
+    control: &Mutex<BrowserControl>,
     session_id: &str,
     ref_map: &RefMap,
     selector_or_ref: &str,
@@ -91,6 +118,19 @@ pub async fn hover(
         iframe_sessions,
     )
     .await?;
+    if control.lock().await.has_native_mouse() {
+        control
+            .lock()
+            .await
+            .agent_native_mouse(
+                serde_json::json!({"type":"mouseMoved","x":x,"y":y,"buttons":0}),
+                client,
+                &effective_session_id,
+                &[effective_session_id.as_str(), session_id],
+            )
+            .await?;
+        return Ok(());
+    }
     client
         .send_command_typed::<_, Value>(
             "Input.dispatchMouseEvent",
@@ -381,6 +421,7 @@ pub async fn scroll(
     let observation = client.observe_activity(
         serde_json::json!({ "type": "activity", "kind": "scrolling" }),
         session_id,
+        client.page_generation(session_id),
         super::activity::InputSource::Agent,
     );
     if let Some(sel) = selector_or_ref {
@@ -492,124 +533,82 @@ pub async fn select_option(
     Ok(())
 }
 
+fn checkbox_function(body: &str) -> String {
+    [
+        "function(desired) { const el=this; const {input,aria,checked}=(",
+        super::element::CHECKED_TARGET_JS,
+        r#")(el);
+        const pointerAccessible = node => {
+            if (!node?.isConnected) return false;
+            const style = getComputedStyle(node);
+            return style.display !== 'none' && style.visibility !== 'hidden' && style.visibility !== 'collapse'
+                && style.pointerEvents !== 'none' && Array.from(node.getClientRects()).some(rect=>rect.width>0 && rect.height>0);
+        };
+        const semanticTarget = pointerAccessible(el) && (aria || el.tabIndex >= 0 || typeof el.onclick === 'function') ? el : null;
+        const pointer = input ? (pointerAccessible(input) ? input : Array.from(input.labels || []).find(pointerAccessible) || semanticTarget) : el;
+        "#,
+        body,
+        "}",
+    ].concat()
+}
+
+pub struct CheckResult {
+    pub input: ClickResult,
+    pub method: &'static str,
+}
+
 pub async fn check(
     client: &CdpClient,
+    control: &Mutex<BrowserControl>,
     session_id: &str,
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<(), String> {
-    let is_checked = super::element::is_element_checked(
+) -> Result<CheckResult, String> {
+    set_checked(
         client,
+        control,
         session_id,
         ref_map,
         selector_or_ref,
         iframe_sessions,
+        true,
     )
-    .await?;
-    if !is_checked {
-        click(
-            client,
-            session_id,
-            ref_map,
-            selector_or_ref,
-            "left",
-            1,
-            iframe_sessions,
-        )
-        .await?;
-
-        // Verify the click changed the state (Playwright parity: _setChecked re-checks).
-        // If the coordinate-based click missed (e.g. hidden input, overlay), retry
-        // with a JS .click() on the element and its associated input.
-        if !super::element::is_element_checked(
-            client,
-            session_id,
-            ref_map,
-            selector_or_ref,
-            iframe_sessions,
-        )
-        .await?
-        {
-            js_click_checkbox(
-                client,
-                session_id,
-                ref_map,
-                selector_or_ref,
-                iframe_sessions,
-            )
-            .await?;
-        }
-    }
-    Ok(())
+    .await
 }
 
 pub async fn uncheck(
     client: &CdpClient,
+    control: &Mutex<BrowserControl>,
     session_id: &str,
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<(), String> {
-    let is_checked = super::element::is_element_checked(
+) -> Result<CheckResult, String> {
+    set_checked(
         client,
+        control,
         session_id,
         ref_map,
         selector_or_ref,
         iframe_sessions,
+        false,
     )
-    .await?;
-    if is_checked {
-        click(
-            client,
-            session_id,
-            ref_map,
-            selector_or_ref,
-            "left",
-            1,
-            iframe_sessions,
-        )
-        .await?;
-
-        // Same verify-and-retry as check().
-        if super::element::is_element_checked(
-            client,
-            session_id,
-            ref_map,
-            selector_or_ref,
-            iframe_sessions,
-        )
-        .await?
-        {
-            js_click_checkbox(
-                client,
-                session_id,
-                ref_map,
-                selector_or_ref,
-                iframe_sessions,
-            )
-            .await?;
-        }
-    }
-    Ok(())
+    .await
 }
 
-/// Fallback for when the coordinate-based CDP click did not toggle the
-/// checkbox/radio state. This mirrors how Playwright dispatches clicks
-/// through the DOM rather than via raw Input.dispatchMouseEvent coordinates.
-///
-/// Uses the same follow-label resolution as `is_element_checked`:
-/// 1. If the element is a native input → `.click()` it directly.
-/// 2. If the element is inside a `<label>` → `.click()` the label's `.control`.
-/// 3. If the element has a nested `<input>` → `.click()` that input.
-/// 4. Otherwise → `.click()` the element itself (handles ARIA role controls).
-async fn js_click_checkbox(
+/// Pick one activation method before acting. Hidden associated controls without
+/// a visible activation path retain programmatic support; visible controls use
+/// normal pointer input. A failed attempt never selects another transport.
+async fn set_checked(
     client: &CdpClient,
+    control: &Mutex<BrowserControl>,
     session_id: &str,
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<(), String> {
+    desired: bool,
+) -> Result<CheckResult, String> {
     let (object_id, effective_session_id) = resolve_element_object_id(
         client,
         session_id,
@@ -618,46 +617,104 @@ async fn js_click_checkbox(
         iframe_sessions,
     )
     .await?;
-
-    let js = r#"function() {
-            var el = this;
-            var tag = el.tagName && el.tagName.toUpperCase();
-            // 1. Native input — click it directly
-            if (tag === 'INPUT' && (el.type === 'checkbox' || el.type === 'radio')) {
-                el.click();
-                return;
+    // State, disabledness and the semantic action share one renderer task.
+    // A state change before this task cannot turn an idempotent check into a
+    // toggle. This is the existing associated-control DOM click, selected
+    // before any physical button instead of retried after a failed click.
+    let preflight = client.send_command("Runtime.callFunctionOn", Some(serde_json::json!({
+        "objectId":object_id, "returnByValue":true,
+        "arguments":[{"value":desired}],
+        "functionDeclaration":checkbox_function(r#"
+            if (!el.isConnected) return {error:'The checkbox is no longer attached.'};
+            if (checked() === desired) return {method:'unchanged'};
+            if (el.closest('[inert],[aria-disabled="true"]') || input?.matches(':disabled') || input?.closest('[inert],[aria-disabled="true"]')) {
+                return {error:'The checkbox is disabled.'};
             }
-            // 2. Follow label → control association
-            var label = tag === 'LABEL' ? el : (el.closest && el.closest('label'));
-            if (label && label.tagName && label.tagName.toUpperCase() === 'LABEL' && label.control) {
-                label.control.click();
-                return;
-            }
-            // 3. Nested native input
-            var input = el.querySelector && el.querySelector('input[type="checkbox"], input[type="radio"]');
-            if (input) {
-                input.click();
-                return;
-            }
-            // 4. ARIA role control — click the element itself
-            el.click();
-        }"#;
-
-    client
-        .send_command_typed::<_, Value>(
-            "Runtime.callFunctionOn",
-            &CallFunctionOnParams {
-                function_declaration: js.to_string(),
-                object_id: Some(object_id),
-                arguments: None,
-                return_by_value: Some(true),
-                await_promise: Some(false),
+            if (pointer) return {method:'pointer'};
+            input.click();
+            return {method:'dom'};
+        "#),
+    })), Some(&effective_session_id));
+    let mut events = client.subscribe();
+    tokio::pin!(preflight);
+    let result = loop {
+        tokio::select! {
+            result = &mut preflight => break result?,
+            event = events.recv() => match event {
+                Ok(event) if event.method == "Page.javascriptDialogOpening" && event.session_id.as_deref().is_none_or(|id| id == session_id || id == effective_session_id) => {
+                    return Ok(CheckResult {input:ClickResult {dialog_opened:true,pending_release:None},method:"dom"});
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err("The browser disconnected while checking the control.".into()),
+                _ => {},
             },
-            Some(&effective_session_id),
+        }
+    };
+    if result.get("exceptionDetails").is_some() {
+        return Err("The checkbox could not be inspected.".into());
+    }
+    let value = &result["result"]["value"];
+    if let Some(error) = value["error"].as_str() {
+        return Err(error.into());
+    }
+    let method = match value["method"].as_str() {
+        Some("unchanged") => {
+            return Ok(CheckResult {
+                input: ClickResult::default(),
+                method: "unchanged",
+            })
+        }
+        Some("dom") => "dom",
+        Some("pointer") => {
+            if control.lock().await.has_native_mouse() {
+                "native"
+            } else {
+                "cdp"
+            }
+        }
+        _ => return Err("The checkbox activation method is unavailable.".into()),
+    };
+    let input = if method == "dom" {
+        ClickResult::default()
+    } else {
+        let target = client.send_command("Runtime.callFunctionOn", Some(serde_json::json!({
+            "objectId":object_id, "functionDeclaration":checkbox_function("return pointer;"), "returnByValue":false,
+        })), Some(&effective_session_id)).await?;
+        let target_id = target["result"]["objectId"].as_str().ok_or(
+            "The checkbox activation target changed. Inspect the current page before retrying.",
+        )?;
+        let (x, y) = super::element::resolve_object_center(
+            client,
+            &effective_session_id,
+            target_id,
+            selector_or_ref,
         )
         .await?;
-
-    Ok(())
+        dispatch_click(
+            client,
+            control,
+            &effective_session_id,
+            &[effective_session_id.as_str(), session_id],
+            x,
+            y,
+            "left",
+            1,
+        )
+        .await?
+    };
+    if !input.dialog_opened
+        && super::element::is_element_checked(
+            client,
+            session_id,
+            ref_map,
+            selector_or_ref,
+            iframe_sessions,
+        )
+        .await?
+            != desired
+    {
+        return Err("The checkbox did not reach the requested state after its activation. Inspect the current page before retrying.".into());
+    }
+    Ok(CheckResult { input, method })
 }
 
 pub async fn focus(
@@ -948,12 +1005,25 @@ pub async fn tap_touch(
 /// never sees the pending-dialog warning.
 async fn dispatch_mouse_or_dialog(
     client: &CdpClient,
+    control: &Mutex<BrowserControl>,
     session_id: &str,
     accept_sessions: &[&str],
     params: &DispatchMouseEventParams,
 ) -> Result<bool, String> {
     use tokio::sync::broadcast::error::RecvError;
 
+    if control.lock().await.has_native_mouse() {
+        return control
+            .lock()
+            .await
+            .agent_native_mouse(
+                serde_json::to_value(params).map_err(|error| error.to_string())?,
+                client,
+                session_id,
+                accept_sessions,
+            )
+            .await;
+    }
     // Subscribe before sending so the dialog event cannot slip past us.
     let mut events = client.subscribe();
     let send =
@@ -993,8 +1063,10 @@ async fn dispatch_mouse_or_dialog(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dispatch_click(
     client: &CdpClient,
+    control: &Mutex<BrowserControl>,
     session_id: &str,
     accept_sessions: &[&str],
     x: f64,
@@ -1005,6 +1077,7 @@ async fn dispatch_click(
     // Move
     if dispatch_mouse_or_dialog(
         client,
+        control,
         session_id,
         accept_sessions,
         &DispatchMouseEventParams {
@@ -1037,6 +1110,7 @@ async fn dispatch_click(
     // Press
     if dispatch_mouse_or_dialog(
         client,
+        control,
         session_id,
         accept_sessions,
         &DispatchMouseEventParams {
@@ -1071,6 +1145,7 @@ async fn dispatch_click(
     // after the button is already up, so there is nothing left to release.
     let dialog_opened = dispatch_mouse_or_dialog(
         client,
+        control,
         session_id,
         accept_sessions,
         &DispatchMouseEventParams {
@@ -1096,8 +1171,12 @@ async fn dispatch_click(
 /// dialog opened mid-click. Called after the dialog is resolved.
 pub async fn dispatch_pending_release(
     client: &CdpClient,
+    control: &Mutex<BrowserControl>,
     release: &PendingRelease,
 ) -> Result<(), String> {
+    if control.lock().await.has_native_mouse() {
+        return control.lock().await.finish_native_dialog().await;
+    }
     client
         .send_command_typed::<_, Value>(
             "Input.dispatchMouseEvent",

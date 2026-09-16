@@ -171,6 +171,29 @@ mod platform {
     }
 
     impl DisplayClient {
+        #[cfg(test)]
+        pub(crate) fn test_channel() -> (Arc<Self>, tokio::net::UnixStream) {
+            let (client, peer) = UnixStream::pair().unwrap();
+            let abort_socket = client.try_clone().unwrap();
+            client.set_nonblocking(true).unwrap();
+            peer.set_nonblocking(true).unwrap();
+            let client = Arc::new(Self {
+                identity: uuid::Uuid::new_v4().to_string(),
+                wire: tokio::sync::Mutex::new(BufReader::new(
+                    tokio::net::UnixStream::from_std(client).unwrap(),
+                )),
+                abort_socket,
+                failed: AtomicBool::new(false),
+                next_id: AtomicU64::new(1),
+                surface: RwLock::new(SurfaceState {
+                    value: Surface::new(2560, 1440),
+                    changed_at: std::time::Instant::now(),
+                    ready: true,
+                }),
+            });
+            (client, tokio::net::UnixStream::from_std(peer).unwrap())
+        }
+
         pub(crate) fn identity(&self) -> &str {
             &self.identity
         }
@@ -407,6 +430,92 @@ mod platform {
             }
             let _ = self.child.kill();
             let _ = self.child.wait();
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use tokio::io::AsyncWriteExt;
+        use tokio::sync::oneshot;
+
+        async fn reply(peer: &mut BufReader<tokio::net::UnixStream>, value: Value) {
+            let body = format!("{value}\n");
+            peer.get_mut().write_all(body.as_bytes()).await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn reset_waits_for_the_prior_input_response_on_the_same_channel() {
+            let (display, peer) = DisplayClient::test_channel();
+            let (seen, received) = oneshot::channel();
+            let (inspect, inspect_receiver) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let mut peer = BufReader::new(peer);
+                let mut line = String::new();
+                peer.read_line(&mut line).await.unwrap();
+                let input: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(input["op"], "input");
+                seen.send(()).unwrap();
+                inspect_receiver.await.unwrap();
+                let mut byte = [0];
+                assert_eq!(
+                    peer.get_mut().try_read(&mut byte).unwrap_err().kind(),
+                    std::io::ErrorKind::WouldBlock
+                );
+                reply(&mut peer, json!({"id":input["id"],"success":false,"error":{"code":"test_input_unknown","message":"Input outcome unknown","operationPerformed":"unknown"}})).await;
+                line.clear();
+                peer.read_line(&mut line).await.unwrap();
+                let reset: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(reset["op"], "reset");
+                reply(
+                    &mut peer,
+                    json!({"id":reset["id"],"success":true,"data":{}}),
+                )
+                .await;
+            });
+            let owner = display.clone();
+            let input = tokio::spawn(async move { owner.input(&[]).await });
+            received.await.unwrap();
+            let owner = display.clone();
+            let (started, start_received) = oneshot::channel();
+            let reset = tokio::spawn(async move {
+                started.send(()).unwrap();
+                owner.reset().await
+            });
+            start_received.await.unwrap();
+            inspect.send(()).unwrap();
+            assert_eq!(input.await.unwrap().unwrap_err().code, "test_input_unknown");
+            reset.await.unwrap().unwrap();
+            server.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn cancelled_input_aborts_the_channel_before_any_reset_can_be_acknowledged() {
+            let (display, peer) = DisplayClient::test_channel();
+            let (seen, received) = oneshot::channel();
+            let server = tokio::spawn(async move {
+                let mut peer = BufReader::new(peer);
+                let mut line = String::new();
+                peer.read_line(&mut line).await.unwrap();
+                let input: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(input["op"], "input");
+                seen.send(()).unwrap();
+                line.clear();
+                assert_eq!(
+                    peer.read_line(&mut line).await.unwrap(),
+                    0,
+                    "cancelled input must close this channel, not queue reset or later input"
+                );
+            });
+            let owner = display.clone();
+            let input = tokio::spawn(async move { owner.input(&[]).await });
+            received.await.unwrap();
+            input.abort();
+            assert!(input.await.unwrap_err().is_cancelled());
+            assert!(!display.available());
+            assert!(display.reset().await.is_err());
+            assert!(display.input(&[]).await.is_err());
+            server.await.unwrap();
         }
     }
 }

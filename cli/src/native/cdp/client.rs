@@ -19,6 +19,7 @@ struct PendingResponse {
     activity: Option<ActivityObservation>,
     reset_page: Option<String>,
     _pointer_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
+    native_pointer: Arc<std::sync::Mutex<Option<activity::NativePointer>>>,
 }
 
 impl PendingResponse {
@@ -33,6 +34,7 @@ impl PendingResponse {
                 reset_page(pages, events, session);
             }
             if let Some(observation) = self.activity {
+                *self.native_pointer.lock().unwrap() = observation.native_pointer();
                 observation.acknowledged();
             }
         } else if let Some(observation) = self.activity {
@@ -139,9 +141,13 @@ struct PendingGuard {
 pub(crate) struct PendingCommand {
     response: oneshot::Receiver<CdpMessage>,
     guard: PendingGuard,
+    native_pointer: Arc<std::sync::Mutex<Option<activity::NativePointer>>>,
 }
 
 impl PendingCommand {
+    pub(crate) fn native_pointer(&self) -> Option<activity::NativePointer> {
+        self.native_pointer.lock().unwrap().clone()
+    }
     pub(crate) async fn acknowledgment(&mut self) -> Result<CdpMessage, String> {
         let result = (&mut self.response)
             .await
@@ -523,8 +529,9 @@ impl CdpClient {
         source: InputSource,
     ) -> Result<PendingCommand, String> {
         let mut observation = session_id.and_then(|session| {
-            activity::from_command(method, params.as_ref()?)
-                .map(|value| self.observe_activity(value, session, source))
+            activity::from_command(method, params.as_ref()?).map(|value| {
+                self.observe_activity(value, session, self.page_generation(session), source)
+            })
         });
         let reset_page = (method == "Emulation.setDeviceMetricsOverride"
             || method == "Emulation.clearDeviceMetricsOverride")
@@ -537,9 +544,11 @@ impl CdpClient {
             let guard = self.native_pointer_lock.clone().lock_owned().await;
             if self.native_pointer_enabled.load(Ordering::Acquire) {
                 if let Some(session) = session_id {
-                    if Box::pin(self.prepare_native_pointer(session, id)).await {
+                    if let Some(context) = Box::pin(self.prepare_native_pointer(session, id)).await
+                    {
                         if let Some(observation) = observation.as_mut() {
                             observation.track_native(self.native_pointer_enabled.clone());
+                            observation.set_native_context(context);
                         }
                     } else {
                         self.native_pointer_enabled.store(false, Ordering::Release);
@@ -562,6 +571,7 @@ impl CdpClient {
             .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
 
         let (tx, rx) = oneshot::channel();
+        let native_pointer = Arc::new(std::sync::Mutex::new(None));
 
         {
             let mut pending = self.pending.lock().await;
@@ -573,6 +583,7 @@ impl CdpClient {
                     activity: observation,
                     reset_page,
                     _pointer_guard: pointer_guard,
+                    native_pointer: native_pointer.clone(),
                 },
             );
         }
@@ -595,6 +606,7 @@ impl CdpClient {
         Ok(PendingCommand {
             response: rx,
             guard,
+            native_pointer,
         })
     }
 
@@ -606,7 +618,7 @@ impl CdpClient {
         self.native_pointer_enabled.store(true, Ordering::Release);
     }
 
-    async fn prepare_native_pointer(&self, session: &str, token: u64) -> bool {
+    async fn prepare_native_pointer(&self, session: &str, token: u64) -> Option<i64> {
         let prepare = async {
             let tree = self
                 .send_command_no_params("Page.getFrameTree", Some(session))
@@ -635,18 +647,22 @@ impl CdpClient {
                 r#"(() => {{
                 globalThis.__ambitPointerToken = {token};
                 if (typeof globalThis.__ambitWindowPointer !== 'function') return false;
-                if (!globalThis.__ambitPointerInstalled) {{
-                    globalThis.__ambitPointerInstalled = true;
-                    for (const [name, eventType] of [['pointermove','move'],['pointerdown','press'],['pointerup','release'],['wheel','scroll']]) {{
-                        addEventListener(name, event => {{
-                            if (!event.isTrusted) return;
-                            globalThis.__ambitWindowPointer(JSON.stringify({{
-                                token: globalThis.__ambitPointerToken, eventType,
-                                clientX: event.clientX, clientY: event.clientY,
-                                screenX: event.screenX, screenY: event.screenY,
-                            }}));
-                        }}, {{capture:true, passive:true}});
-                    }}
+                const handlers = globalThis.__ambitPointerHandlers ||= Object.create(null);
+                for (const [name, eventType] of [['pointermove','move'],['pointerdown','press'],['pointerup','release'],['wheel','scroll']]) {{
+                    const handler = handlers[name] ||= event => {{
+                        if (!event.isTrusted) return;
+                        globalThis.__ambitWindowPointer(JSON.stringify({{
+                            token: globalThis.__ambitPointerToken, eventType,
+                            clientX: event.clientX, clientY: event.clientY,
+                            screenX: event.screenX, screenY: event.screenY,
+                            geometry: {{scale:devicePixelRatio*(visualViewport?.scale??1),width:innerWidth,height:innerHeight,offsetX:visualViewport?.offsetLeft??0,offsetY:visualViewport?.offsetTop??0}},
+                        }}));
+                    }};
+                    // Document replacement can discard listeners while this
+                    // isolated realm survives. Rebind the same function;
+                    // a remembered installation flag is not observation.
+                    removeEventListener(name, handler, true);
+                    addEventListener(name, handler, {{capture:true, passive:true}});
                 }}
                 return true;
             }})()"#
@@ -660,12 +676,13 @@ impl CdpClient {
                     Some(session),
                 )
                 .await?;
-            Ok::<bool, String>(value["result"]["value"] == true)
+            Ok::<Option<i64>, String>((value["result"]["value"] == true).then_some(context))
         };
-        matches!(
-            tokio::time::timeout(std::time::Duration::from_millis(500), prepare).await,
-            Ok(Ok(true))
-        )
+        tokio::time::timeout(std::time::Duration::from_millis(500), prepare)
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .flatten()
     }
 
     pub(crate) fn rotate_page_generation(&self, session: &str) {
@@ -689,15 +706,10 @@ impl CdpClient {
         &self,
         value: Value,
         session: &str,
+        generation: String,
         source: InputSource,
     ) -> ActivityObservation {
-        ActivityObservation::new(
-            value,
-            session,
-            page_generation(&self.page_generations, session),
-            source,
-            self.event_tx.clone(),
-        )
+        ActivityObservation::new(value, session, generation, source, self.event_tx.clone())
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {
