@@ -248,6 +248,28 @@ impl Downloads {
             .unwrap_or_else(|e| e.into_inner())
             .sequence
     }
+    /// A read-only Product snapshot shares the observer without consuming CLI waits.
+    pub(crate) fn completed(
+        &self,
+        frames: Option<&HashSet<String>>,
+        after: u64,
+    ) -> Result<Vec<Download>, String> {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(error) = &state.failure {
+            return Err(error.clone());
+        }
+        Ok(state
+            .records
+            .iter()
+            .filter(|item| {
+                item.status == DownloadStatus::Completed
+                    && item.sequence > after
+                    && frames.is_none_or(|frames| frames.contains(&item.page_id))
+            })
+            .cloned()
+            .collect())
+    }
+
     pub fn reported(&self, guid: &str) {
         if let Some(item) = self
             .state

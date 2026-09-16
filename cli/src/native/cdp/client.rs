@@ -114,6 +114,7 @@ pub struct CdpClient {
     page_generations: PageGenerations,
     event_tx: broadcast::Sender<CdpEvent>,
     pub(crate) downloads: Arc<super::super::downloads::Downloads>,
+    pub(crate) files: Arc<super::super::browser_files::FileDestinations>,
     raw_tx: broadcast::Sender<RawCdpMessage>,
     private_sessions: PrivateSessions,
     native_pointer_enabled: Arc<AtomicBool>,
@@ -225,6 +226,8 @@ impl CdpClient {
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
         let downloads = Arc::new(super::super::downloads::Downloads::default());
         let downloads_reader = downloads.clone();
+        let files = Arc::new(super::super::browser_files::FileDestinations::default());
+        let files_reader = files.clone();
         let (event_tx, _) = broadcast::channel(4096);
         let (raw_tx, _) = broadcast::channel(4096);
 
@@ -371,6 +374,11 @@ impl CdpClient {
                             }
                         }
                     }
+                    files_reader.observe(
+                        method,
+                        parsed.params.as_ref().unwrap_or(&Value::Null),
+                        parsed.session_id.as_deref(),
+                    );
                     // Retain download truth before broadcasting it to consumers.
                     downloads_reader
                         .observe(method, parsed.params.as_ref().unwrap_or(&Value::Null));
@@ -424,6 +432,7 @@ impl CdpClient {
             // command senders so callers get an immediate channel-closed error
             // instead of waiting for the 30-second timeout.
             downloads_reader.closed();
+            files_reader.end();
             pending_clone.lock().await.clear();
 
             // Stop the keepalive task — the connection is gone.
@@ -456,6 +465,7 @@ impl CdpClient {
             page_generations,
             event_tx,
             downloads,
+            files,
             raw_tx,
             private_sessions,
             native_pointer_enabled: Arc::new(AtomicBool::new(false)),

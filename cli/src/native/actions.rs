@@ -7409,6 +7409,95 @@ pub(crate) struct ControlPage<'a>(
 );
 
 impl ControlPage<'_> {
+    pub(crate) async fn prepare_files(
+        &mut self,
+        controller: &str,
+    ) -> Result<(), browser_control::ControlError> {
+        let browser = self.0.browser.as_ref().ok_or_else(|| {
+            browser_control::ControlError::new(
+                "browser_control_files_unavailable",
+                "The browser is unavailable.",
+            )
+        })?;
+        browser.client.files.begin(controller);
+        let sessions: std::collections::HashSet<_> = browser
+            .pages_list()
+            .into_iter()
+            .map(|page| page.session_id)
+            .chain(self.0.iframe_sessions.values().cloned())
+            .collect();
+        for session in sessions {
+            if super::browser_files::intercept(&browser.client, &session, true)
+                .await
+                .is_err()
+            {
+                super::browser_files::stop(&browser.client).await;
+                return Err(browser_control::ControlError::new(
+                    "browser_control_files_unavailable",
+                    "The browser could not prepare file pickers.",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn file_page(
+        &mut self,
+    ) -> Result<super::browser_files::FilePage, browser_control::ControlError> {
+        let unavailable = || {
+            browser_control::ControlError::new(
+                "browser_control_files_unavailable",
+                "The browser page could not be observed.",
+            )
+        };
+        self.0
+            .drain_cdp_events_background()
+            .await
+            .map_err(|_| unavailable())?;
+        let browser = self.0.browser.as_mut().ok_or_else(unavailable)?;
+        browser
+            .synchronize_visible_page()
+            .await
+            .map_err(|_| unavailable())?;
+        let session = browser
+            .active_session_id()
+            .map_err(|_| unavailable())?
+            .to_string();
+        let frames =
+            a11y::active_frame_sessions(&browser.client, &session, &self.0.iframe_sessions)
+                .await
+                .map_err(|_| unavailable())?;
+        Ok(super::browser_files::FilePage {
+            client: browser.client.clone(),
+            root_session: session,
+            frames,
+            display: browser.display_client(),
+        })
+    }
+
+    pub(crate) async fn completed_downloads(
+        &self,
+        after: u64,
+    ) -> Result<Vec<Value>, browser_control::ControlError> {
+        self.0
+            .browser
+            .as_ref()
+            .ok_or_else(|| {
+                browser_control::ControlError::new(
+                    "browser_control_files_unavailable",
+                    "The browser is unavailable.",
+                )
+            })?
+            .completed_downloads(after)
+            .await
+            .map_err(|_| {
+                browser_control::ControlError::new(
+                    "browser_control_files_unavailable",
+                    "The browser downloads could not be observed.",
+                )
+            })
+    }
+
     pub(crate) async fn validate_events(&self, events: &[Value]) -> Result<(), String> {
         let filter = self.0.domain_filter.read().await;
         for event in events {

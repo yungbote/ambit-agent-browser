@@ -38,6 +38,7 @@ async fn expired_native_input_retains_custody_until_reset_is_proven() {
             outcome_unknown: false,
             held: HeldInputs::default(),
             native_input_pending: true,
+            download_cursor: 0,
         }),
         ..BrowserControl::default()
     };
@@ -870,4 +871,46 @@ async fn control_cancelled_transfer_never_replays_an_unacknowledged_release() {
         browser.commands.try_recv().is_err(),
         "lost release must never be sent again"
     );
+}
+
+#[test]
+fn internal_file_requests_require_bounded_identity_and_typed_paths() {
+    let destination = "11223344-1111-4222-8333-123456789abc";
+    for request in [
+        command("files", OWNER),
+        json!({"action":ACTION,"op":"dismissfiles","controllerId":OWNER,"destinationId":destination}),
+        json!({"action":ACTION,"op":"setfiles","controllerId":OWNER,"destinationId":destination,"sequence":1,"files":["/workspace/work/input.bin"]}),
+        json!({"action":ACTION,"op":"drop","controllerId":OWNER,"sequence":1,"expectedSurfaceGeneration":destination,"x":0,"y":21.5}),
+    ] {
+        assert!(ControlRequest::parse(&request).is_ok(), "{request}");
+    }
+    let valid = json!({"action":ACTION,"op":"setfiles","controllerId":OWNER,"destinationId":destination,"sequence":1,"files":["/workspace/work/input.bin"]});
+    for (key, value) in [
+        ("files", json!([])),
+        ("files", json!(["relative"])),
+        ("files", json!(["/x\u{0}y"])),
+        ("files", json!(vec!["/x"; 65])),
+        ("sequence", json!(0)),
+        ("destinationId", json!("wrong")),
+        ("bytes", json!("AA==")),
+        ("path", json!("/etc/passwd")),
+    ] {
+        let mut request = valid.clone();
+        request[key] = value;
+        assert!(ControlRequest::parse(&request).is_err(), "{request}");
+    }
+    let mut status = command("files", OWNER);
+    status["path"] = json!("/arbitrary");
+    assert!(ControlRequest::parse(&status).is_err());
+}
+
+#[test]
+fn completed_download_snapshot_is_readonly_and_has_no_controller_fields() {
+    let request = json!({"action":ACTION,"op":"downloads"});
+    assert!(ControlRequest::parse(&request).is_ok());
+    for field in ["controllerId", "sequence", "path", "files", "destinationId"] {
+        let mut invalid = request.clone();
+        invalid[field] = Value::Null;
+        assert!(ControlRequest::parse(&invalid).is_err(), "{invalid}");
+    }
 }

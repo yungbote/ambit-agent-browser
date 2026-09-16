@@ -854,6 +854,9 @@ impl BrowserManager {
     }
 
     async fn prepare_domains(&self, session_id: &str) -> Result<(), String> {
+        if self.client.files.active() {
+            super::browser_files::intercept(&self.client, session_id, true).await?;
+        }
         self.client
             .send_command_no_params("Page.enable", Some(session_id))
             .await?;
@@ -2354,6 +2357,33 @@ impl BrowserManager {
         self.client.downloads.seed_frames(&tree["frameTree"]);
         let frames = HashSet::from([root.to_owned()]);
         Ok(frames)
+    }
+
+    /// Verified completed results within this browser's owned scope, without
+    /// marking observer records reported or accepting caller-selected paths.
+    pub(crate) async fn completed_downloads(&self, after: u64) -> Result<Vec<Value>, String> {
+        let Some(directory) = self.downloads_directory.as_ref() else {
+            return Ok(Vec::new());
+        };
+        // An owned Chrome process is one Product browser resource. Retain its
+        // completed GUIDs across tab changes/closure. An external attachment
+        // does not confer ownership of unrelated browser contexts.
+        let frames = if self.browser_process.is_some() {
+            None
+        } else {
+            Some(self.download_frames().await?)
+        };
+        Ok(self
+            .client
+            .downloads
+            .completed(frames.as_ref(), after)?
+            .iter()
+            .filter_map(|download| {
+                let mut result = directory.finish(download, None).ok()?;
+                result["id"] = json!(download.guid);
+                Some(result)
+            })
+            .collect())
     }
 
     pub(crate) fn finish_download(

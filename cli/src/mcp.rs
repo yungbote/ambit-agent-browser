@@ -18,6 +18,9 @@
 //! Human browser custody is enforced by the same daemon for CLI and MCP.
 //! Internal ambit_browser_control is intentionally not an MCP tool: the host
 //! must authorize the current user and browser resource before obtaining custody.
+//! Its files/drop/setfiles/dismissfiles/downloads operations are also Product-only: the
+//! host owns immutable staging and download capture; MCP never accepts their
+//! opaque destinations or exposes their browser-local download paths.
 //! Ordinary tools preserve browser_controlled_by_user and unknown outcomes.
 //! Native acknowledged pointer and typing/scrolling activity is streamed with
 //! the observed page identity; it never includes tool input text. Host viewport
@@ -4370,6 +4373,14 @@ mod tests {
         let args = vec![crate::native::browser_control::ACTION.to_string()];
         let flags = crate::flags::parse_flags(&args);
         assert!(crate::commands::parse_command(&args, &flags).is_err());
+        for operation in ["files", "drop", "setfiles", "dismissfiles", "downloads"] {
+            let args = vec![
+                crate::native::browser_control::ACTION.to_string(),
+                operation.to_string(),
+            ];
+            let flags = crate::flags::parse_flags(&args);
+            assert!(crate::commands::parse_command(&args, &flags).is_err());
+        }
     }
 
     #[test]

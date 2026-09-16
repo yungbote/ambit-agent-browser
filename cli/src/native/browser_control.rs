@@ -32,14 +32,14 @@ pub(crate) struct ControlError {
 }
 
 impl ControlError {
-    fn new(code: &'static str, message: impl Into<String>) -> Self {
+    pub(crate) fn new(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             code,
             message: message.into(),
         }
     }
 
-    fn invalid(message: impl Into<String>) -> Self {
+    pub(crate) fn invalid(message: impl Into<String>) -> Self {
         Self::new("browser_control_invalid", message)
     }
 
@@ -61,6 +61,10 @@ pub(crate) struct ControlRequest {
     sequence: Option<u64>,
     events: Option<Vec<Value>>,
     expected_surface_generation: Option<String>,
+    destination_id: Option<String>,
+    files: Option<Vec<String>>,
+    x: Option<f64>,
+    y: Option<f64>,
     #[serde(skip)]
     large_paste: bool,
 }
@@ -69,11 +73,16 @@ pub(crate) struct ControlRequest {
 #[serde(rename_all = "lowercase")]
 enum Operation {
     Inspect,
+    Downloads,
     Acquire,
     Renew,
     Release,
     Input,
     Copy,
+    Files,
+    Drop,
+    Setfiles,
+    Dismissfiles,
 }
 
 impl ControlRequest {
@@ -88,11 +97,33 @@ impl ControlRequest {
             ControlError::invalid("Invalid browser control request fields or types.")
         })?;
         let allowed: &[&str] = match request.op {
-            Operation::Inspect => &["id", "action", "op"],
+            Operation::Inspect | Operation::Downloads => &["id", "action", "op"],
             Operation::Acquire | Operation::Renew => {
                 &["id", "action", "op", "controllerId", "expiresAt"]
             }
-            Operation::Release | Operation::Copy => &["id", "action", "op", "controllerId"],
+            Operation::Release | Operation::Copy | Operation::Files => {
+                &["id", "action", "op", "controllerId"]
+            }
+            Operation::Drop => &[
+                "id",
+                "action",
+                "op",
+                "controllerId",
+                "sequence",
+                "expectedSurfaceGeneration",
+                "x",
+                "y",
+            ],
+            Operation::Setfiles => &[
+                "id",
+                "action",
+                "op",
+                "controllerId",
+                "sequence",
+                "destinationId",
+                "files",
+            ],
+            Operation::Dismissfiles => &["id", "action", "op", "controllerId", "destinationId"],
             Operation::Input => &[
                 "id",
                 "action",
@@ -118,7 +149,7 @@ impl ControlRequest {
                 "Only one explicit window paste may exceed the 65536-byte input limit.",
             ));
         }
-        if request.op == Operation::Inspect {
+        if matches!(request.op, Operation::Inspect | Operation::Downloads) {
             if value.get("controllerId").is_some()
                 || request.expires_at.is_some()
                 || request.sequence.is_some()
@@ -126,7 +157,7 @@ impl ControlRequest {
                 || request.action != ACTION
             {
                 return Err(ControlError::invalid(
-                    "Inspect accepts no controller or input fields.",
+                    "Inspect and downloads accept no controller or input fields.",
                 ));
             }
             return Ok(request);
@@ -140,7 +171,7 @@ impl ControlRequest {
             ));
         }
         match request.op {
-            Operation::Inspect => unreachable!(),
+            Operation::Inspect | Operation::Downloads => unreachable!(),
             Operation::Acquire | Operation::Renew => {
                 if request.expires_at.is_none()
                     || request.sequence.is_some()
@@ -151,13 +182,59 @@ impl ControlRequest {
                     ));
                 }
             }
-            Operation::Release | Operation::Copy => {
+            Operation::Release | Operation::Copy | Operation::Files => {
                 if request.expires_at.is_some()
                     || request.sequence.is_some()
                     || request.events.is_some()
                 {
                     return Err(ControlError::invalid(
                         "Release and copy require only controllerId.",
+                    ));
+                }
+            }
+            Operation::Drop | Operation::Setfiles | Operation::Dismissfiles => {
+                if request.op != Operation::Dismissfiles
+                    && !request
+                        .sequence
+                        .is_some_and(|seq| (1..=MAX_SAFE_INTEGER).contains(&seq))
+                {
+                    return Err(ControlError::invalid(
+                        "File input requires a safe integer sequence starting at 1.",
+                    ));
+                }
+                if request.op == Operation::Drop {
+                    number(value, "x", 0.0, 32768.0, false, true)?;
+                    number(value, "y", 0.0, 32768.0, false, true)?;
+                    if !request
+                        .expected_surface_generation
+                        .as_deref()
+                        .is_some_and(canonical_uuid)
+                    {
+                        return Err(ControlError::invalid(
+                            "Drop requires the current expectedSurfaceGeneration.",
+                        ));
+                    }
+                } else if !request
+                    .destination_id
+                    .as_deref()
+                    .is_some_and(canonical_uuid)
+                {
+                    return Err(ControlError::invalid(
+                        "destinationId must be a canonical nonzero UUID.",
+                    ));
+                }
+                if request.op == Operation::Setfiles
+                    && request.files.as_ref().is_none_or(|files| {
+                        !(1..=super::browser_files::MAX_FILES).contains(&files.len())
+                            || files.iter().any(|file| {
+                                file.len() > 4096
+                                    || file.contains('\0')
+                                    || !std::path::Path::new(file).is_absolute()
+                            })
+                    })
+                {
+                    return Err(ControlError::invalid(
+                        "Setfiles requires between 1 and 64 absolute staged file paths.",
                     ));
                 }
             }
@@ -226,6 +303,7 @@ struct Lease {
     outcome_unknown: bool,
     held: HeldInputs,
     native_input_pending: bool,
+    download_cursor: u64,
 }
 
 impl Lease {
@@ -355,6 +433,9 @@ impl BrowserControl {
             .as_ref()
             .is_some_and(|lease| lease.deadline <= Instant::now())
         {
+            if let Some((client, _)) = browser {
+                super::browser_files::stop(client).await;
+            }
             self.release_held(browser).await?;
         }
         Ok(())
@@ -555,6 +636,28 @@ impl BrowserControl {
             Operation::Inspect => {
                 Ok(json!({ "supported": true, "controlled": self.agent_error().is_some() }))
             }
+            Operation::Downloads => {
+                let page = page.as_mut().ok_or_else(|| {
+                    ControlError::new(
+                        "browser_control_files_unavailable",
+                        "The browser page is unavailable.",
+                    )
+                })?;
+                let downloads = tokio::time::timeout(ACK_TIMEOUT, async {
+                    page.file_page().await?;
+                    page.completed_downloads(0).await
+                })
+                .await
+                .map_err(|_| {
+                    ControlError::new(
+                        "browser_control_files_unavailable",
+                        "The browser downloads could not be observed.",
+                    )
+                })??;
+                Ok(
+                    json!({"supported":true,"controlled":self.agent_error().is_some(),"downloads":downloads}),
+                )
+            }
             Operation::Acquire => {
                 self.expire(browser).await?;
                 request.deadline(now)?;
@@ -603,14 +706,38 @@ impl BrowserControl {
                 self.stream_outcome_unknown = false;
                 let (expires_at, deadline) = request.deadline(Instant::now())?;
                 self.lease = Some(Lease {
-                    controller_id: request.controller_id,
+                    controller_id: request.controller_id.clone(),
                     expires_at,
                     deadline,
                     last_sequence: 0,
-                    outcome_unknown: false,
+                    outcome_unknown: true,
                     held: HeldInputs::default(),
                     native_input_pending: false,
+                    download_cursor: browser
+                        .map(|(client, _)| client.downloads.cursor())
+                        .unwrap_or(0),
                 });
+                if let Some(page) = page.as_mut() {
+                    if let Err(error) = page.prepare_files(&request.controller_id).await {
+                        self.lease = None;
+                        return Err(error);
+                    }
+                }
+                match request.deadline(Instant::now()) {
+                    Ok((expires_at, deadline)) => {
+                        let lease = self.lease.as_mut().unwrap();
+                        lease.expires_at = expires_at;
+                        lease.deadline = deadline;
+                    }
+                    Err(error) => {
+                        if let Some((client, _)) = browser {
+                            super::browser_files::stop(client).await;
+                        }
+                        self.lease = None;
+                        return Err(error);
+                    }
+                }
+                self.lease.as_mut().unwrap().outcome_unknown = false;
                 self.needs_observation = true;
                 if let Some((client, session)) = browser {
                     client.rotate_all_page_generations();
@@ -632,6 +759,9 @@ impl BrowserControl {
                     .as_ref()
                     .is_some_and(|lease| lease.controller_id == request.controller_id)
                 {
+                    if let Some((client, _)) = browser {
+                        super::browser_files::stop(client).await;
+                    }
                     self.release_held(browser).await?;
                     let lease = self.lease.take().unwrap();
                     let response = lease.response("released");
@@ -679,6 +809,97 @@ impl BrowserControl {
                 let mut response = lease.response("copied");
                 response["clipboard"] =
                     json!({ "bytes": text.len(), "text": text, "complete": true });
+                Ok(response)
+            }
+            Operation::Files | Operation::Drop | Operation::Setfiles | Operation::Dismissfiles => {
+                let lease = self.require_owner(&request.controller_id)?;
+                let deadline = lease.deadline.min(Instant::now() + ACK_TIMEOUT);
+                let download_cursor = lease.download_cursor;
+                if let Some(sequence) = request.sequence {
+                    if sequence <= lease.last_sequence {
+                        return Ok(lease.response("duplicate"));
+                    }
+                    if sequence != lease.last_sequence + 1 {
+                        return Err(ControlError::new(
+                            "browser_control_sequence_gap",
+                            format!("Expected input sequence {}.", lease.last_sequence + 1),
+                        ));
+                    }
+                }
+                if request.op == Operation::Drop {
+                    let generation = self
+                        .display
+                        .as_ref()
+                        .map(|display| display.surface().generation)
+                        .or_else(|| {
+                            browser.map(|(client, session)| client.page_generation(session))
+                        });
+                    if request.expected_surface_generation != generation {
+                        return Err(ControlError::new(
+                            "browser_control_surface_stale",
+                            "The browser changed. Use its current frame before dropping files.",
+                        ));
+                    }
+                }
+                let page = page.as_mut().ok_or_else(|| {
+                    ControlError::new(
+                        "browser_control_files_unavailable",
+                        "The browser page is unavailable.",
+                    )
+                })?;
+                let mutating = matches!(request.op, Operation::Drop | Operation::Setfiles);
+                if mutating {
+                    self.lease.as_mut().unwrap().outcome_unknown = true;
+                }
+                let result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                    let file_page = page.file_page().await?;
+                    match request.op {
+                        Operation::Files => {
+                            let chooser = file_page.chooser(&request.controller_id).await?;
+                            let downloads = page.completed_downloads(download_cursor).await?;
+                            Ok(json!({"status":"files","chooser":chooser,"downloads":downloads}))
+                        }
+                        Operation::Drop => {
+                            let destination = file_page.drop_destination(&request.controller_id, request.x.unwrap(), request.y.unwrap(), deadline).await?;
+                            Ok(json!({"status":"destination","destination":destination}))
+                        }
+                        Operation::Setfiles => {
+                            file_page.set_files(&request.controller_id, request.destination_id.as_deref().unwrap(), request.files.as_ref().unwrap(), deadline).await?;
+                            Ok(json!({"status":"applied"}))
+                        }
+                        Operation::Dismissfiles => {
+                            file_page.client.files.dismiss(&request.controller_id, request.destination_id.as_deref().unwrap())?;
+                            Ok(json!({"status":"dismissed"}))
+                        }
+                        _ => unreachable!(),
+                    }
+                }).await;
+                let data = match result {
+                    Ok(result) => result,
+                    Err(_) if matches!(request.op, Operation::Setfiles | Operation::Drop) => {
+                        Err(ControlError::unknown())
+                    }
+                    Err(_) => Err(ControlError::new(
+                        "browser_control_files_unavailable",
+                        "The browser did not finish observing files. Try again.",
+                    )),
+                };
+                if mutating {
+                    self.lease.as_mut().unwrap().outcome_unknown = data
+                        .as_ref()
+                        .is_err_and(|error| error.code == "browser_control_outcome_unknown");
+                }
+                let data = data?;
+                self.require_owner(&request.controller_id)?;
+                let lease = self.lease.as_mut().unwrap();
+                if let Some(sequence) = request.sequence {
+                    lease.last_sequence = sequence;
+                }
+                let mut response = lease.response(data["status"].as_str().unwrap());
+                response
+                    .as_object_mut()
+                    .unwrap()
+                    .extend(data.as_object().unwrap().clone());
                 Ok(response)
             }
             Operation::Input => {
@@ -836,6 +1057,10 @@ impl BrowserControl {
         }
         Ok(lease)
     }
+}
+
+fn canonical_uuid(value: &str) -> bool {
+    uuid::Uuid::parse_str(value).is_ok_and(|id| !id.is_nil() && id.to_string() == value)
 }
 
 fn fields(event: &Value, allowed: &[&str]) -> Result<(), ControlError> {

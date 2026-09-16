@@ -519,6 +519,20 @@ fn frame_target(frame_id: &str, session_id: &str, parent_id: Option<&str>) -> Fr
     }
 }
 
+/// Renderer ownership for the admitted page, including local descendants of
+/// remote frames. Human file destinations share this existing ancestry check.
+pub(crate) async fn active_frame_sessions(
+    client: &CdpClient,
+    top_session_id: &str,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<Vec<(String, String)>, String> {
+    let (_, targets) = collect_frame_sessions(client, top_session_id, iframe_sessions).await?;
+    Ok(targets
+        .into_iter()
+        .map(|target| (target.frame_id, target.session_id))
+        .collect())
+}
+
 /// Return the dedicated target sessions that belong to the active page's
 /// frame tree. The daemon keeps iframe sessions from background tabs so an
 /// audit can recover them after a tab switch, while network capture uses this

@@ -3246,6 +3246,11 @@ Notes:
   - Explicit host copy reads selected text from the focused page/input/frame,
     never the system clipboard. Maximum 1 MiB UTF-8, no truncation; masked
     password fields have no copyable text. Copy does not advance input sequence.
+  - Authorized host file operations poll chooser/download metadata, bind a drop
+    destination, and deliver 1-64 staged files. Paths stay within the Product
+    bridge; file bytes are never input JSON. Navigation or expired custody
+    invalidates upload destinations. Folder uploads are unsupported. These
+    internal operations are intentionally absent from CLI and MCP tools.
   - 'screencast_start' and 'screencast_stop' still control explicit CDP screencasts.
   - Streaming is always enabled. Set AGENT_BROWSER_STREAM_PORT to bind to a
     specific port instead of the default OS-assigned port.
