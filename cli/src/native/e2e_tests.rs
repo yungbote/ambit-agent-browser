@@ -4790,6 +4790,130 @@ async fn e2e_click_reports_covering_overlay() {
 // Profile cookie persistence across restarts
 // ---------------------------------------------------------------------------
 
+/// Real native window exit/reopen uses the daemon-owned private profile.
+/// A different launch configuration and a different daemon must not inherit it.
+#[tokio::test]
+#[ignore]
+async fn e2e_private_window_profile_survives_reopen_and_stays_owned() {
+    let env = EnvGuard::new(&[
+        "AGENT_BROWSER_PROFILE",
+        "AGENT_BROWSER_STATE",
+        "AGENT_BROWSER_RESTORE",
+        "AGENT_BROWSER_SESSION_NAME",
+        "AGENT_BROWSER_ALLOWED_DOMAINS",
+        "AGENT_BROWSER_USER_AGENT",
+        "AGENT_BROWSER_WINDOW_STREAM",
+        "DISPLAY",
+    ]);
+    for key in [
+        "AGENT_BROWSER_PROFILE",
+        "AGENT_BROWSER_STATE",
+        "AGENT_BROWSER_RESTORE",
+        "AGENT_BROWSER_SESSION_NAME",
+        "AGENT_BROWSER_ALLOWED_DOMAINS",
+        "AGENT_BROWSER_USER_AGENT",
+    ] {
+        env.remove(key);
+    }
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let (url, server) = start_cookie_login_server().await;
+    let mut state = DaemonState::new();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"navigate", "url":format!("{url}/login")}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"navigate", "url":url}), &mut state).await,
+    );
+    let before =
+        control_test_command(&json!({"action":"gettext", "selector":"main"}), &mut state).await;
+    assert_success(&before);
+    assert_eq!(before["data"]["text"], "Welcome back");
+    let equivalent =
+        control_test_command(&json!({"action":"launch", "headless":false}), &mut state).await;
+    assert_success(&equivalent);
+    assert_eq!(equivalent["data"]["reused"], true);
+
+    let manager = state.browser.as_mut().unwrap();
+    let _ = manager
+        .client
+        .send_command_no_params("Browser.close", None)
+        .await;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !manager.has_process_exited() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    assert!(
+        manager.has_process_exited(),
+        "the real Chrome window did not exit"
+    );
+    let _ = close_current_browser(&mut state).await;
+    assert_success(
+        &control_test_command(&json!({"action":"navigate", "url":url}), &mut state).await,
+    );
+    let reopened =
+        control_test_command(&json!({"action":"gettext", "selector":"main"}), &mut state).await;
+    assert_success(&reopened);
+    assert_eq!(reopened["data"]["text"], "Welcome back");
+
+    let mut independent = DaemonState::new();
+    assert_success(
+        &control_test_command(&json!({"action":"navigate", "url":url}), &mut independent).await,
+    );
+    let isolated = control_test_command(
+        &json!({"action":"gettext", "selector":"main"}),
+        &mut independent,
+    )
+    .await;
+    assert_success(&isolated);
+    assert_eq!(isolated["data"]["text"], "Please sign in");
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut independent).await);
+    drop(independent);
+
+    assert_success(
+        &control_test_command(
+            &json!({"action":"launch", "userAgent":"Ambit private profile isolation test"}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"navigate", "url":url}), &mut state).await,
+    );
+    let changed =
+        control_test_command(&json!({"action":"gettext", "selector":"main"}), &mut state).await;
+    assert_success(&changed);
+    assert_eq!(changed["data"]["text"], "Please sign in");
+    assert_success(
+        &control_test_command(
+            &json!({"action":"navigate", "url":format!("{url}/login")}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+    assert_success(
+        &control_test_command(
+            &json!({"action":"launch", "userAgent":"Ambit private profile isolation test"}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"navigate", "url":url}), &mut state).await,
+    );
+    let ended =
+        control_test_command(&json!({"action":"gettext", "selector":"main"}), &mut state).await;
+    assert_success(&ended);
+    assert_eq!(ended["data"]["text"], "Please sign in");
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+    server.abort();
+}
+
 #[tokio::test]
 #[ignore]
 async fn e2e_profile_cookie_persistence() {

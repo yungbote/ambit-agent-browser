@@ -259,17 +259,11 @@ fn active_frame_scope_may_have_changed(drained: &DrainedEvents) -> bool {
         || !drained.destroyed_targets.is_empty()
 }
 
-/// Compute a hash of the [`LaunchOptions`] fields that require a browser
-/// relaunch when changed (baked into the Chrome process at startup).
-///
-/// Fields NOT hashed:
-/// ignore_https_errors, color_scheme, download_path
-///
-/// `storage_state` is handled separately in `handle_launch()`: explicit
-/// `storageState` launches always require a clean local browser so the loaded
-/// state replaces the prior session instead of merging into it.
+/// Exact startup configuration used for relaunch and private profile reuse.
+/// Mutable page settings are applied separately; explicit storage-state loads
+/// always replace the session rather than reusing this private profile.
 #[allow(clippy::too_many_arguments)]
-fn launch_hash(
+fn launch_configuration(
     opts: &LaunchOptions,
     allowed_domains: &[String],
     plugin_init_scripts: &[String],
@@ -278,38 +272,35 @@ fn launch_hash(
     engine: Option<&str>,
     connection_kind: &str,
     connection_target: Option<&str>,
-) -> u64 {
-    use std::collections::hash_map::DefaultHasher;
-    use std::hash::{Hash, Hasher};
-
-    let mut h = DefaultHasher::new();
-    engine.hash(&mut h);
-    connection_kind.hash(&mut h);
-    connection_target.hash(&mut h);
-    opts.headless.hash(&mut h);
-    opts.window_stream.hash(&mut h);
-    opts.require_sandbox.hash(&mut h);
-    opts.extensions.hash(&mut h);
-    opts.profile.hash(&mut h);
-    opts.executable_path.hash(&mut h);
-    opts.args.hash(&mut h);
-    opts.proxy.hash(&mut h);
-    opts.proxy_bypass.hash(&mut h);
-    opts.proxy_username.hash(&mut h);
-    opts.proxy_password.hash(&mut h);
-    opts.user_agent.hash(&mut h);
-    opts.ca_cert_digest.hash(&mut h);
-    opts.allow_file_access.hash(&mut h);
-    opts.hide_scrollbars.hash(&mut h);
-    opts.webgpu.hash(&mut h);
-    opts.webmcp.hash(&mut h);
-    opts.no_xvfb.hash(&mut h);
-    opts.restrict_webrtc.hash(&mut h);
-    allowed_domains.hash(&mut h);
-    enable_features.hash(&mut h);
-    init_script_paths.hash(&mut h);
-    plugin_init_scripts.hash(&mut h);
-    h.finish()
+) -> Arc<Value> {
+    Arc::new(json!({
+        "engine": engine,
+        "connectionKind": connection_kind,
+        "connectionTarget": connection_target,
+        "headless": opts.effectively_headless(),
+        "windowStream": opts.window_stream,
+        "requireSandbox": opts.require_sandbox,
+        "extensions": opts.extensions,
+        "profile": opts.profile,
+        "executablePath": opts.executable_path,
+        "args": opts.args,
+        "proxy": opts.proxy,
+        "proxyBypass": opts.proxy_bypass,
+        "proxyUsername": opts.proxy_username,
+        "proxyPassword": opts.proxy_password,
+        "userAgent": opts.user_agent,
+        "caCertDigest": opts.ca_cert_digest,
+        "allowFileAccess": opts.allow_file_access,
+        "hideScrollbars": opts.hide_scrollbars,
+        "webgpu": opts.webgpu,
+        "webmcp": opts.webmcp,
+        "noXvfb": opts.no_xvfb,
+        "restrictWebrtc": opts.restrict_webrtc,
+        "allowedDomains": allowed_domains,
+        "enableFeatures": enable_features,
+        "initScriptPaths": init_script_paths,
+        "pluginInitScripts": plugin_init_scripts,
+    }))
 }
 
 fn launch_connection_identity(
@@ -331,6 +322,66 @@ fn launch_connection_identity(
         return ("provider", Some(provider.to_ascii_lowercase()));
     }
     ("local", None)
+}
+
+fn private_profile_eligible(
+    options: &LaunchOptions,
+    engine: Option<&str>,
+    connection_kind: &str,
+    allowed_domains: &[String],
+    restore_key: Option<&str>,
+) -> bool {
+    options.window_stream
+        && engine.unwrap_or("chrome") == "chrome"
+        && connection_kind == "local"
+        && allowed_domains.is_empty()
+        && options.profile.is_none()
+        && options.storage_state.is_none()
+        && restore_key.is_none()
+}
+
+impl DaemonState {
+    // Observation metadata retains its opaque numeric fingerprint. Exact
+    // comparison data, including proxy credentials, never leaves the owner.
+    fn launch_fingerprint(&self) -> Option<u64> {
+        use std::collections::hash_map::DefaultHasher;
+        use std::hash::{Hash, Hasher};
+        self.launch_configuration.as_ref().map(|configuration| {
+            let mut hash = DefaultHasher::new();
+            configuration.to_string().hash(&mut hash);
+            hash.finish()
+        })
+    }
+
+    fn prepare_private_profile(
+        &mut self,
+        options: &mut LaunchOptions,
+        configuration: &Arc<Value>,
+        eligible: bool,
+    ) {
+        // Domain containment relies on a fresh profile: restored startup
+        // activity could otherwise precede CDP interception. The ordinary
+        // profile/state/CA guards still validate the original caller options.
+        if !eligible
+            || self
+                .retained_profile
+                .as_ref()
+                .is_some_and(|(prior, _)| prior != configuration)
+        {
+            self.retained_profile = None;
+        }
+        options.retained_profile = self
+            .retained_profile
+            .as_ref()
+            .map(|(_, profile)| profile.clone());
+    }
+
+    fn retain_private_profile(&mut self, configuration: Arc<Value>, eligible: bool) {
+        self.retained_profile = eligible
+            .then(|| self.browser.as_ref()?.retained_profile())
+            .flatten()
+            .map(|profile| (configuration, profile));
+    }
 }
 
 fn launch_connection_is_external(
@@ -612,8 +663,11 @@ pub struct DaemonState {
     /// Shared only with the stream input reader; daemon commands retain their
     /// existing outer mutex. Never broadcast controller credentials.
     pub(crate) browser_control: Arc<tokio::sync::Mutex<BrowserControl>>,
-    /// Hash of launch options used for the current browser, for relaunch detection.
-    launch_hash: Option<u64>,
+    /// Exact startup configuration; never serialized in the command protocol.
+    launch_configuration: Option<Arc<Value>>,
+    /// Same-daemon ownership only. Chrome is dropped before these private
+    /// profile/NSS resources; no path is exposed in the command protocol.
+    retained_profile: Option<(Arc<Value>, super::cdp::chrome::RetainedChromeProfile)>,
     effective_ca_cert: Option<EffectiveCaCert>,
     /// Whether browser-level auto-attach has been enabled for the current
     /// browser so top-level popups pause before their first request.
@@ -745,7 +799,8 @@ impl DaemonState {
             stream_server: None,
             idle_activity: Arc::new(IdleActivity::new()),
             browser_control: Arc::new(tokio::sync::Mutex::new(BrowserControl::default())),
-            launch_hash: None,
+            launch_configuration: None,
+            retained_profile: None,
             effective_ca_cert: None,
             network_auto_attach_installed: false,
             engine: env::var("AGENT_BROWSER_ENGINE").unwrap_or_else(|_| "chrome".to_string()),
@@ -2400,7 +2455,7 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
     };
 
     close_active_provider_session(state).await;
-    state.launch_hash = None;
+    state.launch_configuration = None;
     state.webmcp_enabled = false;
     state.network_auto_attach_installed = false;
     state.iframe_sessions.clear();
@@ -2422,6 +2477,7 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
 /// because Safari and iOS sessions live outside `state.browser`.
 pub(crate) async fn close_all_browser_backends(state: &mut DaemonState) -> Result<(), String> {
     let close_result = close_current_browser(state).await;
+    state.retained_profile = None;
 
     if let Some(ref mut webdriver) = state.webdriver_backend {
         let _ = webdriver.close().await;
@@ -4105,7 +4161,7 @@ async fn auto_launch(
             storage_state,
         })?;
         let mgr = BrowserManager::connect_cdp(&cdp).await?;
-        let hash = launch_hash(
+        let configuration = launch_configuration(
             &options,
             &allowed_domains,
             &state.plugin_init_scripts,
@@ -4117,7 +4173,7 @@ async fn auto_launch(
         );
         state.reset_input_state();
         state.browser = Some(mgr);
-        state.launch_hash = Some(hash);
+        state.launch_configuration = Some(configuration.clone());
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
@@ -4142,7 +4198,7 @@ async fn auto_launch(
             restore_key: restore_key.as_deref(),
             storage_state,
         })?;
-        let hash = launch_hash(
+        let configuration = launch_configuration(
             &options,
             &allowed_domains,
             &state.plugin_init_scripts,
@@ -4160,7 +4216,7 @@ async fn auto_launch(
                 return Err(e);
             }
         }
-        state.launch_hash = Some(hash);
+        state.launch_configuration = Some(configuration.clone());
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
@@ -4212,7 +4268,7 @@ async fn auto_launch(
             };
             match connect_result {
                 Ok(mgr) => {
-                    let hash = launch_hash(
+                    let configuration = launch_configuration(
                         &options,
                         &allowed_domains,
                         &state.plugin_init_scripts,
@@ -4224,7 +4280,7 @@ async fn auto_launch(
                     );
                     state.reset_input_state();
                     state.browser = Some(mgr);
-                    state.launch_hash = Some(hash);
+                    state.launch_configuration = Some(configuration.clone());
                     remember_active_provider_session(state, conn.session.clone(), &plugins);
                     state.subscribe_to_browser_events();
                     state.start_fetch_handler();
@@ -4273,7 +4329,7 @@ async fn auto_launch(
         storage_state,
     })?;
     write_extensions_file_from_paths(&state.session_id, options.extensions.as_deref());
-    let hash = launch_hash(
+    let configuration = launch_configuration(
         &options,
         &allowed_domains,
         &state.plugin_init_scripts,
@@ -4283,14 +4339,26 @@ async fn auto_launch(
         "local",
         None,
     );
-    if let Some(ref ca) = effective_ca_cert {
+    let retain_profile = private_profile_eligible(
+        &options,
+        engine.as_deref(),
+        "local",
+        &allowed_domains,
+        restore_key.as_deref(),
+    );
+    state.prepare_private_profile(&mut options, &configuration, retain_profile);
+    if let Some(ca) = effective_ca_cert
+        .as_ref()
+        .filter(|_| options.retained_profile.is_none())
+    {
         options.prepared_nss_home = Some(prepare_nss_home(&ca.bundle)?);
     }
     state.session_setup = SessionSetup::from_launch_options(&options);
     let mgr = BrowserManager::launch(options, engine.as_deref()).await?;
     state.reset_input_state();
     state.browser = Some(mgr);
-    state.launch_hash = Some(hash);
+    state.launch_configuration = Some(configuration.clone());
+    state.retain_private_profile(configuration, retain_profile);
     state.effective_ca_cert = effective_ca_cert;
     state.subscribe_to_browser_events();
     state.start_fetch_handler();
@@ -4500,6 +4568,7 @@ fn launch_options_from_env() -> LaunchOptions {
         ca_bundle: None,
         ca_cert_digest: None,
         prepared_nss_home: None,
+        retained_profile: None,
         color_scheme: env::var("AGENT_BROWSER_COLOR_SCHEME").ok(),
         download_path: env::var("AGENT_BROWSER_DOWNLOAD_PATH").ok(),
         hide_scrollbars: hide_scrollbars_from_env(),
@@ -4844,7 +4913,7 @@ async fn try_load_storage_state(state: &mut DaemonState, path: &Option<String>) 
 async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let effective_ca_cert = resolve_effective_ca_cert(cmd, state)?;
     // Absent field falls back to the daemon's spawn-time env (mirrors
-    // hideScrollbars/webgpu), keeping the launch hash stable when follow-up
+    // hideScrollbars/webgpu), keeping the launch configuration stable when follow-up
     // commands send launch envelopes without an explicit headed choice.
     let headless = cmd
         .get("headless")
@@ -4967,6 +5036,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         ca_bundle: None,
         ca_cert_digest: None,
         prepared_nss_home: None,
+        retained_profile: None,
         color_scheme: cmd
             .get("colorScheme")
             .and_then(|v| v.as_str())
@@ -5028,7 +5098,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 
     let (connection_kind, connection_target) =
         launch_connection_identity(cdp_url, cdp_port, auto_connect, provider_name);
-    let new_hash = launch_hash(
+    let configuration = launch_configuration(
         &launch_options,
         &allowed_domains,
         &state.plugin_init_scripts,
@@ -5038,18 +5108,26 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         connection_kind,
         connection_target.as_deref(),
     );
+    let retain_profile = private_profile_eligible(
+        &launch_options,
+        engine.as_deref(),
+        connection_kind,
+        &allowed_domains,
+        restore_key.as_deref(),
+    );
+    state.prepare_private_profile(&mut launch_options, &configuration, retain_profile);
 
-    // Hash comparison and fast process-exit check are evaluated before the
+    // Configuration comparison and fast process-exit check are evaluated before the
     // async is_connection_alive to skip the expensive CDP liveness probe
     // when a relaunch is already certain.
     let needs_relaunch = if let Some(ref mut mgr) = state.browser {
         let is_external =
             launch_connection_is_external(cdp_url, cdp_port, auto_connect, provider_name);
         let was_external = mgr.is_cdp_connection();
-        let hash_changed = state.launch_hash != Some(new_hash);
+        let configuration_changed = state.launch_configuration.as_ref() != Some(&configuration);
         let storage_state_requires_clean_launch = storage_state_owned.is_some() && !is_external;
         is_external != was_external
-            || hash_changed
+            || configuration_changed
             || storage_state_requires_clean_launch
             || mgr.has_process_exited()
             || !mgr.is_connection_alive().await
@@ -5062,7 +5140,10 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
 
     if needs_relaunch {
         if local_launch {
-            if let Some(ref ca) = effective_ca_cert {
+            if let Some(ca) = effective_ca_cert
+                .as_ref()
+                .filter(|_| launch_options.retained_profile.is_none())
+            {
                 launch_options.prepared_nss_home = Some(prepare_nss_home(&ca.bundle)?);
             }
         }
@@ -5103,7 +5184,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     if let Some(url) = cdp_url {
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_cdp(url).await?);
-        state.launch_hash = Some(new_hash);
+        state.launch_configuration = Some(configuration.clone());
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
@@ -5120,7 +5201,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     if let Some(port) = cdp_port {
         state.reset_input_state();
         state.browser = Some(BrowserManager::connect_cdp(&port.to_string()).await?);
-        state.launch_hash = Some(new_hash);
+        state.launch_configuration = Some(configuration.clone());
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
@@ -5143,7 +5224,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                 return Err(e);
             }
         }
-        state.launch_hash = Some(new_hash);
+        state.launch_configuration = Some(configuration.clone());
         state.subscribe_to_browser_events();
         state.start_fetch_handler();
         state.start_dialog_handler();
@@ -5206,7 +5287,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
                     Ok(mgr) => {
                         state.reset_input_state();
                         state.browser = Some(mgr);
-                        state.launch_hash = Some(new_hash);
+                        state.launch_configuration = Some(configuration.clone());
                         remember_active_provider_session(
                             state,
                             conn.session.clone(),
@@ -5265,7 +5346,8 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     state.reset_input_state();
     state.session_setup = SessionSetup::from_launch_options(&launch_options);
     state.browser = Some(BrowserManager::launch(launch_options, engine.as_deref()).await?);
-    state.launch_hash = Some(new_hash);
+    state.launch_configuration = Some(configuration.clone());
+    state.retain_private_profile(configuration, retain_profile);
     state.subscribe_to_browser_events();
     state.start_fetch_handler();
     state.start_dialog_handler();
@@ -6855,12 +6937,12 @@ async fn handle_session_info(state: &DaemonState) -> Result<Value, String> {
         "browserLaunched": state.browser.is_some(),
         "pageCount": state.browser.as_ref().map(|mgr| mgr.page_count()).unwrap_or(0),
         "engine": state.engine,
-        "launchHash": state.launch_hash,
+        "launchHash": state.launch_fingerprint(),
         "compatibilityStatus": "current",
         "effectiveLaunch": {
             "browserLaunched": state.browser.is_some(),
             "engine": state.engine,
-            "launchHash": state.launch_hash,
+            "launchHash": state.launch_fingerprint(),
         },
         "restoreKey": state.session_name,
         "restoreStatus": state.restore_status,
@@ -12845,7 +12927,7 @@ fn inject_lifecycle(
             "effectiveLaunch": {
                 "browserLaunched": state.browser.is_some(),
                 "engine": state.engine,
-                "launchHash": state.launch_hash,
+                "launchHash": state.launch_fingerprint(),
             }
         }),
     );
@@ -12901,7 +12983,7 @@ mod tests {
     /// paths set `state.browser` before calling this, so returning the error
     /// alone would let the next command skip the attach path and act on
     /// whatever tab is selected. Force-red: drop `rollback_failed_launch`
-    /// from the error arm and `launch_hash` survives the error.
+    /// from the error arm and `launch_configuration` survives the error.
     #[tokio::test]
     async fn apply_tab_binding_rollback_clears_launch_state_on_recovery_failure() {
         let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
@@ -12915,7 +12997,7 @@ mod tests {
             "{not valid json",
         )
         .unwrap();
-        state.launch_hash = Some(42);
+        state.launch_configuration = Some(Arc::new(json!({ "fixture": 42 })));
 
         let err = apply_tab_binding_on_attach_or_rollback(&mut state)
             .await
@@ -12927,7 +13009,7 @@ mod tests {
             err
         );
         assert!(
-            state.launch_hash.is_none(),
+            state.launch_configuration.is_none(),
             "the failed attach must be rolled back, not left committed"
         );
     }
@@ -15020,33 +15102,137 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
     }
 
     #[test]
-    fn test_launch_hash_includes_no_xvfb() {
+    fn test_window_launch_configuration_compares_effective_headless_state() {
+        let first = LaunchOptions {
+            window_stream: true,
+            headless: true,
+            ..Default::default()
+        };
+        let second = LaunchOptions {
+            headless: false,
+            ..first.clone()
+        };
+        assert_eq!(
+            launch_configuration(&first, &[], &[], &[], &[], Some("chrome"), "local", None),
+            launch_configuration(&second, &[], &[], &[], &[], Some("chrome"), "local", None),
+        );
+    }
+
+    #[test]
+    fn test_private_profile_only_reuses_an_owned_unrestricted_chrome_window() {
+        let mut options = LaunchOptions {
+            window_stream: true,
+            ..Default::default()
+        };
+        assert!(private_profile_eligible(
+            &options,
+            Some("chrome"),
+            "local",
+            &[],
+            None
+        ));
+        assert!(!private_profile_eligible(
+            &options,
+            Some("lightpanda"),
+            "local",
+            &[],
+            None
+        ));
+        assert!(!private_profile_eligible(
+            &options,
+            Some("chrome"),
+            "cdp-url",
+            &[],
+            None
+        ));
+        assert!(!private_profile_eligible(
+            &options,
+            Some("chrome"),
+            "local",
+            &["example.test".into()],
+            None
+        ));
+        assert!(!private_profile_eligible(
+            &options,
+            Some("chrome"),
+            "local",
+            &[],
+            Some("restore-key")
+        ));
+        options.profile = Some("/explicit/profile".into());
+        assert!(!private_profile_eligible(
+            &options,
+            Some("chrome"),
+            "local",
+            &[],
+            None
+        ));
+        options.profile = None;
+        options.storage_state = Some("/explicit/state".into());
+        assert!(!private_profile_eligible(
+            &options,
+            Some("chrome"),
+            "local",
+            &[],
+            None
+        ));
+        options.storage_state = None;
+        options.window_stream = false;
+        assert!(!private_profile_eligible(
+            &options,
+            Some("chrome"),
+            "local",
+            &[],
+            None
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_session_info_never_exposes_private_launch_configuration() {
+        let mut state = DaemonState::new();
+        state.launch_configuration = Some(Arc::new(
+            json!({ "proxyPassword": "private-profile-test-value" }),
+        ));
+        let information = handle_session_info(&state).await.unwrap();
+        assert!(information["launchHash"].is_u64());
+        assert_eq!(
+            information["launchHash"],
+            information["effectiveLaunch"]["launchHash"]
+        );
+        assert!(!information
+            .to_string()
+            .contains("private-profile-test-value"));
+        assert!(!information.to_string().contains("proxyPassword"));
+    }
+
+    #[test]
+    fn test_launch_configuration_includes_no_xvfb() {
         let base = LaunchOptions::default();
         let no_xvfb = LaunchOptions {
             no_xvfb: true,
             ..Default::default()
         };
         assert_ne!(
-            launch_hash(&base, &[], &[], &[], &[], Some("chrome"), "local", None),
-            launch_hash(&no_xvfb, &[], &[], &[], &[], Some("chrome"), "local", None)
+            launch_configuration(&base, &[], &[], &[], &[], Some("chrome"), "local", None),
+            launch_configuration(&no_xvfb, &[], &[], &[], &[], Some("chrome"), "local", None)
         );
     }
 
     #[test]
-    fn test_launch_hash_includes_webgpu() {
+    fn test_launch_configuration_includes_webgpu() {
         let base = LaunchOptions::default();
         let webgpu = LaunchOptions {
             webgpu: true,
             ..Default::default()
         };
         assert_ne!(
-            launch_hash(&base, &[], &[], &[], &[], Some("chrome"), "local", None),
-            launch_hash(&webgpu, &[], &[], &[], &[], Some("chrome"), "local", None)
+            launch_configuration(&base, &[], &[], &[], &[], Some("chrome"), "local", None),
+            launch_configuration(&webgpu, &[], &[], &[], &[], Some("chrome"), "local", None)
         );
     }
 
     #[test]
-    fn test_launch_hash_includes_ca_cert() {
+    fn test_launch_configuration_includes_ca_cert() {
         let base = LaunchOptions::default();
         let bundle = crate::ca_bundle::test_bundle(b"proxy-ca");
         let trusted_ca = LaunchOptions {
@@ -15056,8 +15242,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             ..Default::default()
         };
         assert_ne!(
-            launch_hash(&base, &[], &[], &[], &[], Some("chrome"), "local", None),
-            launch_hash(
+            launch_configuration(&base, &[], &[], &[], &[], Some("chrome"), "local", None),
+            launch_configuration(
                 &trusted_ca,
                 &[],
                 &[],
@@ -15110,7 +15296,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
     }
 
     #[test]
-    fn test_launch_hash_uses_ca_content_not_path() {
+    fn test_launch_configuration_uses_ca_content_not_path() {
         let bundle = crate::ca_bundle::test_bundle(b"same");
         let first = EffectiveCaCert {
             path: "/tmp/first.pem".to_string(),
@@ -15132,7 +15318,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         apply_effective_ca_cert(&mut changed_options, &Some(changed));
 
         let hash = |options: &LaunchOptions| {
-            launch_hash(options, &[], &[], &[], &[], Some("chrome"), "local", None)
+            launch_configuration(options, &[], &[], &[], &[], Some("chrome"), "local", None)
         };
         assert_eq!(hash(&first_options), hash(&second_options));
         assert_ne!(hash(&first_options), hash(&changed_options));
@@ -15178,7 +15364,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
     }
 
     #[test]
-    fn test_allowed_domains_enable_webrtc_restriction_and_launch_hashing() {
+    fn test_allowed_domains_enable_webrtc_restriction_and_change_launch_configuration() {
         let guard = EnvGuard::new(&["AGENT_BROWSER_ALLOWED_DOMAINS"]);
         guard.set("AGENT_BROWSER_ALLOWED_DOMAINS", "example.com");
         assert!(launch_options_from_env().restrict_webrtc);
@@ -15189,8 +15375,8 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             ..Default::default()
         };
         assert_ne!(
-            launch_hash(&base, &[], &[], &[], &[], Some("chrome"), "local", None),
-            launch_hash(
+            launch_configuration(&base, &[], &[], &[], &[], Some("chrome"), "local", None),
+            launch_configuration(
                 &restricted,
                 &[],
                 &[],
@@ -15203,7 +15389,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         );
 
         assert_ne!(
-            launch_hash(
+            launch_configuration(
                 &restricted,
                 &["example.com".to_string()],
                 &[],
@@ -15213,7 +15399,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
                 "local",
                 None
             ),
-            launch_hash(
+            launch_configuration(
                 &restricted,
                 &["other.example".to_string()],
                 &[],
@@ -15810,7 +15996,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
     }
 
     #[test]
-    fn test_launch_hash_includes_plugin_init_scripts() {
+    fn test_launch_configuration_includes_plugin_init_scripts() {
         let opts = LaunchOptions::default();
         let no_scripts: Vec<String> = Vec::new();
         let plugin_scripts = vec![
@@ -15818,7 +16004,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         ];
 
         assert_ne!(
-            launch_hash(
+            launch_configuration(
                 &opts,
                 &[],
                 &no_scripts,
@@ -15828,7 +16014,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
                 "local",
                 None
             ),
-            launch_hash(
+            launch_configuration(
                 &opts,
                 &[],
                 &plugin_scripts,
@@ -15842,15 +16028,15 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
     }
 
     #[test]
-    fn test_launch_hash_includes_engine_and_connection_identity() {
+    fn test_launch_configuration_includes_engine_and_connection_identity() {
         let opts = LaunchOptions::default();
 
         assert_ne!(
-            launch_hash(&opts, &[], &[], &[], &[], Some("chrome"), "local", None),
-            launch_hash(&opts, &[], &[], &[], &[], Some("lightpanda"), "local", None)
+            launch_configuration(&opts, &[], &[], &[], &[], Some("chrome"), "local", None),
+            launch_configuration(&opts, &[], &[], &[], &[], Some("lightpanda"), "local", None)
         );
         assert_ne!(
-            launch_hash(
+            launch_configuration(
                 &opts,
                 &[],
                 &[],
@@ -15860,7 +16046,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
                 "cdp-url",
                 Some("ws://one")
             ),
-            launch_hash(
+            launch_configuration(
                 &opts,
                 &[],
                 &[],
@@ -15872,7 +16058,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             )
         );
         assert_ne!(
-            launch_hash(
+            launch_configuration(
                 &opts,
                 &[],
                 &[],
@@ -15882,7 +16068,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
                 "provider",
                 Some("browserbase")
             ),
-            launch_hash(
+            launch_configuration(
                 &opts,
                 &[],
                 &[],

@@ -14,7 +14,7 @@ use crate::ca_bundle::CaBundle;
 pub struct ChromeProcess {
     child: Child,
     pub ws_url: String,
-    temp_user_data_dir: Option<PathBuf>,
+    temp_user_data_dir: Option<Arc<TemporaryBrowserDirectory>>,
     temp_nss_home: Option<PreparedNssHome>,
     /// On Unix, the process group ID used to kill the entire Chrome process tree.
     #[cfg(unix)]
@@ -27,11 +27,11 @@ pub struct ChromeProcess {
     display_process: Option<crate::native::display::DisplayProcess>,
 }
 
-struct PreparedNssHomeInner {
+struct TemporaryBrowserDirectory {
     path: PathBuf,
 }
 
-impl Drop for PreparedNssHomeInner {
+impl Drop for TemporaryBrowserDirectory {
     fn drop(&mut self) {
         for attempt in 0..3 {
             match std::fs::remove_dir_all(&self.path) {
@@ -40,7 +40,7 @@ impl Drop for PreparedNssHomeInner {
                 Err(e) => {
                     let _ = writeln!(
                         std::io::stderr(),
-                        "Warning: failed to clean up temporary CA trust store {}: {}",
+                        "Warning: failed to clean up temporary browser directory {}: {}",
                         self.path.display(),
                         e
                     );
@@ -52,7 +52,7 @@ impl Drop for PreparedNssHomeInner {
 
 #[derive(Clone)]
 pub(crate) struct PreparedNssHome {
-    inner: Arc<PreparedNssHomeInner>,
+    inner: Arc<TemporaryBrowserDirectory>,
 }
 
 impl PreparedNssHome {
@@ -61,7 +61,21 @@ impl PreparedNssHome {
     }
 }
 
+/// Opaque ownership of a driver-created profile and its exact NSS environment.
+/// It has no caller-selected path or serialized credential representation.
+#[derive(Clone)]
+pub(crate) struct RetainedChromeProfile {
+    directory: Arc<TemporaryBrowserDirectory>,
+    nss_home: Option<PreparedNssHome>,
+}
+
 impl ChromeProcess {
+    pub(crate) fn retained_profile(&self) -> Option<RetainedChromeProfile> {
+        Some(RetainedChromeProfile {
+            directory: self.temp_user_data_dir.clone()?,
+            nss_home: self.temp_nss_home.clone(),
+        })
+    }
     #[cfg(target_os = "linux")]
     pub(crate) fn start_window_display(&mut self) -> Result<(), String> {
         let display = self
@@ -133,26 +147,6 @@ impl Drop for ChromeProcess {
         #[cfg(target_os = "linux")]
         drop(self.display_process.take());
         self.kill();
-        if let Some(ref dir) = self.temp_user_data_dir {
-            for attempt in 0..3 {
-                match std::fs::remove_dir_all(dir) {
-                    Ok(()) => break,
-                    Err(_) if attempt < 2 => {
-                        std::thread::sleep(Duration::from_millis(100));
-                    }
-                    Err(e) => {
-                        // Use write! instead of eprintln! to avoid panicking
-                        // if the daemon's stderr pipe is broken (parent dropped it).
-                        let _ = writeln!(
-                            std::io::stderr(),
-                            "Warning: failed to clean up temp profile {}: {}",
-                            dir.display(),
-                            e
-                        );
-                    }
-                }
-            }
-        }
     }
 }
 
@@ -379,6 +373,7 @@ pub struct LaunchOptions {
     pub(crate) ca_bundle: Option<CaBundle>,
     pub(crate) ca_cert_digest: Option<[u8; 32]>,
     pub(crate) prepared_nss_home: Option<PreparedNssHome>,
+    pub(crate) retained_profile: Option<RetainedChromeProfile>,
     pub color_scheme: Option<String>,
     pub download_path: Option<String>,
     /// Hide native scrollbars in headless Chromium screenshots by launching
@@ -443,6 +438,7 @@ impl Default for LaunchOptions {
             ca_bundle: None,
             ca_cert_digest: None,
             prepared_nss_home: None,
+            retained_profile: None,
             color_scheme: None,
             download_path: None,
             hide_scrollbars: true,
@@ -625,10 +621,21 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         let dir = PathBuf::from(&expanded);
         args.push(format!("--user-data-dir={}", expanded));
         (dir, None)
+    } else if let Some(profile) = options.retained_profile.as_ref() {
+        let dir = profile.directory.path.clone();
+        args.push(format!("--user-data-dir={}", dir.display()));
+        (dir, None)
     } else {
         let dir =
             std::env::temp_dir().join(format!("agent-browser-chrome-{}", uuid::Uuid::new_v4()));
-        std::fs::create_dir_all(&dir)
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            builder.mode(0o700);
+        }
+        builder
+            .create(&dir)
             .map_err(|e| format!("Failed to create temp profile dir: {}", e))?;
         args.push(format!("--user-data-dir={}", dir.display()));
         (dir.clone(), Some(dir))
@@ -756,7 +763,7 @@ pub(crate) fn prepare_nss_home(ca_cert: &CaBundle) -> Result<PreparedNssHome, St
     }
 
     Ok(PreparedNssHome {
-        inner: Arc::new(PreparedNssHomeInner { path: home }),
+        inner: Arc::new(TemporaryBrowserDirectory { path: home }),
     })
 }
 
@@ -766,6 +773,9 @@ pub(crate) fn prepare_nss_home(_ca_cert: &CaBundle) -> Result<PreparedNssHome, S
 }
 
 fn resolve_prepared_nss_home(options: &LaunchOptions) -> Result<Option<PreparedNssHome>, String> {
+    if let Some(profile) = options.retained_profile.as_ref() {
+        return Ok(profile.nss_home.clone());
+    }
     if let Some(home) = options.prepared_nss_home.clone() {
         return Ok(Some(home));
     }
@@ -888,7 +898,8 @@ fn launch_chrome_blocking(
                 // The try_launch_chrome temp_user_data_dir is None here because we set profile
                 // to the temp path (treated as a user-supplied path, no second temp dir).
                 if let Some(ref dir) = profile_temp_dir {
-                    process.temp_user_data_dir = Some(dir.clone());
+                    process.temp_user_data_dir =
+                        Some(Arc::new(TemporaryBrowserDirectory { path: dir.clone() }));
                 }
                 return Ok(process);
             }
@@ -930,25 +941,18 @@ fn try_launch_chrome(
         user_data_dir,
         temp_user_data_dir,
     } = build_chrome_args(options)?;
+    let temp_user_data_dir = options
+        .retained_profile
+        .as_ref()
+        .map(|profile| profile.directory.clone())
+        .or_else(|| temp_user_data_dir.map(|path| Arc::new(TemporaryBrowserDirectory { path })));
 
     // Mitigate stale DevToolsActivePort risk (e.g., previous crash left it behind).
     // Puppeteer does similar cleanup before spawning.
     let _ = std::fs::remove_file(user_data_dir.join("DevToolsActivePort"));
 
-    let cleanup_temp_dir = |dir: &Option<PathBuf>| {
-        if let Some(ref d) = dir {
-            let _ = std::fs::remove_dir_all(d);
-        }
-    };
-
     #[cfg(target_os = "linux")]
-    let temp_nss_home = match resolve_prepared_nss_home(options) {
-        Ok(home) => home,
-        Err(error) => {
-            cleanup_temp_dir(&temp_user_data_dir);
-            return Err(error);
-        }
-    };
+    let temp_nss_home = resolve_prepared_nss_home(options)?;
     #[cfg(not(target_os = "linux"))]
     let temp_nss_home: Option<PreparedNssHome> = None;
 
@@ -957,7 +961,6 @@ fn try_launch_chrome(
 
     #[cfg(target_os = "linux")]
     if options.window_stream && xvfb.is_none() {
-        cleanup_temp_dir(&temp_user_data_dir);
         return Err("Window streaming requires a private Xvfb display; clear inherited DISPLAY and ensure Xvfb is available".into());
     }
 
@@ -1004,17 +1007,14 @@ fn try_launch_chrome(
     }
 
     if canceled.load(Ordering::Relaxed) {
-        cleanup_temp_dir(&temp_user_data_dir);
         return Err("Chrome launch canceled".to_string());
     }
     #[cfg(not(windows))]
     let spawned = cmd.spawn();
     #[cfg(windows)]
     let spawned = Child::spawn(chrome_path, &args, options.effectively_headless());
-    let child = spawned.map_err(|e| {
-        cleanup_temp_dir(&temp_user_data_dir);
-        format!("Failed to launch Chrome at {:?}: {}", chrome_path, e)
-    })?;
+    let child =
+        spawned.map_err(|e| format!("Failed to launch Chrome at {:?}: {}", chrome_path, e))?;
 
     // Own Chrome before waiting for readiness. Cancellation or any error now
     // follows the same Drop path as a fully initialized browser, including its
@@ -1892,7 +1892,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&path).unwrap();
         PreparedNssHome {
-            inner: Arc::new(PreparedNssHomeInner { path }),
+            inner: Arc::new(TemporaryBrowserDirectory { path }),
         }
     }
 
@@ -2599,7 +2599,7 @@ mod tests {
             let _process = ChromeProcess {
                 child,
                 ws_url: String::new(),
-                temp_user_data_dir: Some(dir.clone()),
+                temp_user_data_dir: Some(Arc::new(TemporaryBrowserDirectory { path: dir.clone() })),
                 temp_nss_home: None,
                 #[cfg(unix)]
                 pgid: None,
@@ -2612,6 +2612,38 @@ mod tests {
         }
 
         assert!(!dir.exists(), "Temp dir should be cleaned up on drop");
+    }
+
+    #[test]
+    fn test_retained_profile_survives_browser_exit_but_not_its_last_owner() {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-browser-retained-profile-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let process = ChromeProcess {
+            child: spawn_noop_child(),
+            ws_url: String::new(),
+            temp_user_data_dir: Some(Arc::new(TemporaryBrowserDirectory { path: dir.clone() })),
+            temp_nss_home: None,
+            #[cfg(unix)]
+            pgid: None,
+            #[cfg(target_os = "linux")]
+            xvfb: None,
+            #[cfg(target_os = "linux")]
+            display_process: None,
+        };
+        let retained = process.retained_profile().unwrap();
+        drop(process);
+        assert!(
+            dir.exists(),
+            "closing Chrome must preserve its owned profile"
+        );
+        drop(retained);
+        assert!(
+            !dir.exists(),
+            "ending the owner must remove the private profile"
+        );
     }
 
     #[cfg(target_os = "linux")]
