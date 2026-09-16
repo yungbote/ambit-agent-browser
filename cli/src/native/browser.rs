@@ -554,6 +554,7 @@ impl BrowserManager {
         };
 
         if let Some(display) = manager.display_client() {
+            let layout_events = manager.client.subscribe();
             // The owned headed browser may start on its native New Tab page
             // without a window manager to activate it. Select by observation
             // first, then use the existing native activation primitive once.
@@ -567,7 +568,9 @@ impl BrowserManager {
                 .active_window()
                 .ok_or("The browser window is not observable")?
                 .id;
-            manager.resize_window(1280, 720, window, false).await?;
+            manager
+                .resize_window(1280, 720, window, false, layout_events)
+                .await?;
             manager.client.enable_window_pointer();
         }
 

@@ -327,8 +327,8 @@ mod platform {
             Ok((capture, surface))
         }
 
-        pub(crate) async fn input(&self, event: &Value) -> Result<(), DisplayError> {
-            self.request(json!({ "op": "input", "events": [event] }))
+        pub(crate) async fn input(&self, events: &[Value]) -> Result<(), DisplayError> {
+            self.request(json!({ "op": "input", "events": events }))
                 .await?;
             Ok(())
         }
@@ -459,7 +459,7 @@ impl DisplayClient {
     pub(crate) async fn capture(&self) -> Result<(Capture, Surface), DisplayError> {
         match *self {}
     }
-    pub(crate) async fn input(&self, _: &Value) -> Result<(), DisplayError> {
+    pub(crate) async fn input(&self, _: &[Value]) -> Result<(), DisplayError> {
         match *self {}
     }
     pub(crate) async fn reset(&self) -> Result<(), DisplayError> {

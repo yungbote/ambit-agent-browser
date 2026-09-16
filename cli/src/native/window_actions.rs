@@ -30,7 +30,20 @@ impl DaemonState {
         &mut self,
         width: u32,
         height: u32,
+        events: Option<tokio::sync::broadcast::Receiver<crate::native::cdp::types::CdpEvent>>,
     ) -> Result<Surface, String> {
+        let events = if let Some(events) = events {
+            events
+        } else {
+            let events = self
+                .browser
+                .as_ref()
+                .ok_or("Browser not launched")?
+                .client
+                .subscribe();
+            self.drain_cdp_events_background().await?;
+            events
+        };
         let page_blocked = self.pending_dialog.is_some();
         let browser = self.browser.as_mut().ok_or("Browser not launched")?;
         let info = browser.window_info().await?;
@@ -56,13 +69,13 @@ impl DaemonState {
         }
         self.ref_map.clear();
         self.active_frame_id = None;
+        self.window_page_error = Some("browser_layout_pending");
+        let (surface, page_blocked) = browser
+            .resize_window(width, height, id, page_blocked, events)
+            .await?;
         if !page_blocked {
             self.viewport = None;
         }
-        self.window_page_error = Some("browser_layout_pending");
-        let surface = browser
-            .resize_window(width, height, id, page_blocked)
-            .await?;
         self.window_page_error = page_blocked.then_some("browser_dialog_open");
         if let Some(server) = self.stream_server.as_ref() {
             server.set_viewport(width, height).await;
@@ -107,8 +120,12 @@ impl DaemonState {
             return;
         };
         control.require_observation();
+        // Daemon command custody already excludes controller mutations and
+        // native-window raw stream input is disabled. Release this gate so
+        // event reconciliation and normal dialog handling can proceed.
+        drop(control);
         let surface = self
-            .apply_window_layout(request.config.width, request.config.height)
+            .apply_window_layout(request.config.width, request.config.height, None)
             .await
             .ok();
         server.presentation.complete(&request, target, surface);
@@ -156,6 +173,7 @@ impl DaemonState {
             self.apply_window_layout(
                 surface.width / DEVICE_SCALE_FACTOR,
                 surface.height / DEVICE_SCALE_FACTOR,
+                None,
             )
             .await
             .map_err(|_| {

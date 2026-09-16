@@ -743,7 +743,8 @@ impl BrowserControl {
                 let deadline = lease.deadline.min(Instant::now() + ACK_TIMEOUT);
                 let result =
                     tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-                        for event in request.events.unwrap() {
+                        let mut events = request.events.unwrap().into_iter().peekable();
+                        while let Some(event) = events.next() {
                             if Instant::now() >= deadline {
                                 return Err(ControlError::unknown());
                             }
@@ -762,8 +763,15 @@ impl BrowserControl {
                                 continue;
                             }
                             if let Some(display) = self.display.as_ref() {
+                                // Keep the helper's ordered native batch in
+                                // one RPC so video capture cannot interleave
+                                // between its keys. Page commands delimit it.
+                                let mut native_events = vec![event];
+                                while events.peek().is_some_and(|event| !matches!(event["type"].as_str(), Some("viewport" | "navigation"))) {
+                                    native_events.push(events.next().unwrap());
+                                }
                                 lease.native_input_pending = true;
-                                if let Err(error) = display.input(&event).await {
+                                if let Err(error) = display.input(&native_events).await {
                                     return Err(if !applied_any && error.operation_performed == Some(json!(false)) {
                                         ControlError::invalid("The native browser window did not accept this input.")
                                     } else { ControlError::unknown() });

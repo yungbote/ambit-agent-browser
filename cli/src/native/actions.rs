@@ -2676,6 +2676,8 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
                 .as_array()
                 .is_some_and(|events| events.iter().any(|event| event["type"] == "viewport"));
         let operation = async {
+            let layout_events =
+                resizes_window.then(|| state.browser.as_ref().unwrap().client.subscribe());
             if resizes_window {
                 // Observe the exact existing dialog owner before deciding
                 // whether a renderer readback can participate in readiness.
@@ -2694,7 +2696,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
                     browser
                         .as_ref()
                         .map(|(client, session)| (client.as_ref(), session.as_str())),
-                    Some(ControlPage(state)),
+                    Some(ControlPage(state, layout_events)),
                 )
                 .await
         };
@@ -7319,7 +7321,10 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
 
 /// The controller borrows canonical page operations under existing command
 /// custody. Navigation and viewport changes share the same state owners as CLI.
-pub(crate) struct ControlPage<'a>(&'a mut DaemonState);
+pub(crate) struct ControlPage<'a>(
+    &'a mut DaemonState,
+    Option<tokio::sync::broadcast::Receiver<super::cdp::types::CdpEvent>>,
+);
 
 impl ControlPage<'_> {
     pub(crate) async fn validate_events(&self, events: &[Value]) -> Result<(), String> {
@@ -7363,6 +7368,7 @@ impl ControlPage<'_> {
                     .apply_window_layout(
                         event["width"].as_u64().unwrap() as u32,
                         event["height"].as_u64().unwrap() as u32,
+                        self.1.take(),
                     )
                     .await?;
                 return Ok(());

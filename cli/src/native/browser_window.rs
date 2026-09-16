@@ -123,7 +123,8 @@ impl BrowserManager {
         height: u32,
         window_id: u32,
         page_blocked: bool,
-    ) -> Result<Surface, String> {
+        mut events: tokio::sync::broadcast::Receiver<crate::native::cdp::types::CdpEvent>,
+    ) -> Result<(Surface, bool), String> {
         let maximum = MAX_DISPLAY_SIZE / DEVICE_SCALE_FACTOR;
         if !(1..=maximum).contains(&width) || !(1..=maximum).contains(&height) {
             return Err(format!(
@@ -148,23 +149,23 @@ impl BrowserManager {
             // it. Publish only the acknowledged native surface; the daemon
             // keeps page feedback unavailable and retains any emulation.
             display.finish_layout().await;
-            return Ok(display.surface());
+            return Ok((display.surface(), true));
         }
-        // The presentation owner controls actual window layout. An earlier
-        // page emulation must not keep the page at an unrelated fixed width.
-        for page in &self.pages {
-            self.client
-                .send_command_no_params(
-                    "Emulation.clearDeviceMetricsOverride",
-                    Some(&page.session_id),
-                )
-                .await?;
-        }
-
         // XConfigureWindow acknowledges native geometry before Chromium has
         // necessarily reflowed. Require its visible page metrics to agree
         // before publishing the applied surface or a host observation.
-        tokio::time::timeout(Duration::from_secs(2), async {
+        let paint = async {
+            // An earlier page emulation must not keep this layout at an
+            // unrelated fixed width. A newly opened modal can block this
+            // command too, so it shares the same bounded observation phase.
+            for page in &self.pages {
+                self.client
+                    .send_command_no_params(
+                        "Emulation.clearDeviceMetricsOverride",
+                        Some(&page.session_id),
+                    )
+                    .await?;
+            }
             loop {
                 let mut ready = Vec::new();
                 for page in &self.pages {
@@ -235,11 +236,32 @@ impl BrowserManager {
                 }
                 tokio::time::sleep(Duration::from_millis(16)).await;
             }
+        };
+        let modal = async {
+            loop {
+                match events.recv().await {
+                    Ok(event) if event.method == "Page.javascriptDialogOpening" => {
+                        return Ok::<(), String>(())
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err("Browser observation ended during window layout".into())
+                    }
+                    _ => {}
+                }
+            }
+        };
+        // The receiver was armed before draining the daemon's existing event
+        // owner. A dialog that opens during resize is therefore observed too.
+        let page_blocked = tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::select! {
+                result = paint => result.map(|_| false),
+                result = modal => result.map(|_| true),
+            }
         })
         .await
         .map_err(|_| "The browser has not acknowledged the new page layout")??;
         display.finish_layout().await;
-        Ok(display.surface())
+        Ok((display.surface(), page_blocked))
     }
 }
 
