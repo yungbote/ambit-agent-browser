@@ -285,6 +285,24 @@ async fn browser_files_e2e_native_drop_real_bytes_and_repeated_position() {
 
 #[tokio::test]
 #[ignore = "requires installed Chromium"]
+async fn browser_files_e2e_input_drop_uses_native_events_and_default_file_selection() {
+    let (mut state, dir) = launch().await;
+    let source = dir.path().join("input-drop.bin");
+    std::fs::write(&source, [0, 1, 128, 255]).unwrap();
+    evaluate(&state, "window.inputDropTrusted=false;one.addEventListener('drop',event=>window.inputDropTrusted=event.isTrusted)").await;
+    acquire(&mut state).await;
+    let destination = drop_target(&mut state, 1, 60.0, 35.0).await;
+    assert_eq!(destination["kind"], "input");
+    success(&control(&mut state, json!({"op":"setfiles","sequence":2,"destinationId":destination["destinationId"],"files":[source]})).await);
+    assert_eq!(evaluate(&state, "window.inputDropTrusted").await, true);
+    let selected = receipt(&state, 0).await;
+    assert_eq!(selected["kind"], "one");
+    assert_eq!(selected["files"][0]["bytes"], json!([0, 1, 128, 255]));
+    close(&mut state).await;
+}
+
+#[tokio::test]
+#[ignore = "requires installed Chromium"]
 async fn browser_files_e2e_replaced_node_navigation_and_release_refuse_staged_files() {
     let (mut state, dir) = launch().await;
     let file = dir.path().join("staged.bin");

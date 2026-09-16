@@ -606,7 +606,7 @@ impl FilePage {
         let node = node["result"]["objectId"].as_str().ok_or_else(stale)?;
         check_deadline(deadline)?;
         self.client.files.current(controller, id)?;
-        if binding.kind != "drop" {
+        if binding.kind == "chooser" {
             self.client.files.dismiss(controller, id)?;
             self.client
                 .send_command(
