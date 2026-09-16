@@ -365,6 +365,13 @@ async fn browser_files_e2e_downloads_start_at_acquisition_and_keep_exact_paths()
     success(&command(&mut state, json!({"action":"snapshot"})).await);
     let waited = command(&mut state, json!({"action":"waitfordownload"})).await;
     assert_eq!(success(&waited)["guid"], found["guid"]);
+    // Completed history must still name a capture after ordinary source
+    // organization. Product can resume retained immutable bytes by this GUID.
+    std::fs::rename(
+        found["path"].as_str().unwrap(),
+        dir.path().join("moved.bin"),
+    )
+    .unwrap();
     success(&command(&mut state, json!({"action":"tab_new","url":"about:blank"})).await);
     success(&command(&mut state, json!({"action":"tab_close","tabId":"t1"})).await);
     let after_close = command(
@@ -377,6 +384,24 @@ async fn browser_files_e2e_downloads_start_at_acquisition_and_keep_exact_paths()
         .unwrap()
         .iter()
         .any(|download| download["guid"] == found["guid"]));
+    success(&command(&mut state, json!({"action":"close"})).await);
+}
+
+#[tokio::test]
+#[ignore = "requires installed Chromium"]
+async fn browser_files_e2e_unsupported_file_engine_keeps_ordinary_control() {
+    let (mut state, _dir) = launch().await;
+    state.engine = "lightpanda".into();
+    let inspection = command(
+        &mut state,
+        json!({"action":"ambit_browser_control","op":"inspect"}),
+    )
+    .await;
+    assert_eq!(success(&inspection)["filesSupported"], false);
+    acquire(&mut state).await;
+    assert!(!state.browser.as_ref().unwrap().client.files.active());
+    success(&control(&mut state, json!({"op":"release"})).await);
+    state.engine = "chrome".into();
     success(&command(&mut state, json!({"action":"close"})).await);
 }
 

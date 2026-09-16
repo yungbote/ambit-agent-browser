@@ -2359,8 +2359,8 @@ impl BrowserManager {
         Ok(frames)
     }
 
-    /// Verified completed results within this browser's owned scope, without
-    /// marking observer records reported or accepting caller-selected paths.
+    /// Completed observations within this browser's owned scope, without
+    /// consuming command waits or making live-file existence a history gate.
     pub(crate) async fn completed_downloads(&self, after: u64) -> Result<Vec<Value>, String> {
         let Some(directory) = self.downloads_directory.as_ref() else {
             return Ok(Vec::new());
@@ -2378,11 +2378,7 @@ impl BrowserManager {
             .downloads
             .completed(frames.as_ref(), after)?
             .iter()
-            .filter_map(|download| {
-                let mut result = directory.finish(download, None).ok()?;
-                result["id"] = json!(download.guid);
-                Some(result)
-            })
+            .map(|download| directory.observation(download))
             .collect())
     }
 

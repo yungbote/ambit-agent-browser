@@ -351,6 +351,14 @@ pub(crate) struct DownloadDirectory {
     temporary: bool,
 }
 impl DownloadDirectory {
+    /// Browser history is an observation, not a claim that a mutable source
+    /// still exists. Capture/read owners reprove bytes when they are consumed.
+    pub fn observation(&self, download: &Download) -> Value {
+        json!({ "id":download.guid, "guid":download.guid, "frameId":download.frame_id,
+          "path":self.path.join(&download.guid), "suggestedFilename":download.suggested_filename,
+          "status":"completed", "receivedBytes":download.received_bytes })
+    }
+
     pub fn new(path: Option<&str>) -> Result<Self, String> {
         let temporary = path.is_none();
         let path = path.map(PathBuf::from).unwrap_or_else(|| {

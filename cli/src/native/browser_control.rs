@@ -718,7 +718,7 @@ impl BrowserControl {
                         .map(|(client, _)| client.downloads.cursor())
                         .unwrap_or(0),
                 });
-                if let Some(page) = page.as_mut() {
+                if let Some(page) = page.as_mut().filter(|page| page.files_supported()) {
                     if let Err(error) = page.prepare_files(&request.controller_id).await {
                         self.lease = None;
                         return Err(error);
