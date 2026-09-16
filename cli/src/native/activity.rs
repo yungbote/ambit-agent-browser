@@ -16,6 +16,19 @@ pub(crate) const FRAME_GENERATION: &str = "ambitPageGeneration";
 pub(crate) const POINTER_BINDING: &str = "__ambitWindowPointer";
 pub(crate) const POINTER_WORLD: &str = "ambit-window-pointer";
 
+/// Geometry measured by one trusted renderer event in an isolated realm.
+/// It is input to the owned display, never a replacement input acknowledgement.
+#[derive(Clone, Debug)]
+pub(crate) struct NativePointer {
+    pub context: i64,
+    pub page_generation: String,
+    pub client_x: f64,
+    pub client_y: f64,
+    pub screen_x: f64,
+    pub screen_y: f64,
+    pub geometry: Value,
+}
+
 #[derive(Clone, Copy)]
 pub(crate) enum InputSource {
     Agent,
@@ -38,6 +51,8 @@ pub(crate) struct ActivityObservation {
     event: CdpEvent,
     sender: broadcast::Sender<CdpEvent>,
     native_liveness: Option<Arc<AtomicBool>>,
+    native_context: Option<i64>,
+    native_geometry: Option<Value>,
     settled: bool,
 }
 
@@ -59,6 +74,8 @@ impl ActivityObservation {
             },
             sender,
             native_liveness: None,
+            native_context: None,
+            native_geometry: None,
             settled: false,
         }
     }
@@ -71,6 +88,22 @@ impl ActivityObservation {
 
     pub(crate) fn track_native(&mut self, liveness: Arc<AtomicBool>) {
         self.native_liveness = Some(liveness);
+    }
+
+    pub(crate) fn set_native_context(&mut self, context: i64) {
+        self.native_context = Some(context);
+    }
+
+    pub(crate) fn native_pointer(&self) -> Option<NativePointer> {
+        Some(NativePointer {
+            context: self.native_context?,
+            page_generation: self.event.params["pageGeneration"].as_str()?.into(),
+            client_x: self.event.params["x"].as_f64()?,
+            client_y: self.event.params["y"].as_f64()?,
+            screen_x: self.event.params["screenX"].as_f64()?,
+            screen_y: self.event.params["screenY"].as_f64()?,
+            geometry: self.native_geometry.clone()?,
+        })
     }
 
     pub(crate) fn awaits_native_event(&self) -> bool {
@@ -118,6 +151,12 @@ impl ActivityObservation {
         }
         self.event.params["screenX"] = payload["screenX"].clone();
         self.event.params["screenY"] = payload["screenY"].clone();
+        if payload["geometry"]["scale"]
+            .as_f64()
+            .is_some_and(|scale| scale.is_finite() && scale > 0.0)
+        {
+            self.native_geometry = Some(payload["geometry"].clone());
+        }
     }
 }
 

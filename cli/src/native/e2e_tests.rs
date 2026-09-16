@@ -49,6 +49,127 @@ async fn control_test_command(command: &Value, state: &mut DaemonState) -> Value
     Box::pin(execute_command(command, state)).await
 }
 
+/// Own-window mouse input uses the same command and takeover owners as CLI/MCP.
+/// Run with an existing Chrome executable and the host-built display helper.
+#[tokio::test]
+#[ignore]
+async fn e2e_native_agent_mouse_click_drag_dialog_and_takeover() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<!doctype html><style>body{margin:0}button{position:absolute;left:100px;top:120px;width:140px;height:60px}#box{position:absolute;left:320px;top:140px}#drag{position:absolute;left:450px;top:140px;width:80px;height:80px;background:blue}#end{position:absolute;left:650px;top:140px;width:80px;height:80px;background:green}</style><button id=button>Click</button><input id=box type=checkbox><div id=drag></div><div id=end></div><script>window.events=[];window.clicks=0;window.doubles=0;window.ask=false;window.held=false;for(const type of ['pointermove','pointerdown','pointerup','click','dblclick'])addEventListener(type,e=>{events.push({type,trusted:e.isTrusted,buttons:e.buttons,target:e.target.id,x:e.clientX,y:e.clientY,screenX:e.screenX,screenY:e.screenY});if(type==='pointerdown'){held=true;if(ask){ask=false;confirm('Continue native mouse?')}}if(type==='pointerup')held=false;if(type==='click'&&e.target.id==='button')clicks++;if(type==='dblclick'&&e.target.id==='button')doubles++;},true);drag.onpointerdown=e=>drag.setPointerCapture(e.pointerId)</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
+    assert!(state.browser_control.lock().await.has_native_mouse());
+    for action in ["click", "tap", "dblclick", "hover"] {
+        assert_success(
+            &control_test_command(&json!({"action":action,"selector":"#button"}), &mut state).await,
+        );
+    }
+    let events = control_test_command(
+        &json!({"action":"evaluate","script":"({clicks,doubles,events})"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&events);
+    assert_eq!(events["data"]["result"]["clicks"], 4);
+    assert_eq!(events["data"]["result"]["doubles"], 1);
+    assert!(events["data"]["result"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|event| event["trusted"] == true));
+    for action in ["check", "uncheck"] {
+        assert_success(
+            &control_test_command(&json!({"action":action,"selector":"#box"}), &mut state).await,
+        );
+    }
+    assert_success(
+        &control_test_command(
+            &json!({"action":"evaluate","script":"events=[]"}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"drag","source":"#drag","target":"#end"}),
+            &mut state,
+        )
+        .await,
+    );
+    let drag = control_test_command(
+        &json!({"action":"evaluate","script":"({held,events})"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&drag);
+    assert_eq!(drag["data"]["result"]["held"], false);
+    assert!(
+        drag["data"]["result"]["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|event| event["type"] == "pointermove" && event["buttons"] == 1)
+            .count()
+            >= 1
+    );
+    let up = drag["data"]["result"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|event| event["type"] == "pointerup")
+        .unwrap();
+    assert_eq!(up["x"], 690);
+    assert_eq!(up["y"], 180);
+    assert_success(
+        &control_test_command(
+            &json!({"action":"evaluate","script":"ask=true;events=[]"}),
+            &mut state,
+        )
+        .await,
+    );
+    let clicked =
+        control_test_command(&json!({"action":"click","selector":"#button"}), &mut state).await;
+    assert_success(&clicked);
+    assert_eq!(clicked["data"]["dialogOpened"], true);
+    assert_success(
+        &control_test_command(&json!({"action":"dialog","response":"accept"}), &mut state).await,
+    );
+    let held =
+        control_test_command(&json!({"action":"evaluate","script":"held"}), &mut state).await;
+    assert_success(&held);
+    assert_eq!(held["data"]["result"], false);
+    assert_success(
+        &control_test_command(&json!({"action":"mousemove","x":490,"y":180}), &mut state).await,
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"mousedown","button":"left"}), &mut state).await,
+    );
+    let owner = uuid::Uuid::new_v4().to_string();
+    assert_success(&control_test_command(&json!({"action":"ambit_browser_control","op":"acquire","controllerId":owner,"expiresAt":super::stream::timestamp_ms()+25000}), &mut state).await);
+    assert_error_code(
+        &control_test_command(&json!({"action":"click","selector":"#button"}), &mut state).await,
+        "browser_controlled_by_user",
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"ambit_browser_control","op":"release","controllerId":owner}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(&control_test_command(&json!({"action":"snapshot"}), &mut state).await);
+    let released =
+        control_test_command(&json!({"action":"evaluate","script":"held"}), &mut state).await;
+    assert_success(&released);
+    assert_eq!(released["data"]["result"], false);
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#button"}), &mut state).await,
+    );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
 #[tokio::test]
 #[ignore]
 async fn e2e_browser_control_copy_uses_actual_focus_and_exact_unicode() {

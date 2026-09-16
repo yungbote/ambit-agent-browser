@@ -759,7 +759,7 @@ fn initialize_result(params: Option<&Value>, config: &McpConfig) -> Value {
         let mut descriptor = host_bound::descriptor();
         descriptor.as_object_mut().unwrap().remove("tools");
         result["capabilities"]["experimental"] = json!({ "io.ambit/browser": descriptor });
-        result["instructions"] = json!("Use the typed browser tools in the host-assigned browser session. Each operation returns its outcome and a current viewport capture when available. Coordinates use viewport CSS pixels. Human control temporarily prevents agent operations.");
+        result["instructions"] = json!("Use the typed browser tools in the host-assigned browser session. Each operation returns its outcome and a current viewport capture when available. Coordinates use viewport CSS pixels. Owned-window mouse tools move the native cursor through the display input owner. Human control temporarily prevents agent operations.");
     }
     result
 }

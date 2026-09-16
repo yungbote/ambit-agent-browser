@@ -2802,6 +2802,8 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
+    state.browser_control.lock().await.begin_agent_command();
+
     if let Err(err) = validate_restore_config_from_command(cmd) {
         return error_response(&id, &err);
     }
@@ -6031,6 +6033,7 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 
     let result = interaction::click(
         &mgr.client,
+        &state.browser_control,
         &session_id,
         &state.ref_map,
         selector,
@@ -6057,6 +6060,7 @@ async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
 
     let result = interaction::dblclick(
         &mgr.client,
+        &state.browser_control,
         &session_id,
         &state.ref_map,
         selector,
@@ -6195,6 +6199,7 @@ async fn handle_hover(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 
     interaction::hover(
         &mgr.client,
+        &state.browser_control,
         &session_id,
         &state.ref_map,
         selector,
@@ -6279,14 +6284,19 @@ async fn handle_check(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
-    interaction::check(
+    let clicked = interaction::check(
         &mgr.client,
+        &state.browser_control,
         &session_id,
         &state.ref_map,
         selector,
         &state.iframe_sessions,
     )
     .await?;
+    if clicked.dialog_opened {
+        state.pending_pointer_release = clicked.pending_release;
+        return Ok(json!({"dialogOpened":true}));
+    }
     Ok(json!({ "checked": selector }))
 }
 
@@ -6298,14 +6308,19 @@ async fn handle_uncheck(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
-    interaction::uncheck(
+    let clicked = interaction::uncheck(
         &mgr.client,
+        &state.browser_control,
         &session_id,
         &state.ref_map,
         selector,
         &state.iframe_sessions,
     )
     .await?;
+    if clicked.dialog_opened {
+        state.pending_pointer_release = clicked.pending_release;
+        return Ok(json!({"dialogOpened":true}));
+    }
     Ok(json!({ "unchecked": selector }))
 }
 
@@ -7179,17 +7194,21 @@ async fn handle_mouse(cmd: &Value, state: &DaemonState) -> Result<Value, String>
     let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("none");
     let click_count = cmd.get("clickCount").and_then(|v| v.as_i64()).unwrap_or(0);
 
-    mgr.client
-        .send_command(
-            "Input.dispatchMouseEvent",
-            Some(json!({
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_input(
+            "input_mouse",
+            json!({
                 "type": event_type,
                 "x": x,
                 "y": y,
                 "button": button,
                 "clickCount": click_count,
-            })),
-            Some(&session_id),
+            }),
+            &mgr.client,
+            &session_id,
         )
         .await?;
 
@@ -7617,8 +7636,9 @@ async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     // Frame-tree acknowledgment orders this cursor after prior browser events.
     // A previously observed GUID completing cannot settle the selected one.
     let cursor = mgr.client.downloads.cursor();
-    interaction::click(
+    let clicked = interaction::click(
         &mgr.client,
+        &state.browser_control,
         &session_id,
         &state.ref_map,
         selector,
@@ -7627,6 +7647,13 @@ async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         &state.iframe_sessions,
     )
     .await?;
+    if clicked.dialog_opened {
+        state.pending_pointer_release = clicked.pending_release;
+        return Err(
+            "The click opened a dialog before downloading. Resolve the dialog before continuing."
+                .into(),
+        );
+    }
     let download = mgr
         .client
         .downloads
@@ -8017,6 +8044,24 @@ async fn handle_tap(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
 
+    if state.browser_control.lock().await.has_native_mouse() {
+        let result = interaction::click(
+            &mgr.client,
+            &state.browser_control,
+            &session_id,
+            &state.ref_map,
+            sel,
+            "left",
+            1,
+            &state.iframe_sessions,
+        )
+        .await?;
+        if result.dialog_opened {
+            state.pending_pointer_release = result.pending_release;
+        }
+        return Ok(json!({"tapped":sel,"dialogOpened":result.dialog_opened}));
+    }
+
     interaction::tap_touch(
         &mgr.client,
         &session_id,
@@ -8263,12 +8308,24 @@ async fn handle_dialog(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     state.pending_dialog = None;
     result?;
 
+    if state.browser_control.lock().await.has_native_mouse() {
+        state
+            .browser_control
+            .lock()
+            .await
+            .finish_native_dialog()
+            .await?;
+        state.pending_pointer_release = None;
+        return Ok(json!({"handled":true,"accepted":accept}));
+    }
+
     // If a click's mousedown opened this dialog, the button is still logically
     // down. Release it now that the page is unblocked so the next click does
     // not register as a drag or double-click.
     if let Some(release) = state.pending_pointer_release.take() {
         if let Some(ref mgr) = state.browser {
-            let _ = interaction::dispatch_pending_release(&mgr.client, &release).await;
+            interaction::dispatch_pending_release(&mgr.client, &state.browser_control, &release)
+                .await?;
         }
     }
     Ok(json!({ "handled": true, "accepted": accept }))
@@ -8807,17 +8864,21 @@ async fn handle_wheel(cmd: &Value, state: &DaemonState) -> Result<Value, String>
     let delta_x = cmd.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let delta_y = cmd.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
 
-    mgr.client
-        .send_command(
-            "Input.dispatchMouseEvent",
-            Some(json!({
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_input(
+            "input_mouse",
+            json!({
                 "type": "mouseWheel",
                 "x": x,
                 "y": y,
                 "deltaX": delta_x,
                 "deltaY": delta_y,
-            })),
-            Some(&session_id),
+            }),
+            &mgr.client,
+            &session_id,
         )
         .await?;
 
@@ -9675,6 +9736,7 @@ async fn execute_subaction(
         "click" => {
             let result = interaction::click(
                 &mgr.client,
+                &state.browser_control,
                 &session_id,
                 &state.ref_map,
                 selector,
@@ -9706,19 +9768,25 @@ async fn execute_subaction(
             Ok(json!({ "filled": selector }))
         }
         "check" => {
-            interaction::check(
+            let clicked = interaction::check(
                 &mgr.client,
+                &state.browser_control,
                 &session_id,
                 &state.ref_map,
                 selector,
                 &state.iframe_sessions,
             )
             .await?;
+            if clicked.dialog_opened {
+                state.pending_pointer_release = clicked.pending_release;
+                return Ok(json!({"dialogOpened":true}));
+            }
             Ok(json!({ "checked": selector }))
         }
         "hover" => {
             interaction::hover(
                 &mgr.client,
+                &state.browser_control,
                 &session_id,
                 &state.ref_map,
                 selector,
@@ -10438,6 +10506,31 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         &state.iframe_sessions,
     )
     .await?;
+
+    if state.browser_control.lock().await.has_native_mouse() {
+        let dialog_opened = state
+            .browser_control
+            .lock()
+            .await
+            .agent_native_drag(
+                &mgr.client,
+                &session_id,
+                (&source_session_id, sx, sy),
+                (&target_session_id, tx, ty),
+            )
+            .await?;
+        if dialog_opened {
+            state.pending_pointer_release = Some(interaction::PendingRelease {
+                session_id: source_session_id,
+                x: sx,
+                y: sy,
+                button: "left".into(),
+            });
+        }
+        return Ok(
+            json!({"dragged":!dialog_opened,"dialogOpened":dialog_opened,"source":source,"target":target}),
+        );
+    }
 
     // Mouse down at source
     mgr.client
@@ -12135,8 +12228,9 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
             )
         })?
     };
-    interaction::click(
+    let clicked = interaction::click(
         &mgr.client,
+        &state.browser_control,
         &session_id,
         &state.ref_map,
         &sub_sel,
@@ -12145,6 +12239,12 @@ async fn handle_auth_login(cmd: &Value, state: &mut DaemonState) -> Result<Value
         &state.iframe_sessions,
     )
     .await?;
+    if clicked.dialog_opened {
+        state.pending_pointer_release = clicked.pending_release;
+        return Err(
+            "The sign-in click opened a dialog. Resolve the dialog before continuing.".into(),
+        );
+    }
 
     // Wait for navigation after submit (with fallback timeout)
     let mut rx = mgr.client.subscribe();

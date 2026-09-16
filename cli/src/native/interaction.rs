@@ -2,9 +2,11 @@ use std::collections::HashMap;
 
 use serde_json::Value;
 
+use super::browser_control::BrowserControl;
 use super::cdp::client::CdpClient;
 use super::cdp::types::*;
 use super::element::{resolve_element_center, resolve_element_object_id, RefMap};
+use tokio::sync::Mutex;
 
 /// Outcome of a click. `dialog_opened` is true if a JavaScript dialog opened
 /// mid-sequence (the page is then blocked until `dialog accept`/`dismiss`).
@@ -27,6 +29,7 @@ pub struct PendingRelease {
 
 pub async fn click(
     client: &CdpClient,
+    control: &Mutex<BrowserControl>,
     session_id: &str,
     ref_map: &RefMap,
     selector_or_ref: &str,
@@ -42,11 +45,31 @@ pub async fn click(
         iframe_sessions,
     )
     .await?;
+    if control.lock().await.has_native_mouse() && click_count > 1 {
+        for _ in 0..click_count {
+            let result = dispatch_click(
+                client,
+                control,
+                &effective_session_id,
+                &[effective_session_id.as_str(), session_id],
+                x,
+                y,
+                button,
+                1,
+            )
+            .await?;
+            if result.dialog_opened {
+                return Ok(result);
+            }
+        }
+        return Ok(ClickResult::default());
+    }
     // A click-triggered dialog can fire on the frame's own session (OOPIF) or
     // on the top-level page session; both count as "ours". A dialog on any
     // other session belongs to a background tab and must not abort this click.
     dispatch_click(
         client,
+        control,
         &effective_session_id,
         &[effective_session_id.as_str(), session_id],
         x,
@@ -59,6 +82,7 @@ pub async fn click(
 
 pub async fn dblclick(
     client: &CdpClient,
+    control: &Mutex<BrowserControl>,
     session_id: &str,
     ref_map: &RefMap,
     selector_or_ref: &str,
@@ -66,6 +90,7 @@ pub async fn dblclick(
 ) -> Result<ClickResult, String> {
     click(
         client,
+        control,
         session_id,
         ref_map,
         selector_or_ref,
@@ -78,6 +103,7 @@ pub async fn dblclick(
 
 pub async fn hover(
     client: &CdpClient,
+    control: &Mutex<BrowserControl>,
     session_id: &str,
     ref_map: &RefMap,
     selector_or_ref: &str,
@@ -91,6 +117,19 @@ pub async fn hover(
         iframe_sessions,
     )
     .await?;
+    if control.lock().await.has_native_mouse() {
+        control
+            .lock()
+            .await
+            .agent_native_mouse(
+                serde_json::json!({"type":"mouseMoved","x":x,"y":y,"buttons":0}),
+                client,
+                &effective_session_id,
+                &[effective_session_id.as_str(), session_id],
+            )
+            .await?;
+        return Ok(());
+    }
     client
         .send_command_typed::<_, Value>(
             "Input.dispatchMouseEvent",
@@ -381,6 +420,7 @@ pub async fn scroll(
     let observation = client.observe_activity(
         serde_json::json!({ "type": "activity", "kind": "scrolling" }),
         session_id,
+        client.page_generation(session_id),
         super::activity::InputSource::Agent,
     );
     if let Some(sel) = selector_or_ref {
@@ -494,11 +534,12 @@ pub async fn select_option(
 
 pub async fn check(
     client: &CdpClient,
+    control: &Mutex<BrowserControl>,
     session_id: &str,
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<ClickResult, String> {
     let is_checked = super::element::is_element_checked(
         client,
         session_id,
@@ -508,8 +549,9 @@ pub async fn check(
     )
     .await?;
     if !is_checked {
-        click(
+        let clicked = click(
             client,
+            control,
             session_id,
             ref_map,
             selector_or_ref,
@@ -518,6 +560,9 @@ pub async fn check(
             iframe_sessions,
         )
         .await?;
+        if clicked.dialog_opened {
+            return Ok(clicked);
+        }
 
         // Verify the click changed the state (Playwright parity: _setChecked re-checks).
         // If the coordinate-based click missed (e.g. hidden input, overlay), retry
@@ -531,6 +576,9 @@ pub async fn check(
         )
         .await?
         {
+            if control.lock().await.has_native_mouse() {
+                return Err("The checkbox did not reach the requested state after the native click. Inspect the current page before retrying.".into());
+            }
             js_click_checkbox(
                 client,
                 session_id,
@@ -541,16 +589,17 @@ pub async fn check(
             .await?;
         }
     }
-    Ok(())
+    Ok(ClickResult::default())
 }
 
 pub async fn uncheck(
     client: &CdpClient,
+    control: &Mutex<BrowserControl>,
     session_id: &str,
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<ClickResult, String> {
     let is_checked = super::element::is_element_checked(
         client,
         session_id,
@@ -560,8 +609,9 @@ pub async fn uncheck(
     )
     .await?;
     if is_checked {
-        click(
+        let clicked = click(
             client,
+            control,
             session_id,
             ref_map,
             selector_or_ref,
@@ -570,6 +620,9 @@ pub async fn uncheck(
             iframe_sessions,
         )
         .await?;
+        if clicked.dialog_opened {
+            return Ok(clicked);
+        }
 
         // Same verify-and-retry as check().
         if super::element::is_element_checked(
@@ -581,6 +634,9 @@ pub async fn uncheck(
         )
         .await?
         {
+            if control.lock().await.has_native_mouse() {
+                return Err("The checkbox did not reach the requested state after the native click. Inspect the current page before retrying.".into());
+            }
             js_click_checkbox(
                 client,
                 session_id,
@@ -591,7 +647,7 @@ pub async fn uncheck(
             .await?;
         }
     }
-    Ok(())
+    Ok(ClickResult::default())
 }
 
 /// Fallback for when the coordinate-based CDP click did not toggle the
@@ -948,12 +1004,25 @@ pub async fn tap_touch(
 /// never sees the pending-dialog warning.
 async fn dispatch_mouse_or_dialog(
     client: &CdpClient,
+    control: &Mutex<BrowserControl>,
     session_id: &str,
     accept_sessions: &[&str],
     params: &DispatchMouseEventParams,
 ) -> Result<bool, String> {
     use tokio::sync::broadcast::error::RecvError;
 
+    if control.lock().await.has_native_mouse() {
+        return control
+            .lock()
+            .await
+            .agent_native_mouse(
+                serde_json::to_value(params).map_err(|error| error.to_string())?,
+                client,
+                session_id,
+                accept_sessions,
+            )
+            .await;
+    }
     // Subscribe before sending so the dialog event cannot slip past us.
     let mut events = client.subscribe();
     let send =
@@ -995,6 +1064,7 @@ async fn dispatch_mouse_or_dialog(
 
 async fn dispatch_click(
     client: &CdpClient,
+    control: &Mutex<BrowserControl>,
     session_id: &str,
     accept_sessions: &[&str],
     x: f64,
@@ -1005,6 +1075,7 @@ async fn dispatch_click(
     // Move
     if dispatch_mouse_or_dialog(
         client,
+        control,
         session_id,
         accept_sessions,
         &DispatchMouseEventParams {
@@ -1037,6 +1108,7 @@ async fn dispatch_click(
     // Press
     if dispatch_mouse_or_dialog(
         client,
+        control,
         session_id,
         accept_sessions,
         &DispatchMouseEventParams {
@@ -1071,6 +1143,7 @@ async fn dispatch_click(
     // after the button is already up, so there is nothing left to release.
     let dialog_opened = dispatch_mouse_or_dialog(
         client,
+        control,
         session_id,
         accept_sessions,
         &DispatchMouseEventParams {
@@ -1096,8 +1169,12 @@ async fn dispatch_click(
 /// dialog opened mid-click. Called after the dialog is resolved.
 pub async fn dispatch_pending_release(
     client: &CdpClient,
+    control: &Mutex<BrowserControl>,
     release: &PendingRelease,
 ) -> Result<(), String> {
+    if control.lock().await.has_native_mouse() {
+        return control.lock().await.finish_native_dialog().await;
+    }
     client
         .send_command_typed::<_, Value>(
             "Input.dispatchMouseEvent",
