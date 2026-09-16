@@ -2688,7 +2688,18 @@ pub(crate) async fn execute_command_received(
         {
             Ok(response) => response,
             Err(_) => {
-                json!({ "id": command["id"], "success": false, "code": "command_outcome_unknown", "error": "The browser command exceeded its host deadline. It may have executed; inspect the current page before retrying." })
+                let mut error = "The browser command exceeded its host deadline. It may have executed; inspect the current page before retrying.".to_string();
+                if let Err(cleanup) = state
+                    .browser_control
+                    .lock()
+                    .await
+                    .cancel_native_input()
+                    .await
+                {
+                    error.push(' ');
+                    error.push_str(&cleanup);
+                }
+                json!({ "id": command["id"], "success": false, "code": "command_outcome_unknown", "error": error })
             }
         }
     };
@@ -12907,11 +12918,19 @@ fn error_response(id: &str, error: &str) -> Value {
     if error.starts_with(super::browser::TAB_GONE_PREFIX) {
         resp["code"] = json!("tab_gone");
     } else if let Some((code, _)) = error.split_once(": ") {
-        if code.starts_with("webmcp_") {
+        if code.starts_with("webmcp_") || code == "browser_control_outcome_unknown" {
             resp["code"] = json!(code);
         }
     }
     resp
+}
+
+#[cfg(test)]
+pub(crate) fn native_error_response_for_test(error: &str) -> Value {
+    error_response(
+        "native-input-failure-test",
+        &super::browser::to_ai_friendly_error(error),
+    )
 }
 
 fn attach_tab_gone_data(resp: &mut Value, state: &DaemonState) {

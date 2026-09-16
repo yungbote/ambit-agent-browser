@@ -251,6 +251,16 @@ fn result(mut response: Response) -> Value {
 }
 
 #[cfg(test)]
+pub(super) fn native_error_result_for_test(error: &str) -> Value {
+    result(
+        serde_json::from_value(crate::native::actions::native_error_response_for_test(
+            error,
+        ))
+        .unwrap(),
+    )
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

@@ -637,19 +637,22 @@ impl CdpClient {
                 r#"(() => {{
                 globalThis.__ambitPointerToken = {token};
                 if (typeof globalThis.__ambitWindowPointer !== 'function') return false;
-                if (!globalThis.__ambitPointerInstalled) {{
-                    globalThis.__ambitPointerInstalled = true;
-                    for (const [name, eventType] of [['pointermove','move'],['pointerdown','press'],['pointerup','release'],['wheel','scroll']]) {{
-                        addEventListener(name, event => {{
-                            if (!event.isTrusted) return;
-                            globalThis.__ambitWindowPointer(JSON.stringify({{
-                                token: globalThis.__ambitPointerToken, eventType,
-                                clientX: event.clientX, clientY: event.clientY,
-                                screenX: event.screenX, screenY: event.screenY,
-                                geometry: {{scale:devicePixelRatio*(visualViewport?.scale??1),width:innerWidth,height:innerHeight,offsetX:visualViewport?.offsetLeft??0,offsetY:visualViewport?.offsetTop??0}},
-                            }}));
-                        }}, {{capture:true, passive:true}});
-                    }}
+                const handlers = globalThis.__ambitPointerHandlers ||= Object.create(null);
+                for (const [name, eventType] of [['pointermove','move'],['pointerdown','press'],['pointerup','release'],['wheel','scroll']]) {{
+                    const handler = handlers[name] ||= event => {{
+                        if (!event.isTrusted) return;
+                        globalThis.__ambitWindowPointer(JSON.stringify({{
+                            token: globalThis.__ambitPointerToken, eventType,
+                            clientX: event.clientX, clientY: event.clientY,
+                            screenX: event.screenX, screenY: event.screenY,
+                            geometry: {{scale:devicePixelRatio*(visualViewport?.scale??1),width:innerWidth,height:innerHeight,offsetX:visualViewport?.offsetLeft??0,offsetY:visualViewport?.offsetTop??0}},
+                        }}));
+                    }};
+                    // Document replacement can discard listeners while this
+                    // isolated realm survives. Rebind the same function;
+                    // a remembered installation flag is not observation.
+                    removeEventListener(name, handler, true);
+                    addEventListener(name, handler, {{capture:true, passive:true}});
                 }}
                 return true;
             }})()"#

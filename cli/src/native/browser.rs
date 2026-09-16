@@ -199,6 +199,12 @@ fn active_page_index_after_add(
 
 /// Converts common error messages into AI-friendly, actionable descriptions.
 pub fn to_ai_friendly_error(error: &str) -> String {
+    // This is the existing input outcome classification. Rewriting a word
+    // such as "timeout" inside it must not turn a partial action into a
+    // definite failure that the host could retry automatically.
+    if error.starts_with("browser_control_outcome_unknown: ") {
+        return error.to_string();
+    }
     let lower = error.to_lowercase();
     // Classify a genuine locator miss first: its anchored shape ("No element
     // found: ...") echoes the selector/name, which may itself contain a word like

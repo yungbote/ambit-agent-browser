@@ -51,6 +51,136 @@ async fn control_test_command(command: &Value, state: &mut DaemonState) -> Value
 
 #[tokio::test]
 #[ignore]
+async fn e2e_native_mouse_failure_releases_without_replaying_the_action() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let page =
+        "data:text/html,<title>Native release</title><body style='margin:0;height:100vh'></body>";
+    assert_success(
+        &control_test_command(&json!({"action":"navigate","url":page}), &mut state).await,
+    );
+    // A claimed zero mask on a move cannot erase an acknowledged native hold.
+    assert_success(
+        &control_test_command(&json!({"action":"mousemove","x":100,"y":100}), &mut state).await,
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"mousedown","button":"left"}), &mut state).await,
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"input_mouse","type":"mouseMoved","x":101,"y":100,"buttons":0}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"navigate","url":"about:blank"}),
+            &mut state,
+        )
+        .await,
+    );
+    let moved =
+        control_test_command(&json!({"action":"mousemove","x":110,"y":110}), &mut state).await;
+    assert_eq!(moved["success"], false);
+    assert!(moved["error"].as_str().unwrap().contains("changed"));
+    assert_success(&control_test_command(&json!({"action":"snapshot"}), &mut state).await);
+    assert_success(&control_test_command(&json!({"action":"evaluate","script":"window.moves=[];window.downs=0;addEventListener('pointermove',e=>moves.push({buttons:e.buttons,trusted:e.isTrusted}),true);addEventListener('pointerdown',()=>downs++,true)"}), &mut state).await);
+    assert_success(
+        &control_test_command(&json!({"action":"mousemove","x":120,"y":120}), &mut state).await,
+    );
+    let released = control_test_command(
+        &json!({"action":"evaluate","script":"({last:moves.at(-1),downs})"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&released);
+    assert_eq!(
+        released["data"]["result"],
+        json!({"last":{"buttons":0,"trusted":true},"downs":0})
+    );
+
+    // An explicit mouseup can clear a stale mapping before attempting input.
+    assert_success(
+        &control_test_command(&json!({"action":"mousedown","button":"left"}), &mut state).await,
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"navigate","url":page}), &mut state).await,
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"mouseup","button":"left"}), &mut state).await,
+    );
+    assert_success(&control_test_command(&json!({"action":"snapshot"}), &mut state).await);
+    assert_success(&control_test_command(&json!({"action":"evaluate","script":"window.moves=[];addEventListener('pointermove',e=>moves.push(e.buttons),true)"}), &mut state).await);
+    assert_success(
+        &control_test_command(&json!({"action":"mousemove","x":125,"y":125}), &mut state).await,
+    );
+    let released = control_test_command(
+        &json!({"action":"evaluate","script":"moves.at(-1)"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&released);
+    assert_eq!(released["data"]["result"], 0);
+
+    // document.open may preserve the isolated realm or complete before its
+    // readback. Either outcome must leave native input released; an observed
+    // failure stays unknown, while a completed click may succeed.
+    let html = r#"<!doctype html><button id=replace style='margin:80px;padding:30px' onmousedown="document.open();document.write('<title>Replaced</title><main>New document</main>');document.close()">Replace document</button>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
+    let replaced =
+        control_test_command(&json!({"action":"click","selector":"#replace"}), &mut state).await;
+    if replaced["success"] == false {
+        assert_eq!(replaced["code"], "browser_control_outcome_unknown");
+    }
+    assert_success(&control_test_command(&json!({"action":"snapshot"}), &mut state).await);
+    assert_success(&control_test_command(&json!({"action":"evaluate","script":"window.moves=[];window.downs=0;addEventListener('pointermove',e=>moves.push(e.buttons),true);addEventListener('pointerdown',()=>downs++,true)"}), &mut state).await);
+    assert_success(
+        &control_test_command(&json!({"action":"mousemove","x":130,"y":130}), &mut state).await,
+    );
+    let released = control_test_command(
+        &json!({"action":"evaluate","script":"({buttons:moves.at(-1),downs})"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&released);
+    assert_eq!(released["data"]["result"], json!({"buttons":0,"downs":0}));
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_native_mouse_host_timeout_preserves_unknown_and_releases_the_press() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let captures = tempfile::tempdir().unwrap();
+    let html = r#"<!doctype html><button id=busy style='margin:80px;padding:30px'>Busy handler</button><script>window.downs=0;window.ups=0;busy.onpointerdown=()=>{downs++;const until=performance.now()+800;while(performance.now()<until){}};addEventListener('pointerup',()=>ups++,true)</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
+    let timed_out = control_test_command(
+        &json!({"action":"click","selector":"#busy","ambitFeedback":{
+            "namespace":std::env::var("AGENT_BROWSER_NAMESPACE").unwrap_or_default(),
+            "session":state.session_id,"captureDirectory":captures.path(),"timeoutMs":200,
+        }}),
+        &mut state,
+    )
+    .await;
+    assert_error_code(&timed_out, "command_outcome_unknown");
+    let released = control_test_command(
+        &json!({"action":"evaluate","script":"({downs,ups})"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&released);
+    assert_eq!(released["data"]["result"], json!({"downs":1,"ups":1}));
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
     env.set("AGENT_BROWSER_WINDOW_STREAM", "1");

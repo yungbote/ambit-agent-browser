@@ -16,6 +16,15 @@ use crate::native::display::{DisplayClient, Surface};
 
 const GEOMETRY: &str = "({scale:devicePixelRatio*(visualViewport?.scale??1),width:innerWidth,height:innerHeight,offsetX:visualViewport?.offsetLeft??0,offsetY:visualViewport?.offsetTop??0})";
 
+fn outcome_unknown(message: impl AsRef<str>) -> String {
+    let message = message.as_ref();
+    if message.starts_with("browser_control_outcome_unknown: ") {
+        message.into()
+    } else {
+        format!("browser_control_outcome_unknown: {message}")
+    }
+}
+
 #[derive(Clone)]
 struct Mapping {
     session: String,
@@ -49,6 +58,7 @@ impl Mapping {
 pub(super) struct NativeMouse {
     mappings: HashMap<String, Mapping>,
     buttons: i64,
+    modifiers: i64,
     /// Set before the helper can perform input. Cancellation cannot clear it.
     unknown: bool,
 }
@@ -62,6 +72,46 @@ impl NativeMouse {
 
     pub(super) fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    fn require_known(&self) -> Result<(), String> {
+        if self.unknown {
+            return Err("browser_control_outcome_unknown: Native input release is unconfirmed. Close the browser before sending more mouse input; do not replay the original action.".into());
+        }
+        Ok(())
+    }
+
+    pub(super) fn needs_release(&self) -> bool {
+        self.buttons != 0 || self.modifiers != 0 || self.unknown
+    }
+
+    /// Cleanup has its own real acknowledgement. It never turns an earlier
+    /// action with an unknown outcome into an acknowledged successful action.
+    pub(super) async fn release(&mut self, display: &DisplayClient) -> Result<(), String> {
+        self.unknown = true;
+        display.reset().await.map_err(|error| {
+            outcome_unknown(format!("Native input release is unconfirmed ({error}). Close the browser before sending more mouse input."))
+        })?;
+        self.reset();
+        Ok(())
+    }
+
+    async fn finish(
+        &mut self,
+        result: Result<bool, String>,
+        display: &DisplayClient,
+    ) -> Result<bool, String> {
+        if let Err(original) = result {
+            if self.needs_release() {
+                let original = outcome_unknown(original);
+                if let Err(cleanup) = self.release(display).await {
+                    return Err(format!("{original} {cleanup}"));
+                }
+                return Err(original);
+            }
+            return Err(original);
+        }
+        result
     }
 
     async fn current(
@@ -106,9 +156,7 @@ impl NativeMouse {
         x: f64,
         y: f64,
     ) -> Result<Mapping, String> {
-        if self.unknown {
-            return Err("browser_control_outcome_unknown: The native mouse input may have executed. Take control to inspect and release it; do not replay it.".into());
-        }
+        self.require_known()?;
         if let Some(mapping) = self.mappings.get(session) {
             self.current(mapping, client, display).await?;
             return Ok(mapping.clone());
@@ -163,19 +211,45 @@ impl NativeMouse {
         session: &str,
         display: &DisplayClient,
         dialog_sessions: &[&str],
+        allow_release_cleanup: bool,
     ) -> Result<bool, String> {
-        let x = params["x"]
-            .as_f64()
-            .filter(|x| x.is_finite())
-            .ok_or("Invalid mouse x")?;
-        let y = params["y"]
-            .as_f64()
-            .filter(|y| y.is_finite())
-            .ok_or("Invalid mouse y")?;
-        let mapping = self.prepare(client, session, display, x, y).await?;
-        let point = mapping.point(x, y, &display.surface())?;
-        self.dispatch_at(params, point, &mapping, client, display, dialog_sessions)
-            .await
+        // Do not turn another command into a retry of an unconfirmed reset.
+        self.require_known()?;
+        let coordinates = (|| {
+            let x = params["x"]
+                .as_f64()
+                .filter(|x| x.is_finite())
+                .ok_or("Invalid mouse x")?;
+            let y = params["y"]
+                .as_f64()
+                .filter(|y| y.is_finite())
+                .ok_or("Invalid mouse y")?;
+            Ok::<_, String>((x, y))
+        })();
+        let (x, y) = match coordinates {
+            Ok(point) => point,
+            Err(error) => return self.finish(Err(error), display).await,
+        };
+        let mapping = match self.prepare(client, session, display, x, y).await {
+            Ok(mapping) => mapping,
+            Err(error) => {
+                // An explicit release needs no stale page coordinates. This
+                // branch precedes any new native dispatch; a failed attempted
+                // input below must retain its original failure instead.
+                if allow_release_cleanup && params["type"] == "mouseReleased" && self.buttons != 0 {
+                    self.release(display).await?;
+                    return Ok(false);
+                }
+                return self.finish(Err(error), display).await;
+            }
+        };
+        let result = async {
+            let point = mapping.point(x, y, &display.surface())?;
+            self.dispatch_at(params, point, &mapping, client, display, dialog_sessions)
+                .await
+        }
+        .await;
+        self.finish(result, display).await
     }
 
     async fn dispatch_at(
@@ -195,21 +269,17 @@ impl NativeMouse {
         ) {
             return Err("Unsupported mouse event type".into());
         }
-        let buttons = params["buttons"].as_i64().unwrap_or_else(|| {
-            if event_type == "mousePressed" {
-                self.buttons
-                    | i64::from(crate::native::input::mouse_button_mask(
-                        params["button"].as_str().unwrap_or("left"),
-                    ))
-            } else if event_type == "mouseReleased" {
-                self.buttons
-                    & !i64::from(crate::native::input::mouse_button_mask(
-                        params["button"].as_str().unwrap_or("left"),
-                    ))
-            } else {
-                self.buttons
-            }
-        });
+        // The helper changes one physical button per press/release. A caller's
+        // claimed bitmask cannot clear the owner's actual acknowledged hold.
+        let button = i64::from(crate::native::input::mouse_button_mask(
+            params["button"].as_str().unwrap_or("left"),
+        ));
+        let buttons = match event_type {
+            "mousePressed" => self.buttons | button,
+            "mouseReleased" => self.buttons & !button,
+            _ => self.buttons,
+        };
+        let modifiers = params["modifiers"].as_i64().unwrap_or(0);
         let surface = display.surface();
         let screen_x = point.0 / f64::from(surface.device_scale_factor);
         let screen_y = point.1 / f64::from(surface.device_scale_factor);
@@ -240,10 +310,12 @@ impl NativeMouse {
         if let Err(error) = display.input(&[event]).await {
             if error.operation_performed == Some(json!(false)) {
                 self.unknown = false;
+                return Err(error.to_string());
             }
-            return Err(error.to_string());
+            return Err(format!("browser_control_outcome_unknown: Native input may have executed ({error}). Do not replay the original action."));
         }
         self.buttons = buttons;
+        self.modifiers = modifiers;
         self.unknown = false;
         observation.acknowledged();
         if !observe {
@@ -264,13 +336,13 @@ impl NativeMouse {
         loop {
             tokio::select! {
                 result = &mut observed => {
-                    let result = result?;
-                    if result["result"]["value"] != true { return Err("The current page could not be observed after native input.".into()); }
+                    let result = result.map_err(outcome_unknown)?;
+                    if result["result"]["value"] != true { return Err(outcome_unknown("The current page could not be observed after native input. Inspect the page before retrying the action.")); }
                     return Ok(false);
                 }
                 event = events.recv() => match event {
                     Ok(event) if event.method == "Page.javascriptDialogOpening" && event.session_id.as_deref().is_none_or(|id| dialog_sessions.contains(&id)) => return Ok(true),
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err("The browser disconnected after native input.".into()),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err(outcome_unknown("The browser disconnected after native input. Do not replay the action.")),
                     _ => {},
                 },
             }
@@ -278,6 +350,21 @@ impl NativeMouse {
     }
 
     pub(super) async fn drag(
+        &mut self,
+        client: &CdpClient,
+        display: &DisplayClient,
+        page_session: &str,
+        source: (&str, f64, f64),
+        target: (&str, f64, f64),
+    ) -> Result<bool, String> {
+        self.require_known()?;
+        let result = self
+            .drag_inner(client, display, page_session, source, target)
+            .await;
+        self.finish(result, display).await
+    }
+
+    async fn drag_inner(
         &mut self,
         client: &CdpClient,
         display: &DisplayClient,
@@ -406,5 +493,170 @@ mod tests {
         assert!(mouse.mappings.is_empty());
         assert!(!mouse.unknown);
         assert_eq!(mouse.buttons, 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn failed_readback_releases_held_input_but_preserves_the_original_failure() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (display, peer) = DisplayClient::test_channel();
+        let server = tokio::spawn(async move {
+            let mut peer = BufReader::new(peer);
+            let mut line = String::new();
+            peer.read_line(&mut line).await.unwrap();
+            let command: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(command["op"], "reset");
+            let reply = format!("{}\n", json!({"id":command["id"],"success":true,"data":{}}));
+            peer.get_mut().write_all(reply.as_bytes()).await.unwrap();
+        });
+        let mut mouse = NativeMouse::default();
+        mouse.buttons = 1;
+        mouse.modifiers = 2;
+        mouse.mappings.insert("page".into(), mapping(2.0, 262.0));
+        let original = "browser_control_outcome_unknown: Renderer readback failed after the press";
+        assert_eq!(
+            mouse
+                .finish(Err(original.into()), &display)
+                .await
+                .unwrap_err(),
+            original
+        );
+        assert!(!mouse.needs_release());
+        assert!(mouse.mappings.is_empty());
+        server.await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn lost_reset_receipt_retains_unknown_hold_and_fences_new_input() {
+        use tokio::io::{AsyncBufReadExt, BufReader};
+        let (display, peer) = DisplayClient::test_channel();
+        let server = tokio::spawn(async move {
+            let mut peer = BufReader::new(peer);
+            let mut line = String::new();
+            peer.read_line(&mut line).await.unwrap();
+            let command: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(command["op"], "reset");
+            // The helper closes without acknowledging this cleanup.
+        });
+        let mut mouse = NativeMouse::default();
+        mouse.buttons = 1;
+        mouse.mappings.insert("page".into(), mapping(2.0, 262.0));
+        let error = mouse
+            .finish(Err("Original mouse action failed".into()), &display)
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("browser_control_outcome_unknown:"));
+        assert!(error.contains("Original mouse action failed"));
+        assert!(error.contains("release is unconfirmed"));
+        assert!(mouse.unknown);
+        assert_eq!(mouse.buttons, 1);
+        mouse.begin_command();
+        assert_eq!(mouse.mappings.len(), 1);
+        assert!(mouse
+            .require_known()
+            .unwrap_err()
+            .starts_with("browser_control_outcome_unknown:"));
+        assert!(!display.available());
+        server.await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn acknowledged_press_and_failed_page_readback_stay_unknown_through_mcp() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cdp_server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            for readback in [false, true] {
+                let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                    panic!("expected CDP command")
+                };
+                let command: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(command["method"], "Runtime.evaluate");
+                let response = if readback {
+                    assert_eq!(command["params"]["expression"], "true");
+                    json!({"id":command["id"],"error":{"code":-32000,"message":"Renderer readback timeout after native press"}})
+                } else {
+                    assert_eq!(command["params"]["expression"], GEOMETRY);
+                    json!({"id":command["id"],"result":{"result":{"value":{"scale":2.0}}}})
+                };
+                socket
+                    .send(Message::Text(response.to_string()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let (display, peer) = DisplayClient::test_channel();
+        let helper = tokio::spawn(async move {
+            let mut peer = BufReader::new(peer);
+            let mut operations = Vec::new();
+            for expected in ["info", "input", "reset"] {
+                let mut line = String::new();
+                peer.read_line(&mut line).await.unwrap();
+                let command: Value = serde_json::from_str(&line).unwrap();
+                assert_eq!(command["op"], expected);
+                operations.push(expected);
+                if expected == "input" {
+                    assert_eq!(command["events"].as_array().unwrap().len(), 1);
+                    assert_eq!(command["events"][0]["eventType"], "mousePressed");
+                }
+                let data = if expected == "info" {
+                    json!({"width":2560,"height":1440,"windows":[{"id":1,"pid":1,"x":0,"y":0,"width":2560,"height":1440,"mapped":true,"focused":true,"overrideRedirect":false,"windowType":"normal"}]})
+                } else {
+                    json!({})
+                };
+                let response = format!(
+                    "{}\n",
+                    json!({"id":command["id"],"success":true,"data":data})
+                );
+                peer.get_mut().write_all(response.as_bytes()).await.unwrap();
+            }
+            operations
+        });
+        let mut mouse = NativeMouse::default();
+        let mut measured = mapping(2.0, 262.0);
+        measured.surface = display.surface().generation;
+        measured.pointer.page_generation = client.page_generation("page");
+        mouse.mappings.insert("page".into(), measured);
+        let mut control = super::super::BrowserControl::default();
+        control.set_display(Some(display.clone()));
+        control.native_mouse = mouse;
+        let error = control
+            .agent_native_mouse(
+                json!({"type":"mousePressed","x":210,"y":175,"button":"left","buttons":1}),
+                &client,
+                "page",
+                &["page"],
+            )
+            .await
+            .unwrap_err();
+        assert!(error.starts_with("browser_control_outcome_unknown:"));
+        assert!(error.contains("Renderer readback timeout"));
+        assert!(!control.native_mouse.needs_release());
+        assert!(control.needs_observation());
+        assert_eq!(helper.await.unwrap(), ["info", "input", "reset"]);
+        cdp_server.await.unwrap();
+        let result = crate::mcp::native_error_result_for_test(&error);
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"]["response"]["success"], false);
+        assert_eq!(
+            result["structuredContent"]["response"]["code"],
+            "browser_control_outcome_unknown"
+        );
+        assert!(result["structuredContent"]["response"]
+            .get("operationPerformed")
+            .is_none());
+        if let Ok(path) = std::env::var("AMBIT_TEST_NATIVE_MOUSE_MCP_RESULT") {
+            std::fs::write(path, serde_json::to_vec_pretty(&result).unwrap()).unwrap();
+        }
     }
 }

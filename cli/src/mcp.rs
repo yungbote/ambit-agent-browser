@@ -4045,6 +4045,11 @@ fn tool_result_from_run(run: CliRun) -> Value {
     })
 }
 
+#[cfg(test)]
+pub(crate) fn native_error_result_for_test(error: &str) -> Value {
+    host_bound::native_error_result_for_test(error)
+}
+
 fn tool_text(parsed: Option<&Value>, stdout: &str, stderr: &str) -> String {
     let mut text = match parsed {
         Some(value) => response_text(value).unwrap_or_else(|| {
