@@ -98,8 +98,9 @@ impl FileDestinations {
             .insert(session.into());
     }
 
-    /// Navigation in any frame of a session invalidates its one pending
-    /// destination. This also covers ancestor removal and renderer swaps.
+    /// Invalidate the selected document and its renderer, without making an
+    /// unrelated child-frame navigation cancel a staged upload. Retained node
+    /// connectivity is also checked before delivery, including ancestor removal.
     pub(crate) fn observe(&self, method: &str, params: &Value, session: Option<&str>) {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if method == "Target.detachedFromTarget" {
@@ -118,20 +119,28 @@ impl FileDestinations {
             return;
         }
         let Some(session) = session else { return };
-        if matches!(
-            method,
-            "Page.frameNavigated"
-                | "Page.frameDetached"
-                | "Page.documentOpened"
-                | "Runtime.executionContextsCleared"
-                | "DOM.documentUpdated"
-        ) && state.destination.as_ref().is_some_and(|destination| {
-            destination.session == session
-                || destination
-                    .binding
-                    .as_ref()
-                    .is_some_and(|binding| binding.root_session == session)
-        }) {
+        if state
+            .destination
+            .as_ref()
+            .is_some_and(|destination| match method {
+                "Page.frameNavigated" | "Page.documentOpened" => {
+                    params["frame"]["id"].as_str() == Some(destination.frame.as_str())
+                        || (params["frame"]["parentId"]
+                            .as_str()
+                            .is_none_or(str::is_empty)
+                            && (destination.session == session
+                                || destination
+                                    .binding
+                                    .as_ref()
+                                    .is_some_and(|binding| binding.root_session == session)))
+                }
+                "Page.frameDetached" => {
+                    params["frameId"].as_str() == Some(destination.frame.as_str())
+                }
+                "Runtime.executionContextsCleared" => destination.session == session,
+                _ => false,
+            })
+        {
             state.destination = None;
         }
         if method != "Page.fileChooserOpened" || !state.sessions.contains(session) {
@@ -634,9 +643,11 @@ impl FilePage {
                     self.client.send_command_from("Input.dispatchDragEvent", Some(json!({"type":kind,"x":x,"y":y,
                         "data":{"items":[],"files":files,"dragOperationsMask":1}})), Some(&destination.session), InputSource::Human).await.map_err(|_| ControlError::unknown())?;
                     let receipt = self.command("Runtime.callFunctionOn", json!({"objectId":binding.object,"returnByValue":true,
-                        "arguments":[{"value":event}],"functionDeclaration":"function(event){return this.receipts[event]===true;}"}), &destination.session).await?;
+                        "arguments":[{"value":event}],"functionDeclaration":"function(event){return this.receipts[event]===true;}"}), &destination.session).await.map_err(|error| if kind=="drop" {ControlError::unknown()} else {error})?;
                     if receipt["result"]["value"] != true {
-                        return Err(ControlError::new("browser_control_drop_rejected", "The page did not accept the file drop at the selected element. Try its upload button."));
+                        return Err(if kind=="drop" {ControlError::unknown()} else {
+                            ControlError::new("browser_control_drop_rejected", "The page did not accept the drag at the selected element. Try its upload button.")
+                        });
                     }
                 }
                 Ok(())

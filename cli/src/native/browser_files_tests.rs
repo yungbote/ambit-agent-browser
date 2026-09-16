@@ -24,7 +24,7 @@ fn file_destinations_follow_controller_and_renderer_lifecycle() {
         ),
         (
             "Page.frameDetached",
-            json!({"frameId":"child","reason":"swap"}),
+            json!({"frameId":"main","reason":"swap"}),
             Some("page"),
         ),
         (
@@ -33,7 +33,6 @@ fn file_destinations_follow_controller_and_renderer_lifecycle() {
             Some("page"),
         ),
         ("Runtime.executionContextsCleared", json!({}), Some("page")),
-        ("DOM.documentUpdated", json!({}), Some("page")),
         (
             "Target.detachedFromTarget",
             json!({"sessionId":"page"}),
@@ -96,4 +95,27 @@ fn staged_paths_must_be_canonical_regular_files() {
         assert!(validate_paths(&[link.to_str().unwrap().into()]).is_err());
     }
     assert!(check_deadline(Instant::now()).is_err());
+}
+
+#[test]
+fn unrelated_iframe_navigation_does_not_cancel_file_selection() {
+    let files = FileDestinations::default();
+    let id = pending(&files);
+    files.observe(
+        "Page.frameNavigated",
+        &json!({"frame":{"id":"advertisement","parentId":"main"}}),
+        Some("page"),
+    );
+    files.observe(
+        "Page.frameDetached",
+        &json!({"frameId":"advertisement"}),
+        Some("page"),
+    );
+    assert!(files.current(OWNER, &id).is_ok());
+    files.observe(
+        "Page.frameNavigated",
+        &json!({"frame":{"id":"main"}}),
+        Some("page"),
+    );
+    assert!(files.current(OWNER, &id).is_err());
 }

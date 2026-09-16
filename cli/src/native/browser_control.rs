@@ -633,9 +633,10 @@ impl BrowserControl {
     ) -> Result<Value, ControlError> {
         let now = Instant::now();
         match request.op {
-            Operation::Inspect => {
-                Ok(json!({ "supported": true, "controlled": self.agent_error().is_some() }))
-            }
+            Operation::Inspect => Ok(
+                json!({ "supported": true, "controlled": self.agent_error().is_some(),
+                    "filesSupported": page.as_ref().is_some_and(|page| page.files_supported()) }),
+            ),
             Operation::Downloads => {
                 let page = page.as_mut().ok_or_else(|| {
                     ControlError::new(
@@ -655,7 +656,7 @@ impl BrowserControl {
                     )
                 })??;
                 Ok(
-                    json!({"supported":true,"controlled":self.agent_error().is_some(),"downloads":downloads}),
+                    json!({"supported":true,"controlled":self.agent_error().is_some(),"filesSupported":page.files_supported(),"downloads":downloads}),
                 )
             }
             Operation::Acquire => {

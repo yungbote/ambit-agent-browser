@@ -3246,6 +3246,8 @@ Notes:
   - Explicit host copy reads selected text from the focused page/input/frame,
     never the system clipboard. Maximum 1 MiB UTF-8, no truncation; masked
     password fields have no copyable text. Copy does not advance input sequence.
+  - Inspect advertises filesSupported for an available Chromium page. Hosts
+    treat an omitted file capability as unsupported for rolling compatibility.
   - Authorized host file operations poll chooser/download metadata, bind a drop
     destination, and deliver 1-64 staged files. Paths stay within the Product
     bridge; file bytes are never input JSON. Navigation or expired custody

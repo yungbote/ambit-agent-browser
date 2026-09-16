@@ -7409,6 +7409,15 @@ pub(crate) struct ControlPage<'a>(
 );
 
 impl ControlPage<'_> {
+    pub(crate) fn files_supported(&self) -> bool {
+        self.0.engine.eq_ignore_ascii_case("chrome")
+            && self
+                .0
+                .browser
+                .as_ref()
+                .is_some_and(|browser| browser.active_session_id().is_ok())
+    }
+
     pub(crate) async fn prepare_files(
         &mut self,
         controller: &str,

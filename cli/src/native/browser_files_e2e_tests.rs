@@ -74,6 +74,12 @@ async fn launch() -> (DaemonState, tempfile::TempDir) {
         .await,
     );
     success(&command(&mut state,json!({"action":"navigate","url":format!("data:text/html;base64,{}",STANDARD.encode(PAGE))})).await);
+    let capabilities = command(
+        &mut state,
+        json!({"action":"ambit_browser_control","op":"inspect"}),
+    )
+    .await;
+    assert_eq!(success(&capabilities)["filesSupported"], true);
     (state, directory)
 }
 
@@ -349,6 +355,7 @@ async fn browser_files_e2e_downloads_start_at_acquisition_and_keep_exact_paths()
     .await;
     let retained = success(&retained);
     assert_eq!(retained["controlled"], false);
+    assert_eq!(retained["filesSupported"], true);
     assert!(retained.get("controllerId").is_none());
     assert!(retained["downloads"]
         .as_array()

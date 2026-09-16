@@ -914,3 +914,15 @@ fn completed_download_snapshot_is_readonly_and_has_no_controller_fields() {
         assert!(ControlRequest::parse(&invalid).is_err(), "{invalid}");
     }
 }
+
+#[tokio::test]
+async fn inspect_does_not_infer_file_support_without_a_chromium_page() {
+    let mut control = BrowserControl::default();
+    let result = control
+        .execute(parse(json!({"action":ACTION,"op":"inspect"})), None)
+        .await
+        .unwrap();
+    assert_eq!(result["supported"], true);
+    assert_eq!(result["filesSupported"], false);
+    assert!(result.get("controllerId").is_none());
+}
