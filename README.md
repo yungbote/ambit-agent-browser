@@ -1600,6 +1600,8 @@ agent-browser open example.com
 
 You can also manage streaming at runtime with `stream enable`, `stream disable`, and `stream status`:
 
+Repeated `stream enable` calls keep the current stream and its connected viewers. Omitting `--port`, using `--port 0`, or specifying the active port returns its current status. A different explicit port is refused until you disable the stream. Repeated `stream disable` calls succeed without restarting or closing the browser.
+
 ```bash
 agent-browser stream enable --port 9223   # Re-enable on a specific port
 agent-browser stream disable              # Stop streaming for the session

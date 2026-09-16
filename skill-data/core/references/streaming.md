@@ -50,6 +50,8 @@ agent-browser stream disable           # Tear it down
 
 `AGENT_BROWSER_STREAM_PORT` pins the port for the whole daemon instead of passing `--port`.
 
+Repeated `stream enable` calls keep the current stream and its connected viewers. Omitting `--port`, using `--port 0`, or specifying the active port returns its current status. A different explicit port is refused until you disable the stream. Repeated `stream disable` calls succeed without restarting or closing the browser.
+
 Frame encoding is daemon-wide, read once at startup:
 
 | Variable | Default | Notes |

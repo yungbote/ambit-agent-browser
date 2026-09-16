@@ -1770,14 +1770,14 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_STREAM_ENABLE,
             "Stream enable",
-            "Enable runtime WebSocket streaming.",
+            "Enable runtime WebSocket streaming. Repeated calls reuse the active stream and viewers. Omit port or use 0 to keep its port; a different explicit port requires disabling first.",
             json!({ "port": { "type": "integer" } }),
             &[],
         ),
         tool(
             TOOL_STREAM_DISABLE,
             "Stream disable",
-            "Disable streaming and finish the current live stream.",
+            "Disable streaming and finish the current live stream. Succeeds when already disabled.",
             json!({}),
             &[],
         ),
@@ -4684,6 +4684,31 @@ mod tests {
                 "boolean"
             );
         }
+    }
+
+    #[test]
+    fn stream_enable_preserves_canonical_port_selection() {
+        for (arguments, port) in [
+            (json!({}), None),
+            (json!({ "port": 0 }), Some(0)),
+            (json!({ "port": 9223 }), Some(9223)),
+        ] {
+            let invocation = call_stream_enable(&arguments).unwrap();
+            let flags = crate::flags::parse_flags(&invocation.cli_args);
+            let command = crate::commands::parse_command(
+                &crate::flags::clean_args(&invocation.cli_args),
+                &flags,
+            )
+            .unwrap();
+            assert_eq!(command["action"], "stream_enable");
+            assert_eq!(command.get("port").and_then(Value::as_u64), port);
+        }
+        let invocation = call_literal(&json!({}), &["stream", "disable"]).unwrap();
+        let flags = crate::flags::parse_flags(&invocation.cli_args);
+        let command =
+            crate::commands::parse_command(&crate::flags::clean_args(&invocation.cli_args), &flags)
+                .unwrap();
+        assert_eq!(command["action"], "stream_disable");
     }
 
     #[test]

@@ -9115,15 +9115,23 @@ async fn current_stream_status(state: &DaemonState) -> Value {
 }
 
 async fn handle_stream_enable(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    if state.stream_server.is_some() {
-        return Err("Streaming is already enabled for this session".to_string());
-    }
-
     let requested_port = match cmd.get("port").and_then(|value| value.as_u64()) {
         Some(raw) => u16::try_from(raw)
             .map_err(|_| format!("Invalid stream port '{}': expected 0-65535", raw))?,
         None => 0,
     };
+
+    // Enabling an automatically started stream preserves its connected viewers.
+    // An explicit different port is a requested change, not an idempotent retry.
+    if let Some(server) = state.stream_server.as_ref() {
+        if requested_port != 0 && requested_port != server.port() {
+            return Err(format!(
+                "Streaming is active on port {}; disable it before enabling a different port",
+                server.port()
+            ));
+        }
+        return Ok(current_stream_status(state).await);
+    }
 
     let (server, client_slot) = StreamServer::start_with_control(
         requested_port,
@@ -9154,13 +9162,13 @@ async fn handle_stream_enable(cmd: &Value, state: &mut DaemonState) -> Result<Va
 }
 
 async fn handle_stream_disable(state: &mut DaemonState) -> Result<Value, String> {
-    let Some(server) = state.stream_server.clone() else {
-        return Err("Streaming is not enabled for this session".to_string());
-    };
-
-    server.shutdown().await;
+    if let Some(server) = state.stream_server.clone() {
+        server.shutdown().await;
+    }
     state.stream_server = None;
     state.stream_client = None;
+    // A previous attempt can stop the server but fail removing its metadata.
+    // Retrying must finish that cleanup before reporting the desired state.
     remove_stream_file(&state.session_id)?;
     remove_engine_file(&state.session_id);
     remove_provider_file(&state.session_id);
@@ -14610,10 +14618,31 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             fs::read_to_string(&stream_path).expect("stream metadata file should exist");
         assert_eq!(port_file.trim(), port.to_string());
 
-        let duplicate_err = handle_stream_enable(&json!({}), &mut state)
+        let original_server = state.stream_server.clone().unwrap();
+        for request in [json!({}), json!({ "port": 0 }), json!({ "port": port })] {
+            let repeated = handle_stream_enable(&request, &mut state)
+                .await
+                .expect("enabling the existing stream should succeed");
+            assert_eq!(repeated, enabled_status);
+            assert!(Arc::ptr_eq(
+                &original_server,
+                state.stream_server.as_ref().unwrap()
+            ));
+            assert_eq!(fs::read_to_string(&stream_path).unwrap(), port_file);
+        }
+        let other_port = if port == 65535 { port - 1 } else { port + 1 };
+        let conflict = handle_stream_enable(&json!({ "port": other_port }), &mut state)
             .await
-            .expect_err("duplicate enable should fail");
-        assert!(duplicate_err.contains("already enabled"));
+            .expect_err("an explicit different port must not replace the active stream");
+        assert!(conflict.contains("different port"));
+        assert!(Arc::ptr_eq(
+            &original_server,
+            state.stream_server.as_ref().unwrap()
+        ));
+        assert!(handle_stream_enable(&json!({ "port": 65536 }), &mut state)
+            .await
+            .unwrap_err()
+            .contains("Invalid stream port"));
 
         let status = handle_stream_status(&state)
             .await
@@ -14638,10 +14667,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         assert_eq!(final_status["enabled"], false);
         assert_eq!(final_status["port"], Value::Null);
 
-        let disable_err = handle_stream_disable(&mut state)
+        let disabled_again = handle_stream_disable(&mut state)
             .await
-            .expect_err("duplicate disable should fail");
-        assert!(disable_err.contains("not enabled"));
+            .expect("disabling an already disabled stream should succeed");
+        assert_eq!(disabled_again, disabled);
 
         let _ = fs::remove_dir_all(&socket_dir);
     }
@@ -14710,6 +14739,24 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             state.stream_client.is_none(),
             "stream disable should clear stream_client even when metadata cleanup fails"
         );
+
+        let retry_error = handle_stream_disable(&mut state)
+            .await
+            .expect_err("a retry must still report the unresolved cleanup failure");
+        assert!(retry_error.contains("Failed to remove stream metadata"));
+        fs::remove_dir(&stream_path).unwrap();
+        fs::write(&stream_path, "9223").unwrap();
+        let engine_path = socket_dir.join("stream-disable-cleanup-session.engine");
+        let provider_path = socket_dir.join("stream-disable-cleanup-session.provider");
+        fs::write(&engine_path, "chrome").unwrap();
+        fs::write(&provider_path, "local").unwrap();
+        assert_eq!(
+            handle_stream_disable(&mut state).await.unwrap(),
+            json!({ "disabled": true })
+        );
+        assert!(!stream_path.exists());
+        assert!(!engine_path.exists());
+        assert!(!provider_path.exists());
 
         let _ = fs::remove_dir_all(&socket_dir);
     }

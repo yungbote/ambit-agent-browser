@@ -1312,6 +1312,8 @@ async fn e2e_lightpanda_auto_launch_can_open_page() {
 #[tokio::test]
 #[ignore]
 async fn e2e_runtime_stream_enable_before_launch_attaches_and_disables() {
+    use futures_util::SinkExt;
+
     let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "AGENT_BROWSER_SESSION"]);
     let socket_dir = std::env::temp_dir().join(format!(
         "agent-browser-e2e-stream-{}-{}",
@@ -1400,6 +1402,32 @@ async fn e2e_runtime_stream_enable_before_launch_attaches_and_disables() {
         observed_connected,
         "runtime stream should report connected=true after browser launch"
     );
+
+    // Repeating enable must preserve the connected viewer and its stream port.
+    for request in [json!({}), json!({ "port": 0 }), json!({ "port": port })] {
+        let mut command = request;
+        command["id"] = json!("repeat-enable");
+        command["action"] = json!("stream_enable");
+        let response = execute_command(&command, &mut state).await;
+        assert_success(&response);
+        assert_eq!(get_data(&response)["port"], port);
+        assert_eq!(get_data(&response)["connected"], true);
+    }
+    ws.send(tokio_tungstenite::tungstenite::Message::Ping(vec![1, 2, 3]))
+        .await
+        .expect("the original viewer must remain connected");
+    let pong_deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let message = tokio::time::timeout_at(pong_deadline, ws.next())
+            .await
+            .expect("existing viewer must remain responsive")
+            .expect("repeated enable must not close the viewer")
+            .expect("stream message must remain valid");
+        if let tokio_tungstenite::tungstenite::Message::Pong(payload) = message {
+            assert_eq!(payload, vec![1, 2, 3]);
+            break;
+        }
+    }
 
     let resp = execute_command(
         &json!({ "id": "4", "action": "stream_disable" }),

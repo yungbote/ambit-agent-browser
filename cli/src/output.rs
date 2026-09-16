@@ -3200,7 +3200,9 @@ an already-running daemon. If --port is omitted, agent-browser binds an
 available localhost port automatically and reports it back.
 
 Notes:
-  - 'stream enable' creates the WebSocket server.
+  - 'stream enable' keeps an existing stream and its viewers. Omitted/zero
+    --port accepts the active port; a different port requires disabling first.
+  - 'stream disable' also succeeds when streaming is already disabled.
   - WebSocket clients trigger frame streaming automatically.
   - Orderly close or stream disable emits {"type":"finished"} before closing
     the WebSocket. An unlabelled disconnect does not establish completion.

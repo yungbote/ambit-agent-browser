@@ -22,6 +22,8 @@ agent-browser stream disable           # Stop streaming for the session
 
 `stream status` returns the enabled state, active port, browser connection state, and whether screencasting is active. `stream disable` tears the server down and removes the session's `.stream` metadata file.
 
+Repeated `stream enable` calls keep the current stream and its connected viewers. Omitting `--port`, using `--port 0`, or specifying the active port returns its current status. A different explicit port is refused until you disable the stream. Repeated `stream disable` calls succeed without restarting or closing the browser.
+
 Use [Video Recording](/recording) when you need a saved WebM or MP4 artifact instead of a live WebSocket stream. Recording requires `ffmpeg` on `PATH`.
 
 ## Owned Chromium window on Linux

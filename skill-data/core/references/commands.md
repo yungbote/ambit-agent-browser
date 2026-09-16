@@ -355,6 +355,8 @@ agent-browser webmcp cancel <invocation-id>
 agent-browser stream disable          # Stop it
 ```
 
+Repeated `stream enable` calls keep the current stream and its connected viewers. Omitting `--port`, using `--port 0`, or specifying the active port returns its current status. A different explicit port is refused until you disable the stream. Repeated `stream disable` calls succeed without restarting or closing the browser.
+
 Clients connect to `ws://127.0.0.1:<port>` and receive `frame`, `status`, `tabs`, `url`, and `console` messages. They send `input_mouse`, `input_keyboard`, and `input_touch` to drive the page, `{"type":"config","maxFps":N}` (1 to 120, `0` = uncapped) to cap their own frame rate, and `{"type":"config","pacing":"ack"}` to receive one frame at a time, acknowledged with `{"type":"ack","seq":N}`. Both settings can be declared on the URL instead (`ws://127.0.0.1:<port>/?pacing=ack&maxFps=10`). See [streaming.md](streaming.md).
 
 ## Observability Dashboard
