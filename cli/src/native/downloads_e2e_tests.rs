@@ -499,6 +499,64 @@ async fn e2e_download_observes_new_browser_context() {
 
 #[tokio::test]
 #[ignore = "requires a supplied real Chromium executable"]
+async fn e2e_download_attached_context_requires_explicit_setup_and_retains_files() {
+    let (mut host, fixture, _host_downloads) = launch().await;
+    let endpoint = command(&mut host, json!({"action": "cdp_url"})).await;
+    let cdp_url = success(&endpoint)["cdpUrl"].as_str().unwrap().to_owned();
+    let mut attached = DaemonState::new();
+    success(
+        &command(
+            &mut attached,
+            json!({"action": "launch", "cdpUrl": cdp_url}),
+        )
+        .await,
+    );
+    success(&command(&mut attached, json!({"action": "window_new"})).await);
+    success(
+        &command(
+            &mut attached,
+            json!({"action": "navigate", "url": fixture.url}),
+        )
+        .await,
+    );
+    let retained_files = tempfile::tempdir().unwrap();
+    let destination = retained_files.path().join("exports").join("receipt.bin");
+    // Repeated waits must leave the attached session unconfigured. Opening a
+    // window and observing downloads do not authorize changing its storage.
+    for _ in 0..2 {
+        let response = command(
+            &mut attached,
+            json!({"action": "waitfordownload", "timeout": 100}),
+        )
+        .await;
+        assert_eq!(response["success"], false, "{response}");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("not configured"),
+            "{response}"
+        );
+    }
+    assert_eq!(std::fs::read_dir(retained_files.path()).unwrap().count(), 0);
+    let downloaded = command(
+        &mut attached,
+        json!({"action": "download", "selector": "#receipt", "path": destination}),
+    )
+    .await;
+    assert_eq!(
+        assert_download(&downloaded, RECEIPT, "receipt.bin"),
+        destination
+    );
+    success(&command(&mut attached, json!({"action": "close"})).await);
+    let still_alive = command(&mut host, json!({"action": "evaluate", "script": "6 * 7"})).await;
+    assert_eq!(success(&still_alive)["result"], 42);
+    assert_eq!(std::fs::read(&destination).unwrap(), RECEIPT);
+    success(&command(&mut host, json!({"action": "close"})).await);
+}
+
+#[tokio::test]
+#[ignore = "requires a supplied real Chromium executable"]
 async fn e2e_download_commands_preserve_human_control_custody() {
     let (mut state, _fixture, downloads) = launch().await;
     success(

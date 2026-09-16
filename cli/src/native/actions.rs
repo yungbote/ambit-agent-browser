@@ -10666,7 +10666,7 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
             .and_then(|v| v.as_str())
             .ok_or("Failed to create browser context")?
             .to_string();
-        mgr.configure_downloads(Some(&context_id)).await?;
+        mgr.inherit_downloads(&context_id).await?;
 
         let create_result: super::cdp::types::CreateTargetResult = mgr
             .client

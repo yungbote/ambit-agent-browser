@@ -2323,6 +2323,19 @@ impl BrowserManager {
         self.configure_downloads(context).await
     }
 
+    /// New contexts inherit an existing download setup. Opening a window in an
+    /// attached browser must neither require nor invent that setup.
+    pub(crate) async fn inherit_downloads(&mut self, context: &str) -> Result<(), String> {
+        if self
+            .downloads_directory
+            .as_ref()
+            .is_some_and(|directory| !directory.contexts.is_empty())
+        {
+            self.configure_downloads(Some(context)).await?;
+        }
+        Ok(())
+    }
+
     pub(crate) async fn download_frames(&self) -> Result<HashSet<String>, String> {
         if self
             .downloads_directory
