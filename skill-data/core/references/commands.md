@@ -135,7 +135,21 @@ agent-browser wait --text "Success"        # Wait for text (or -t)
 agent-browser wait --url "**/dashboard"    # Wait for URL pattern (or -u)
 agent-browser wait --load networkidle      # Wait for network idle (or -l)
 agent-browser wait --fn "window.ready"     # Wait for JS condition (or -f)
+agent-browser wait --download [path]       # Return or save the next unreported download
 ```
+
+## Downloads
+
+```bash
+agent-browser download @e1 ./report.csv   # Click and save the resulting download
+agent-browser click @e2
+agent-browser wait --download            # Return its actual saved path
+agent-browser wait --download ./file.zip --timeout 30000
+```
+
+Agent-browser-managed Chromium observes downloads throughout its lifetime and retains up to 256 recent terminal records. `download` selects the first newly observed download from the clicked page or its frames; this is start order, not a causal association with a network request. `wait --download` selects the oldest retained unreported download from the current page or its frames, even if it completed before the wait. An optional path saves the actual bytes there. Completed downloads and reported cancellations are consumed once; a timeout does not consume the download. A canceled download returns an error. If the retained history no longer contains a download selected by an active wait, the wait reports that it is unavailable.
+
+Set `--download-path <dir>` or `AGENT_BROWSER_DOWNLOAD_PATH` to retain files in a chosen directory; otherwise the managed browser's temporary directory is removed when it closes. An attached browser's active context is configured only by an explicit `download`, using the destination's parent directory as retained storage. `wait --download` alone never changes an attached browser's download settings. Paths belong to the machine running the browser. JSON results include the absolute `path`, `guid`, `suggestedFilename`, `status: "completed"`, and `receivedBytes`. These commands respect an active human control lease.
 
 ## Mouse Control
 

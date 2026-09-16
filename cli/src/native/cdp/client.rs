@@ -113,6 +113,7 @@ pub struct CdpClient {
     pending: PendingMap,
     page_generations: PageGenerations,
     event_tx: broadcast::Sender<CdpEvent>,
+    pub(crate) downloads: Arc<super::super::downloads::Downloads>,
     raw_tx: broadcast::Sender<RawCdpMessage>,
     private_sessions: PrivateSessions,
     native_pointer_enabled: Arc<AtomicBool>,
@@ -222,6 +223,8 @@ impl CdpClient {
         let ws_tx = Arc::new(Mutex::new(ws_tx));
 
         let pending: PendingMap = Arc::new(Mutex::new(HashMap::new()));
+        let downloads = Arc::new(super::super::downloads::Downloads::default());
+        let downloads_reader = downloads.clone();
         let (event_tx, _) = broadcast::channel(4096);
         let (raw_tx, _) = broadcast::channel(4096);
 
@@ -368,6 +371,9 @@ impl CdpClient {
                             }
                         }
                     }
+                    // Retain download truth before broadcasting it to consumers.
+                    downloads_reader
+                        .observe(method, parsed.params.as_ref().unwrap_or(&Value::Null));
                     // Event
                     let mut event = CdpEvent {
                         method: method.clone(),
@@ -417,6 +423,7 @@ impl CdpClient {
             // Reader loop exited (connection closed or error). Drop all pending
             // command senders so callers get an immediate channel-closed error
             // instead of waiting for the 30-second timeout.
+            downloads_reader.closed();
             pending_clone.lock().await.clear();
 
             // Stop the keepalive task — the connection is gone.
@@ -448,6 +455,7 @@ impl CdpClient {
             pending,
             page_generations,
             event_tx,
+            downloads,
             raw_tx,
             private_sessions,
             native_pointer_enabled: Arc::new(AtomicBool::new(false)),

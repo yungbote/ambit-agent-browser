@@ -1845,7 +1845,13 @@ agent-browser download - Download a file by clicking an element
 
 Usage: agent-browser download <selector> <path>
 
-Clicks an element that triggers a download and saves the file to the specified path.
+Clicks an element and saves the first newly observed download from its page or
+frames. Selection follows download start order, not network-request causality.
+Once selected, another download cannot complete or cancel this wait.
+Paths refer to the machine running the browser. JSON includes the actual absolute
+path, guid, suggestedFilename, status, and receivedBytes.
+For an attached browser, this configures only the active context and retains
+download files in the destination's parent directory.
 
 Arguments:
   selector             Element to click (CSS selector or @ref)
@@ -2030,10 +2036,16 @@ Modes:
   --load <state>       Wait for load state (load, domcontentloaded, networkidle)
   --fn <expression>    Wait for JavaScript expression to be truthy
   --text <text>        Wait for text to appear on page (substring match)
-  --download [path]    Wait for a download to complete (optionally save to path)
+  --download [path]    Return or save the next unreported download
 
 Download Options (with --download):
-  --timeout <ms>       Timeout in milliseconds for download to start
+  --timeout <ms>       Timeout in milliseconds for download completion
+
+Download waits select the oldest retained unreported download from the current
+page or its frames, including files completed before the wait. A path saves the
+actual file there; otherwise its saved path is returned. Cancellations are reported
+once. Up to 256 recent terminal records are retained. Waiting alone never
+changes an attached browser's download settings.
 
 Wait for text to disappear:
   Use --fn or --state hidden to wait for text or elements to go away:

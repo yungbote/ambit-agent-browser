@@ -405,6 +405,7 @@ pub struct BrowserManager {
     default_timeout_ms: u64,
     /// Stored download path from launch options, re-applied to new contexts (e.g., recording)
     pub download_path: Option<String>,
+    downloads_directory: Option<super::downloads::DownloadDirectory>,
     /// Whether to ignore HTTPS certificate errors, re-applied to new contexts (e.g., recording)
     pub ignore_https_errors: bool,
     /// Origins visited during this session, used by save_state to collect cross-origin localStorage.
@@ -548,6 +549,7 @@ impl BrowserManager {
                 active_page_index: 0,
                 default_timeout_ms: 25_000,
                 download_path: download_path.clone(),
+                downloads_directory: None,
                 ignore_https_errors,
                 visited_origins: HashSet::new(),
                 next_tab_id: 1,
@@ -617,15 +619,11 @@ impl BrowserManager {
                 .await;
         }
 
-        if let Some(ref path) = download_path {
-            let _ = manager
-                .client
-                .send_command(
-                    "Browser.setDownloadBehavior",
-                    Some(json!({ "behavior": "allow", "downloadPath": path })),
-                    None,
-                )
-                .await;
+        if engine == "chrome" {
+            // Owned Chromium has a stable download directory and observes
+            // completions even while no command is waiting for them.
+            manager.configure_downloads(None).await?;
+            manager.download_frames().await?;
         }
 
         Ok(manager)
@@ -663,6 +661,7 @@ impl BrowserManager {
             active_page_index: 0,
             default_timeout_ms: 25_000,
             download_path: None,
+            downloads_directory: None,
             ignore_https_errors: false,
             visited_origins: HashSet::new(),
             next_tab_id: 1,
@@ -2239,20 +2238,123 @@ impl BrowserManager {
         &self.visited_origins
     }
 
-    pub async fn set_download_behavior(&self, download_path: &str) -> Result<(), String> {
-        let session_id = self.active_session_id()?;
+    /// Configure only the context the caller owns or explicitly acts upon.
+    /// Attaching to somebody else's browser never changes download behavior.
+    pub(crate) async fn configure_downloads(
+        &mut self,
+        context: Option<&str>,
+    ) -> Result<(), String> {
+        if self.direct_page {
+            return Err("This page-only CDP connection cannot observe browser downloads".into());
+        }
+        if self.downloads_directory.is_none() {
+            if self.browser_process.is_none() && self.download_path.is_none() {
+                return Err("An attached browser needs an explicit download directory before changing its download behavior".into());
+            }
+            self.downloads_directory = Some(super::downloads::DownloadDirectory::new(
+                self.download_path.as_deref(),
+            )?);
+        }
+        let directory = self.downloads_directory.as_mut().unwrap();
+        let context = context.map(str::to_owned);
+        if directory.contexts.contains(&context) {
+            return Ok(());
+        }
+        let mut params = json!({ "behavior": "allowAndName", "downloadPath": directory.path, "eventsEnabled": true });
+        if let Some(context) = &context {
+            params["browserContextId"] = json!(context);
+        }
         self.client
+            .send_command("Browser.setDownloadBehavior", Some(params), None)
+            .await?;
+        directory.contexts.insert(context);
+        Ok(())
+    }
+
+    pub(crate) async fn configure_active_downloads(
+        &mut self,
+        destination: &str,
+    ) -> Result<(), String> {
+        if self.browser_process.is_none()
+            && self.downloads_directory.is_none()
+            && self.download_path.is_none()
+        {
+            let path = std::path::Path::new(destination);
+            let absolute = if path.is_absolute() {
+                path.to_owned()
+            } else {
+                std::env::current_dir()
+                    .map_err(|error| error.to_string())?
+                    .join(path)
+            };
+            self.download_path = Some(
+                absolute
+                    .parent()
+                    .ok_or("Download destination has no parent")?
+                    .to_str()
+                    .ok_or("Download directory is not UTF-8")?
+                    .to_owned(),
+            );
+        }
+        let target = self.active_target_id()?.to_string();
+        // Chrome exposes a synthetic ID for its default context in TargetInfo,
+        // but setDownloadBehavior accepts only the explicit context roster.
+        let contexts = self
+            .client
+            .send_command_no_params("Target.getBrowserContexts", None)
+            .await?;
+        let contexts = contexts["browserContextIds"]
+            .as_array()
+            .ok_or("Browser context roster is unavailable")?;
+        let info = self
+            .client
             .send_command(
-                "Browser.setDownloadBehavior",
-                Some(json!({
-                    "behavior": "allowAndName",
-                    "downloadPath": download_path,
-                    "eventsEnabled": true,
-                })),
-                Some(session_id),
+                "Target.getTargetInfo",
+                Some(json!({"targetId": target})),
+                None,
             )
             .await?;
-        Ok(())
+        if info["targetInfo"]["targetId"].as_str() != Some(target.as_str()) {
+            return Err("Cannot identify the download's browser context".into());
+        }
+        let context = info["targetInfo"]["browserContextId"]
+            .as_str()
+            .filter(|id| contexts.iter().any(|context| context.as_str() == Some(*id)));
+        self.configure_downloads(context).await
+    }
+
+    pub(crate) async fn download_frames(&self) -> Result<HashSet<String>, String> {
+        if self
+            .downloads_directory
+            .as_ref()
+            .is_none_or(|directory| directory.contexts.is_empty())
+        {
+            return Err("Download observation is not configured for this browser; use download to configure the active context".into());
+        }
+        let tree = self
+            .client
+            .send_command_no_params("Page.getFrameTree", Some(self.active_session_id()?))
+            .await?;
+        let root = tree["frameTree"]["frame"]["id"]
+            .as_str()
+            .ok_or("The download's page frame is unavailable")?;
+        self.client.downloads.seed_frames(&tree["frameTree"]);
+        let frames = HashSet::from([root.to_owned()]);
+        Ok(frames)
+    }
+
+    pub(crate) fn finish_download(
+        &self,
+        download: &super::downloads::Download,
+        destination: Option<&str>,
+    ) -> Result<Value, String> {
+        let result = self
+            .downloads_directory
+            .as_ref()
+            .ok_or("Browser download storage is unavailable")?
+            .finish(download, destination)?;
+        self.client.downloads.reported(&download.guid);
+        Ok(result)
     }
 }
 
@@ -2384,6 +2486,7 @@ async fn initialize_lightpanda_manager(
             active_page_index: 0,
             default_timeout_ms: 25_000,
             download_path: None,
+            downloads_directory: None,
             ignore_https_errors: false,
             visited_origins: HashSet::new(),
             next_tab_id: 1,
@@ -3089,6 +3192,7 @@ mod tests {
             active_page_index: 0,
             default_timeout_ms: 25_000,
             download_path: None,
+            downloads_directory: None,
             ignore_https_errors: false,
             visited_origins: HashSet::new(),
             next_tab_id: 100,

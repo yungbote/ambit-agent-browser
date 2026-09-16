@@ -1063,7 +1063,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_DOWNLOAD,
             "Download file",
-            "Click an element and save the download.",
+            "Click an element and save its observed download. Returns the actual saved path, download GUID, filename and completed status.",
             json!({ "selector": selector_schema(), "path": { "type": "string" } }),
             &["selector", "path"],
         ),
@@ -1098,7 +1098,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_WAIT_FOR_DOWNLOAD,
             "Wait for download",
-            "Wait for a browser download.",
+            "Wait for the oldest retained unreported download from the current page, including an already completed download. Returns its actual path and download identity; cancellation fails without claiming a file.",
             json!({ "path": { "type": "string", "description": "Optional output path." }, "waitTimeoutMs": wait_timeout_schema() }),
             &[],
         ),
@@ -4154,6 +4154,24 @@ fn write_json_line(stdout: &mut io::Stdout, value: &Value) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn download_tools_keep_cli_destination_and_timeout_semantics() {
+        let download = call_download(&json!({"selector":"#save","path":"receipt.bin"})).unwrap();
+        assert_eq!(
+            download.command_args,
+            vec!["download", "#save", "receipt.bin"]
+        );
+        let wait = call_wait_download(&json!({"path":"result.bin", "waitTimeoutMs":7000})).unwrap();
+        assert_eq!(
+            wait.command_args,
+            vec!["wait", "--download", "result.bin", "--timeout", "7000"]
+        );
+        assert_eq!(
+            call_wait_download(&json!({})).unwrap().command_args,
+            vec!["wait", "--download"]
+        );
+    }
 
     #[test]
     fn tools_list_contains_typed_tools() {

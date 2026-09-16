@@ -16,10 +16,16 @@ The selector must resolve to a file input. Multiple file paths are accepted for 
 
 ```bash
 agent-browser download @e5 ./report.csv
+agent-browser click @e6
+agent-browser wait --download
 agent-browser wait --download ./archive.zip --timeout 30000
 ```
 
-Use `download` when a specific element triggers the download. Use `wait --download` when another action starts the download and you need to wait for completion.
+`download` clicks the element and saves the first newly observed download from its page or frames to the requested path. Selection follows download start order; it does not establish which network request the click caused. `wait --download` returns the oldest retained unreported download from the current page or its frames, including one that completed before the wait began. With a path, it saves that file there; without one, it returns the actual saved path.
+
+Each completed download or reported cancellation is consumed once. Canceled downloads return an error; a timeout leaves the download available for a later wait. Once selected, a download retains its own identity, so another download's completion or cancellation cannot settle that wait. The browser retains up to 256 recent terminal records. A wait reports an unavailable download if its selected record leaves that history.
+
+JSON results include the absolute `path`, download `guid`, `suggestedFilename`, `status: "completed"`, and `receivedBytes`. Paths refer to the machine running the browser.
 
 Set a default download directory for browser-initiated downloads:
 
@@ -27,7 +33,9 @@ Set a default download directory for browser-initiated downloads:
 agent-browser --download-path ./downloads open https://app.example.com
 ```
 
-Without `--download-path`, downloads go to a temporary directory that is cleaned up when the browser closes.
+Agent-browser-managed Chromium observes downloads throughout its lifetime. Without `--download-path`, its downloads go to a temporary directory that is cleaned up when the browser closes.
+
+Attaching to an existing browser leaves its download settings unchanged. An explicit `download` configures only the active context, using the destination's parent directory as retained storage. `wait --download` alone never changes an attached browser's settings.
 
 ## Screenshots and PDFs
 

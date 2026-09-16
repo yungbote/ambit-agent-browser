@@ -17,6 +17,7 @@ pub mod daemon;
 #[allow(dead_code)]
 pub mod diff;
 pub(crate) mod display;
+pub(crate) mod downloads;
 #[allow(dead_code)]
 pub mod element;
 pub(crate) mod feedback;
@@ -59,3 +60,6 @@ pub mod webmcp;
 mod e2e_tests;
 #[cfg(test)]
 mod parity_tests;
+
+#[cfg(test)]
+mod downloads_e2e_tests;

@@ -140,10 +140,12 @@ agent-browser wait "#spinner" --state hidden           # Wait for element to dis
 
 ```bash
 agent-browser download <sel> <path>   # Click element to trigger download
-agent-browser wait --download [path]  # Wait for any download to complete
+agent-browser wait --download [path]  # Return or save the next unreported download
 ```
 
-Use `--download-path <dir>` (or `AGENT_BROWSER_DOWNLOAD_PATH` env) to set a default download directory. Without it, downloads go to a temporary directory that is deleted when the browser closes.
+`download` saves the first newly observed download from the clicked page or its frames, selected by start order. `wait --download` handles the oldest retained unreported download from the current page or its frames, including downloads completed before the wait. An optional path saves the actual file there; otherwise the result contains its existing absolute path. Canceled downloads return an error and are not returned again by later waits. Recent terminal history is limited to 256 records.
+
+Agent-browser-managed Chromium observes downloads throughout its lifetime. Use `--download-path <dir>` (or `AGENT_BROWSER_DOWNLOAD_PATH` env) to set its download directory. Without it, downloads go to a temporary directory that is deleted when the browser closes. An attached browser's active context is configured only by an explicit `download`, using its destination's parent directory as retained storage; `wait --download` alone does not change download settings.
 
 See [Files & Clipboard](/files) for upload, download, local file, screenshot, PDF, and clipboard workflows.
 

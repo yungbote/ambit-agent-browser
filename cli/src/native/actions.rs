@@ -7604,55 +7604,19 @@ async fn handle_set_media(cmd: &Value, state: &mut DaemonState) -> Result<Value,
 async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let selector = cmd
         .get("selector")
-        .and_then(|v| v.as_str())
+        .and_then(Value::as_str)
         .ok_or("Missing 'selector' parameter")?;
-    let path_str = cmd
+    let path = cmd
         .get("path")
-        .and_then(|v| v.as_str())
+        .and_then(Value::as_str)
         .ok_or("Missing 'path' parameter")?;
-
-    // Resolve to absolute path and canonicalize to prevent path traversal
-    let raw_dest = if std::path::Path::new(path_str).is_absolute() {
-        PathBuf::from(path_str)
-    } else {
-        std::env::current_dir()
-            .map_err(|e| format!("Failed to get current directory: {}", e))?
-            .join(path_str)
-    };
-
-    // Extract directory and desired filename
-    let download_dir = raw_dest
-        .parent()
-        .ok_or("Invalid download path: no parent directory")?
-        .to_path_buf();
-
-    // Create the directory if it doesn't exist
-    std::fs::create_dir_all(&download_dir)
-        .map_err(|e| format!("Failed to create download directory: {}", e))?;
-
-    // Canonicalize after mkdir so the path actually exists for resolution
-    let download_dir = download_dir
-        .canonicalize()
-        .map_err(|e| format!("Failed to resolve download directory: {}", e))?;
-    let dest = download_dir.join(
-        raw_dest
-            .file_name()
-            .ok_or("Invalid download path: no filename")?,
-    );
-    let download_dir_str = download_dir
-        .to_str()
-        .ok_or("Download directory path is not valid UTF-8")?;
-
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
+    mgr.configure_active_downloads(path).await?;
+    let frames = mgr.download_frames().await?;
     let session_id = mgr.active_session_id()?.to_string();
-
-    // Set download behavior to save to the parent directory
-    mgr.set_download_behavior(download_dir_str).await?;
-
-    // Subscribe to CDP events before clicking so we don't miss the download event
-    let mut rx = mgr.client.subscribe();
-
-    // Click the element to trigger the download
+    // Frame-tree acknowledgment orders this cursor after prior browser events.
+    // A previously observed GUID completing cannot settle the selected one.
+    let cursor = mgr.client.downloads.cursor();
     interaction::click(
         &mgr.client,
         &session_id,
@@ -7663,98 +7627,12 @@ async fn handle_download(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         &state.iframe_sessions,
     )
     .await?;
-
-    // Wait for download to complete
-    const DOWNLOAD_TIMEOUT: tokio::time::Duration = tokio::time::Duration::from_secs(30);
-    let deadline = tokio::time::Instant::now() + DOWNLOAD_TIMEOUT;
-    let mut downloaded_guid: Option<String> = None;
-
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err("Timeout waiting for download to complete".to_string());
-        }
-
-        match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Ok(event)) => {
-                // Browser-domain download events may arrive without a sessionId
-                // or with a different sessionId than the page session, so we
-                // accept them regardless. Page-domain events are matched by
-                // session to avoid cross-tab confusion.
-                let is_page_session = event.session_id.as_deref() == Some(&session_id);
-                let is_download_event = |method: &str, browser_method: &str, page_method: &str| {
-                    method == browser_method || (method == page_method && is_page_session)
-                };
-
-                // Capture the GUID from downloadWillBegin
-                if is_download_event(
-                    &event.method,
-                    "Browser.downloadWillBegin",
-                    "Page.downloadWillBegin",
-                ) {
-                    if let Some(guid) = event.params.get("guid").and_then(|v| v.as_str()) {
-                        downloaded_guid = Some(guid.to_string());
-                    }
-                }
-                // Check for download completion or cancellation
-                if is_download_event(
-                    &event.method,
-                    "Browser.downloadProgress",
-                    "Page.downloadProgress",
-                ) {
-                    match event.params.get("state").and_then(|v| v.as_str()) {
-                        Some("completed") => break,
-                        Some("canceled") => {
-                            return Err("Download was canceled".to_string());
-                        }
-                        _ => {}
-                    }
-                }
-            }
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(_)) => return Err("Event stream closed".to_string()),
-            Err(_) => return Err("Timeout waiting for download to complete".to_string()),
-        }
-    }
-
-    // With "allowAndName" behavior, Chrome saves the file using the GUID as filename.
-    // Rename it to the user-requested filename.
-    if let Some(guid) = downloaded_guid {
-        let guid_path = download_dir.join(&guid);
-        // Chrome may still be flushing the file to disk after signalling
-        // completion; wait briefly for it to appear.
-        for _ in 0..10 {
-            if guid_path.exists() {
-                break;
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-        }
-        if guid_path.exists() {
-            std::fs::rename(&guid_path, &dest)
-                .map_err(|e| format!("Failed to rename downloaded file: {}", e))?;
-        } else {
-            // The file might have been saved under its original name instead
-            // of the GUID (e.g. when Chrome falls back to "allow" behavior).
-            if !dest.exists() {
-                return Err(format!(
-                    "Downloaded file not found at expected path (GUID: {})",
-                    guid
-                ));
-            }
-        }
-    } else {
-        // GUID capture failed -- the file may have been saved under its original name
-        // by Chrome. Only return success if dest already exists (avoid touching
-        // unrelated files in the directory).
-        if !dest.exists() {
-            return Err(
-                "Download completed but could not determine the downloaded file name".to_string(),
-            );
-        }
-    }
-
-    let dest_str = dest.to_string_lossy().to_string();
-    Ok(json!({ "path": dest_str }))
+    let download = mgr
+        .client
+        .downloads
+        .wait(&frames, Some(cursor), std::time::Duration::from_secs(30))
+        .await?;
+    mgr.finish_download(&download, Some(path))
 }
 
 // ---------------------------------------------------------------------------
@@ -10761,41 +10639,17 @@ async fn handle_responsebody(cmd: &Value, state: &DaemonState) -> Result<Value, 
 
 async fn handle_waitfordownload(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
-    let timeout_ms = state.timeout_ms(cmd);
-
-    let mut rx = mgr.client.subscribe();
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_millis(timeout_ms);
-
-    loop {
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        if remaining.is_zero() {
-            return Err("Timeout waiting for download".to_string());
-        }
-
-        match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Ok(event)) => {
-                // Browser-domain events may arrive without a sessionId;
-                // Page-domain events are matched by session.
-                let is_page_session = event.session_id.as_deref() == Some(&session_id);
-                let is_progress = event.method == "Browser.downloadProgress"
-                    || (event.method == "Page.downloadProgress" && is_page_session);
-
-                if is_progress
-                    && event.params.get("state").and_then(|v| v.as_str()) == Some("completed")
-                {
-                    let path = cmd
-                        .get("path")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("download");
-                    return Ok(json!({ "path": path }));
-                }
-            }
-            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => continue,
-            Ok(Err(_)) => return Err("Event stream closed".to_string()),
-            Err(_) => return Err("Timeout waiting for download".to_string()),
-        }
-    }
+    let frames = mgr.download_frames().await?;
+    let download = mgr
+        .client
+        .downloads
+        .wait(
+            &frames,
+            None,
+            std::time::Duration::from_millis(state.timeout_ms(cmd)),
+        )
+        .await?;
+    mgr.finish_download(&download, cmd.get("path").and_then(Value::as_str))
 }
 
 async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -10812,6 +10666,7 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
             .and_then(|v| v.as_str())
             .ok_or("Failed to create browser context")?
             .to_string();
+        mgr.configure_downloads(Some(&context_id)).await?;
 
         let create_result: super::cdp::types::CreateTargetResult = mgr
             .client

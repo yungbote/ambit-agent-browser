@@ -130,6 +130,7 @@ agent-browser scroll <dir> [px]       # Scroll (up/down/left/right, --selector <
 agent-browser scrollintoview <sel>    # Scroll element into view (alias: scrollinto)
 agent-browser drag <src> <tgt>        # Drag and drop
 agent-browser upload <sel> <files>    # Upload files
+agent-browser download <sel> <path>   # Click and save a download
 agent-browser screenshot [path]       # Take screenshot (--full for full page, saves to a temporary directory if no path)
 agent-browser screenshot --annotate   # Annotated screenshot with numbered element labels
 agent-browser screenshot --screenshot-dir ./shots    # Save to custom directory
@@ -258,6 +259,19 @@ agent-browser wait "#spinner" --state hidden
 ```
 
 **Load states:** `load`, `domcontentloaded`, `networkidle`
+
+### Downloads
+
+```bash
+agent-browser download @e5 ./report.csv
+agent-browser click @e6
+agent-browser wait --download
+agent-browser wait --download ./archive.zip --timeout 30000
+```
+
+`download` clicks the element and saves the first newly observed download from its page or frames. This selects by download start order, so overlapping requests that begin downloading after the click can compete. `wait --download` returns the oldest retained unreported download from the current page or its frames, including one that completed before the wait began. Supplying a path saves that file there; omitting it returns the actual saved path. A canceled download returns an error, and later waits advance to the next download.
+
+Agent-browser-managed Chromium observes downloads throughout its lifetime and retains up to 256 recent terminal records. Use `--download-path <dir>` or `AGENT_BROWSER_DOWNLOAD_PATH` to keep its files in a chosen directory; otherwise its temporary directory is removed when the browser closes. For an attached browser, only an explicit `download` configures the active context, using the destination's parent directory as retained storage; `wait --download` alone does not change its download settings. Paths refer to the machine running the browser. JSON results include the absolute `path`, download `guid`, `suggestedFilename`, `status`, and `receivedBytes`.
 
 ### Batch Execution
 
