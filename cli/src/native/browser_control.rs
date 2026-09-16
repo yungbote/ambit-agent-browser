@@ -18,6 +18,8 @@ use super::input::{input_command, stream_event, HeldInputs};
 pub(crate) const ACTION: &str = "ambit_browser_control";
 const MAX_LEASE_MS: u64 = 30_000;
 const MAX_REQUEST_BYTES: usize = 65_536;
+const MAX_PASTE_BYTES: usize = 1024 * 1024;
+const MAX_PASTE_REQUEST_BYTES: usize = 6 * MAX_PASTE_BYTES + 8192;
 const MAX_EVENTS: usize = 64;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_PENDING_STREAM_INPUTS: usize = 256;
@@ -58,6 +60,9 @@ pub(crate) struct ControlRequest {
     expires_at: Option<u64>,
     sequence: Option<u64>,
     events: Option<Vec<Value>>,
+    expected_surface_generation: Option<String>,
+    #[serde(skip)]
+    large_paste: bool,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -73,12 +78,13 @@ enum Operation {
 
 impl ControlRequest {
     pub(crate) fn parse(value: &Value) -> Result<Self, ControlError> {
-        if value.to_string().len() > MAX_REQUEST_BYTES {
+        let request_bytes = value.to_string().len();
+        if request_bytes > MAX_PASTE_REQUEST_BYTES {
             return Err(ControlError::invalid(
                 "Control requests must be at most 65536 bytes.",
             ));
         }
-        let request: Self = serde_json::from_value(value.clone()).map_err(|_| {
+        let mut request: Self = serde_json::from_value(value.clone()).map_err(|_| {
             ControlError::invalid("Invalid browser control request fields or types.")
         })?;
         let allowed: &[&str] = match request.op {
@@ -87,9 +93,31 @@ impl ControlRequest {
                 &["id", "action", "op", "controllerId", "expiresAt"]
             }
             Operation::Release | Operation::Copy => &["id", "action", "op", "controllerId"],
-            Operation::Input => &["id", "action", "op", "controllerId", "sequence", "events"],
+            Operation::Input => &[
+                "id",
+                "action",
+                "op",
+                "controllerId",
+                "sequence",
+                "events",
+                "expectedSurfaceGeneration",
+            ],
         };
         fields(value, allowed)?;
+        request.large_paste = request_bytes > MAX_REQUEST_BYTES;
+        if request.large_paste
+            && !(request.op == Operation::Input
+                && request.expected_surface_generation.is_some()
+                && request.events.as_ref().is_some_and(|events| {
+                    events.len() == 1
+                        && events[0]["type"] == "input_keyboard"
+                        && events[0]["eventType"] == "insertText"
+                }))
+        {
+            return Err(ControlError::invalid(
+                "Only one explicit window paste may exceed the 65536-byte input limit.",
+            ));
+        }
         if request.op == Operation::Inspect {
             if value.get("controllerId").is_some()
                 || request.expires_at.is_some()
@@ -134,6 +162,18 @@ impl ControlRequest {
                 }
             }
             Operation::Input => {
+                if request
+                    .expected_surface_generation
+                    .as_ref()
+                    .is_some_and(|value| {
+                        !uuid::Uuid::parse_str(value)
+                            .is_ok_and(|id| !id.is_nil() && id.to_string() == *value)
+                    })
+                {
+                    return Err(ControlError::invalid(
+                        "expectedSurfaceGeneration must be a canonical nonzero UUID.",
+                    ));
+                }
                 if request.expires_at.is_some()
                     || !request
                         .sequence
@@ -185,11 +225,12 @@ struct Lease {
     last_sequence: u64,
     outcome_unknown: bool,
     held: HeldInputs,
+    native_input_pending: bool,
 }
 
 impl Lease {
     fn holds_custody(&self, now: Instant) -> bool {
-        self.deadline > now
+        self.deadline > now || self.native_input_pending || self.held.next_release().is_some()
     }
 
     fn response(&self, status: &str) -> Value {
@@ -207,6 +248,7 @@ pub(crate) struct BrowserControl {
     stream_held: HeldInputs,
     /// Set before enqueueing so cancellation cannot lose an uncertain send.
     stream_outcome_unknown: bool,
+    display: Option<std::sync::Arc<super::display::DisplayClient>>,
 }
 
 struct PendingStreamInput {
@@ -243,6 +285,16 @@ async fn neutralize_held(client: &CdpClient, held: &mut HeldInputs) -> Result<()
 }
 
 impl BrowserControl {
+    pub(crate) fn set_display(
+        &mut self,
+        display: Option<std::sync::Arc<super::display::DisplayClient>>,
+    ) {
+        self.display = display;
+    }
+
+    pub(crate) fn require_observation(&mut self) {
+        self.needs_observation = true;
+    }
     pub(crate) fn needs_observation(&self) -> bool {
         self.needs_observation
     }
@@ -315,6 +367,14 @@ impl BrowserControl {
         let Some(lease) = self.lease.as_mut() else {
             return Ok(());
         };
+        if lease.native_input_pending {
+            let was_unknown = lease.outcome_unknown;
+            lease.outcome_unknown = true;
+            let display = self.display.as_ref().ok_or_else(ControlError::unknown)?;
+            display.reset().await.map_err(|_| ControlError::unknown())?;
+            lease.native_input_pending = false;
+            lease.outcome_unknown = was_unknown;
+        }
         if lease.held.next_release().is_none() {
             return Ok(());
         }
@@ -339,7 +399,9 @@ impl BrowserControl {
     }
 
     pub(crate) fn reset_browser(&mut self) {
-        self.needs_observation = false;
+        // Human handback remains observable even when the user closes Chrome.
+        // Host feedback can then report the proven absence of an active page
+        // before any later action is allowed to create a fresh browser.
         self.pending_stream.clear();
         self.stream_held = HeldInputs::default();
         self.stream_outcome_unknown = false;
@@ -357,6 +419,11 @@ impl BrowserControl {
         client: &CdpClient,
         session_id: Option<&str>,
     ) -> Result<(), ControlError> {
+        if self.display.is_some() {
+            return Err(ControlError::invalid(
+                "Native window input requires the current controller and input sequence.",
+            ));
+        }
         self.expire(Some((client, session_id.unwrap_or_default())))
             .await?;
         if let Some(error) = self.agent_error() {
@@ -468,6 +535,19 @@ impl BrowserControl {
         &mut self,
         request: ControlRequest,
         browser: Option<(&CdpClient, &str)>,
+        page: Option<super::actions::ControlPage<'_>>,
+    ) -> Result<Value, ControlError> {
+        let mut response = self.execute_operation(request, browser, page).await?;
+        if let Some(display) = self.display.as_ref() {
+            response["surface"] = json!(display.surface());
+        }
+        Ok(response)
+    }
+
+    async fn execute_operation(
+        &mut self,
+        request: ControlRequest,
+        browser: Option<(&CdpClient, &str)>,
         mut page: Option<super::actions::ControlPage<'_>>,
     ) -> Result<Value, ControlError> {
         let now = Instant::now();
@@ -500,7 +580,12 @@ impl BrowserControl {
                         "This controller was released. Acquire with a new controllerId.",
                     ));
                 }
-                if browser.is_none() {
+                if browser.is_none()
+                    && self
+                        .display
+                        .as_ref()
+                        .is_none_or(|display| !display.available())
+                {
                     return Err(ControlError::new(
                         "browser_control_unavailable",
                         "This session has no active CDP browser to control.",
@@ -508,7 +593,13 @@ impl BrowserControl {
                 }
                 self.drain_stream().await?;
                 self.stream_outcome_unknown = true;
-                neutralize_held(browser.unwrap().0, &mut self.stream_held).await?;
+                if let Some((client, _)) = browser {
+                    neutralize_held(client, &mut self.stream_held).await?;
+                }
+                if let Some(display) = self.display.as_ref() {
+                    display.reset().await.map_err(|_| ControlError::unknown())?;
+                    display.invalidate().await;
+                }
                 self.stream_outcome_unknown = false;
                 let (expires_at, deadline) = request.deadline(Instant::now())?;
                 self.lease = Some(Lease {
@@ -518,10 +609,12 @@ impl BrowserControl {
                     last_sequence: 0,
                     outcome_unknown: false,
                     held: HeldInputs::default(),
+                    native_input_pending: false,
                 });
                 self.needs_observation = true;
                 if let Some((client, session)) = browser {
-                    client.rotate_page_generation(session);
+                    client.rotate_all_page_generations();
+                    let _ = session;
                 }
                 Ok(self.lease.as_ref().unwrap().response("controlled"))
             }
@@ -590,6 +683,11 @@ impl BrowserControl {
             }
             Operation::Input => {
                 self.require_owner(&request.controller_id)?;
+                if request.large_paste && self.display.is_none() {
+                    return Err(ControlError::invalid(
+                        "Large native paste requires the owned browser window.",
+                    ));
+                }
                 let sequence = request.sequence.unwrap();
                 let lease = self.lease.as_mut().unwrap();
                 if sequence <= lease.last_sequence {
@@ -600,6 +698,19 @@ impl BrowserControl {
                         "browser_control_sequence_gap",
                         format!("Expected input sequence {}.", lease.last_sequence + 1),
                     ));
+                }
+                if let Some(display) = self.display.as_ref() {
+                    if request.expected_surface_generation.as_deref()
+                        != Some(display.surface().generation.as_str())
+                    {
+                        return Err(ControlError::new("browser_control_surface_stale", "The browser window changed. Use its current frame before sending input."));
+                    }
+                    let events = request.events.as_ref().unwrap();
+                    if events.iter().any(|event| event["type"] == "viewport") && events.len() != 1 {
+                        return Err(ControlError::invalid(
+                            "Window resizing must be acknowledged before sending other input.",
+                        ));
+                    }
                 }
                 let (client, session_id) = browser.ok_or_else(|| {
                     ControlError::new(
@@ -627,18 +738,45 @@ impl BrowserControl {
                 // Reserve before the first await. A cancelled command or a lost
                 // reply must never leave the sequence available for replay.
                 lease.outcome_unknown = true;
+                let native_pending_before = lease.native_input_pending;
+                let mut applied_any = false;
                 let deadline = lease.deadline.min(Instant::now() + ACK_TIMEOUT);
                 let result =
                     tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-                        for event in request.events.unwrap() {
+                        let mut events = request.events.unwrap().into_iter().peekable();
+                        while let Some(event) = events.next() {
                             if Instant::now() >= deadline {
-                                return Err("Input deadline elapsed".to_string());
+                                return Err(ControlError::unknown());
                             }
                             if matches!(event["type"].as_str(), Some("viewport" | "navigation")) {
+                                if event["type"] == "viewport" {
+                                    if let Some(display) = self.display.as_ref() {
+                                        display.reset().await.map_err(|_| ControlError::unknown())?;
+                                        lease.native_input_pending = false;
+                                    }
+                                }
                                 page.as_mut()
-                                    .ok_or("Browser page control is unavailable")?
+                                    .ok_or_else(ControlError::unknown)?
                                     .apply(&event)
-                                    .await?;
+                                    .await.map_err(|_| ControlError::unknown())?;
+                                applied_any = true;
+                                continue;
+                            }
+                            if let Some(display) = self.display.as_ref() {
+                                // Keep the helper's ordered native batch in
+                                // one RPC so video capture cannot interleave
+                                // between its keys. Page commands delimit it.
+                                let mut native_events = vec![event];
+                                while events.peek().is_some_and(|event| !matches!(event["type"].as_str(), Some("viewport" | "navigation"))) {
+                                    native_events.push(events.next().unwrap());
+                                }
+                                lease.native_input_pending = true;
+                                if let Err(error) = display.input(&native_events).await {
+                                    return Err(if !applied_any && error.operation_performed == Some(json!(false)) {
+                                        ControlError::invalid("The native browser window did not accept this input.")
+                                    } else { ControlError::unknown() });
+                                }
+                                applied_any = true;
                                 continue;
                             }
                             lease.held.before_send(session_id, &event);
@@ -653,14 +791,21 @@ impl BrowserControl {
                                     Some(session_id),
                                     InputSource::Human,
                                 )
-                                .await?;
+                                .await.map_err(|_| ControlError::unknown())?;
                             lease.held.acknowledged(session_id, &event);
+                            applied_any = true;
                         }
-                        Ok::<_, String>(())
+                        Ok::<_, ControlError>(())
                     })
                     .await;
-                if !matches!(result, Ok(Ok(()))) {
-                    return Err(ControlError::unknown());
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) if error.code != "browser_control_outcome_unknown" => {
+                        lease.outcome_unknown = false;
+                        lease.native_input_pending = native_pending_before;
+                        return Err(error);
+                    }
+                    _ => return Err(ControlError::unknown()),
                 }
                 lease.last_sequence = sequence;
                 lease.outcome_unknown = false;
@@ -805,12 +950,12 @@ fn validate_event(event: &Value) -> Result<(), ControlError> {
                 return if event
                     .get("text")
                     .and_then(Value::as_str)
-                    .is_some_and(|text| !text.is_empty() && text.len() <= 4096)
+                    .is_some_and(|text| !text.is_empty() && text.len() <= MAX_PASTE_BYTES)
                 {
                     Ok(())
                 } else {
                     Err(ControlError::invalid(
-                        "Text insertion requires between 1 and 4096 UTF-8 bytes.",
+                        "Text insertion must fit the control request and contain at most 1 MiB of UTF-8 text.",
                     ))
                 };
             }

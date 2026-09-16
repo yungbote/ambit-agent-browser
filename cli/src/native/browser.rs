@@ -137,9 +137,12 @@ fn is_internal_chrome_target(url: &str) -> bool {
         || url.starts_with("devtools://")
 }
 
-pub(crate) fn should_track_target(target: &TargetInfo) -> bool {
+/// An attached user's browser keeps its internal UI out of automatic selection.
+/// A privately owned whole window includes those visible pages (notably New
+/// Tab), under the same target preparation and network controls as other tabs.
+pub(crate) fn should_track_target(target: &TargetInfo, include_browser_ui: bool) -> bool {
     (target.target_type == "page" || target.target_type == "webview")
-        && (target.url.is_empty() || !is_internal_chrome_target(&target.url))
+        && (include_browser_ui || target.url.is_empty() || !is_internal_chrome_target(&target.url))
 }
 
 fn update_page_target_info_in_pages(pages: &mut [PageInfo], target: &TargetInfo) -> bool {
@@ -427,6 +430,9 @@ pub struct BrowserManager {
     headless: bool,
 }
 
+#[path = "browser_window.rs"]
+mod window;
+
 /// Stable machine-readable prefix for "the bound tab no longer exists"
 /// errors, so scripts using `--json` can match on it.
 pub const TAB_GONE_PREFIX: &str = "tab_gone:";
@@ -496,6 +502,7 @@ impl BrowserManager {
         let color_scheme = options.color_scheme.clone();
         let download_path = options.download_path.clone();
         let headless = options.effectively_headless();
+        let window_stream = options.window_stream;
 
         let (ws_url, process) = match engine {
             "lightpanda" => {
@@ -509,13 +516,19 @@ impl BrowserManager {
                 (url, BrowserProcess::Lightpanda(lp))
             }
             _ => {
-                let chrome = launch_chrome(options).await?;
+                let mut chrome = launch_chrome(options).await?;
+                if window_stream {
+                    #[cfg(target_os = "linux")]
+                    chrome.start_window_display()?;
+                    #[cfg(not(target_os = "linux"))]
+                    return Err("Private window streaming is supported on Linux".into());
+                }
                 let url = chrome.ws_url.clone();
                 (url, BrowserProcess::Chrome(chrome))
             }
         };
 
-        let manager = if engine == "lightpanda" {
+        let mut manager = if engine == "lightpanda" {
             initialize_lightpanda_manager(ws_url, process).await?
         } else {
             let client = Arc::new(CdpClient::connect(&ws_url).await?);
@@ -539,6 +552,27 @@ impl BrowserManager {
             manager.discover_and_attach_targets().await?;
             manager
         };
+
+        if let Some(display) = manager.display_client() {
+            let layout_events = manager.client.subscribe();
+            // The owned headed browser may start on its native New Tab page
+            // without a window manager to activate it. Select by observation
+            // first, then use the existing native activation primitive once.
+            manager
+                .synchronize_visible_page()
+                .await
+                .map_err(str::to_string)?;
+            manager.bring_to_front().await?;
+            let info = display.info().await.map_err(|error| error.to_string())?;
+            let window = info
+                .active_window()
+                .ok_or("The browser window is not observable")?
+                .id;
+            manager
+                .resize_window(1280, 720, window, false, layout_events)
+                .await?;
+            manager.client.enable_window_pointer();
+        }
 
         let session_id = manager.active_session_id()?.to_string();
 
@@ -672,7 +706,7 @@ impl BrowserManager {
         let page_targets: Vec<TargetInfo> = result
             .target_infos
             .into_iter()
-            .filter(should_track_target)
+            .filter(|target| should_track_target(target, self.display_client().is_some()))
             .collect();
 
         if page_targets.is_empty() {
@@ -1359,6 +1393,14 @@ impl BrowserManager {
 
     pub fn get_cdp_url(&self) -> &str {
         &self.ws_url
+    }
+
+    pub(crate) fn display_client(&self) -> Option<Arc<super::display::DisplayClient>> {
+        #[cfg(target_os = "linux")]
+        if let Some(BrowserProcess::Chrome(process)) = self.browser_process.as_ref() {
+            return process.display_client();
+        }
+        None
     }
 
     /// Returns the Chrome debug server address as "host:port".
@@ -2527,7 +2569,7 @@ mod tests {
             browser_context_id: None,
         };
 
-        assert!(should_track_target(&target));
+        assert!(should_track_target(&target, false));
     }
 
     #[test]
@@ -2541,7 +2583,8 @@ mod tests {
             browser_context_id: None,
         };
 
-        assert!(!should_track_target(&target));
+        assert!(!should_track_target(&target, false));
+        assert!(should_track_target(&target, true));
     }
 
     #[test]

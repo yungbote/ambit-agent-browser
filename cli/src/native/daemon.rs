@@ -12,8 +12,8 @@ use tokio::sync::{Notify, RwLock};
 use tokio::task::JoinSet;
 
 use super::actions::{
-    auto_save_restore_state, close_all_browser_backends, close_current_browser, execute_command,
-    maybe_autosave_restore_state, DaemonState,
+    auto_save_restore_state, close_all_browser_backends, close_current_browser,
+    execute_command_received, maybe_autosave_restore_state, DaemonState,
 };
 use super::cdp::client::CdpClient;
 use super::state;
@@ -370,6 +370,7 @@ async fn maintain_browser(state: Arc<tokio::sync::Mutex<DaemonState>>, autosave_
                     error
                 );
             } else {
+                state.apply_pending_window_layout().await;
                 maybe_autosave_restore_state(&mut state, autosave_interval_ms).await;
             }
         }
@@ -419,6 +420,8 @@ async fn handle_connection<S>(
 
                 idle_activity.mark();
 
+                let received_at = std::time::Instant::now();
+
                 let action = cmd
                     .get("action")
                     .and_then(|v| v.as_str())
@@ -427,7 +430,7 @@ async fn handle_connection<S>(
 
                 let response = match command_state(&state, &cmd).await {
                     Ok(mut s) => {
-                        let response = execute_command(&cmd, &mut s).await;
+                        let response = execute_command_received(&cmd, &mut s, received_at).await;
                         // Refresh while command custody is still held.
                         idle_activity.mark();
                         response

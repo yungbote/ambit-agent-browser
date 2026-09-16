@@ -23,6 +23,8 @@ pub struct ChromeProcess {
     /// hosts. Dropped (and killed) after the Chrome tree is torn down.
     #[cfg(target_os = "linux")]
     xvfb: Option<XvfbServer>,
+    #[cfg(target_os = "linux")]
+    display_process: Option<crate::native::display::DisplayProcess>,
 }
 
 struct PreparedNssHomeInner {
@@ -60,6 +62,27 @@ impl PreparedNssHome {
 }
 
 impl ChromeProcess {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn start_window_display(&mut self) -> Result<(), String> {
+        let display = self
+            .xvfb
+            .as_ref()
+            .ok_or("Window streaming requires this browser's private Xvfb display")?;
+        self.display_process = Some(crate::native::display::DisplayProcess::spawn(
+            &display.display,
+            &display.auth_file,
+            self.child.id(),
+        )?);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn display_client(&self) -> Option<Arc<crate::native::display::DisplayClient>> {
+        self.display_process
+            .as_ref()
+            .map(|display| display.client.clone())
+    }
+
     pub fn kill(&mut self) {
         let _ = self.child.kill();
         // On Unix, kill the entire process group to ensure Chrome helper
@@ -107,6 +130,8 @@ impl ChromeProcess {
 
 impl Drop for ChromeProcess {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        drop(self.display_process.take());
         self.kill();
         if let Some(ref dir) = self.temp_user_data_dir {
             for attempt in 0..3 {
@@ -221,7 +246,12 @@ fn maybe_start_xvfb(options: &LaunchOptions) -> Option<XvfbServer> {
         return None;
     }
 
-    let (w, h) = options.viewport_size.unwrap_or((1280, 720));
+    let (w, h) = if options.window_stream {
+        let size = crate::native::display::MAX_DISPLAY_SIZE;
+        (size, size)
+    } else {
+        options.viewport_size.unwrap_or((1280, 720))
+    };
 
     // Private MIT-MAGIC-COOKIE-1 authority file; passed to the server via
     // -auth and to the paired Chrome via XAUTHORITY. Removed on Drop.
@@ -329,6 +359,8 @@ fn maybe_start_xvfb(options: &LaunchOptions) -> Option<XvfbServer> {
 #[derive(Clone)]
 pub struct LaunchOptions {
     pub headless: bool,
+    /// Expose the actual privately owned Chrome window to the host viewer.
+    pub window_stream: bool,
     /// Require Chrome sandboxing; disable environment-based sandbox fallback.
     pub require_sandbox: bool,
     pub executable_path: Option<String>,
@@ -383,7 +415,9 @@ impl LaunchOptions {
     /// Extensions force headed mode because Chrome does not inject their
     /// content scripts under `--headless=new`.
     pub(crate) fn effectively_headless(&self) -> bool {
-        self.headless && self.extensions.as_ref().is_none_or(|exts| exts.is_empty())
+        !self.window_stream
+            && self.headless
+            && self.extensions.as_ref().is_none_or(|exts| exts.is_empty())
     }
 }
 
@@ -391,6 +425,7 @@ impl Default for LaunchOptions {
     fn default() -> Self {
         Self {
             headless: true,
+            window_stream: false,
             require_sandbox: false,
             executable_path: None,
             proxy: None,
@@ -621,12 +656,24 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         .iter()
         .any(|a| a.starts_with("--start-maximized") || a.starts_with("--window-size="));
 
-    if !has_window_size && effectively_headless {
+    if !has_window_size && (effectively_headless || options.window_stream) {
         let (w, h) = options.viewport_size.unwrap_or((1280, 720));
         args.push(format!("--window-size={},{}", w, h));
     }
 
     args.extend(user_args);
+
+    if options.window_stream {
+        // Window capture and native input use one fixed, explicit raster
+        // scale. Page emulation remains a separate CDP operation.
+        args.retain(|arg| !arg.starts_with("--force-device-scale-factor="));
+        args.push(format!(
+            "--force-device-scale-factor={}",
+            crate::native::display::DEVICE_SCALE_FACTOR
+        ));
+        args.push("--window-position=0,0".into());
+        args.push("--disable-infobars".into());
+    }
 
     if options.restrict_webrtc {
         // Append this after user and plugin arguments so an unsafe custom
@@ -908,6 +955,12 @@ fn try_launch_chrome(
     #[cfg(target_os = "linux")]
     let xvfb = maybe_start_xvfb(options);
 
+    #[cfg(target_os = "linux")]
+    if options.window_stream && xvfb.is_none() {
+        cleanup_temp_dir(&temp_user_data_dir);
+        return Err("Window streaming requires a private Xvfb display; clear inherited DISPLAY and ensure Xvfb is available".into());
+    }
+
     #[cfg(not(windows))]
     let mut cmd = Command::new(chrome_path);
     #[cfg(not(windows))]
@@ -977,6 +1030,8 @@ fn try_launch_chrome(
         pgid,
         #[cfg(target_os = "linux")]
         xvfb,
+        #[cfg(target_os = "linux")]
+        display_process: None,
     };
     let stderr = process
         .child
@@ -2550,6 +2605,8 @@ mod tests {
                 pgid: None,
                 #[cfg(target_os = "linux")]
                 xvfb: None,
+                #[cfg(target_os = "linux")]
+                display_process: None,
             };
             // _process dropped here
         }

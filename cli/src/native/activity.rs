@@ -2,6 +2,10 @@
 //! Coordinates describe dispatched input; DOM scrolling has no invented cursor.
 
 use serde_json::{json, Value};
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use tokio::sync::broadcast;
 
 use super::cdp::types::CdpEvent;
@@ -9,6 +13,8 @@ use super::input::mouse_button_mask;
 
 pub(crate) const EVENT: &str = "Ambit.inputAcknowledged";
 pub(crate) const FRAME_GENERATION: &str = "ambitPageGeneration";
+pub(crate) const POINTER_BINDING: &str = "__ambitWindowPointer";
+pub(crate) const POINTER_WORLD: &str = "ambit-window-pointer";
 
 #[derive(Clone, Copy)]
 pub(crate) enum InputSource {
@@ -31,6 +37,8 @@ impl InputSource {
 pub(crate) struct ActivityObservation {
     event: CdpEvent,
     sender: broadcast::Sender<CdpEvent>,
+    native_liveness: Option<Arc<AtomicBool>>,
+    settled: bool,
 }
 
 impl ActivityObservation {
@@ -50,12 +58,77 @@ impl ActivityObservation {
                 session_id: Some(session.into()),
             },
             sender,
+            native_liveness: None,
+            settled: false,
         }
     }
 
     pub(crate) fn acknowledged(mut self) {
+        self.settled = true;
         self.event.params["timestamp"] = json!(super::stream::timestamp_ms());
-        let _ = self.sender.send(self.event);
+        let _ = self.sender.send(self.event.clone());
+    }
+
+    pub(crate) fn track_native(&mut self, liveness: Arc<AtomicBool>) {
+        self.native_liveness = Some(liveness);
+    }
+
+    pub(crate) fn awaits_native_event(&self) -> bool {
+        self.native_liveness.is_some() && self.event.params.get("screenX").is_none()
+    }
+
+    pub(crate) fn abandon_native_attribution(&self) {
+        if let Some(liveness) = self.native_liveness.as_ref() {
+            liveness.store(false, Ordering::Release);
+        }
+    }
+
+    pub(crate) fn refused(mut self) {
+        self.settled = true;
+    }
+
+    pub(crate) fn native_event(&mut self, session: &str, payload: &Value) {
+        if self
+            .native_liveness
+            .as_ref()
+            .is_none_or(|live| !live.load(Ordering::Acquire))
+            || self.event.session_id.as_deref() != Some(session)
+            || self.event.params["eventType"] != payload["eventType"]
+        {
+            return;
+        }
+        for (command, actual) in [("x", "clientX"), ("y", "clientY")] {
+            let (Some(command), Some(actual)) = (
+                self.event.params[command].as_f64(),
+                payload[actual].as_f64(),
+            ) else {
+                return;
+            };
+            if !actual.is_finite() || (command - actual).abs() > 1.0 {
+                return;
+            }
+        }
+        for field in ["screenX", "screenY"] {
+            if !payload[field]
+                .as_f64()
+                .is_some_and(|value| value.is_finite() && (-32768.0..=32768.0).contains(&value))
+            {
+                return;
+            }
+        }
+        self.event.params["screenX"] = payload["screenX"].clone();
+        self.event.params["screenY"] = payload["screenY"].clone();
+    }
+}
+
+impl Drop for ActivityObservation {
+    fn drop(&mut self) {
+        if !self.settled {
+            // An unacknowledged pointer might still reach the renderer.
+            // Stop attribution instead of relabelling a late event with a
+            // later command's private token.
+            self.abandon_native_attribution();
+        }
     }
 }
 

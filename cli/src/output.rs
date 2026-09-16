@@ -4084,6 +4084,9 @@ Environment:
   AGENT_BROWSER_STATE_EXPIRE_DAYS Auto-delete saved states older than N days (default: 30)
   AGENT_BROWSER_ENCRYPTION_KEY   64-char hex key for AES-256-GCM session encryption
   AGENT_BROWSER_STREAM_PORT      Override WebSocket streaming port (default: OS-assigned)
+  AGENT_BROWSER_WINDOW_STREAM    1 = stream the owned Chromium window on private Linux X11
+                                Primary presentation up to 20 fps; secondary viewers 10 fps
+  AGENT_BROWSER_DISPLAY_HELPER   Native window helper path (default: beside agent-browser)
   AGENT_BROWSER_STREAM_QUALITY   JPEG quality 0-100 (default: 80)
   AGENT_BROWSER_STREAM_MAX_WIDTH  Cap frame width in pixels (default: the viewport)
   AGENT_BROWSER_STREAM_MAX_HEIGHT Cap frame height in pixels (default: the viewport)

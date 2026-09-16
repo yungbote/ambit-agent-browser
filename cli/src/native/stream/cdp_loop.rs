@@ -112,6 +112,8 @@ pub(super) async fn cdp_event_loop(
     frame_watch: watch::Sender<Option<Arc<super::StreamFrame>>>,
     screencast_config: Arc<super::ScreencastConfig>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
+    display_slot: Arc<RwLock<Option<Arc<crate::native::display::DisplayClient>>>>,
+    presentation: Arc<super::presentation::Presentation>,
     client_notify: Arc<tokio::sync::Notify>,
     screencasting: Arc<Mutex<bool>>,
     client_count: Arc<Mutex<usize>>,
@@ -158,8 +160,9 @@ pub(super) async fn cdp_event_loop(
                 let vh = *viewport_height.lock().await;
 
                 let eng = last_engine.read().await.clone();
+                let display = display_slot.read().await.clone();
                 let is_chrome = eng == "chrome";
-                let supports_screencast = is_chrome;
+                let supports_screencast = is_chrome && display.is_none();
                 let supports_same_document_navigation = is_chrome;
 
                 if supports_screencast {
@@ -180,14 +183,14 @@ pub(super) async fn cdp_event_loop(
 
                 {
                     let mut sc = screencasting.lock().await;
-                    *sc = supports_screencast;
+                    *sc = supports_screencast || display.is_some();
                 }
 
                 let rec = *recording.lock().await;
                 let status = json!({
                     "type": "status",
                     "connected": true,
-                    "screencasting": supports_screencast,
+                    "screencasting": supports_screencast || display.is_some(),
                     "viewportWidth": vw,
                     "viewportHeight": vh,
                     "engine": eng,
@@ -206,9 +209,46 @@ pub(super) async fn cdp_event_loop(
                 let mut seed_in_flight = supports_same_document_navigation;
                 let mut active_main_frame_id = None;
                 let mut pending_same_document = VecDeque::<(Option<String>, String, String)>::new();
+                let mut presentation_rx = presentation.subscribe();
+                let mut capture_fps = presentation.capture_fps();
+                let mut display_tick = tokio::time::interval(std::time::Duration::from_millis(
+                    1000 / u64::from(capture_fps),
+                ));
+                display_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut display_failed = false;
 
                 loop {
                     tokio::select! {
+                        changed = presentation_rx.changed(), if display.is_some() => {
+                            if changed.is_err() { break; }
+                            let next = presentation.capture_fps();
+                            if next != capture_fps {
+                                capture_fps = next;
+                                let period = std::time::Duration::from_millis(1000 / u64::from(capture_fps));
+                                display_tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                                display_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            }
+                        }
+                        _ = display_tick.tick(), if display.is_some() && !display_failed => {
+                            match display.as_ref().unwrap().capture().await {
+                                Ok((capture, surface)) => {
+                                    let seq = super::next_frame_seq();
+                                    let message = json!({
+                                        "type": "frame", "seq": seq, "encoding": capture.encoding,
+                                        "data": capture.data, "surface": surface,
+                                    });
+                                    frame_watch.send_replace(Some(Arc::new(super::StreamFrame {
+                                        seq: Some(seq), json: message.to_string(),
+                                    })));
+                                }
+                                Err(error) if error.code == "display_layout_pending" => {},
+                                Err(_) => {
+                                    display_failed = true;
+                                    frame_watch.send_replace(None);
+                                    let _ = frame_tx.send(json!({"type":"error", "code":"display_unavailable"}).to_string());
+                                }
+                            }
+                        }
                         seeded_frame_id = &mut frame_tree_seed => {
                             seed_in_flight = false;
                             if active_main_frame_id.is_none() {
@@ -261,7 +301,30 @@ pub(super) async fn cdp_event_loop(
                                 Ok(evt) => {
                                     if evt.method == crate::native::activity::EVENT {
                                         if session_matches(session_id.as_deref(), evt.session_id.as_deref()) {
-                                            let _ = frame_tx.send(evt.params.to_string());
+                                            let mut activity = evt.params;
+                                            if display.is_some() {
+                                                activity["coordinateSpace"] = json!("viewport-css");
+                                            }
+                                            if let (Some(display), Some(screen_x), Some(screen_y), Some(page)) = (
+                                                display.as_ref(), activity["screenX"].as_f64(), activity["screenY"].as_f64(), evt.session_id.as_deref()
+                                            ) {
+                                                let surface = display.surface();
+                                                let x = screen_x * f64::from(surface.device_scale_factor);
+                                                let y = screen_y * f64::from(surface.device_scale_factor);
+                                                if activity["source"] == "agent"
+                                                    && activity["pageGeneration"] == client_arc.page_generation(page)
+                                                    && x >= 0.0 && y >= 0.0 && x < f64::from(surface.width) && y < f64::from(surface.height) {
+                                                    activity["coordinateSpace"] = json!("display-pixels");
+                                                    activity["surfaceGeneration"] = json!(surface.generation);
+                                                    activity["x"] = json!(x);
+                                                    activity["y"] = json!(y);
+                                                }
+                                            }
+                                            if let Some(object) = activity.as_object_mut() {
+                                                object.remove("screenX");
+                                                object.remove("screenY");
+                                            }
+                                            let _ = frame_tx.send(activity.to_string());
                                         }
                                     } else if evt.method == "Page.frameNavigated" {
                                         if let Some(frame) = evt.params.get("frame") {
@@ -349,6 +412,10 @@ pub(super) async fn cdp_event_loop(
                                                 Some(json!({ "sessionId": sid })),
                                                 evt.session_id.as_deref(),
                                             ).await;
+                                        }
+
+                                        if display.is_some() {
+                                            continue;
                                         }
 
                                         if let Some(data) = evt.params.get("data").and_then(|v| v.as_str()) {
@@ -450,7 +517,13 @@ pub(super) async fn cdp_event_loop(
                             let new_vw = *viewport_width.lock().await;
                             let new_vh = *viewport_height.lock().await;
                             let viewport_changed = new_vw != vw || new_vh != vh;
-                            if client_changed || session_changed || viewport_changed {
+                            let current_display = display_slot.read().await.clone();
+                            let display_changed = match (&display, &current_display) {
+                                (Some(previous), Some(current)) => !Arc::ptr_eq(previous, current),
+                                (None, None) => false,
+                                _ => true,
+                            };
+                            if client_changed || session_changed || viewport_changed || display_changed {
                                 if supports_screencast {
                                     let _ = client_arc
                                         .send_command_no_params("Page.stopScreencast", session_id.as_deref())
@@ -763,6 +836,8 @@ mod tests {
             frame_watch,
             Arc::new(super::super::ScreencastConfig::default()),
             client_slot,
+            Arc::new(RwLock::new(None)),
+            Arc::new(super::super::presentation::Presentation::new()),
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
             client_count,
@@ -1189,6 +1264,8 @@ mod tests {
             frame_watch,
             Arc::new(super::super::ScreencastConfig::default()),
             Arc::new(RwLock::new(Some(client.clone()))),
+            Arc::new(RwLock::new(None)),
+            Arc::new(super::super::presentation::Presentation::new()),
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(1)),

@@ -215,15 +215,12 @@ impl HostBinding {
                 ..Response::default()
             }));
         }
-        if crate::should_send_local_launch_config(&flags, &command) {
-            let response = send(crate::build_local_launch_command(&flags), &flags.session);
-            if !response.success {
-                return Ok(result(response));
-            }
-        }
+        let launch = crate::should_send_local_launch_config(&flags, &command)
+            .then(|| crate::build_local_launch_command(&flags));
         command[REQUEST_FIELD] = json!({ "namespace": self.config.namespace,
             "session": self.config.session, "captureDirectory": self.config.capture_directory,
-            "timeoutMs": invocation.timeout_ms, "expectedObservation": self.config.expected_observation });
+            "timeoutMs": invocation.timeout_ms, "expectedObservation": self.config.expected_observation,
+            "launch": launch });
         Ok(result(send(command, &flags.session)))
     }
 }

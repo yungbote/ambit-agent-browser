@@ -24,6 +24,22 @@ agent-browser stream disable           # Stop streaming for the session
 
 Use [Video Recording](/recording) when you need a saved WebM or MP4 artifact instead of a live WebSocket stream. Recording requires `ffmpeg` on `PATH`.
 
+## Owned Chromium window on Linux
+
+The primary presentation receives up to 20 fps through the existing acknowledgment-paced stream. Secondary viewers stay at 10 fps, and capture returns to 10 fps when the primary disconnects. A slow viewer receives the latest frame without accumulating a queue; large windows may capture more slowly.
+
+Set `AGENT_BROWSER_WINDOW_STREAM=1` to show the actual Chromium tabs, address bar, menus, dialogs and native cursor. The driver launches its automated Chromium process on a private authenticated Xvfb display and owns both until that browser closes. Install the host-built `browser-display` helper beside the native executable, or set its absolute path with `AGENT_BROWSER_DISPLAY_HELPER`. An inherited desktop display is not used for this mode.
+
+The existing stream carries full-window JPEG frames with a `surface` object: `kind: "browser-window"`, `coordinateSpace: "display-pixels"`, a UUID `generation`, physical `width` and `height`, `originX: 0`, `originY: 0`, `deviceScaleFactor: 2`, and `cursorIncluded: true`. These frames omit CDP page-frame metadata. Native UI scale is fixed at 2; Chromium page zoom and page screenshots retain their independently measured CSS geometry.
+
+A configured viewer supplies a stable UUID and `width`/`height` in CSS pixels, each from 1 through 2048. The first viewer owns presentation, with a two-second grace for reconnecting under the same UUID. Other viewers scale the same window. Layout changes run at existing command boundaries, wait for native geometry and unblocked-page compositor feedback, and invalidate older observations. A known native modal uses the acknowledged window surface while page feedback remains unavailable; resize does not dismiss it. A human input lease defers passive layout changes. The existing stream reports `presentation` with `role`, requested dimensions and the applied surface, or `error: "viewport_unavailable"`. Raster dimensions are bounded at 4096×4096; large surfaces have higher capture cost.
+
+Human window input uses the existing host lease and sequence with `expectedSurfaceGeneration` from the painted frame. Pointer coordinates are physical pixels; wheel distances remain CSS distances. A stale generation yields `browser_control_surface_stale` before input or sequence consumption. A controlled `viewport` event uses CSS dimensions and must be the only event in its batch. Touch interfaces translate gestures into native mouse/wheel input, because this X11 helper does not provide multitouch.
+
+Explicit Copy and Paste operate on the native focused control, including the address bar. Each paste is one `insertText` event, with at most 1 MiB of UTF-8 text and a 6 MiB plus 8192 byte encoded envelope. Ordinary input batches stay bounded at 64 KiB. Clipboard delivery does not imply that all application reactions have completed. Empty or masked-password selections leave the user's local clipboard unchanged.
+
+CLI and MCP automation continue to use their existing page tools. After handoff or layout changes, obtain a fresh page observation before choosing another action. The native driver observes actual window/page focus rather than assuming its last selected tab is still visible. Ambiguous focus and pinned-tab mismatches require explicit selection. A native window close keeps the daemon available for an explicit `open`; that creates a new browser, without claiming to restore closed tabs. The CLI `close` command ends the session and its display.
+
 ## Runtime status response
 
 `agent-browser stream status --json` returns data like:
@@ -170,7 +186,7 @@ A `config` message sent later still wins. An unrecognized or unparsable value on
 
 ## Native activity and host control
 
-Host controller input batches also accept `{ "type": "viewport", "width": 640, "height": 480 }`, with integer CSS dimensions from 1 through 32768. Resizing uses the same sequence and acknowledgement as pointer or keyboard input, preserves the current device scale and mobile emulation, and updates stream geometry before the next event in that batch. An acquisition waits at most two seconds for an active agent command, then reports `browser_control_unavailable` if it is still busy; no controller is created by that refusal. A shared five-second preparation deadline covers the stream-input gate, prior acknowledgements, and held-input cleanup.
+Page-stream controller input batches also accept `{ "type": "viewport", "width": 640, "height": 480 }`, with integer CSS dimensions from 1 through 32768. Resizing uses the same sequence and acknowledgement as pointer or keyboard input, preserves the current device scale and mobile emulation, and updates stream geometry before the next event in that batch. An acquisition waits at most two seconds for an active agent command, then reports `browser_control_unavailable` if it is still busy; no controller is created by that refusal. A shared five-second preparation deadline covers the stream-input gate, prior acknowledgements, and held-input cleanup.
 
 Native stream frames include an opaque `pageGeneration`. Acknowledged CDP mouse input emits `pointer` records with that identity, `source` (`agent` or `human`), `eventType` (`move`, `press`, `release`, `scroll`), viewport CSS `x`/`y`, buttons, modifiers and an epoch-millisecond timestamp. Typing and programmatic scrolling emit `activity` records with `kind: "typing"` or `kind: "scrolling"`, identity, source and timestamp only. Neither record includes typed text, keys, selectors or controller identities. Main-page navigation and acknowledged viewport changes emit a pointer `reset` with a new generation. Display activity only against a frame carrying the same generation; unknown or rejected input produces no activity claim.
 
@@ -178,7 +194,7 @@ Native stream frames include an opaque `pageGeneration`. Acknowledged CDP mouse 
 
 Host control supports sequenced `navigation` events with `action` `navigate`, `back`, `forward`, or `reload`; only `navigate` includes `url`. The same CLI URL normalization and native network policy apply. An acknowledged navigation may continue loading or display a browser error page. Existing URL stream records include observed `canGoBack` and `canGoForward` booleans when history is available, including initial attachment.
 
-Explicit `{ "op": "copy", "controllerId": "..." }` reads plain selected text in the actual focused page/input/frame, including shadow roots. Its result keeps the controller identity, expiry and last sequence, adds `status: "copied"`, and returns `clipboard: { text, bytes, complete: true }`. The UTF-8 text limit is 1 MiB; larger selections return `browser_control_copy_too_large` without truncation. Copy responses allow 6 MiB plus framing for JSON escaping; input requests remain at 64 KiB. No system clipboard is read and no browser clipboard permission is changed. Masked password fields yield no copyable text, matching Chromium; clients leave their local clipboard unchanged for an empty selection.
+In page streaming mode, explicit `{ "op": "copy", "controllerId": "..." }` reads plain selected text in the actual focused page/input/frame, including shadow roots. Its result keeps the controller identity, expiry and last sequence, adds `status: "copied"`, and returns `clipboard: { text, bytes, complete: true }`. The UTF-8 text limit is 1 MiB; larger selections return `browser_control_copy_too_large` without truncation. Copy responses allow 6 MiB plus framing for JSON escaping; input requests remain at 64 KiB. No system clipboard is read and no browser clipboard permission is changed. Masked password fields yield no copyable text, matching Chromium; clients leave their local clipboard unchanged for an empty selection.
 
 ## Input injection
 

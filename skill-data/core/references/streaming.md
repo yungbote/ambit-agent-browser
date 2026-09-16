@@ -7,11 +7,36 @@ Stream a session's viewport over WebSocket and drive it with remote input. This 
 ## Contents
 
 - [Enabling the stream](#enabling-the-stream)
+- [Owned Chromium window](#owned-chromium-window)
 - [Connecting](#connecting)
 - [Messages from the server](#messages-from-the-server)
 - [Messages from the client](#messages-from-the-client)
 - [Frame rate and staleness](#frame-rate-and-staleness)
 - [Limitations](#limitations)
+
+## Owned Chromium window
+
+While a primary presenter is connected, native capture and its delivery are capped at 20 fps. Secondary viewers stay capped at 10 fps, and capture returns to 10 fps after primary disconnect. Lower per-client limits apply to delivery; capture cadence follows primary presence. Existing acknowledgment pacing and latest-frame replacement bound work for a slow viewer; the raster limit is not a promise of constant frame rate.
+
+`AGENT_BROWSER_WINDOW_STREAM=1` selects a private authenticated Linux Xvfb display for the same locally launched Chromium process used by CLI/MCP automation. Its frame includes native tabs, the address bar, menus, dialogs and the XFixes cursor. The host supplies a `browser-display` executable beside the native driver, or an absolute `AGENT_BROWSER_DISPLAY_HELPER` path. The helper and private display share the Chrome process lifetime. This mode refuses an inherited display; it does not attach to a global desktop.
+
+The existing WebSocket upgrade accepts the `X-Ambit-Browser-Viewer` UUID header and `width`/`height` query parameters, all present or all omitted. Dimensions are positive CSS integers up to 2048. The first configured viewer owns layout; other viewers receive a secondary role and scale the same surface. Reconnect under the same UUID within two seconds to retain presentation ownership. The old connection's closure cannot clear a newer connection. A human input lease defers passive layout changes.
+
+The existing stream sends these records:
+
+```json
+{"type":"presentation","role":"primary","requested":{"width":780,"height":600},"applied":{"kind":"browser-window","coordinateSpace":"display-pixels","generation":"d65bab6a-3a6d-42d5-826a-d794155ea2b6","width":1560,"height":1200,"originX":0,"originY":0,"deviceScaleFactor":2,"cursorIncluded":true}}
+```
+
+Each full-window `frame` has the same `surface` shape, its existing `seq`, and JPEG `data`; it omits page screencast `metadata`. The raster is bounded at 4096×4096. Native UI scale remains 2 independently of the viewing device and of Chromium's page zoom. The driver serializes actual RandR/window resize, clears prior page-metrics emulation, invalidates observations, and waits for native acknowledgment plus an unblocked visible-page compositor readback before publishing the applied surface. For a known native modal, it preserves the dialog and publishes the acknowledged native surface while page feedback remains unavailable. A refused layout reports `presentation.error: "viewport_unavailable"`. Large surfaces cost more to capture; the dimension limit is not a frame-rate guarantee.
+
+Human control remains an internal host operation under the existing controller lease and input sequence. Full-window input adds the painted `expectedSurfaceGeneration`; mismatch returns `browser_control_surface_stale` without effects or sequence consumption. Mouse coordinates are physical display pixels, and wheel distances remain CSS distances. A `viewport` event accepts CSS dimensions and must be the sole event in the batch. The X11 helper supports keyboard and mouse; clients implement touch gestures through those native primitives instead of sending CDP touch coordinates over a window frame.
+
+Copy invokes Chromium's native Copy on the current focused control, including browser chrome, and returns at most 1 MiB of exact UTF-8 text. Empty/password selections do not replace the user's local clipboard. Paste is one `input_keyboard` / `insertText` event per explicit intent. This single-event request permits 1 MiB of UTF-8 text, with an encoded native envelope bounded at `6 * 1024 * 1024 + 8192` bytes. Ordinary input envelopes remain at 65536 bytes. Both limits include native framing. Never split one paste into multiple native Ctrl+V operations or replay an unknown input. Clipboard transfer acknowledgment proves delivery, not completion of every application reaction.
+
+Actual CDP agent pointer events may include a proven display-pixel action marker with `source: "agent"` and `surfaceGeneration`. The driver derives this only from a trusted event observed in its private page realm during the acknowledged command. Unmatched events remain in viewport CSS space and must not be overlaid on full-window pixels. This marker is separate from the captured native user cursor; neither telemetry path exposes typed text or clipboard content.
+
+Before ordinary page actions, the driver observes native window focus and actual page visibility. Ambiguous focus and pinned-tab mismatches require explicit tab selection. After human handback or a layout change, CLI callers must obtain a new snapshot or screenshot; host-bound MCP supplies fresh feedback with `browser_observation_required`. Queued actions admitted before the layout change cannot use a later observation to replay stale coordinates. Native window closure leaves the existing daemon available for an explicit `open`, which creates a new browser with a fresh target. `close` ends that session and reaps its display. Unlabelled stream loss still does not prove permanent closure.
 
 ## Enabling the stream
 
