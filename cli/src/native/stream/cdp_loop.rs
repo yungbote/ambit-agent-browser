@@ -113,6 +113,7 @@ pub(super) async fn cdp_event_loop(
     screencast_config: Arc<super::ScreencastConfig>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<crate::native::display::DisplayClient>>>>,
+    presentation: Arc<super::presentation::Presentation>,
     client_notify: Arc<tokio::sync::Notify>,
     screencasting: Arc<Mutex<bool>>,
     client_count: Arc<Mutex<usize>>,
@@ -208,12 +209,26 @@ pub(super) async fn cdp_event_loop(
                 let mut seed_in_flight = supports_same_document_navigation;
                 let mut active_main_frame_id = None;
                 let mut pending_same_document = VecDeque::<(Option<String>, String, String)>::new();
-                let mut display_tick = tokio::time::interval(std::time::Duration::from_millis(100));
+                let mut presentation_rx = presentation.subscribe();
+                let mut capture_fps = presentation.capture_fps();
+                let mut display_tick = tokio::time::interval(std::time::Duration::from_millis(
+                    1000 / u64::from(capture_fps),
+                ));
                 display_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut display_failed = false;
 
                 loop {
                     tokio::select! {
+                        changed = presentation_rx.changed(), if display.is_some() => {
+                            if changed.is_err() { break; }
+                            let next = presentation.capture_fps();
+                            if next != capture_fps {
+                                capture_fps = next;
+                                let period = std::time::Duration::from_millis(1000 / u64::from(capture_fps));
+                                display_tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
+                                display_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                            }
+                        }
                         _ = display_tick.tick(), if display.is_some() && !display_failed => {
                             match display.as_ref().unwrap().capture().await {
                                 Ok((capture, surface)) => {
@@ -822,6 +837,7 @@ mod tests {
             Arc::new(super::super::ScreencastConfig::default()),
             client_slot,
             Arc::new(RwLock::new(None)),
+            Arc::new(super::super::presentation::Presentation::new()),
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
             client_count,
@@ -1249,6 +1265,7 @@ mod tests {
             Arc::new(super::super::ScreencastConfig::default()),
             Arc::new(RwLock::new(Some(client.clone()))),
             Arc::new(RwLock::new(None)),
+            Arc::new(super::super::presentation::Presentation::new()),
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(1)),

@@ -16,6 +16,8 @@ Stream a session's viewport over WebSocket and drive it with remote input. This 
 
 ## Owned Chromium window
 
+While a primary presenter is connected, native capture and its delivery are capped at 20 fps. Secondary viewers stay capped at 10 fps, and capture returns to 10 fps after primary disconnect. Lower per-client limits apply to delivery; capture cadence follows primary presence. Existing acknowledgment pacing and latest-frame replacement bound work for a slow viewer; the raster limit is not a promise of constant frame rate.
+
 `AGENT_BROWSER_WINDOW_STREAM=1` selects a private authenticated Linux Xvfb display for the same locally launched Chromium process used by CLI/MCP automation. Its frame includes native tabs, the address bar, menus, dialogs and the XFixes cursor. The host supplies a `browser-display` executable beside the native driver, or an absolute `AGENT_BROWSER_DISPLAY_HELPER` path. The helper and private display share the Chrome process lifetime. This mode refuses an inherited display; it does not attach to a global desktop.
 
 The existing WebSocket upgrade accepts the `X-Ambit-Browser-Viewer` UUID header and `width`/`height` query parameters, all present or all omitted. Dimensions are positive CSS integers up to 2048. The first configured viewer owns layout; other viewers receive a secondary role and scale the same surface. Reconnect under the same UUID within two seconds to retain presentation ownership. The old connection's closure cannot clear a newer connection. A human input lease defers passive layout changes.

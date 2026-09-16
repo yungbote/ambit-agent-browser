@@ -460,7 +460,10 @@ async fn handle_ws_client(
 
     client_notify.notify_one();
 
-    let mut next_allowed = deadline_from(last_sent, initial_config.max_fps);
+    let mut next_allowed = deadline_from(
+        last_sent,
+        presentation.client_fps(connection_id, initial_config.max_fps),
+    );
     let mut pending_frame = false;
 
     loop {
@@ -501,6 +504,7 @@ async fn handle_ws_client(
                 let config = initial_config.presentation.unwrap();
                 presentation.claim_if_available(connection_id, config);
                 presentation_rx.borrow_and_update();
+                next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, config_rx.borrow().max_fps));
                 if ws_tx.send(Message::Text(presentation.acknowledgment(connection_id, config).to_string())).await.is_err() { break; }
             }
             changed = config_rx.changed() => {
@@ -512,7 +516,7 @@ async fn handle_ws_client(
                 let cfg = *config_rx.borrow_and_update();
                 // Loosening the cap pulls the deadline into the past, so a
                 // pending frame goes out at once.
-                next_allowed = deadline_from(last_sent, cfg.max_fps);
+                next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, cfg.max_fps));
                 // Leaving ack pacing releases a frame that is still waiting on
                 // an acknowledgement the client will now never send.
                 if !cfg.ack_pacing {
@@ -559,7 +563,7 @@ async fn handle_ws_client(
                     }
                     last_sent = Some(Instant::now());
                 }
-                next_allowed = deadline_from(last_sent, cfg.max_fps);
+                next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, cfg.max_fps));
             }
         }
     }

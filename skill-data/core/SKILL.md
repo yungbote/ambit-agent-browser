@@ -360,6 +360,8 @@ See [references/video-recording.md](references/video-recording.md) for frame rat
 
 ### Owned browser window
 
+The native primary presentation uses acknowledgment-paced delivery up to 20 fps; secondary viewers stay at 10 fps. Slow viewers receive the latest frame without a growing queue.
+
 A Linux host may enable `AGENT_BROWSER_WINDOW_STREAM=1` to show the actual Chromium window while the normal CLI and MCP tools automate that same browser. Human window input and agent page coordinates use different spaces: stream surfaces are physical display pixels at native UI scale 2; screenshots from page tools retain their measured viewport CSS mapping and page zoom. After a user handoff or dock layout change, use a fresh snapshot or screenshot before choosing the next action. Host-bound MCP supplies this observation with `browser_observation_required`; do not replay the blocked action. Native tab focus is re-observed before page commands, and ambiguous or pinned-tab mismatches require explicit tab selection. See [references/streaming.md](references/streaming.md) for the window protocol, helper requirements, clipboard limits and lifecycle.
 
 ### Iframes

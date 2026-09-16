@@ -428,6 +428,7 @@ impl StreamServer {
         let recording_bg = recording.clone();
         let frame_watch_bg = frame_watch_tx.clone();
         let screencast_cfg_bg = screencast_config.clone();
+        let presentation_bg = presentation.clone();
         let cdp_task = tokio::spawn(async move {
             cdp_loop::cdp_event_loop(
                 frame_tx_bg,
@@ -435,6 +436,7 @@ impl StreamServer {
                 screencast_cfg_bg,
                 client_slot_bg,
                 display_slot_bg,
+                presentation_bg,
                 client_notify_bg,
                 screencasting_bg,
                 client_count_bg,

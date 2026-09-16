@@ -26,6 +26,8 @@ Use [Video Recording](/recording) when you need a saved WebM or MP4 artifact ins
 
 ## Owned Chromium window on Linux
 
+The primary presentation receives up to 20 fps through the existing acknowledgment-paced stream. Secondary viewers stay at 10 fps, and capture returns to 10 fps when the primary disconnects. A slow viewer receives the latest frame without accumulating a queue; large windows may capture more slowly.
+
 Set `AGENT_BROWSER_WINDOW_STREAM=1` to show the actual Chromium tabs, address bar, menus, dialogs and native cursor. The driver launches its automated Chromium process on a private authenticated Xvfb display and owns both until that browser closes. Install the host-built `browser-display` helper beside the native executable, or set its absolute path with `AGENT_BROWSER_DISPLAY_HELPER`. An inherited desktop display is not used for this mode.
 
 The existing stream carries full-window JPEG frames with a `surface` object: `kind: "browser-window"`, `coordinateSpace: "display-pixels"`, a UUID `generation`, physical `width` and `height`, `originX: 0`, `originY: 0`, `deviceScaleFactor: 2`, and `cursorIncluded: true`. These frames omit CDP page-frame metadata. Native UI scale is fixed at 2; Chromium page zoom and page screenshots retain their independently measured CSS geometry.

@@ -78,6 +78,37 @@ impl Presentation {
         self.cell.borrow().owner.is_some()
     }
 
+    pub(crate) fn capture_fps(&self) -> u32 {
+        if self
+            .cell
+            .borrow()
+            .owner
+            .as_ref()
+            .is_some_and(|owner| owner.disconnected_until.is_none())
+        {
+            20
+        } else {
+            10
+        }
+    }
+
+    pub(crate) fn client_fps(&self, connection: Uuid, requested: u32) -> u32 {
+        let state = self.cell.borrow();
+        let Some(owner) = state.owner.as_ref() else {
+            return requested;
+        };
+        let limit = if owner.connection == connection && owner.disconnected_until.is_none() {
+            20
+        } else {
+            10
+        };
+        if requested == 0 {
+            limit
+        } else {
+            requested.min(limit)
+        }
+    }
+
     pub(crate) fn configure(&self, connection: Uuid, config: PresentationConfig) {
         self.configure_inner(connection, config, true);
     }
@@ -352,5 +383,31 @@ mod tests {
         assert!(state.pending("owned-window").is_some());
         state.disconnect(first);
         assert_eq!(state.acknowledgment(reconnect, config)["role"], "primary");
+    }
+
+    #[test]
+    fn only_the_connected_primary_gets_interactive_frame_pacing() {
+        let state = Presentation::new();
+        let primary = Uuid::new_v4();
+        let secondary = Uuid::new_v4();
+        let config = PresentationConfig {
+            viewer: Uuid::new_v4(),
+            width: 780,
+            height: 600,
+        };
+        assert_eq!(state.capture_fps(), 10);
+        assert_eq!(state.client_fps(primary, 60), 60);
+        state.configure(primary, config);
+        assert_eq!(state.capture_fps(), 20);
+        assert_eq!(state.client_fps(primary, 20), 20);
+        assert_eq!(state.client_fps(primary, 5), 5);
+        assert_eq!(state.client_fps(secondary, 20), 10);
+        assert_eq!(state.client_fps(secondary, 0), 10);
+        state.disconnect(primary);
+        assert_eq!(state.capture_fps(), 10);
+        assert_eq!(state.client_fps(primary, 20), 10);
+        state.configure(secondary, config);
+        assert_eq!(state.client_fps(primary, 20), 10);
+        assert_eq!(state.client_fps(secondary, 20), 20);
     }
 }
