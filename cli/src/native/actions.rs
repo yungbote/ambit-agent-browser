@@ -6293,11 +6293,11 @@ async fn handle_check(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         &state.iframe_sessions,
     )
     .await?;
-    if clicked.dialog_opened {
-        state.pending_pointer_release = clicked.pending_release;
-        return Ok(json!({"dialogOpened":true}));
+    if clicked.input.dialog_opened {
+        state.pending_pointer_release = clicked.input.pending_release;
+        return Ok(json!({"dialogOpened":true,"method":clicked.method}));
     }
-    Ok(json!({ "checked": selector }))
+    Ok(json!({ "checked": selector, "method":clicked.method }))
 }
 
 async fn handle_uncheck(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -6317,11 +6317,11 @@ async fn handle_uncheck(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         &state.iframe_sessions,
     )
     .await?;
-    if clicked.dialog_opened {
-        state.pending_pointer_release = clicked.pending_release;
-        return Ok(json!({"dialogOpened":true}));
+    if clicked.input.dialog_opened {
+        state.pending_pointer_release = clicked.input.pending_release;
+        return Ok(json!({"dialogOpened":true,"method":clicked.method}));
     }
-    Ok(json!({ "unchecked": selector }))
+    Ok(json!({ "unchecked": selector, "method":clicked.method }))
 }
 
 async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -9777,11 +9777,11 @@ async fn execute_subaction(
                 &state.iframe_sessions,
             )
             .await?;
-            if clicked.dialog_opened {
-                state.pending_pointer_release = clicked.pending_release;
-                return Ok(json!({"dialogOpened":true}));
+            if clicked.input.dialog_opened {
+                state.pending_pointer_release = clicked.input.pending_release;
+                return Ok(json!({"dialogOpened":true,"method":clicked.method}));
             }
-            Ok(json!({ "checked": selector }))
+            Ok(json!({ "checked": selector, "method":clicked.method }))
         }
         "hover" => {
             interaction::hover(

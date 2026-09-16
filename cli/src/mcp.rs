@@ -955,8 +955,8 @@ fn tools() -> Vec<Value> {
         ),
         tool(TOOL_HOVER, "Hover element", "Hover an element.", json!({ "selector": selector_schema() }), &["selector"]),
         tool(TOOL_FOCUS, "Focus element", "Focus an element.", json!({ "selector": selector_schema() }), &["selector"]),
-        tool(TOOL_CHECK, "Check element", "Check a checkbox or switch.", json!({ "selector": selector_schema() }), &["selector"]),
-        tool(TOOL_UNCHECK, "Uncheck element", "Uncheck a checkbox or switch.", json!({ "selector": selector_schema() }), &["selector"]),
+        tool(TOOL_CHECK, "Check element", "Check a checkbox or switch with one verified activation. Returns the actual native, CDP, DOM, or unchanged method.", json!({ "selector": selector_schema() }), &["selector"]),
+        tool(TOOL_UNCHECK, "Uncheck element", "Uncheck a checkbox or switch with one verified activation. Returns the actual native, CDP, DOM, or unchanged method.", json!({ "selector": selector_schema() }), &["selector"]),
         tool(
             TOOL_SELECT,
             "Select options",

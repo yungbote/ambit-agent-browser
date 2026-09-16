@@ -18,6 +18,7 @@ const GEOMETRY: &str = "({scale:devicePixelRatio*(visualViewport?.scale??1),widt
 
 #[derive(Clone)]
 struct Mapping {
+    session: String,
     pointer: NativePointer,
     surface: String,
     window: (u32, i32, i32, u32, u32),
@@ -67,9 +68,9 @@ impl NativeMouse {
         &self,
         mapping: &Mapping,
         client: &CdpClient,
-        session: &str,
         display: &DisplayClient,
     ) -> Result<(), String> {
+        let session = mapping.session.as_str();
         if !display.ready()
             || mapping.surface != display.surface().generation
             || mapping.pointer.page_generation != client.page_generation(session)
@@ -109,7 +110,7 @@ impl NativeMouse {
             return Err("browser_control_outcome_unknown: The native mouse input may have executed. Take control to inspect and release it; do not replay it.".into());
         }
         if let Some(mapping) = self.mappings.get(session) {
-            self.current(mapping, client, session, display).await?;
+            self.current(mapping, client, display).await?;
             return Ok(mapping.clone());
         }
         if self.buttons != 0 {
@@ -145,11 +146,12 @@ impl NativeMouse {
             "The browser did not report the native mouse position. No native button was sent.",
         )?;
         let mapping = Mapping {
+            session: session.into(),
             pointer,
             surface: surface.generation,
             window,
         };
-        self.current(&mapping, client, session, display).await?;
+        self.current(&mapping, client, display).await?;
         self.mappings.insert(session.into(), mapping.clone());
         Ok(mapping)
     }
@@ -172,16 +174,8 @@ impl NativeMouse {
             .ok_or("Invalid mouse y")?;
         let mapping = self.prepare(client, session, display, x, y).await?;
         let point = mapping.point(x, y, &display.surface())?;
-        self.dispatch_at(
-            params,
-            point,
-            &mapping,
-            client,
-            session,
-            display,
-            dialog_sessions,
-        )
-        .await
+        self.dispatch_at(params, point, &mapping, client, display, dialog_sessions)
+            .await
     }
 
     async fn dispatch_at(
@@ -190,10 +184,10 @@ impl NativeMouse {
         point: (f64, f64),
         mapping: &Mapping,
         client: &CdpClient,
-        session: &str,
         display: &DisplayClient,
         dialog_sessions: &[&str],
     ) -> Result<bool, String> {
+        let session = mapping.session.as_str();
         let event_type = params["type"].as_str().ok_or("Missing mouse event type")?;
         if !matches!(
             event_type,
@@ -221,8 +215,10 @@ impl NativeMouse {
         let screen_y = point.1 / f64::from(surface.device_scale_factor);
         // Held moves may cross an iframe. Their real helper acknowledgement
         // proves movement; only button boundaries need a renderer/dialog join.
-        let observe = !(event_type == "mouseMoved" && self.buttons != 0)
-            && !(event_type == "mouseReleased" && self.buttons == 0);
+        let observe = !matches!(
+            (event_type, self.buttons),
+            ("mouseMoved", 1..) | ("mouseReleased", 0)
+        );
         let mut events = client.subscribe();
         let mut event = crate::native::input::stream_event("input_mouse", &params);
         event["x"] = json!(point.0);
@@ -304,7 +300,6 @@ impl NativeMouse {
                 start,
                 &start_mapping,
                 client,
-                source.0,
                 display,
                 &[source.0, page_session],
             )
@@ -313,8 +308,7 @@ impl NativeMouse {
             return Ok(true);
         }
         for step in 1..=10 {
-            self.current(&start_mapping, client, source.0, display)
-                .await?;
+            self.current(&start_mapping, client, display).await?;
             let fraction = f64::from(step) / 10.0;
             let point = (
                 (start.0 + (end.0 - start.0) * fraction).round(),
@@ -325,21 +319,18 @@ impl NativeMouse {
                 point,
                 &start_mapping,
                 client,
-                source.0,
                 display,
                 &[source.0, page_session],
             )
             .await?;
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        self.current(&end_mapping, client, target.0, display)
-            .await?;
+        self.current(&end_mapping, client, display).await?;
         self.dispatch_at(
             params("mouseReleased", target.1, target.2, 0),
             end,
             &end_mapping,
             client,
-            target.0,
             display,
             &[target.0, page_session],
         )
@@ -353,6 +344,7 @@ mod tests {
 
     fn mapping(scale: f64, screen_y: f64) -> Mapping {
         Mapping {
+            session: "page".into(),
             pointer: NativePointer {
                 context: 7,
                 page_generation: "page".into(),

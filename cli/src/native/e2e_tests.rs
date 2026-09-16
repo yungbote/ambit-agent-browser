@@ -49,6 +49,138 @@ async fn control_test_command(command: &Value, state: &mut DaemonState) -> Value
     Box::pin(execute_command(command, state)).await
 }
 
+#[tokio::test]
+#[ignore]
+async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<!doctype html><div id=hidden><input id=control type=checkbox style='display:none'></div><input id=labelled type=checkbox style='display:none'><label for=labelled id=label>Visible checkbox label</label><div id=semantic role=checkbox aria-checked=false tabindex=0 style=padding:20px>Custom checkbox<input type=checkbox style=display:none></div><script>window.buttons=0;window.domClicks=0;window.refuse=false;window.ask=false;addEventListener('pointerdown',()=>buttons++,true);control.addEventListener('click',e=>{domClicks++;if(refuse)e.preventDefault();if(ask){ask=false;confirm('Apply checkbox?')}});semantic.addEventListener('click',()=>{const checked=semantic.getAttribute('aria-checked')!=='true';semantic.setAttribute('aria-checked',String(checked));semantic.querySelector('input').checked=checked});</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
+    for (action, method) in [("check", "dom"), ("check", "unchanged"), ("uncheck", "dom")] {
+        let result =
+            control_test_command(&json!({"action":action,"selector":"#hidden"}), &mut state).await;
+        assert_success(&result);
+        assert_eq!(result["data"]["method"], method);
+    }
+    let measured = control_test_command(
+        &json!({"action":"evaluate","script":"({buttons,domClicks,checked:control.checked})"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&measured);
+    assert_eq!(
+        measured["data"]["result"],
+        json!({"buttons":0,"domClicks":2,"checked":false})
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"evaluate","script":"control.disabled=true"}),
+            &mut state,
+        )
+        .await,
+    );
+    let disabled =
+        control_test_command(&json!({"action":"check","selector":"#hidden"}), &mut state).await;
+    assert_eq!(disabled["success"], false);
+    assert!(disabled["error"].as_str().unwrap().contains("disabled"));
+    // Current state is rechecked inside the semantic task, before any toggle.
+    assert_success(
+        &control_test_command(
+            &json!({"action":"evaluate","script":"control.disabled=false;control.checked=true"}),
+            &mut state,
+        )
+        .await,
+    );
+    let unchanged =
+        control_test_command(&json!({"action":"check","selector":"#hidden"}), &mut state).await;
+    assert_success(&unchanged);
+    assert_eq!(unchanged["data"]["method"], "unchanged");
+    assert_success(
+        &control_test_command(
+            &json!({"action":"evaluate","script":"control.checked=false;refuse=true"}),
+            &mut state,
+        )
+        .await,
+    );
+    let refused =
+        control_test_command(&json!({"action":"check","selector":"#hidden"}), &mut state).await;
+    assert_eq!(refused["success"], false);
+    assert!(refused["error"]
+        .as_str()
+        .unwrap()
+        .contains("requested state"));
+    let measured = control_test_command(
+        &json!({"action":"evaluate","script":"({buttons,domClicks,checked:control.checked})"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&measured);
+    assert_eq!(
+        measured["data"]["result"],
+        json!({"buttons":0,"domClicks":3,"checked":false})
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"evaluate","script":"refuse=false;ask=true"}),
+            &mut state,
+        )
+        .await,
+    );
+    let blocked =
+        control_test_command(&json!({"action":"check","selector":"#hidden"}), &mut state).await;
+    assert_success(&blocked);
+    assert_eq!(blocked["data"]["method"], "dom");
+    assert_eq!(blocked["data"]["dialogOpened"], true);
+    assert_success(
+        &control_test_command(&json!({"action":"dialog","response":"accept"}), &mut state).await,
+    );
+    let completed = control_test_command(
+        &json!({"action":"evaluate","script":"({buttons,domClicks,checked:control.checked})"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&completed);
+    assert_eq!(
+        completed["data"]["result"],
+        json!({"buttons":0,"domClicks":4,"checked":true})
+    );
+    // An associated visible label remains a real native pointer activation,
+    // even when the selector names its hidden input.
+    let labelled = control_test_command(
+        &json!({"action":"check","selector":"#labelled"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&labelled);
+    assert_eq!(labelled["data"]["method"], "native");
+    let measured = control_test_command(
+        &json!({"action":"evaluate","script":"({buttons,domClicks,checked:labelled.checked})"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&measured);
+    assert_eq!(
+        measured["data"]["result"],
+        json!({"buttons":1,"domClicks":4,"checked":true})
+    );
+    let semantic = control_test_command(
+        &json!({"action":"check","selector":"#semantic"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&semantic);
+    assert_eq!(semantic["data"]["method"], "native");
+    let measured = control_test_command(&json!({"action":"evaluate","script":"({buttons,domClicks,checked:semantic.getAttribute('aria-checked')})"}), &mut state).await;
+    assert_success(&measured);
+    assert_eq!(
+        measured["data"]["result"],
+        json!({"buttons":2,"domClicks":4,"checked":"true"})
+    );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
 /// Own-window mouse input uses the same command and takeover owners as CLI/MCP.
 /// Run with an existing Chrome executable and the host-built display helper.
 #[tokio::test]
