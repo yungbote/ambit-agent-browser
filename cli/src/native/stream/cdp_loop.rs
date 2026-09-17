@@ -1,11 +1,14 @@
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::time::Instant;
 
 use futures_util::FutureExt;
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 
+use crate::native::browser_control::custody_active;
 use crate::native::cdp::client::CdpClient;
+use crate::native::display::CaptureRequest;
 use crate::native::network;
 
 use super::timestamp_ms;
@@ -114,6 +117,7 @@ pub(super) async fn cdp_event_loop(
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<crate::native::display::DisplayClient>>>>,
     presentation: Arc<super::presentation::Presentation>,
+    mut custody: watch::Receiver<Option<Instant>>,
     client_notify: Arc<tokio::sync::Notify>,
     screencasting: Arc<Mutex<bool>>,
     client_count: Arc<Mutex<usize>>,
@@ -210,38 +214,71 @@ pub(super) async fn cdp_event_loop(
                 let mut active_main_frame_id = None;
                 let mut pending_same_document = VecDeque::<(Option<String>, String, String)>::new();
                 let mut presentation_rx = presentation.subscribe();
-                let mut capture_fps = presentation.capture_fps();
-                let mut display_tick = tokio::time::interval(std::time::Duration::from_millis(
-                    1000 / u64::from(capture_fps),
-                ));
+                // Pacing follows the viewing situation: the presenter roster
+                // and the human lease. Both are re-read at every tick, so a
+                // lease that lapses without a message still slows capture.
+                let mut controlled = custody_active(*custody.borrow_and_update());
+                let mut pacing = presentation.capture_pacing(controlled);
+                let mut display_tick = tokio::time::interval(pacing.period());
                 display_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 let mut display_failed = false;
+                // The generation the newest published frame carries. A rotated
+                // generation is republished on unchanged pixels so viewers can
+                // name the current surface in their next input.
+                let mut published_generation: Option<String> = None;
+                macro_rules! repace {
+                    () => {{
+                        let next = presentation.capture_pacing(controlled);
+                        if next != pacing {
+                            pacing = next;
+                            display_tick = tokio::time::interval_at(
+                                tokio::time::Instant::now() + pacing.period(),
+                                pacing.period(),
+                            );
+                            display_tick
+                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                        }
+                    }};
+                }
 
                 loop {
                     tokio::select! {
                         changed = presentation_rx.changed(), if display.is_some() => {
                             if changed.is_err() { break; }
-                            let next = presentation.capture_fps();
-                            if next != capture_fps {
-                                capture_fps = next;
-                                let period = std::time::Duration::from_millis(1000 / u64::from(capture_fps));
-                                display_tick = tokio::time::interval_at(tokio::time::Instant::now() + period, period);
-                                display_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                            }
+                            repace!();
+                        }
+                        changed = custody.changed(), if display.is_some() => {
+                            if changed.is_err() { break; }
+                            controlled = custody_active(*custody.borrow_and_update());
+                            repace!();
                         }
                         _ = display_tick.tick(), if display.is_some() && !display_failed => {
-                            match display.as_ref().unwrap().capture().await {
-                                Ok((capture, surface)) => {
+                            let now_controlled = custody_active(*custody.borrow());
+                            if now_controlled != controlled {
+                                controlled = now_controlled;
+                                repace!();
+                            }
+                            let display = display.as_ref().unwrap();
+                            let request = CaptureRequest {
+                                // A controlling client renders its own pointer.
+                                cursor: !controlled,
+                                budget_bytes: pacing.budget_bytes,
+                                force: published_generation.as_deref() != Some(display.surface().generation.as_str()),
+                            };
+                            match display.capture(request).await {
+                                Ok(Some((capture, surface))) => {
                                     let seq = super::next_frame_seq();
                                     let message = json!({
                                         "type": "frame", "seq": seq, "encoding": capture.encoding,
                                         "data": capture.data, "surface": surface,
                                     });
+                                    published_generation = Some(surface.generation);
                                     frame_watch.send_replace(Some(Arc::new(super::StreamFrame {
                                         seq: Some(seq), json: message.to_string(),
                                     })));
                                 }
-                                Err(error) if error.code == "display_layout_pending" => {},
+                                Ok(None) => {}
+                                Err(error) if error.is_transient() => {}
                                 Err(_) => {
                                     display_failed = true;
                                     frame_watch.send_replace(None);
@@ -838,6 +875,7 @@ mod tests {
             client_slot,
             Arc::new(RwLock::new(None)),
             Arc::new(super::super::presentation::Presentation::new()),
+            watch::channel(None).1,
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
             client_count,
@@ -1266,6 +1304,7 @@ mod tests {
             Arc::new(RwLock::new(Some(client.clone()))),
             Arc::new(RwLock::new(None)),
             Arc::new(super::super::presentation::Presentation::new()),
+            watch::channel(None).1,
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(1)),

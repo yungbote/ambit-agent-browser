@@ -429,6 +429,7 @@ impl StreamServer {
         let frame_watch_bg = frame_watch_tx.clone();
         let screencast_cfg_bg = screencast_config.clone();
         let presentation_bg = presentation.clone();
+        let custody_bg = browser_control.lock().await.custody();
         let cdp_task = tokio::spawn(async move {
             cdp_loop::cdp_event_loop(
                 frame_tx_bg,
@@ -437,6 +438,7 @@ impl StreamServer {
                 client_slot_bg,
                 display_slot_bg,
                 presentation_bg,
+                custody_bg,
                 client_notify_bg,
                 screencasting_bg,
                 client_count_bg,

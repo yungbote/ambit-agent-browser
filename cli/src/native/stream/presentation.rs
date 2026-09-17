@@ -9,6 +9,35 @@ use uuid::Uuid;
 
 const RECONNECT_GRACE: Duration = Duration::from_secs(2);
 
+/// Capture rate and encoded-size budget for one viewing situation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct FramePacing {
+    pub fps: u32,
+    pub budget_bytes: u32,
+}
+
+impl FramePacing {
+    /// A human holds the input lease: input feedback must feel immediate.
+    pub(crate) const CONTROLLED: Self = Self {
+        fps: 30,
+        budget_bytes: 120_000,
+    };
+    /// A presenter is connected and watching the agent work.
+    pub(crate) const PRESENTED: Self = Self {
+        fps: 15,
+        budget_bytes: 200_000,
+    };
+    /// Secondary viewers only.
+    pub(crate) const PASSIVE: Self = Self {
+        fps: 10,
+        budget_bytes: 300_000,
+    };
+
+    pub(crate) fn period(self) -> Duration {
+        Duration::from_micros(1_000_000 / u64::from(self.fps))
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PresentationConfig {
     pub viewer: Uuid,
@@ -78,29 +107,41 @@ impl Presentation {
         self.cell.borrow().owner.is_some()
     }
 
-    pub(crate) fn capture_fps(&self) -> u32 {
-        if self
-            .cell
+    fn presented(&self) -> bool {
+        self.cell
             .borrow()
             .owner
             .as_ref()
             .is_some_and(|owner| owner.disconnected_until.is_none())
-        {
-            20
+    }
+
+    /// Frame pacing follows who is looking: a controlling human gets the
+    /// interactive rate, a connected presenter a reading rate, anyone else
+    /// the passive rate. The budget bounds encoded bytes per frame so the
+    /// stream's bitrate stays roughly level across rates.
+    pub(crate) fn capture_pacing(&self, controlled: bool) -> FramePacing {
+        if controlled {
+            FramePacing::CONTROLLED
+        } else if self.presented() {
+            FramePacing::PRESENTED
         } else {
-            10
+            FramePacing::PASSIVE
         }
     }
 
-    pub(crate) fn client_fps(&self, connection: Uuid, requested: u32) -> u32 {
+    pub(crate) fn client_fps(&self, connection: Uuid, requested: u32, controlled: bool) -> u32 {
         let state = self.cell.borrow();
         let Some(owner) = state.owner.as_ref() else {
             return requested;
         };
         let limit = if owner.connection == connection && owner.disconnected_until.is_none() {
-            20
+            if controlled {
+                FramePacing::CONTROLLED.fps
+            } else {
+                FramePacing::PRESENTED.fps
+            }
         } else {
-            10
+            FramePacing::PASSIVE.fps
         };
         if requested == 0 {
             limit
@@ -395,19 +436,47 @@ mod tests {
             width: 780,
             height: 600,
         };
-        assert_eq!(state.capture_fps(), 10);
-        assert_eq!(state.client_fps(primary, 60), 60);
+        assert_eq!(state.capture_pacing(false), FramePacing::PASSIVE);
+        assert_eq!(state.client_fps(primary, 60, false), 60);
         state.configure(primary, config);
-        assert_eq!(state.capture_fps(), 20);
-        assert_eq!(state.client_fps(primary, 20), 20);
-        assert_eq!(state.client_fps(primary, 5), 5);
-        assert_eq!(state.client_fps(secondary, 20), 10);
-        assert_eq!(state.client_fps(secondary, 0), 10);
+        assert_eq!(state.capture_pacing(false), FramePacing::PRESENTED);
+        assert_eq!(state.client_fps(primary, 20, false), 15);
+        assert_eq!(state.client_fps(primary, 5, false), 5);
+        assert_eq!(state.client_fps(secondary, 20, false), 10);
+        assert_eq!(state.client_fps(secondary, 0, false), 10);
         state.disconnect(primary);
-        assert_eq!(state.capture_fps(), 10);
-        assert_eq!(state.client_fps(primary, 20), 10);
+        assert_eq!(state.capture_pacing(false), FramePacing::PASSIVE);
+        assert_eq!(state.client_fps(primary, 20, false), 10);
         state.configure(secondary, config);
-        assert_eq!(state.client_fps(primary, 20), 10);
-        assert_eq!(state.client_fps(secondary, 20), 20);
+        assert_eq!(state.client_fps(primary, 20, false), 10);
+        assert_eq!(state.client_fps(secondary, 20, false), 15);
+    }
+
+    /// A human lease raises the rate for the controlling presenter only, and
+    /// tightens the per-frame byte budget so the bitrate stays level.
+    #[test]
+    fn a_human_lease_raises_the_primary_rate_and_tightens_the_budget() {
+        let state = Presentation::new();
+        let primary = Uuid::new_v4();
+        let secondary = Uuid::new_v4();
+        let config = PresentationConfig {
+            viewer: Uuid::new_v4(),
+            width: 780,
+            height: 600,
+        };
+        assert_eq!(state.capture_pacing(true), FramePacing::CONTROLLED);
+        state.configure(primary, config);
+        assert_eq!(state.capture_pacing(true).fps, 30);
+        assert!(
+            FramePacing::CONTROLLED.budget_bytes < FramePacing::PRESENTED.budget_bytes
+                && FramePacing::PRESENTED.budget_bytes < FramePacing::PASSIVE.budget_bytes
+        );
+        assert_eq!(state.client_fps(primary, 0, true), 30);
+        assert_eq!(state.client_fps(primary, 20, true), 20);
+        assert_eq!(state.client_fps(secondary, 0, true), 10);
+        assert_eq!(
+            FramePacing::CONTROLLED.period(),
+            Duration::from_micros(33_333)
+        );
     }
 }

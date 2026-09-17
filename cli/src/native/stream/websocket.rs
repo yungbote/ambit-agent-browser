@@ -11,7 +11,7 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
-use crate::native::browser_control::BrowserControl;
+use crate::native::browser_control::{custody_active, BrowserControl};
 use crate::native::cdp::client::CdpClient;
 #[cfg(test)]
 use crate::native::input::keyboard_params;
@@ -367,6 +367,7 @@ async fn handle_ws_client(
     let connection_id = uuid::Uuid::new_v4();
     let _presentation_connection = presentation.connection(connection_id);
     let mut presentation_rx = presentation.subscribe();
+    let mut custody_rx = browser_control.lock().await.custody();
     if let Some(config) = initial_config.presentation {
         presentation.configure(connection_id, config);
         idle_activity.mark();
@@ -460,9 +461,11 @@ async fn handle_ws_client(
 
     client_notify.notify_one();
 
+    // The delivery cap follows the same custody the capture loop follows.
+    let mut controlled = custody_active(*custody_rx.borrow_and_update());
     let mut next_allowed = deadline_from(
         last_sent,
-        presentation.client_fps(connection_id, initial_config.max_fps),
+        presentation.client_fps(connection_id, initial_config.max_fps, controlled),
     );
     let mut pending_frame = false;
 
@@ -504,7 +507,7 @@ async fn handle_ws_client(
                 let config = initial_config.presentation.unwrap();
                 presentation.claim_if_available(connection_id, config);
                 presentation_rx.borrow_and_update();
-                next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, config_rx.borrow().max_fps));
+                next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, config_rx.borrow().max_fps, controlled));
                 if ws_tx.send(Message::Text(presentation.acknowledgment(connection_id, config).to_string())).await.is_err() { break; }
             }
             changed = config_rx.changed() => {
@@ -516,12 +519,17 @@ async fn handle_ws_client(
                 let cfg = *config_rx.borrow_and_update();
                 // Loosening the cap pulls the deadline into the past, so a
                 // pending frame goes out at once.
-                next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, cfg.max_fps));
+                next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, cfg.max_fps, controlled));
                 // Leaving ack pacing releases a frame that is still waiting on
                 // an acknowledgement the client will now never send.
                 if !cfg.ack_pacing {
                     awaiting_ack = None;
                 }
+            }
+            changed = custody_rx.changed() => {
+                if changed.is_err() { break; }
+                controlled = custody_active(*custody_rx.borrow_and_update());
+                next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, config_rx.borrow().max_fps, controlled));
             }
             changed = input_error_rx.changed() => {
                 if changed.is_err() { break; }
@@ -563,7 +571,8 @@ async fn handle_ws_client(
                     }
                     last_sent = Some(Instant::now());
                 }
-                next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, cfg.max_fps));
+                controlled = custody_active(*custody_rx.borrow());
+                next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, cfg.max_fps, controlled));
             }
         }
     }

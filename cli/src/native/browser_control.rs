@@ -14,6 +14,7 @@ use serde_json::{json, Value};
 
 use super::cdp::client::{CdpClient, PendingCommand};
 use super::input::{input_command, stream_event, HeldInputs};
+use tokio::sync::watch;
 
 mod mouse;
 
@@ -319,7 +320,6 @@ impl Lease {
     }
 }
 
-#[derive(Default)]
 pub(crate) struct BrowserControl {
     lease: Option<Lease>,
     needs_observation: bool,
@@ -330,6 +330,30 @@ pub(crate) struct BrowserControl {
     stream_outcome_unknown: bool,
     display: Option<std::sync::Arc<super::display::DisplayClient>>,
     native_mouse: mouse::NativeMouse,
+    /// The current lease deadline, published for frame pacing. Readers
+    /// compare it with their own clock; no timer expires it.
+    custody: watch::Sender<Option<Instant>>,
+}
+
+impl Default for BrowserControl {
+    fn default() -> Self {
+        Self {
+            lease: None,
+            needs_observation: false,
+            last_released: None,
+            pending_stream: VecDeque::new(),
+            stream_held: HeldInputs::default(),
+            stream_outcome_unknown: false,
+            display: None,
+            native_mouse: mouse::NativeMouse::default(),
+            custody: watch::channel(None).0,
+        }
+    }
+}
+
+/// Whether a published lease deadline still grants a human custody now.
+pub(crate) fn custody_active(deadline: Option<Instant>) -> bool {
+    deadline.is_some_and(|deadline| deadline > Instant::now())
 }
 
 struct PendingStreamInput {
@@ -380,6 +404,24 @@ impl BrowserControl {
 
     pub(crate) fn begin_agent_command(&mut self) {
         self.native_mouse.begin_command();
+    }
+
+    /// Observe lease deadlines without holding this gate. Frame pacing and
+    /// pointer compositing follow it; input custody never does.
+    pub(crate) fn custody(&self) -> watch::Receiver<Option<Instant>> {
+        self.custody.subscribe()
+    }
+
+    fn publish_custody(&self) {
+        let deadline = self.lease.as_ref().map(|lease| lease.deadline);
+        self.custody.send_if_modified(|current| {
+            if *current == deadline {
+                false
+            } else {
+                *current = deadline;
+                true
+            }
+        });
     }
 
     pub(crate) fn has_native_mouse(&self) -> bool {
@@ -599,6 +641,7 @@ impl BrowserControl {
         if let Some(lease) = self.lease.take() {
             self.last_released = Some(lease);
         }
+        self.publish_custody();
     }
 
     /// Enqueue in wire order without waiting for each event's acknowledgment.
@@ -728,7 +771,9 @@ impl BrowserControl {
         browser: Option<(&CdpClient, &str)>,
         page: Option<super::actions::ControlPage<'_>>,
     ) -> Result<Value, ControlError> {
-        let mut response = self.execute_operation(request, browser, page).await?;
+        let result = self.execute_operation(request, browser, page).await;
+        self.publish_custody();
+        let mut response = result?;
         if let Some(display) = self.display.as_ref() {
             response["surface"] = json!(display.surface());
         }
@@ -754,17 +799,17 @@ impl BrowserControl {
                         "The browser page is unavailable.",
                     )
                 })?;
-                let downloads = tokio::time::timeout(ACK_TIMEOUT, async {
-                    page.file_page().await?;
-                    page.completed_downloads(0).await
-                })
-                .await
-                .map_err(|_| {
-                    ControlError::new(
-                        "browser_control_files_unavailable",
-                        "The browser downloads could not be observed.",
-                    )
-                })??;
+                // Completed downloads are owned by the browser process, not
+                // by a page. Listing them must stay cheap: the Product polls
+                // it beside human input, under the same command custody.
+                let downloads = tokio::time::timeout(ACK_TIMEOUT, page.completed_downloads(0))
+                    .await
+                    .map_err(|_| {
+                        ControlError::new(
+                            "browser_control_files_unavailable",
+                            "The browser downloads could not be observed.",
+                        )
+                    })??;
                 Ok(
                     json!({"supported":true,"controlled":self.agent_error().is_some(),"filesSupported":page.files_supported(),"downloads":downloads}),
                 )
