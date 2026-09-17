@@ -134,9 +134,11 @@ pub(crate) struct Capture {
     pub patches: Vec<Patch>,
     pub cursor_included: bool,
     #[serde(default)]
+    #[cfg_attr(not(test), allow(dead_code))] // Retained for capture qualification.
     pub quality: u32,
     /// The helper's per-stage wall times for this capture, for measurement.
     #[serde(default)]
+    #[cfg_attr(not(test), allow(dead_code))] // Measured in native capture qualification.
     pub timings: Option<Value>,
 }
 
@@ -148,21 +150,37 @@ pub(crate) struct Patch {
     pub width: u32,
     pub height: u32,
     pub data: String,
+    /// Decoder padding keeps 4:2:0 chroma interpolation identical to a whole
+    /// frame. The viewer draws this source crop at x/y, never the padding.
+    #[serde(default)]
+    pub source_x: u32,
+    #[serde(default)]
+    pub source_y: u32,
 }
 
 impl Capture {
     fn coherent(&self, request: CaptureRequest, surface: &Surface) -> bool {
         let whole = self.data.is_some();
         let patched = !self.patches.is_empty();
+        // A forced frame republishes the whole surface; patches are only
+        // ever answers to a request that allowed them.
         whole != patched
-            && (request.patches || !patched)
+            && (request.patches && !request.force || !patched)
             && self.width == surface.width
             && self.height == surface.height
             && self.encoding == "jpeg"
             && self.cursor_included == request.cursor
+            && self.patches.len() <= 64
             && self.patches.iter().all(|patch| {
-                patch.width > 0
+                !patch.data.is_empty()
+                    && patch.source_x <= 16
+                    && patch.source_y <= 16
+                    && patch.x % 16 == 0
+                    && patch.y % 16 == 0
+                    && patch.width > 0
+                    && patch.width <= 512
                     && patch.height > 0
+                    && patch.height <= 512
                     && patch
                         .x
                         .checked_add(patch.width)
@@ -841,6 +859,34 @@ mod platform {
                 "display_unavailable"
             );
             assert!(!display.available());
+            helper.await.unwrap();
+
+            // So do patches answered to a forced (republishing) request.
+            let (display, _peer, frames) = DisplayClient::test_channel();
+            let helper = tokio::spawn(async move {
+                let mut frames = BufReader::new(frames);
+                let request = read_request(&mut frames).await;
+                assert_eq!(
+                    (&request["patches"], &request["force"]),
+                    (&json!(true), &json!(true))
+                );
+                reply(
+                    &mut frames,
+                    json!({"id":request["id"],"success":true,"data":patch(16, 32, 160, 48)}),
+                )
+                .await;
+            });
+            assert_eq!(
+                display
+                    .capture(CaptureRequest {
+                        force: true,
+                        ..patched
+                    })
+                    .await
+                    .unwrap_err()
+                    .code,
+                "display_unavailable"
+            );
             helper.await.unwrap();
 
             let (display, _peer, frames) = DisplayClient::test_channel();

@@ -467,10 +467,12 @@ mod tests {
         assert_eq!(state.capture_pacing(true), FramePacing::CONTROLLED);
         state.configure(primary, config);
         assert_eq!(state.capture_pacing(true).fps, 30);
-        assert!(
-            FramePacing::CONTROLLED.budget_bytes < FramePacing::PRESENTED.budget_bytes
-                && FramePacing::PRESENTED.budget_bytes < FramePacing::PASSIVE.budget_bytes
-        );
+        const {
+            assert!(
+                FramePacing::CONTROLLED.budget_bytes < FramePacing::PRESENTED.budget_bytes
+                    && FramePacing::PRESENTED.budget_bytes < FramePacing::PASSIVE.budget_bytes
+            );
+        }
         assert_eq!(state.client_fps(primary, 0, true), 30);
         assert_eq!(state.client_fps(primary, 20, true), 20);
         assert_eq!(state.client_fps(secondary, 0, true), 10);

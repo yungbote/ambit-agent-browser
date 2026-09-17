@@ -459,6 +459,7 @@ async fn handle_ws_client(
     // Id written but not yet acknowledged, ack pacing only. While set the
     // writer holds, and newer frames replace each other in the watch channel.
     let mut awaiting_ack: Option<u64> = None;
+    let mut delivered_seq: Option<u64> = None;
 
     // Seed with the newest frame, marked seen so the writer does not re-send
     // it. Charged against the cap, so a URL-declared cap governs the gap after.
@@ -467,10 +468,11 @@ async fn handle_ws_client(
     let initial_frame = frame_watch
         .borrow_and_update()
         .clone()
-        .filter(|frame| initial_config.patches || !frame.patch);
+        .filter(|frame| !frame.patch);
     if let Some(frame) = initial_frame {
         if ws_tx.send(Message::Text(frame.json.clone())).await.is_ok() {
             last_sent = Some(Instant::now());
+            delivered_seq = frame.seq;
             if initial_config.ack_pacing {
                 awaiting_ack = frame.seq;
             }
@@ -579,6 +581,13 @@ async fn handle_ws_client(
                 pending_frame = false;
                 let cfg = *config_rx.borrow();
                 if let Some(frame) = frame {
+                    // Latest-frame-wins is safe for whole frames only. A
+                    // delta can travel only after its exact base reached
+                    // this connection; otherwise rebase with a whole frame.
+                    if frame.patch && (frame.base_seq.is_none() || frame.base_seq != delivered_seq) {
+                        client_notify.notify_one();
+                        continue;
+                    }
                     if cfg.ack_pacing {
                         awaiting_ack = frame.seq;
                         // Settle against the banked watermark: a client that
@@ -591,6 +600,7 @@ async fn handle_ws_client(
                         break;
                     }
                     last_sent = Some(Instant::now());
+                    delivered_seq = frame.seq;
                 }
                 controlled = custody_active(*custody_rx.borrow());
                 next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, cfg.max_fps, controlled));

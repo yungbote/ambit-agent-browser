@@ -112,6 +112,8 @@ pub(super) struct StreamFrame {
     /// Damaged rectangles over the previous whole frame. Only a client that
     /// declared it composites patches may receive one.
     pub(super) patch: bool,
+    /// Exact frame this delta amends. Whole frames have no dependency.
+    pub(super) base_seq: Option<u64>,
 }
 
 /// Frame id inside an already-serialized frame. Only the legacy
@@ -524,6 +526,7 @@ impl StreamServer {
             seq: seq_in_serialized_frame(frame_json),
             json: frame_json.to_string(),
             patch: false,
+            base_seq: None,
         })));
     }
 
@@ -548,6 +551,7 @@ impl StreamServer {
             seq: Some(seq),
             json: msg.to_string(),
             patch: false,
+            base_seq: None,
         })));
     }
 
@@ -898,6 +902,51 @@ mod tests {
         let frame = next_frame(&mut ws).await;
         assert_eq!(frame.get("data").and_then(|v| v.as_str()), Some("fresh"));
 
+        server.shutdown().await;
+    }
+
+    fn publish_test_patch(server: &StreamServer, seq: u64, base_seq: u64) {
+        server.frame_watch.send_replace(Some(Arc::new(StreamFrame {
+            seq: Some(seq),
+            json: json!({"type":"frame","seq":seq,"baseSeq":base_seq,"patches":[{"data":"patch"}]})
+                .to_string(),
+            patch: true,
+            base_seq: Some(base_seq),
+        })));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_patch_viewer_starts_with_whole_and_rebases_after_skipped_delta() {
+        let (server, _slot) = StreamServer::start_without_client(
+            0,
+            "patch-chain".into(),
+            true,
+            Arc::new(IdleActivity::new()),
+        )
+        .await
+        .unwrap();
+        publish_test_patch(&server, 2, 1);
+        let mut ws = connect_client_to(server.port(), "/?patches=1&pacing=ack").await;
+        expect_no_frame(&mut ws, 50).await;
+        server.broadcast_frame(r#"{"type":"frame","seq":3,"data":"whole"}"#);
+        assert_eq!(next_frame(&mut ws).await["seq"], 3);
+        // While the whole frame is unacknowledged, delta 4 is overwritten by
+        // delta 5. Sending 5 would permanently lose the pixels changed in 4.
+        publish_test_patch(&server, 4, 3);
+        publish_test_patch(&server, 5, 4);
+        ws.send(Message::Text(r#"{"type":"ack","seq":3}"#.into()))
+            .await
+            .unwrap();
+        expect_no_frame(&mut ws, 50).await;
+        server.broadcast_frame(r#"{"type":"frame","seq":6,"data":"rebased"}"#);
+        assert_eq!(next_frame(&mut ws).await["seq"], 6);
+        ws.send(Message::Text(r#"{"type":"ack","seq":6}"#.into()))
+            .await
+            .unwrap();
+        publish_test_patch(&server, 7, 6);
+        let delta = next_frame(&mut ws).await;
+        assert_eq!(delta["seq"], 7);
+        assert_eq!(delta["baseSeq"], 6);
         server.shutdown().await;
     }
 

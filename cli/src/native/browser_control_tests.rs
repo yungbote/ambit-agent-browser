@@ -926,3 +926,58 @@ async fn inspect_does_not_infer_file_support_without_a_chromium_page() {
     assert_eq!(result["filesSupported"], false);
     assert!(result.get("controllerId").is_none());
 }
+
+#[tokio::test]
+async fn resumed_controller_rejects_late_input_and_starts_a_fresh_sequence() {
+    let mut browser = Browser::new().await;
+    let gate = Arc::new(Mutex::new(BrowserControl::default()));
+    {
+        let mut control = gate.lock().await;
+        let connection = Some((browser.client.as_ref(), "page"));
+        control
+            .execute(parse(command("acquire", OWNER)), connection)
+            .await
+            .unwrap();
+        control
+            .execute(parse(command("release", OWNER)), connection)
+            .await
+            .unwrap();
+        let fresh = control
+            .execute(parse(command("acquire", OTHER)), connection)
+            .await
+            .unwrap();
+        assert_eq!(fresh["lastSequence"], 0);
+        for sequence in [1, 2] {
+            assert_eq!(
+                control
+                    .execute(input(sequence), connection)
+                    .await
+                    .unwrap_err()
+                    .code,
+                "browser_control_stale"
+            );
+        }
+        assert!(
+            browser.commands.try_recv().is_err(),
+            "late input must never reach the browser"
+        );
+    }
+    let task_gate = gate.clone();
+    let client = browser.client.clone();
+    let task = tokio::spawn(async move {
+        let mut next = input(1);
+        next.controller_id = OTHER.into();
+        task_gate
+            .lock()
+            .await
+            .execute(next, Some((client.as_ref(), "page")))
+            .await
+    });
+    let sent = browser.next().await;
+    assert_eq!(sent["method"], "Input.dispatchKeyEvent");
+    browser.ack(&sent).await;
+    let applied = task.await.unwrap().unwrap();
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["lastSequence"], 1);
+    assert!(browser.commands.try_recv().is_err());
+}

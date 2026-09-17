@@ -230,7 +230,7 @@ pub(super) async fn cdp_event_loop(
                 // The newest published frame was a patch; a new or changed
                 // viewer roster then needs a whole frame first.
                 let mut published_patches = false;
-                let mut known_clients = count;
+                let mut published_seq = None;
                 macro_rules! repace {
                     () => {{
                         let next = presentation.capture_pacing(controlled);
@@ -279,9 +279,10 @@ pub(super) async fn cdp_event_loop(
                                 patches: patches_allowed,
                             };
                             match display.capture(request).await {
-                                Ok(Some((capture, surface))) => {
+                                Ok(Some((capture, mut surface))) => {
                                     let seq = super::next_frame_seq();
                                     let patch = capture.data.is_none();
+                                    surface.cursor_included = capture.cursor_included;
                                     let mut message = json!({
                                         "type": "frame", "seq": seq, "encoding": capture.encoding,
                                         "surface": surface,
@@ -290,12 +291,15 @@ pub(super) async fn cdp_event_loop(
                                         message["data"] = json!(data);
                                     } else {
                                         message["patches"] = json!(capture.patches);
+                                        message["baseSeq"] = json!(published_seq);
                                     }
                                     published_generation = Some(surface.generation);
                                     published_patches = patch;
                                     frame_watch.send_replace(Some(Arc::new(super::StreamFrame {
                                         seq: Some(seq), json: message.to_string(), patch,
+                                        base_seq: if patch { published_seq } else { None },
                                     })));
+                                    published_seq = Some(seq);
                                 }
                                 Ok(None) => {}
                                 Err(error) if error.is_transient() => {}
@@ -498,6 +502,7 @@ pub(super) async fn cdp_event_loop(
                                                     seq: Some(seq),
                                                     json: msg.to_string(),
                                                     patch: false,
+                                                    base_seq: None,
                                                 },
                                             )));
                                         }
@@ -553,12 +558,11 @@ pub(super) async fn cdp_event_loop(
                         }
                         _ = client_notify.notified() => {
                             let count = *client_count.lock().await;
-                            if count != known_clients {
-                                known_clients = count;
-                                if published_patches {
-                                    published_generation = None;
-                                }
-                            }
+                            // A new viewer or a writer that skipped a delta
+                            // needs a whole frame. This uses the existing
+                            // wakeup without rotating input coordinates.
+                            published_generation = None;
+                            display_tick.reset_immediately();
                             let new_session_id = cdp_session_id.read().await.clone();
                             if count == 0 {
                                 if supports_screencast {
