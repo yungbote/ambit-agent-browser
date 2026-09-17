@@ -2655,7 +2655,10 @@ pub(crate) async fn execute_command_received(
         .remove(super::feedback::REQUEST_FIELD);
     let expiry_error = state.expire_browser_control().await.err();
     let controlled = expiry_error.or(state.browser_control.lock().await.agent_error());
-    let requires_observation = state.browser_control.lock().await.needs_observation();
+    let requires_observation = window_actions::observation_required(
+        &command,
+        state.browser_control.lock().await.needs_observation(),
+    );
     let mut response = if let Some(error) = controlled {
         json!({ "id": command["id"], "success": false, "code": error.code, "error": error.message })
     } else if requires_observation {
@@ -2703,6 +2706,9 @@ pub(crate) async fn execute_command_received(
             }
         }
     };
+    if response["success"] == true && window_actions::observes_page(&command) {
+        state.browser_control.lock().await.observed();
+    }
     state.apply_pending_window_layout().await;
     super::feedback::attach(&request, &mut response, state).await;
     response
@@ -7672,6 +7678,37 @@ async fn handle_viewport(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         .and_then(|v| v.as_f64())
         .unwrap_or(1.0);
     let mobile = cmd.get("mobile").and_then(|v| v.as_bool()).unwrap_or(false);
+
+    if mgr.display_client().is_some() {
+        // An owned window has a real size, not an emulated one. Its raster
+        // scale is fixed and it follows a connected viewer's layout.
+        let maximum =
+            (super::display::MAX_DISPLAY_SIZE / super::display::DEVICE_SCALE_FACTOR) as i64;
+        if !(1..=maximum).contains(&i64::from(width)) || !(1..=maximum).contains(&i64::from(height))
+        {
+            return Err(format!(
+                "Window dimensions must be between 1 and {maximum} CSS pixels"
+            ));
+        }
+        if mobile || (cmd.get("deviceScaleFactor").is_some() && scale != 1.0) {
+            return Err("The browser window renders at its native device scale factor and does not emulate mobile devices".into());
+        }
+        if state
+            .stream_server
+            .as_ref()
+            .is_some_and(|server| server.presentation.configured())
+        {
+            return Err("The browser window follows the connected viewer's layout; resize that view instead of the viewport".into());
+        }
+        let surface = state
+            .apply_window_layout(width as u32, height as u32, None)
+            .await?;
+        return Ok(json!({
+            "width": width, "height": height,
+            "deviceScaleFactor": surface.device_scale_factor, "mobile": false,
+            "surface": surface,
+        }));
+    }
 
     mgr.set_viewport(width, height, scale, mobile).await?;
 

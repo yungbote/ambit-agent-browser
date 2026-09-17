@@ -21,8 +21,16 @@ fn explicit_browser_action(command: &Value) -> bool {
     ) || command["action"] == crate::connection::INTERNAL_DAEMON_SHUTDOWN_ACTION
 }
 
-fn observes_page(command: &Value) -> bool {
+/// A snapshot or screenshot is itself the observation every gate asks for.
+pub(super) fn observes_page(command: &Value) -> bool {
     matches!(command["action"].as_str(), Some("snapshot" | "screenshot"))
+}
+
+/// Whether a command must be refused until the agent observes the browser
+/// again. Observing commands are never refused: they are how the requirement
+/// is satisfied.
+pub(super) fn observation_required(command: &Value, needs_observation: bool) -> bool {
+    needs_observation && !observes_page(command)
 }
 
 impl DaemonState {
@@ -119,7 +127,9 @@ impl DaemonState {
         let Some(request) = server.presentation.pending(&target) else {
             return;
         };
-        control.require_observation();
+        // A viewer's layout is not human input: it needs no fresh observation
+        // from the agent. Stale coordinates are already fenced by the cleared
+        // refs, the rotated page generations and admission-time staleness.
         // Daemon command custody already excludes controller mutations and
         // native-window raw stream input is disabled. Release this gate so
         // event reconciliation and normal dialog handling can proceed.
@@ -207,11 +217,34 @@ impl DaemonState {
         if command
             .get(crate::native::feedback::REQUEST_FIELD)
             .is_none()
-            && !observes_page(command)
-            && self.browser_control.lock().await.needs_observation()
+            && observation_required(
+                command,
+                self.browser_control.lock().await.needs_observation(),
+            )
         {
             return Err(("browser_observation_required", "The browser changed during window control. Run snapshot or screenshot and choose the next action from that fresh observation."));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn observing_commands_are_never_refused_for_lack_of_an_observation() {
+        for action in ["snapshot", "screenshot"] {
+            let command = json!({ "action": action });
+            assert!(observes_page(&command));
+            assert!(!observation_required(&command, true));
+        }
+        for action in ["click", "frame", "type", "mouse", "scroll"] {
+            let command = json!({ "action": action });
+            assert!(!observes_page(&command));
+            assert!(observation_required(&command, true));
+            assert!(!observation_required(&command, false));
+        }
     }
 }
