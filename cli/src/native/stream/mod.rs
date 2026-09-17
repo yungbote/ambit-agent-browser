@@ -993,6 +993,99 @@ mod tests {
         server.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn bounded_frame_window_keeps_cadence_with_delayed_paint_acks() {
+        use std::collections::VecDeque;
+        use std::time::Duration;
+        for delay_ms in [90, 200] {
+            let (server, _slot) = StreamServer::start_without_client(
+                0,
+                format!("window-{delay_ms}"),
+                true,
+                Arc::new(IdleActivity::new()),
+            )
+            .await
+            .unwrap();
+            let server = Arc::new(server);
+            let mut client =
+                connect_client_to(server.port(), "/?pacing=ack&frameWindow=8&maxFps=30").await;
+            let producer_server = server.clone();
+            let producer = tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_micros(33_333));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                for _ in 0..60 {
+                    tick.tick().await;
+                    producer_server.broadcast_screencast_frame("AA==", &FrameMetadata::default());
+                }
+            });
+            let deadline = tokio::time::Instant::now() + Duration::from_millis(2200);
+            let mut acknowledgments = VecDeque::new();
+            let mut delivered = 0;
+            let mut max_outstanding = 0;
+            loop {
+                let next_ack = acknowledgments
+                    .front()
+                    .map(|(at, _)| *at)
+                    .unwrap_or(deadline);
+                tokio::select! {
+                    _ = tokio::time::sleep_until(deadline) => break,
+                    _ = tokio::time::sleep_until(next_ack), if !acknowledgments.is_empty() => {
+                        let mut latest = 0;
+                        while acknowledgments.front().is_some_and(|(at,_)| *at <= tokio::time::Instant::now()) {
+                            latest = acknowledgments.pop_front().unwrap().1;
+                        }
+                        client.send(Message::Text(json!({"type":"ack","seq":latest}).to_string())).await.unwrap();
+                    }
+                    message = client.next() => {
+                        let Message::Text(raw) = message.unwrap().unwrap() else {continue};
+                        let frame:Value=serde_json::from_str(&raw).unwrap();
+                        if frame["type"]!="frame" {continue;}
+                        delivered+=1;
+                        acknowledgments.push_back((tokio::time::Instant::now()+Duration::from_millis(delay_ms),frame["seq"].as_u64().unwrap()));
+                        max_outstanding=max_outstanding.max(acknowledgments.len());
+                    }
+                }
+            }
+            producer.await.unwrap();
+            assert!(
+                delivered >= 45,
+                "{delay_ms}ms ACK delay delivered only {delivered} of 60 frames"
+            );
+            assert!(max_outstanding <= 8, "negotiated flight window exceeded");
+            println!(
+                "FRAME_WINDOW {}",
+                json!({"ackDelayMs":delay_ms,"produced":60,"delivered":delivered,"maxOutstanding":max_outstanding})
+            );
+            server.shutdown().await;
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frame_window_stops_at_its_bound_until_a_cumulative_ack() {
+        let (server, _) = StreamServer::start_without_client(
+            0,
+            "bounded-window".into(),
+            true,
+            Arc::new(IdleActivity::new()),
+        )
+        .await
+        .unwrap();
+        let mut client = connect_client_to(server.port(), "/?pacing=ack&frameWindow=8").await;
+        let mut last = 0;
+        for _ in 0..8 {
+            server.broadcast_screencast_frame("AA==", &FrameMetadata::default());
+            last = next_frame(&mut client).await["seq"].as_u64().unwrap();
+        }
+        server.broadcast_screencast_frame("AQ==", &FrameMetadata::default());
+        expect_no_frame(&mut client, 100).await;
+        client
+            .send(Message::Text(json!({"type":"ack","seq":last}).to_string()))
+            .await
+            .unwrap();
+        assert_eq!(next_frame(&mut client).await["data"], "AQ==");
+        server.shutdown().await;
+    }
+
     fn publish_test_patch(server: &StreamServer, seq: u64, base_seq: u64) {
         server.frame_watch.send_replace(Some(Arc::new(StreamFrame {
             seq: Some(seq),

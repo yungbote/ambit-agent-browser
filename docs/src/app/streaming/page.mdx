@@ -83,6 +83,8 @@ Negotiate `patches=1` for JPEG damage rectangles and `frames=binary` to avoid ba
 
 A delta's `baseSeq` must equal the last painted frame with matching surface generation and dimensions. Fresh viewers and skipped dependencies receive a whole frame. With `pacing=ack`, acknowledge only after the complete frame is painted. Other records remain text JSON; existing text viewers are unchanged.
 
+For a viewer across a network, negotiate `pacing=ack&frameWindow=8` to allow up to eight delivered frames and at most 12 MiB awaiting acknowledgment. The default window is one for compatibility. A cumulative ACK names the newest frame actually painted; it also retires the preceding delivered frames whose pixels that composed frame includes. A slow viewer stops at the count or byte bound, and skipped delta dependencies still require a whole frame.
+
 ### Frame messages
 
 The server sends frame messages with base64-encoded images:

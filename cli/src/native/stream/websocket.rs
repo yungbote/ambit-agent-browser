@@ -1,4 +1,5 @@
 use serde_json::{json, Value};
+use std::collections::VecDeque;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -29,7 +30,7 @@ const MAX_CONFIGURABLE_FPS: u32 = 120;
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Per-connection delivery settings, set by the client's `config` message.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct ClientConfig {
     /// Frames per second ceiling. 0 means uncapped.
     max_fps: u32,
@@ -44,6 +45,55 @@ struct ClientConfig {
     patches: bool,
     /// JPEG payloads travel as bytes after a bounded metadata header.
     binary: bool,
+    /// Maximum outstanding frames. One preserves the existing ack protocol;
+    /// a negotiated window covers network delay without an unbounded queue.
+    frame_window: usize,
+}
+
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            max_fps: 0,
+            ack_pacing: false,
+            presentation: None,
+            patches: false,
+            binary: false,
+            frame_window: 1,
+        }
+    }
+}
+
+const MAX_FRAME_WINDOW: usize = 8;
+const MAX_WINDOW_BYTES: usize = 12 * 1024 * 1024;
+
+#[derive(Default)]
+struct InFlightFrames {
+    frames: VecDeque<(u64, usize)>,
+    bytes: usize,
+}
+
+impl InFlightFrames {
+    fn has_slot(&self, window: usize) -> bool {
+        self.frames.len() < window
+    }
+    fn has_bytes(&self, bytes: usize) -> bool {
+        self.bytes
+            .checked_add(bytes)
+            .is_some_and(|total| total <= MAX_WINDOW_BYTES)
+    }
+    fn sent(&mut self, seq: u64, bytes: usize) {
+        self.frames.push_back((seq, bytes));
+        self.bytes += bytes;
+    }
+    fn acknowledge(&mut self, seq: u64) {
+        while self.frames.front().is_some_and(|(sent, _)| *sent <= seq) {
+            self.bytes -= self.frames.pop_front().unwrap().1;
+        }
+    }
+    fn clear(&mut self) {
+        self.frames.clear();
+        self.bytes = 0;
+    }
 }
 
 /// Parse a client `config` message into the settings it changes, leaving the
@@ -120,6 +170,15 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
             },
             "patches" => cfg.patches = value == "1",
             "frames" => cfg.binary = value == "binary",
+            "frameWindow" => {
+                if let Some(window) = value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|window| (1..=MAX_FRAME_WINDOW).contains(window))
+                {
+                    cfg.frame_window = window;
+                }
+            }
             _ => {}
         }
     }
@@ -478,9 +537,10 @@ async fn handle_ws_client(
     // Invariant: only a successful send writes `last_sent`. `None` means
     // nothing was delivered, so the cap owes this connection no wait.
     let mut last_sent: Option<Instant> = None;
-    // Id written but not yet acknowledged, ack pacing only. While set the
-    // writer holds, and newer frames replace each other in the watch channel.
-    let mut awaiting_ack: Option<u64> = None;
+    // Only sequence and byte counts are retained here, never another payload
+    // queue. Undelivered whole frames still replace one another in the watch.
+    let mut in_flight = InFlightFrames::default();
+    let mut byte_blocked = false;
     let mut delivered_seq: Option<u64> = None;
 
     // Seed with the newest frame, marked seen so the writer does not re-send
@@ -493,11 +553,26 @@ async fn handle_ws_client(
         .filter(|frame| !frame.patch);
     if let Some(frame) = initial_frame {
         if let Some(message) = frame.message(initial_config.binary) {
+            let message_bytes = message.len();
+            if message_bytes > MAX_WINDOW_BYTES {
+                let _ = ws_tx.send(Message::Close(None)).await;
+                drop(reader_task);
+                retire_viewer(
+                    &client_count,
+                    &patch_clients,
+                    initial_config.patches,
+                    &client_notify,
+                )
+                .await;
+                return;
+            }
             if ws_tx.send(message).await.is_ok() {
                 last_sent = Some(Instant::now());
                 delivered_seq = frame.seq;
                 if initial_config.ack_pacing {
-                    awaiting_ack = frame.seq;
+                    if let Some(seq) = frame.seq {
+                        in_flight.sent(seq, message_bytes);
+                    }
                 }
             }
         }
@@ -567,7 +642,8 @@ async fn handle_ws_client(
                 // Leaving ack pacing releases a frame that is still waiting on
                 // an acknowledgement the client will now never send.
                 if !cfg.ack_pacing {
-                    awaiting_ack = None;
+                    in_flight.clear();
+                    byte_blocked = false;
                 }
             }
             changed = custody_rx.changed() => {
@@ -587,14 +663,12 @@ async fn handle_ws_client(
                     break;
                 }
                 let acked = *ack_rx.borrow_and_update();
-                // Cumulative: an ack for a newer frame covers the one in
-                // flight, so a client that renders out of order or skips ids
-                // still unblocks the writer.
-                if awaiting_ack.is_some_and(|seq| acked >= seq) {
-                    awaiting_ack = None;
-                }
+                // The native relay accepts only a sequence it actually sent.
+                // Painting it also settles every earlier delivered frame.
+                in_flight.acknowledge(acked);
+                byte_blocked = false;
             }
-            _ = tokio::time::sleep_until(next_allowed), if pending_frame && awaiting_ack.is_none() => {
+            _ = tokio::time::sleep_until(next_allowed), if pending_frame && !byte_blocked && (!config_rx.borrow().ack_pacing || in_flight.has_slot(config_rx.borrow().frame_window)) => {
                 // Invariant: read at send time, not arrival time. That is what
                 // makes this latest-frame-wins; anything that arrived while the
                 // writer waited is skipped rather than queued.
@@ -612,17 +686,21 @@ async fn handle_ws_client(
                         client_notify.notify_one();
                         continue;
                     }
-                    if cfg.ack_pacing {
-                        awaiting_ack = frame.seq;
-                        // Settle against the banked watermark: a client that
-                        // acked ahead of the stream would never move it again.
-                        if awaiting_ack.is_some_and(|seq| *ack_rx.borrow() >= seq) {
-                            awaiting_ack = None;
-                        }
-                    }
                     let Some(message) = frame.message(initial_config.binary) else { break; };
+                    let bytes = message.len();
+                    if bytes > MAX_WINDOW_BYTES { break; }
+                    if cfg.ack_pacing && !in_flight.has_bytes(bytes) {
+                        pending_frame = true;
+                        byte_blocked = true;
+                        continue;
+                    }
                     if ws_tx.send(message).await.is_err() {
                         break;
+                    }
+                    if cfg.ack_pacing {
+                        if let Some(seq) = frame.seq { in_flight.sent(seq, bytes); }
+                        // Preserve the existing native cumulative watermark.
+                        in_flight.acknowledge(*ack_rx.borrow());
                     }
                     last_sent = Some(Instant::now());
                     delivered_seq = frame.seq;
@@ -635,14 +713,27 @@ async fn handle_ws_client(
 
     drop(reader_task);
 
-    {
-        let mut count = client_count.lock().await;
-        *count = count.saturating_sub(1);
-        if initial_config.patches {
-            patch_clients.fetch_sub(1, Ordering::AcqRel);
-        }
-    }
+    retire_viewer(
+        &client_count,
+        &patch_clients,
+        initial_config.patches,
+        &client_notify,
+    )
+    .await;
+}
 
+async fn retire_viewer(
+    client_count: &Mutex<usize>,
+    patch_clients: &AtomicUsize,
+    patches: bool,
+    client_notify: &Notify,
+) {
+    let mut count = client_count.lock().await;
+    *count = count.saturating_sub(1);
+    if patches {
+        patch_clients.fetch_sub(1, Ordering::AcqRel);
+    }
+    drop(count);
     client_notify.notify_one();
 }
 
@@ -878,6 +969,32 @@ mod tests {
         assert!(config_from_upgrade(&upgrade("/?patches=1")).patches);
         assert!(!config_from_upgrade(&upgrade("/?patches=0")).patches);
         assert!(!config_from_upgrade(&upgrade("/")).patches);
+    }
+
+    #[test]
+    fn frame_window_is_bounded_by_count_and_bytes_and_released_cumulatively() {
+        let mut flight = InFlightFrames::default();
+        flight.sent(10, MAX_WINDOW_BYTES / 2);
+        flight.sent(12, MAX_WINDOW_BYTES / 2);
+        assert!(!flight.has_slot(2));
+        assert!(flight.has_slot(8));
+        assert!(!flight.has_bytes(1));
+        flight.acknowledge(10);
+        assert!(flight.has_bytes(MAX_WINDOW_BYTES / 2));
+        assert!(!flight.has_bytes(MAX_WINDOW_BYTES / 2 + 1));
+        flight.acknowledge(12);
+        assert!(flight.frames.is_empty());
+        assert_eq!(flight.bytes, 0);
+        assert_eq!(
+            config_from_upgrade(&upgrade("/?frameWindow=8")).frame_window,
+            8
+        );
+        for invalid in ["0", "9", "-1", "bad"] {
+            assert_eq!(
+                config_from_upgrade(&upgrade(&format!("/?frameWindow={invalid}"))).frame_window,
+                1
+            );
+        }
     }
 
     #[test]

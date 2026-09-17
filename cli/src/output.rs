@@ -3237,6 +3237,8 @@ Notes:
   - Window viewers can opt into patches=1 for exact-base damage rectangles
     and frames=binary for JPEG bytes after a bounded JSON metadata header.
     Acknowledge after painting; missing patch bases require a whole frame.
+    frameWindow=1..8 bounds outstanding frames (default 1, at most 12 MiB).
+    A cumulative ACK names the newest frame actually painted.
   - Upgrade-bound presenters can resize on the existing connection with
     {"type":"presentation","width":733,"height":896}. Identity stays bound
     to the upgrade; input still requires its existing controller lease.

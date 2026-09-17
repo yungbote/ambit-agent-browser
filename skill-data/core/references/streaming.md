@@ -48,6 +48,8 @@ Append `patches=1` to opt into damage patches. The driver sends them only while 
 
 Append `frames=binary` to receive JPEG bytes without base64. Each binary WebSocket message contains a four-byte unsigned big-endian header length, the UTF-8 JSON header, then JPEG bytes in declaration order. The header is at most 64 KiB and the entire message at most 12 MiB. Whole-frame metadata replaces `data` with `byteLength`; each patch replaces its own `data` with `byteLength`. The length sum must exactly match the remaining bytes. Other metadata, including `seq`, `baseSeq`, surface and source crops, is unchanged. Status, presentation and activity remain text JSON. Negotiate `pacing=ack` and acknowledge the frame only after decoding and painting it. Existing text viewers remain compatible and do not need to opt in.
 
+For a viewer across a network, negotiate `pacing=ack&frameWindow=8` to allow up to eight delivered frames and at most 12 MiB awaiting acknowledgment. The default window is one for compatibility. A cumulative ACK names the newest frame actually painted; it also retires the preceding delivered frames whose pixels that composed frame includes. A slow viewer stops at the count or byte bound, and skipped delta dependencies still require a whole frame.
+
 ## Enabling the stream
 
 Streaming is always available; the server binds an OS-assigned localhost port unless told otherwise.
