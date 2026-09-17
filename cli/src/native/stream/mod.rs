@@ -109,6 +109,9 @@ pub(super) fn next_frame_seq() -> u64 {
 pub(super) struct StreamFrame {
     pub(super) seq: Option<u64>,
     pub(super) json: String,
+    /// Damaged rectangles over the previous whole frame. Only a client that
+    /// declared it composites patches may receive one.
+    pub(super) patch: bool,
 }
 
 /// Frame id inside an already-serialized frame. Only the legacy
@@ -192,6 +195,9 @@ pub struct StreamServer {
     /// to the newest frame instead of draining a stale ordered backlog.
     frame_watch: watch::Sender<Option<Arc<StreamFrame>>>,
     client_count: Arc<Mutex<usize>>,
+    /// Connected clients that composite damage patches; when every client
+    /// does, window frames may travel as patches.
+    patch_clients: Arc<std::sync::atomic::AtomicUsize>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<super::display::DisplayClient>>>>,
     /// The active CDP page session ID (from Target.attachToTarget).
@@ -361,6 +367,7 @@ impl StreamServer {
         let (frame_watch_tx, frame_watch_rx) = watch::channel::<Option<Arc<StreamFrame>>>(None);
         let screencast_config = Arc::new(ScreencastConfig::from_env());
         let client_count = Arc::new(Mutex::new(0usize));
+        let patch_clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let client_notify = Arc::new(Notify::new());
         let screencasting = Arc::new(Mutex::new(false));
         let cdp_session_id = Arc::new(RwLock::new(None::<String>));
@@ -374,6 +381,7 @@ impl StreamServer {
 
         let frame_tx_clone = frame_tx.clone();
         let client_count_clone = client_count.clone();
+        let patch_clients_accept = patch_clients.clone();
         let client_slot_clone = client_slot.clone();
         let notify_clone = client_notify.clone();
         let idle_activity_clone = idle_activity.clone();
@@ -396,6 +404,7 @@ impl StreamServer {
                 frame_tx_clone,
                 frame_watch_accept,
                 client_count_clone,
+                patch_clients_accept,
                 client_slot_clone,
                 notify_clone,
                 idle_activity_clone,
@@ -420,6 +429,7 @@ impl StreamServer {
         let client_notify_bg = client_notify.clone();
         let screencasting_bg = screencasting.clone();
         let client_count_bg = client_count.clone();
+        let patch_clients_bg = patch_clients.clone();
         let cdp_session_bg = cdp_session_id.clone();
         let vw_bg = viewport_width.clone();
         let vh_bg = viewport_height.clone();
@@ -442,6 +452,7 @@ impl StreamServer {
                 client_notify_bg,
                 screencasting_bg,
                 client_count_bg,
+                patch_clients_bg,
                 cdp_session_bg,
                 vw_bg,
                 vh_bg,
@@ -463,6 +474,7 @@ impl StreamServer {
                 frame_watch: frame_watch_tx,
                 screencast_config,
                 client_count,
+                patch_clients,
                 client_slot: client_slot.clone(),
                 display_slot,
                 cdp_session_id,
@@ -511,6 +523,7 @@ impl StreamServer {
         self.frame_watch.send_replace(Some(Arc::new(StreamFrame {
             seq: seq_in_serialized_frame(frame_json),
             json: frame_json.to_string(),
+            patch: false,
         })));
     }
 
@@ -534,6 +547,7 @@ impl StreamServer {
         self.frame_watch.send_replace(Some(Arc::new(StreamFrame {
             seq: Some(seq),
             json: msg.to_string(),
+            patch: false,
         })));
     }
 

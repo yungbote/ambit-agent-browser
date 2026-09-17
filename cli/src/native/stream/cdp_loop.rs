@@ -121,6 +121,7 @@ pub(super) async fn cdp_event_loop(
     client_notify: Arc<tokio::sync::Notify>,
     screencasting: Arc<Mutex<bool>>,
     client_count: Arc<Mutex<usize>>,
+    patch_clients: Arc<std::sync::atomic::AtomicUsize>,
     cdp_session_id: Arc<RwLock<Option<String>>>,
     viewport_width: Arc<Mutex<u32>>,
     viewport_height: Arc<Mutex<u32>>,
@@ -226,6 +227,10 @@ pub(super) async fn cdp_event_loop(
                 // generation is republished on unchanged pixels so viewers can
                 // name the current surface in their next input.
                 let mut published_generation: Option<String> = None;
+                // The newest published frame was a patch; a new or changed
+                // viewer roster then needs a whole frame first.
+                let mut published_patches = false;
+                let mut known_clients = count;
                 macro_rules! repace {
                     () => {{
                         let next = presentation.capture_pacing(controlled);
@@ -259,22 +264,37 @@ pub(super) async fn cdp_event_loop(
                                 repace!();
                             }
                             let display = display.as_ref().unwrap();
+                            // Patches amend a whole frame every viewer holds;
+                            // one viewer that does not composite them makes
+                            // the next frame whole for everyone.
+                            let patches_allowed = patch_clients.load(std::sync::atomic::Ordering::Acquire) == *client_count.lock().await;
+                            if !patches_allowed && published_patches {
+                                published_generation = None;
+                            }
                             let request = CaptureRequest {
                                 // A controlling client renders its own pointer.
                                 cursor: !controlled,
                                 budget_bytes: pacing.budget_bytes,
                                 force: published_generation.as_deref() != Some(display.surface().generation.as_str()),
+                                patches: patches_allowed,
                             };
                             match display.capture(request).await {
                                 Ok(Some((capture, surface))) => {
                                     let seq = super::next_frame_seq();
-                                    let message = json!({
+                                    let patch = capture.data.is_none();
+                                    let mut message = json!({
                                         "type": "frame", "seq": seq, "encoding": capture.encoding,
-                                        "data": capture.data, "surface": surface,
+                                        "surface": surface,
                                     });
+                                    if let Some(data) = capture.data {
+                                        message["data"] = json!(data);
+                                    } else {
+                                        message["patches"] = json!(capture.patches);
+                                    }
                                     published_generation = Some(surface.generation);
+                                    published_patches = patch;
                                     frame_watch.send_replace(Some(Arc::new(super::StreamFrame {
-                                        seq: Some(seq), json: message.to_string(),
+                                        seq: Some(seq), json: message.to_string(), patch,
                                     })));
                                 }
                                 Ok(None) => {}
@@ -477,6 +497,7 @@ pub(super) async fn cdp_event_loop(
                                                 super::StreamFrame {
                                                     seq: Some(seq),
                                                     json: msg.to_string(),
+                                                    patch: false,
                                                 },
                                             )));
                                         }
@@ -532,6 +553,12 @@ pub(super) async fn cdp_event_loop(
                         }
                         _ = client_notify.notified() => {
                             let count = *client_count.lock().await;
+                            if count != known_clients {
+                                known_clients = count;
+                                if published_patches {
+                                    published_generation = None;
+                                }
+                            }
                             let new_session_id = cdp_session_id.read().await.clone();
                             if count == 0 {
                                 if supports_screencast {
@@ -879,6 +906,7 @@ mod tests {
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
             client_count,
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             cdp_session_id.clone(),
             Arc::new(Mutex::new(1280)),
             Arc::new(Mutex::new(720)),
@@ -1308,6 +1336,7 @@ mod tests {
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(1)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             Arc::new(RwLock::new(Some("S-ACTIVE".to_string()))),
             Arc::new(Mutex::new(1280)),
             Arc::new(Mutex::new(720)),

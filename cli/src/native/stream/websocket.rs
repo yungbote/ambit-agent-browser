@@ -1,5 +1,6 @@
 use serde_json::{json, Value};
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -39,6 +40,8 @@ struct ClientConfig {
     /// client kept up. Mirrors CDP's own `Page.screencastFrameAck`.
     ack_pacing: bool,
     presentation: Option<PresentationConfig>,
+    /// The client composites damage patches over its last whole frame.
+    patches: bool,
 }
 
 /// Parse a client `config` message into the settings it changes, leaving the
@@ -113,6 +116,7 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
                 "push" => cfg.ack_pacing = false,
                 _ => {}
             },
+            "patches" => cfg.patches = value == "1",
             _ => {}
         }
     }
@@ -154,6 +158,7 @@ pub(super) async fn accept_loop(
     frame_tx: broadcast::Sender<String>,
     frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
     client_count: Arc<Mutex<usize>>,
+    patch_clients: Arc<AtomicUsize>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
@@ -190,6 +195,7 @@ pub(super) async fn accept_loop(
                 let frame_tx = frame_tx.clone();
                 let frame_watch = frame_watch.clone();
                 let client_count = client_count.clone();
+                let patch_clients = patch_clients.clone();
                 let client_slot = client_slot.clone();
                 let client_notify = client_notify.clone();
                 let idle_activity = idle_activity.clone();
@@ -212,6 +218,7 @@ pub(super) async fn accept_loop(
                         frame_tx,
                         frame_watch,
                         client_count,
+                        patch_clients,
                         client_slot,
                         client_notify,
                         idle_activity,
@@ -262,6 +269,7 @@ async fn handle_connection(
     frame_tx: broadcast::Sender<String>,
     frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
     client_count: Arc<Mutex<usize>>,
+    patch_clients: Arc<AtomicUsize>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
@@ -294,6 +302,7 @@ async fn handle_connection(
             frame_rx,
             frame_watch,
             client_count,
+            patch_clients,
             client_slot,
             client_notify,
             idle_activity,
@@ -326,6 +335,7 @@ async fn handle_ws_client(
     mut broadcast_rx: broadcast::Receiver<String>,
     mut frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
     client_count: Arc<Mutex<usize>>,
+    patch_clients: Arc<AtomicUsize>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
@@ -376,6 +386,9 @@ async fn handle_ws_client(
     {
         let mut count = client_count.lock().await;
         *count += 1;
+        if initial_config.patches {
+            patch_clients.fetch_add(1, Ordering::AcqRel);
+        }
     }
 
     let (mut ws_tx, ws_rx) = ws_stream.split();
@@ -449,7 +462,12 @@ async fn handle_ws_client(
 
     // Seed with the newest frame, marked seen so the writer does not re-send
     // it. Charged against the cap, so a URL-declared cap governs the gap after.
-    let initial_frame = frame_watch.borrow_and_update().clone();
+    // A patch is meaningless without the whole frame it amends; a client that
+    // does not composite gets the next whole frame instead.
+    let initial_frame = frame_watch
+        .borrow_and_update()
+        .clone()
+        .filter(|frame| initial_config.patches || !frame.patch);
     if let Some(frame) = initial_frame {
         if ws_tx.send(Message::Text(frame.json.clone())).await.is_ok() {
             last_sent = Some(Instant::now());
@@ -554,7 +572,10 @@ async fn handle_ws_client(
                 // Invariant: read at send time, not arrival time. That is what
                 // makes this latest-frame-wins; anything that arrived while the
                 // writer waited is skipped rather than queued.
-                let frame = frame_watch.borrow_and_update().clone();
+                let frame = frame_watch
+                    .borrow_and_update()
+                    .clone()
+                    .filter(|frame| initial_config.patches || !frame.patch);
                 pending_frame = false;
                 let cfg = *config_rx.borrow();
                 if let Some(frame) = frame {
@@ -582,6 +603,9 @@ async fn handle_ws_client(
     {
         let mut count = client_count.lock().await;
         *count = count.saturating_sub(1);
+        if initial_config.patches {
+            patch_clients.fetch_sub(1, Ordering::AcqRel);
+        }
     }
 
     client_notify.notify_one();
@@ -799,6 +823,13 @@ mod tests {
                 target
             );
         }
+    }
+
+    #[test]
+    fn test_config_from_upgrade_reads_patch_compositing() {
+        assert!(config_from_upgrade(&upgrade("/?patches=1")).patches);
+        assert!(!config_from_upgrade(&upgrade("/?patches=0")).patches);
+        assert!(!config_from_upgrade(&upgrade("/")).patches);
     }
 
     #[test]

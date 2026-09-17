@@ -114,6 +114,9 @@ pub(crate) struct CaptureRequest {
     pub cursor: bool,
     pub budget_bytes: u32,
     pub force: bool,
+    /// Every viewer composites damaged rectangles onto its last full frame,
+    /// so the helper may answer with patches instead of a whole frame.
+    pub patches: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -122,10 +125,54 @@ pub(crate) struct Capture {
     pub width: u32,
     pub height: u32,
     pub encoding: String,
-    pub data: String,
+    /// A whole frame. Absent when the frame is carried as `patches`.
+    #[serde(default)]
+    pub data: Option<String>,
+    /// Damaged rectangles, aligned to the encoder's block grid, that replace
+    /// the same rectangles of the viewer's last whole frame.
+    #[serde(default)]
+    pub patches: Vec<Patch>,
     pub cursor_included: bool,
     #[serde(default)]
     pub quality: u32,
+    /// The helper's per-stage wall times for this capture, for measurement.
+    #[serde(default)]
+    pub timings: Option<Value>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Patch {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
+    pub data: String,
+}
+
+impl Capture {
+    fn coherent(&self, request: CaptureRequest, surface: &Surface) -> bool {
+        let whole = self.data.is_some();
+        let patched = !self.patches.is_empty();
+        whole != patched
+            && (request.patches || !patched)
+            && self.width == surface.width
+            && self.height == surface.height
+            && self.encoding == "jpeg"
+            && self.cursor_included == request.cursor
+            && self.patches.iter().all(|patch| {
+                patch.width > 0
+                    && patch.height > 0
+                    && patch
+                        .x
+                        .checked_add(patch.width)
+                        .is_some_and(|edge| edge <= surface.width)
+                    && patch
+                        .y
+                        .checked_add(patch.height)
+                        .is_some_and(|edge| edge <= surface.height)
+            })
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -429,6 +476,7 @@ mod platform {
                     json!({
                         "op": "capture", "cursor": request.cursor,
                         "budgetBytes": request.budget_bytes, "force": request.force,
+                        "patches": request.patches,
                     }),
                 )
                 .await?;
@@ -445,11 +493,7 @@ mod platform {
                     operation_performed: Some(json!(false)),
                 });
             }
-            if capture.width != after.width
-                || capture.height != after.height
-                || capture.encoding != "jpeg"
-                || capture.cursor_included != request.cursor
-            {
+            if !capture.coherent(request, &after) {
                 self.abort();
                 return Err(DisplayError::unavailable());
             }
@@ -581,6 +625,7 @@ mod platform {
             cursor: true,
             budget_bytes: 0,
             force: false,
+            patches: false,
         };
 
         #[tokio::test]
@@ -694,6 +739,7 @@ mod platform {
                         cursor: false,
                         budget_bytes: 120000,
                         force: false,
+                        patches: false,
                     })
                     .await
             });
@@ -751,6 +797,66 @@ mod platform {
             assert!(error.is_transient());
             assert!(display.available());
             assert!(display.capture(CAPTURE).await.unwrap().is_some());
+            helper.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn patches_are_accepted_only_when_requested_and_inside_the_surface() {
+            let patch = |x: u32, y: u32, width: u32, height: u32| {
+                json!({"changed":true,"width":2560,"height":1440,"encoding":"jpeg","cursorIncluded":true,"quality":75,
+                    "patches":[{"x":x,"y":y,"width":width,"height":height,"data":"AA=="}]})
+            };
+            let (display, _peer, frames) = DisplayClient::test_channel();
+            let helper = tokio::spawn(async move {
+                let mut frames = BufReader::new(frames);
+                let request = read_request(&mut frames).await;
+                assert_eq!(request["patches"], true);
+                reply(
+                    &mut frames,
+                    json!({"id":request["id"],"success":true,"data":patch(16, 32, 160, 48)}),
+                )
+                .await;
+                let request = read_request(&mut frames).await;
+                assert_eq!(request["patches"], false);
+                reply(
+                    &mut frames,
+                    json!({"id":request["id"],"success":true,"data":patch(16, 32, 160, 48)}),
+                )
+                .await;
+            });
+            let patched = CaptureRequest {
+                patches: true,
+                ..CAPTURE
+            };
+            let (captured, _) = display.capture(patched).await.unwrap().unwrap();
+            assert!(captured.data.is_none());
+            assert_eq!(captured.patches.len(), 1);
+            assert_eq!(
+                (captured.patches[0].x, captured.patches[0].width),
+                (16, 160)
+            );
+            // Patches answered to a whole-frame request contradict it.
+            assert_eq!(
+                display.capture(CAPTURE).await.unwrap_err().code,
+                "display_unavailable"
+            );
+            assert!(!display.available());
+            helper.await.unwrap();
+
+            let (display, _peer, frames) = DisplayClient::test_channel();
+            let helper = tokio::spawn(async move {
+                let mut frames = BufReader::new(frames);
+                let request = read_request(&mut frames).await;
+                reply(
+                    &mut frames,
+                    json!({"id":request["id"],"success":true,"data":patch(2560, 0, 16, 16)}),
+                )
+                .await;
+            });
+            assert_eq!(
+                display.capture(patched).await.unwrap_err().code,
+                "display_unavailable"
+            );
             helper.await.unwrap();
         }
 
