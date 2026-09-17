@@ -125,6 +125,13 @@ pub struct CdpClient {
     _keepalive_handle: tokio::task::JoinHandle<()>,
 }
 
+/// How long an acknowledged pointer command waits for its trusted renderer
+/// event before completing without a native measurement. The event is emitted
+/// by the renderer while it handles the input, so it normally precedes the
+/// acknowledgment; the window covers a loaded browser process reordering the
+/// two channels, not a point the page never reports.
+const NATIVE_POINTER_JOIN_WINDOW: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Removes a pending entry if `send_command` is cancelled mid-await (e.g. an
 /// outer timeout on the liveness probe), so a command whose response never
 /// comes can't leak until the connection closes (#1528). Normal exits disarm
@@ -319,13 +326,15 @@ impl CdpClient {
                             let pages = pages_clone.clone();
                             let events = event_tx_clone.clone();
                             tokio::spawn(async move {
-                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                tokio::time::sleep(NATIVE_POINTER_JOIN_WINDOW).await;
                                 if let Some(mut request) = pending.lock().await.remove(&id) {
-                                    if let Some(observation) = request.activity.as_ref() {
-                                        // An unmatched event must never later
-                                        // acquire a subsequent command's token.
-                                        observation.abandon_native_attribution();
-                                    }
+                                    // The renderer event did not arrive in time
+                                    // (or never fires here, e.g. the point is
+                                    // owned by an out-of-process frame). This
+                                    // command completes without a native
+                                    // measurement; its token can no longer be
+                                    // matched, so a late event is dropped. The
+                                    // next command measures afresh.
                                     let response = request.response.take().unwrap();
                                     request.complete(response, &pages, &events);
                                 }
@@ -544,14 +553,16 @@ impl CdpClient {
             let guard = self.native_pointer_lock.clone().lock_owned().await;
             if self.native_pointer_enabled.load(Ordering::Acquire) {
                 if let Some(session) = session_id {
+                    // A preparation that fails (a frame mid-navigation, a
+                    // slow renderer) costs this one command its measurement.
+                    // It is retried by the next pointer command; attribution
+                    // is never switched off for the browser's lifetime.
                     if let Some(context) = Box::pin(self.prepare_native_pointer(session, id)).await
                     {
                         if let Some(observation) = observation.as_mut() {
-                            observation.track_native(self.native_pointer_enabled.clone());
+                            observation.track_native();
                             observation.set_native_context(context);
                         }
-                    } else {
-                        self.native_pointer_enabled.store(false, Ordering::Release);
                     }
                 }
             }
@@ -941,10 +952,9 @@ mod tests {
                     .unwrap();
                 assert_eq!(event.method, activity::EVENT);
                 assert_eq!(event.params.get("screenX"), matched.then_some(&json!(56)));
-                assert_eq!(
+                assert!(
                     client.native_pointer_enabled.load(Ordering::Acquire),
-                    matched,
-                    "command {index}"
+                    "command {index}: one unmatched event must not end native attribution"
                 );
             }
             assert!(client.pending.lock().await.is_empty());

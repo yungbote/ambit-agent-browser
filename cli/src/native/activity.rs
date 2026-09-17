@@ -2,10 +2,6 @@
 //! Coordinates describe dispatched input; DOM scrolling has no invented cursor.
 
 use serde_json::{json, Value};
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
 use tokio::sync::broadcast;
 
 use super::cdp::types::CdpEvent;
@@ -47,13 +43,17 @@ impl InputSource {
 /// Created before dispatch and committed only on an acknowledged response.
 /// Keeping the observed page identity avoids relabelling a prior input after
 /// navigation. No key, text, selector, command or controller ID is retained.
+///
+/// A renderer pointer event joins the observation only when its private
+/// token, session, event type and client coordinates all match the command;
+/// an event from an earlier command therefore cannot describe a later one.
 pub(crate) struct ActivityObservation {
     event: CdpEvent,
     sender: broadcast::Sender<CdpEvent>,
-    native_liveness: Option<Arc<AtomicBool>>,
+    /// The command expects a trusted renderer pointer event to join it.
+    native_tracked: bool,
     native_context: Option<i64>,
     native_geometry: Option<Value>,
-    settled: bool,
 }
 
 impl ActivityObservation {
@@ -73,21 +73,19 @@ impl ActivityObservation {
                 session_id: Some(session.into()),
             },
             sender,
-            native_liveness: None,
+            native_tracked: false,
             native_context: None,
             native_geometry: None,
-            settled: false,
         }
     }
 
     pub(crate) fn acknowledged(mut self) {
-        self.settled = true;
         self.event.params["timestamp"] = json!(super::stream::timestamp_ms());
         let _ = self.sender.send(self.event.clone());
     }
 
-    pub(crate) fn track_native(&mut self, liveness: Arc<AtomicBool>) {
-        self.native_liveness = Some(liveness);
+    pub(crate) fn track_native(&mut self) {
+        self.native_tracked = true;
     }
 
     pub(crate) fn set_native_context(&mut self, context: i64) {
@@ -107,24 +105,14 @@ impl ActivityObservation {
     }
 
     pub(crate) fn awaits_native_event(&self) -> bool {
-        self.native_liveness.is_some() && self.event.params.get("screenX").is_none()
+        self.native_tracked && self.event.params.get("screenX").is_none()
     }
 
-    pub(crate) fn abandon_native_attribution(&self) {
-        if let Some(liveness) = self.native_liveness.as_ref() {
-            liveness.store(false, Ordering::Release);
-        }
-    }
-
-    pub(crate) fn refused(mut self) {
-        self.settled = true;
-    }
+    /// The browser refused the command; nothing was observed.
+    pub(crate) fn refused(self) {}
 
     pub(crate) fn native_event(&mut self, session: &str, payload: &Value) {
-        if self
-            .native_liveness
-            .as_ref()
-            .is_none_or(|live| !live.load(Ordering::Acquire))
+        if !self.native_tracked
             || self.event.session_id.as_deref() != Some(session)
             || self.event.params["eventType"] != payload["eventType"]
         {
@@ -156,17 +144,6 @@ impl ActivityObservation {
             .is_some_and(|scale| scale.is_finite() && scale > 0.0)
         {
             self.native_geometry = Some(payload["geometry"].clone());
-        }
-    }
-}
-
-impl Drop for ActivityObservation {
-    fn drop(&mut self) {
-        if !self.settled {
-            // An unacknowledged pointer might still reach the renderer.
-            // Stop attribution instead of relabelling a late event with a
-            // later command's private token.
-            self.abandon_native_attribution();
         }
     }
 }
