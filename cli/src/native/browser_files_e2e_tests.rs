@@ -106,7 +106,15 @@ async fn capture_fixture(state: &DaemonState, name: &str) {
         )
         .unwrap();
         if let Some(display) = browser.display_client() {
-            let (capture, _) = display.capture().await.unwrap();
+            let (capture, _) = display
+                .capture(crate::native::display::CaptureRequest {
+                    cursor: true,
+                    budget_bytes: 0,
+                    force: true,
+                })
+                .await
+                .unwrap()
+                .expect("a forced capture always returns a frame");
             std::fs::write(
                 directory.join(format!("{name}-window.jpg")),
                 STANDARD.decode(capture.data).unwrap(),

@@ -499,7 +499,7 @@ mod tests {
     #[tokio::test]
     async fn failed_readback_releases_held_input_but_preserves_the_original_failure() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let (display, peer) = DisplayClient::test_channel();
+        let (display, peer, _frames) = DisplayClient::test_channel();
         let server = tokio::spawn(async move {
             let mut peer = BufReader::new(peer);
             let mut line = String::new();
@@ -532,7 +532,7 @@ mod tests {
     #[tokio::test]
     async fn lost_reset_receipt_retains_unknown_hold_and_fences_new_input() {
         use tokio::io::{AsyncBufReadExt, BufReader};
-        let (display, peer) = DisplayClient::test_channel();
+        let (display, peer, _frames) = DisplayClient::test_channel();
         let server = tokio::spawn(async move {
             let mut peer = BufReader::new(peer);
             let mut line = String::new();
@@ -599,7 +599,7 @@ mod tests {
         let client = CdpClient::connect(&format!("ws://{address}"))
             .await
             .unwrap();
-        let (display, peer) = DisplayClient::test_channel();
+        let (display, peer, _frames) = DisplayClient::test_channel();
         let helper = tokio::spawn(async move {
             let mut peer = BufReader::new(peer);
             let mut operations = Vec::new();

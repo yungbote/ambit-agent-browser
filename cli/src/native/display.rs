@@ -2,6 +2,11 @@
 //!
 //! The helper implements platform operations. Browser custody, command order,
 //! frame pacing and observation identity remain in the native driver.
+//!
+//! Two channels reach the helper: the control channel (stdio) carries input,
+//! geometry and clipboard operations in strict order; the frame channel
+//! (an inherited descriptor) carries only captures. A capture in flight never
+//! delays acknowledged native input.
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -14,6 +19,8 @@ pub(crate) const MAX_DISPLAY_SIZE: u32 = 4096;
 pub(crate) const DEVICE_SCALE_FACTOR: u32 = 2;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+/// The descriptor the helper serves captures on; see `DisplayProcess::spawn`.
+const FRAME_CHANNEL_FD: i32 = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -26,6 +33,9 @@ pub(crate) struct Surface {
     pub origin_x: i32,
     pub origin_y: i32,
     pub device_scale_factor: u32,
+    /// The surface's raster space includes the native pointer. A frame captured
+    /// for a controlling client omits the composited pointer (that client
+    /// renders its own); the coordinate contract does not change with it.
     pub cursor_included: bool,
 }
 
@@ -94,6 +104,18 @@ impl DisplayInfo {
     }
 }
 
+/// What one capture asks of the helper. `cursor` composites the native pointer
+/// (and counts its movement as change); `budget_bytes` bounds the encoded frame
+/// through the helper's adaptive quality (0 = no bound); `force` returns a
+/// frame even when nothing changed, so a rotated surface generation can be
+/// published on the same pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct CaptureRequest {
+    pub cursor: bool,
+    pub budget_bytes: u32,
+    pub force: bool,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Capture {
@@ -102,6 +124,8 @@ pub(crate) struct Capture {
     pub encoding: String,
     pub data: String,
     pub cursor_included: bool,
+    #[serde(default)]
+    pub quality: u32,
 }
 
 #[derive(Debug, Deserialize)]
@@ -120,6 +144,14 @@ impl DisplayError {
             operation_performed: Some(json!("unknown")),
         }
     }
+
+    /// The frame loop skips these; they are not helper failures.
+    pub(crate) fn is_transient(&self) -> bool {
+        matches!(
+            self.code.as_str(),
+            "display_layout_pending" | "display_frame_stale"
+        )
+    }
 }
 
 impl std::fmt::Display for DisplayError {
@@ -137,15 +169,21 @@ pub(crate) fn enabled() -> bool {
 #[cfg(target_os = "linux")]
 mod platform {
     use super::*;
-    use std::os::fd::OwnedFd;
+    use std::os::fd::{AsRawFd, OwnedFd};
     use std::os::unix::net::UnixStream;
     use std::process::{Child, Command, Stdio};
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
+    type Wire = BufReader<tokio::net::UnixStream>;
+
     pub(crate) struct DisplayClient {
         identity: String,
-        wire: tokio::sync::Mutex<BufReader<tokio::net::UnixStream>>,
-        abort_socket: UnixStream,
+        /// Ordered control operations: info, resize, input, reset, copy.
+        control: tokio::sync::Mutex<Wire>,
+        /// Captures only. Independent of the control channel so a frame in
+        /// flight never delays native input.
+        frames: tokio::sync::Mutex<Wire>,
+        abort_sockets: [UnixStream; 2],
         failed: AtomicBool,
         next_id: AtomicU64,
         surface: RwLock<SurfaceState>,
@@ -170,28 +208,66 @@ mod platform {
         }
     }
 
+    struct Channel {
+        client: UnixStream,
+        helper: UnixStream,
+    }
+
+    fn channel() -> Result<Channel, String> {
+        let (client, helper) = UnixStream::pair().map_err(|e| e.to_string())?;
+        Ok(Channel { client, helper })
+    }
+
     impl DisplayClient {
-        #[cfg(test)]
-        pub(crate) fn test_channel() -> (Arc<Self>, tokio::net::UnixStream) {
-            let (client, peer) = UnixStream::pair().unwrap();
-            let abort_socket = client.try_clone().unwrap();
-            client.set_nonblocking(true).unwrap();
-            peer.set_nonblocking(true).unwrap();
-            let client = Arc::new(Self {
+        fn new(
+            control: UnixStream,
+            frames: UnixStream,
+            surface: Surface,
+            ready: bool,
+        ) -> Result<Arc<Self>, String> {
+            let abort_sockets = [
+                control.try_clone().map_err(|e| e.to_string())?,
+                frames.try_clone().map_err(|e| e.to_string())?,
+            ];
+            let wire = |socket: UnixStream| -> Result<Wire, String> {
+                socket.set_nonblocking(true).map_err(|e| e.to_string())?;
+                Ok(BufReader::new(
+                    tokio::net::UnixStream::from_std(socket).map_err(|e| e.to_string())?,
+                ))
+            };
+            Ok(Arc::new(Self {
                 identity: uuid::Uuid::new_v4().to_string(),
-                wire: tokio::sync::Mutex::new(BufReader::new(
-                    tokio::net::UnixStream::from_std(client).unwrap(),
-                )),
-                abort_socket,
+                control: tokio::sync::Mutex::new(wire(control)?),
+                frames: tokio::sync::Mutex::new(wire(frames)?),
+                abort_sockets,
                 failed: AtomicBool::new(false),
                 next_id: AtomicU64::new(1),
                 surface: RwLock::new(SurfaceState {
-                    value: Surface::new(2560, 1440),
+                    value: surface,
                     changed_at: std::time::Instant::now(),
-                    ready: true,
+                    ready,
                 }),
-            });
-            (client, tokio::net::UnixStream::from_std(peer).unwrap())
+            }))
+        }
+
+        /// A client whose control and frame peers the test drives directly.
+        #[cfg(test)]
+        pub(crate) fn test_channel() -> (Arc<Self>, tokio::net::UnixStream, tokio::net::UnixStream)
+        {
+            let control = channel().unwrap();
+            let frames = channel().unwrap();
+            let client = Self::new(
+                control.client,
+                frames.client,
+                Surface::new(2560, 1440),
+                true,
+            )
+            .unwrap();
+            let peer = |socket: UnixStream| {
+                socket.set_nonblocking(true).unwrap();
+                tokio::net::UnixStream::from_std(socket).unwrap()
+            };
+            (client, peer(control.helper), peer(frames.helper))
         }
 
         pub(crate) fn identity(&self) -> &str {
@@ -215,12 +291,14 @@ mod platform {
 
         fn abort(&self) {
             self.failed.store(true, Ordering::Release);
-            let _ = self.abort_socket.shutdown(std::net::Shutdown::Both);
+            for socket in &self.abort_sockets {
+                let _ = socket.shutdown(std::net::Shutdown::Both);
+            }
         }
 
         async fn command(
             &self,
-            wire: &mut BufReader<tokio::net::UnixStream>,
+            wire: &mut Wire,
             mut request: Value,
         ) -> Result<Value, DisplayError> {
             if !self.available() {
@@ -271,7 +349,7 @@ mod platform {
         }
 
         pub(crate) async fn request(&self, request: Value) -> Result<Value, DisplayError> {
-            let mut wire = self.wire.lock().await;
+            let mut wire = self.control.lock().await;
             self.command(&mut wire, request).await
         }
 
@@ -286,7 +364,7 @@ mod platform {
             height: u32,
             window_id: Option<u32>,
         ) -> Result<DisplayInfo, DisplayError> {
-            let mut wire = self.wire.lock().await;
+            let mut wire = self.control.lock().await;
             // Geometry can change before a failed or cancelled reply. Fence
             // queued coordinates and frame publication before that effect.
             {
@@ -313,41 +391,69 @@ mod platform {
         }
 
         pub(crate) async fn invalidate(&self) {
-            let _wire = self.wire.lock().await;
+            let _wire = self.control.lock().await;
             let mut surface = self.surface.write().unwrap();
             surface.value.generation = uuid::Uuid::new_v4().to_string();
             surface.changed_at = std::time::Instant::now();
         }
 
         pub(crate) async fn finish_layout(&self) {
-            let _wire = self.wire.lock().await;
+            let _wire = self.control.lock().await;
             let mut surface = self.surface.write().unwrap();
             surface.ready = true;
             surface.changed_at = std::time::Instant::now();
         }
 
-        pub(crate) async fn capture(&self) -> Result<(Capture, Surface), DisplayError> {
-            let mut wire = self.wire.lock().await;
-            if !self.surface.read().unwrap().ready {
+        /// One frame, or `None` when the display has not changed since the
+        /// previous capture. A generation rotated while the frame was in
+        /// flight makes the frame stale (transient), never a helper failure.
+        pub(crate) async fn capture(
+            &self,
+            request: CaptureRequest,
+        ) -> Result<Option<(Capture, Surface)>, DisplayError> {
+            let mut wire = self.frames.lock().await;
+            let before = {
+                let state = self.surface.read().unwrap();
+                if !state.ready {
+                    return Err(DisplayError {
+                        code: "display_layout_pending".into(),
+                        message: "The browser is applying its window layout.".into(),
+                        operation_performed: Some(json!(false)),
+                    });
+                }
+                state.value.clone()
+            };
+            let reply = self
+                .command(
+                    &mut wire,
+                    json!({
+                        "op": "capture", "cursor": request.cursor,
+                        "budgetBytes": request.budget_bytes, "force": request.force,
+                    }),
+                )
+                .await?;
+            if reply["changed"] == false {
+                return Ok(None);
+            }
+            let capture: Capture =
+                serde_json::from_value(reply).map_err(|_| DisplayError::unavailable())?;
+            let after = self.surface();
+            if after.generation != before.generation {
                 return Err(DisplayError {
-                    code: "display_layout_pending".into(),
-                    message: "The browser is applying its window layout.".into(),
+                    code: "display_frame_stale".into(),
+                    message: "The browser window changed while this frame was captured.".into(),
                     operation_performed: Some(json!(false)),
                 });
             }
-            let capture: Capture =
-                serde_json::from_value(self.command(&mut wire, json!({ "op": "capture" })).await?)
-                    .map_err(|_| DisplayError::unavailable())?;
-            let surface = self.surface();
-            if capture.width != surface.width
-                || capture.height != surface.height
+            if capture.width != after.width
+                || capture.height != after.height
                 || capture.encoding != "jpeg"
-                || !capture.cursor_included
+                || capture.cursor_included != request.cursor
             {
                 self.abort();
                 return Err(DisplayError::unavailable());
             }
-            Ok((capture, surface))
+            Ok(Some((capture, after)))
         }
 
         pub(crate) async fn input(&self, events: &[Value]) -> Result<(), DisplayError> {
@@ -382,36 +488,53 @@ mod platform {
                         .map(|dir| dir.join("browser-display"))
                 })
                 .ok_or("Browser display helper path is unavailable")?;
-            let (client, helper) = UnixStream::pair().map_err(|e| e.to_string())?;
-            let abort_socket = client.try_clone().map_err(|e| e.to_string())?;
-            client.set_nonblocking(true).map_err(|e| e.to_string())?;
-            let wire = tokio::net::UnixStream::from_std(client).map_err(|e| e.to_string())?;
-            let helper_out: OwnedFd = helper.try_clone().map_err(|e| e.to_string())?.into();
-            let helper_in: OwnedFd = helper.into();
-            let child = Command::new(executable)
-                .args(["--chrome-pid", &chrome_pid.to_string()])
+            let control = channel()?;
+            let frames = channel()?;
+            let helper_out: OwnedFd = control
+                .helper
+                .try_clone()
+                .map_err(|e| e.to_string())?
+                .into();
+            let helper_in: OwnedFd = control.helper.into();
+            let frame_channel: OwnedFd = frames.helper.into();
+            let mut command = Command::new(executable);
+            command
+                .args([
+                    "--chrome-pid",
+                    &chrome_pid.to_string(),
+                    "--capture-fd",
+                    &FRAME_CHANNEL_FD.to_string(),
+                ])
                 .env("DISPLAY", display)
                 .env("XAUTHORITY", authority)
                 .stdin(Stdio::from(helper_in))
                 .stdout(Stdio::from(helper_out))
-                .stderr(Stdio::null())
+                .stderr(Stdio::null());
+            let frame_fd = frame_channel.as_raw_fd();
+            // SAFETY: dup2 is async-signal-safe and the only work done between
+            // fork and exec. The duplicate has no close-on-exec flag, so the
+            // helper inherits exactly this descriptor as its frame channel.
+            unsafe {
+                use std::os::unix::process::CommandExt;
+                command.pre_exec(move || {
+                    if libc::dup2(frame_fd, FRAME_CHANNEL_FD) == FRAME_CHANNEL_FD {
+                        Ok(())
+                    } else {
+                        Err(std::io::Error::last_os_error())
+                    }
+                });
+            }
+            let child = command
                 .spawn()
                 .map_err(|e| format!("Browser display helper could not start: {e}"))?;
-            Ok(Self {
-                child,
-                client: Arc::new(DisplayClient {
-                    identity: uuid::Uuid::new_v4().to_string(),
-                    wire: tokio::sync::Mutex::new(BufReader::new(wire)),
-                    abort_socket,
-                    failed: AtomicBool::new(false),
-                    next_id: AtomicU64::new(1),
-                    surface: RwLock::new(SurfaceState {
-                        value: Surface::new(MAX_DISPLAY_SIZE, MAX_DISPLAY_SIZE),
-                        changed_at: std::time::Instant::now(),
-                        ready: false,
-                    }),
-                }),
-            })
+            drop(frame_channel);
+            let client = DisplayClient::new(
+                control.client,
+                frames.client,
+                Surface::new(MAX_DISPLAY_SIZE, MAX_DISPLAY_SIZE),
+                false,
+            )?;
+            Ok(Self { child, client })
         }
     }
 
@@ -444,16 +567,30 @@ mod platform {
             peer.get_mut().write_all(body.as_bytes()).await.unwrap();
         }
 
+        async fn read_request(peer: &mut BufReader<tokio::net::UnixStream>) -> Value {
+            let mut line = String::new();
+            peer.read_line(&mut line).await.unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+
+        fn frame(width: u32, height: u32, cursor: bool) -> Value {
+            json!({"changed":true,"width":width,"height":height,"encoding":"jpeg","data":"AA==","cursorIncluded":cursor,"quality":85})
+        }
+
+        const CAPTURE: CaptureRequest = CaptureRequest {
+            cursor: true,
+            budget_bytes: 0,
+            force: false,
+        };
+
         #[tokio::test]
         async fn reset_waits_for_the_prior_input_response_on_the_same_channel() {
-            let (display, peer) = DisplayClient::test_channel();
+            let (display, peer, _frames) = DisplayClient::test_channel();
             let (seen, received) = oneshot::channel();
             let (inspect, inspect_receiver) = oneshot::channel();
             let server = tokio::spawn(async move {
                 let mut peer = BufReader::new(peer);
-                let mut line = String::new();
-                peer.read_line(&mut line).await.unwrap();
-                let input: Value = serde_json::from_str(&line).unwrap();
+                let input = read_request(&mut peer).await;
                 assert_eq!(input["op"], "input");
                 seen.send(()).unwrap();
                 inspect_receiver.await.unwrap();
@@ -463,9 +600,7 @@ mod platform {
                     std::io::ErrorKind::WouldBlock
                 );
                 reply(&mut peer, json!({"id":input["id"],"success":false,"error":{"code":"test_input_unknown","message":"Input outcome unknown","operationPerformed":"unknown"}})).await;
-                line.clear();
-                peer.read_line(&mut line).await.unwrap();
-                let reset: Value = serde_json::from_str(&line).unwrap();
+                let reset = read_request(&mut peer).await;
                 assert_eq!(reset["op"], "reset");
                 reply(
                     &mut peer,
@@ -490,21 +625,25 @@ mod platform {
         }
 
         #[tokio::test]
-        async fn cancelled_input_aborts_the_channel_before_any_reset_can_be_acknowledged() {
-            let (display, peer) = DisplayClient::test_channel();
+        async fn cancelled_input_aborts_both_channels_before_any_reset_can_be_acknowledged() {
+            let (display, peer, frames) = DisplayClient::test_channel();
             let (seen, received) = oneshot::channel();
             let server = tokio::spawn(async move {
                 let mut peer = BufReader::new(peer);
-                let mut line = String::new();
-                peer.read_line(&mut line).await.unwrap();
-                let input: Value = serde_json::from_str(&line).unwrap();
+                let input = read_request(&mut peer).await;
                 assert_eq!(input["op"], "input");
                 seen.send(()).unwrap();
-                line.clear();
+                let mut line = String::new();
                 assert_eq!(
                     peer.read_line(&mut line).await.unwrap(),
                     0,
                     "cancelled input must close this channel, not queue reset or later input"
+                );
+                let mut frames = BufReader::new(frames);
+                assert_eq!(
+                    frames.read_line(&mut line).await.unwrap(),
+                    0,
+                    "the frame channel closes with the control channel"
                 );
             });
             let owner = display.clone();
@@ -515,7 +654,124 @@ mod platform {
             assert!(!display.available());
             assert!(display.reset().await.is_err());
             assert!(display.input(&[]).await.is_err());
+            assert!(display.capture(CAPTURE).await.is_err());
             server.await.unwrap();
+        }
+
+        /// The point of the second channel: a capture the helper is still
+        /// encoding cannot delay an input acknowledgment.
+        #[tokio::test]
+        async fn input_is_acknowledged_while_a_capture_is_in_flight() {
+            let (display, peer, frames) = DisplayClient::test_channel();
+            let (capture_seen, capture_received) = oneshot::channel();
+            let (input_done, input_finished) = oneshot::channel();
+            let helper = tokio::spawn(async move {
+                let mut frames = BufReader::new(frames);
+                let mut peer = BufReader::new(peer);
+                let capture = read_request(&mut frames).await;
+                assert_eq!(capture["op"], "capture");
+                assert_eq!(capture["cursor"], false);
+                assert_eq!(capture["budgetBytes"], 120000);
+                capture_seen.send(()).unwrap();
+                let input = read_request(&mut peer).await;
+                assert_eq!(input["op"], "input");
+                reply(
+                    &mut peer,
+                    json!({"id":input["id"],"success":true,"data":{}}),
+                )
+                .await;
+                input_finished.await.unwrap();
+                reply(
+                    &mut frames,
+                    json!({"id":capture["id"],"success":true,"data":frame(2560, 1440, false)}),
+                )
+                .await;
+            });
+            let owner = display.clone();
+            let capture = tokio::spawn(async move {
+                owner
+                    .capture(CaptureRequest {
+                        cursor: false,
+                        budget_bytes: 120000,
+                        force: false,
+                    })
+                    .await
+            });
+            capture_received.await.unwrap();
+            display.input(&[]).await.unwrap();
+            input_done.send(()).unwrap();
+            let (captured, surface) = capture.await.unwrap().unwrap().unwrap();
+            assert!(!captured.cursor_included);
+            assert_eq!(captured.quality, 85);
+            assert_eq!(surface.width, 2560);
+            helper.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn unchanged_capture_yields_no_frame_and_a_rotated_generation_is_transient() {
+            let (display, _peer, frames) = DisplayClient::test_channel();
+            let (rotate, rotated) = oneshot::channel();
+            let helper = tokio::spawn(async move {
+                let mut frames = BufReader::new(frames);
+                let first = read_request(&mut frames).await;
+                reply(
+                    &mut frames,
+                    json!({"id":first["id"],"success":true,"data":{"changed":false}}),
+                )
+                .await;
+                let second = read_request(&mut frames).await;
+                assert_eq!(second["force"], true);
+                rotate.send(()).unwrap();
+                reply(
+                    &mut frames,
+                    json!({"id":second["id"],"success":true,"data":frame(2560, 1440, true)}),
+                )
+                .await;
+                let third = read_request(&mut frames).await;
+                reply(
+                    &mut frames,
+                    json!({"id":third["id"],"success":true,"data":frame(2560, 1440, true)}),
+                )
+                .await;
+            });
+            assert!(display.capture(CAPTURE).await.unwrap().is_none());
+            let owner = display.clone();
+            let forced = tokio::spawn(async move {
+                owner
+                    .capture(CaptureRequest {
+                        force: true,
+                        ..CAPTURE
+                    })
+                    .await
+            });
+            rotated.await.unwrap();
+            display.invalidate().await;
+            let error = forced.await.unwrap().unwrap_err();
+            assert_eq!(error.code, "display_frame_stale");
+            assert!(error.is_transient());
+            assert!(display.available());
+            assert!(display.capture(CAPTURE).await.unwrap().is_some());
+            helper.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn a_frame_that_contradicts_the_request_is_fatal() {
+            let (display, _peer, frames) = DisplayClient::test_channel();
+            let helper = tokio::spawn(async move {
+                let mut frames = BufReader::new(frames);
+                let request = read_request(&mut frames).await;
+                reply(
+                    &mut frames,
+                    json!({"id":request["id"],"success":true,"data":frame(2560, 1440, false)}),
+                )
+                .await;
+            });
+            assert_eq!(
+                display.capture(CAPTURE).await.unwrap_err().code,
+                "display_unavailable"
+            );
+            assert!(!display.available());
+            helper.await.unwrap();
         }
     }
 }
@@ -565,7 +821,10 @@ impl DisplayClient {
     pub(crate) async fn finish_layout(&self) {
         match *self {}
     }
-    pub(crate) async fn capture(&self) -> Result<(Capture, Surface), DisplayError> {
+    pub(crate) async fn capture(
+        &self,
+        _: CaptureRequest,
+    ) -> Result<Option<(Capture, Surface)>, DisplayError> {
         match *self {}
     }
     pub(crate) async fn input(&self, _: &[Value]) -> Result<(), DisplayError> {
