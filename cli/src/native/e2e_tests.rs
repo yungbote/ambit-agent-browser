@@ -11746,3 +11746,318 @@ async fn e2e_find_role_document_matches_root() {
 
     let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
 }
+
+/// Measures the driver-side frame and input path of the owned window and
+/// prints one `LATENCY {...}` JSON line: whole frames, unchanged frames,
+/// typing-sized damage (patches when the helper offers them), input
+/// acknowledgment alone and under continuous capture load. It asserts the
+/// contract (unchanged frames are not re-sent, input never waits on capture);
+/// timings are measurements, not machine-independent latency guarantees.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_native_window_latency_measurements() {
+    use crate::native::display::CaptureRequest;
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let page = "data:text/html,<title>Latency</title><body style='margin:0;font-family:sans-serif'><h1>Frame latency</h1><input id=t autofocus style='font-size:24px;width:400px;caret-color:transparent'><p>Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua. Ut enim ad minim veniam, quis nostrud exercitation ullamco laboris nisi ut aliquip ex ea commodo consequat.</p><p>Duis aute irure dolor in reprehenderit in voluptate velit esse cillum dolore eu fugiat nulla pariatur. Excepteur sint occaecat cupidatat non proident, sunt in culpa qui officia deserunt mollit anim id est laborum.</p></body>";
+    assert_success(
+        &control_test_command(&json!({"action":"navigate","url":page}), &mut state).await,
+    );
+    state.apply_window_layout(733, 896, None).await.unwrap();
+    let display = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .display_client()
+        .expect("owned display");
+    fn stats(samples: &[f64]) -> Value {
+        let mut sorted = samples.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let avg = sorted.iter().sum::<f64>() / sorted.len() as f64;
+        json!({"avg": avg, "p95": sorted[(sorted.len() * 95 / 100).min(sorted.len() - 1)], "max": sorted[sorted.len() - 1], "n": sorted.len()})
+    }
+    let ms = |started: std::time::Instant| started.elapsed().as_secs_f64() * 1000.0;
+    let bytes = |capture: &crate::native::display::Capture| -> usize {
+        capture
+            .data
+            .as_ref()
+            .map(|data| data.len() * 3 / 4)
+            .unwrap_or(0)
+            + capture
+                .patches
+                .iter()
+                .map(|patch| patch.data.len() * 3 / 4)
+                .sum::<usize>()
+    };
+    let whole = CaptureRequest {
+        cursor: true,
+        budget_bytes: 0,
+        force: true,
+        patches: false,
+    };
+    let incremental = CaptureRequest {
+        cursor: false,
+        budget_bytes: 120_000,
+        force: false,
+        patches: true,
+    };
+
+    let (first, surface) = display.capture(whole).await.unwrap().unwrap();
+    assert_eq!((surface.width, surface.height), (1466, 1792));
+    let mut full = Vec::new();
+    let mut full_bytes = Vec::new();
+    let mut timings = Vec::new();
+    for _ in 0..20 {
+        let started = std::time::Instant::now();
+        let (capture, _) = display.capture(whole).await.unwrap().unwrap();
+        full.push(ms(started));
+        full_bytes.push(bytes(&capture));
+        timings.push(capture.timings.unwrap_or(Value::Null));
+    }
+    // Actual full-surface repaint, separately from republishing the cached
+    // JPEG above. Wait for browser paint before timing capture itself.
+    let mut damage = Vec::new();
+    let mut damage_timings = Vec::new();
+    for index in 0..10 {
+        let color = if index % 2 == 0 { "#f0d0b0" } else { "#d0e0f0" };
+        assert_success(&control_test_command(&json!({
+            "action":"evaluate", "script":format!("document.body.style.backgroundColor='{color}'")
+        }), &mut state).await);
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let started = std::time::Instant::now();
+        let (capture, _) = display.capture(whole).await.unwrap().unwrap();
+        damage.push(ms(started));
+        let timing = capture.timings.unwrap_or(Value::Null);
+        assert!(
+            timing["fetchUs"].as_u64().unwrap_or(0) > 0,
+            "the browser repaint must actually be captured"
+        );
+        damage_timings.push(timing);
+    }
+    // Settle cursor removal and any quality changes before measuring an
+    // unchanged surface. Those transitions themselves require a real frame.
+    let mut settled = false;
+    for _ in 0..10 {
+        if display.capture(incremental).await.unwrap().is_none() {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled, "the static capture did not settle");
+    // Nothing changed on screen: no frame travels, the check is the cost.
+    let mut unchanged = Vec::new();
+    for _ in 0..20 {
+        let started = std::time::Instant::now();
+        let frame = display.capture(incremental).await.unwrap();
+        unchanged.push(ms(started));
+        assert!(
+            frame.is_none(),
+            "an unchanged display must not yield a frame"
+        );
+    }
+    // One typed character: a small damage, carried as patches.
+    let mut typing = Vec::new();
+    let mut typing_bytes = Vec::new();
+    let mut typing_patches = Vec::new();
+    let mut typing_timings = Vec::new();
+    for ch in ["a", "b", "c", "d", "e"] {
+        display
+            .input(&[
+                json!({"type":"input_keyboard","eventType":"keyDown","key":ch,"code":format!("Key{}", ch.to_uppercase()),"text":ch,"modifiers":0}),
+                json!({"type":"input_keyboard","eventType":"keyUp","key":ch,"code":format!("Key{}", ch.to_uppercase()),"modifiers":0}),
+            ])
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let started = std::time::Instant::now();
+        let (capture, _) = display
+            .capture(incremental)
+            .await
+            .unwrap()
+            .expect("typing changes the display");
+        typing.push(ms(started));
+        typing_bytes.push(bytes(&capture));
+        typing_patches.push(capture.patches.len());
+        typing_timings.push(capture.timings.unwrap_or(Value::Null));
+    }
+    // Input acknowledgment alone, then under continuous whole-frame capture.
+    let mut input_alone = Vec::new();
+    for index in 0..50u32 {
+        let started = std::time::Instant::now();
+        display
+            .input(&[json!({"type":"input_mouse","eventType":"mouseMoved","x":200 + index,"y":300,"modifiers":0})])
+            .await
+            .unwrap();
+        input_alone.push(ms(started));
+    }
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let loader = {
+        let display = display.clone();
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let mut frames = 0u32;
+            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                if display.capture(whole).await.is_ok() {
+                    frames += 1;
+                }
+            }
+            frames
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let mut input_loaded = Vec::new();
+    let load_started = std::time::Instant::now();
+    for index in 0..50u32 {
+        let started = std::time::Instant::now();
+        display
+            .input(&[json!({"type":"input_mouse","eventType":"mouseMoved","x":300 + index,"y":300,"modifiers":0})])
+            .await
+            .unwrap();
+        input_loaded.push(ms(started));
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let load_seconds = load_started.elapsed().as_secs_f64();
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    let frames = loader.await.unwrap();
+    println!(
+        "LATENCY {}",
+        json!({
+            "surface": {"width": surface.width, "height": surface.height},
+            "first_frame_bytes": bytes(&first),
+            "cached_whole_capture_ms": stats(&full), "full_bytes": full_bytes, "full_timings": timings,
+            "full_damage_capture_ms": stats(&damage), "full_damage_timings": damage_timings,
+            "unchanged_capture_ms": stats(&unchanged),
+            "typing_capture_ms": stats(&typing), "typing_bytes": typing_bytes,
+            "typing_patches": typing_patches, "typing_timings": typing_timings,
+            "input_alone_ms": stats(&input_alone),
+            "input_under_capture_load_ms": stats(&input_loaded),
+            "capture_fps_under_load": frames as f64 / load_seconds,
+        })
+    );
+    let _ = close_current_browser(&mut state).await;
+}
+
+/// Actual Chrome stream: negotiated deltas maintain their exact base while
+/// human input uses the same command owner as the production control channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_native_controlled_stream_patches_and_input_latency() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let enabled =
+        control_test_command(&json!({"action":"stream_enable","port":0}), &mut state).await;
+    assert_success(&enabled);
+    let port = enabled["data"]["port"].as_u64().unwrap();
+    let html = "<body><div id=a style='position:absolute;width:80px;height:80px;background:red'></div><script>let n=0;function tick(){a.style.left=(++n%500)+'px';requestAnimationFrame(tick)}tick()</script>";
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
+    let viewer = uuid::Uuid::new_v4().to_string();
+    let mut request =
+        format!("ws://127.0.0.1:{port}/?patches=1&pacing=ack&maxFps=60&width=733&height=896")
+            .into_client_request()
+            .unwrap();
+    request
+        .headers_mut()
+        .insert("X-Ambit-Browser-Viewer", viewer.parse().unwrap());
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    state.apply_pending_window_layout().await;
+    let controller = uuid::Uuid::new_v4().to_string();
+    let expiry = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 30_000;
+    assert_success(&control_test_command(&json!({"action":"ambit_browser_control","op":"acquire","controllerId":controller,"expiresAt":expiry}), &mut state).await);
+    let reader = tokio::spawn(async move {
+        let start = tokio::time::Instant::now();
+        let mut last = None;
+        let mut patches = 0;
+        let mut controlled_frames = 0;
+        while start.elapsed() < std::time::Duration::from_secs(2) {
+            let Some(Ok(message)) =
+                tokio::time::timeout(std::time::Duration::from_secs(1), ws.next())
+                    .await
+                    .unwrap()
+            else {
+                break;
+            };
+            if !message.is_text() {
+                continue;
+            }
+            let frame: Value = serde_json::from_str(message.to_text().unwrap()).unwrap();
+            if frame["type"] != "frame" {
+                continue;
+            }
+            let seq = frame["seq"].as_u64().unwrap();
+            if frame.get("patches").is_some() {
+                assert_eq!(
+                    frame["baseSeq"].as_u64(),
+                    last,
+                    "a dropped delta must rebase"
+                );
+                patches += 1;
+            } else {
+                assert!(frame["data"].is_string());
+            }
+            last = Some(seq);
+            if frame["surface"]["cursorIncluded"] == false {
+                assert_eq!(frame["surface"]["width"], 1466);
+                assert_eq!(frame["surface"]["height"], 1792);
+                controlled_frames += 1;
+            }
+            ws.send(tokio_tungstenite::tungstenite::Message::Text(
+                json!({"type":"ack","seq":seq}).to_string(),
+            ))
+            .await
+            .unwrap();
+        }
+        assert!(
+            patches > 0,
+            "the changing page must exercise delta delivery"
+        );
+        assert!(
+            controlled_frames > 0,
+            "human frames must omit the server cursor"
+        );
+        (
+            controlled_frames as f64 / start.elapsed().as_secs_f64(),
+            patches,
+        )
+    });
+    let mut samples = Vec::new();
+    for seq in 1..=50 {
+        let generation = state
+            .browser
+            .as_ref()
+            .unwrap()
+            .display_client()
+            .unwrap()
+            .surface()
+            .generation;
+        let started = std::time::Instant::now();
+        let response = control_test_command(&json!({"action":"ambit_browser_control","op":"input","controllerId":controller,"sequence":seq,"expectedSurfaceGeneration":generation,"events":[{"type":"input_mouse","eventType":"mouseMoved","x":200+seq,"y":300,"modifiers":0}]}), &mut state).await;
+        samples.push(started.elapsed().as_secs_f64() * 1000.0);
+        assert_success(&response);
+        assert_eq!(response["data"]["lastSequence"], seq);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    let (fps, patches) = reader.await.unwrap();
+    samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    println!(
+        "CONTROLLED_STREAM {}",
+        json!({"fps":fps,"patchFrames":patches,"inputMs":{"mean":samples.iter().sum::<f64>()/samples.len() as f64,"p95":samples[47],"max":samples[49]}})
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"ambit_browser_control","op":"release","controllerId":controller}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
