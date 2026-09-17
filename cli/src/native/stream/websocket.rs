@@ -42,6 +42,8 @@ struct ClientConfig {
     presentation: Option<PresentationConfig>,
     /// The client composites damage patches over its last whole frame.
     patches: bool,
+    /// JPEG payloads travel as bytes after a bounded metadata header.
+    binary: bool,
 }
 
 /// Parse a client `config` message into the settings it changes, leaving the
@@ -117,6 +119,7 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
                 _ => {}
             },
             "patches" => cfg.patches = value == "1",
+            "frames" => cfg.binary = value == "binary",
             _ => {}
         }
     }
@@ -132,6 +135,23 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
         _ => None,
     };
     cfg
+}
+
+/// Only an upgrade-bound presenter may change its requested geometry. The
+/// message cannot select another viewer or introduce presentation ownership.
+fn updated_presentation(mut config: ClientConfig, message: &Value) -> Option<ClientConfig> {
+    let current = config.presentation?;
+    let width = message.get("width")?.as_u64()?;
+    let height = message.get("height")?.as_u64()?;
+    if !(1..=2048).contains(&width) || !(1..=2048).contains(&height) {
+        return None;
+    }
+    config.presentation = Some(PresentationConfig {
+        viewer: current.viewer,
+        width: width as u32,
+        height: height as u32,
+    });
+    Some(config)
 }
 
 /// Read the acknowledged frame id from a client `ack` message. Acks are
@@ -410,6 +430,8 @@ async fn handle_ws_client(
         idle_activity.clone(),
         browser_control,
         input_error_tx,
+        presentation.clone(),
+        connection_id,
     )));
 
     if let Some(config) = initial_config.presentation {
@@ -470,11 +492,13 @@ async fn handle_ws_client(
         .clone()
         .filter(|frame| !frame.patch);
     if let Some(frame) = initial_frame {
-        if ws_tx.send(Message::Text(frame.json.clone())).await.is_ok() {
-            last_sent = Some(Instant::now());
-            delivered_seq = frame.seq;
-            if initial_config.ack_pacing {
-                awaiting_ack = frame.seq;
+        if let Some(message) = frame.message(initial_config.binary) {
+            if ws_tx.send(message).await.is_ok() {
+                last_sent = Some(Instant::now());
+                delivered_seq = frame.seq;
+                if initial_config.ack_pacing {
+                    awaiting_ack = frame.seq;
+                }
             }
         }
     }
@@ -524,7 +548,7 @@ async fn handle_ws_client(
             }
             changed = presentation_rx.changed(), if initial_config.presentation.is_some() => {
                 if changed.is_err() { break; }
-                let config = initial_config.presentation.unwrap();
+                let config = config_rx.borrow().presentation.unwrap();
                 presentation.claim_if_available(connection_id, config);
                 presentation_rx.borrow_and_update();
                 next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, config_rx.borrow().max_fps, controlled));
@@ -596,7 +620,8 @@ async fn handle_ws_client(
                             awaiting_ack = None;
                         }
                     }
-                    if ws_tx.send(Message::Text(frame.json.clone())).await.is_err() {
+                    let Some(message) = frame.message(initial_config.binary) else { break; };
+                    if ws_tx.send(message).await.is_err() {
                         break;
                     }
                     last_sent = Some(Instant::now());
@@ -634,6 +659,8 @@ async fn reader_loop(
     idle_activity: Arc<IdleActivity>,
     browser_control: Arc<Mutex<BrowserControl>>,
     input_errors: watch::Sender<Option<Value>>,
+    presentation: Arc<Presentation>,
+    connection_id: uuid::Uuid,
 ) {
     while let Some(msg) = ws_rx.next().await {
         match msg {
@@ -643,6 +670,17 @@ async fn reader_loop(
                     Err(_) => continue,
                 };
                 let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if msg_type == "presentation" {
+                    let current = *config.borrow();
+                    if let Some(next) = updated_presentation(current, &parsed) {
+                        // Publish the connection's new dimensions first so an
+                        // acknowledgment cannot reclaim its previous size.
+                        config.send_replace(next);
+                        presentation.configure(connection_id, next.presentation.unwrap());
+                        idle_activity.mark();
+                    }
+                    continue;
+                }
                 if msg_type == "config" {
                     // Bound to a local first: a `watch` Ref taken in the
                     // `if let` scrutinee lives for the whole body, and
@@ -840,6 +878,48 @@ mod tests {
         assert!(config_from_upgrade(&upgrade("/?patches=1")).patches);
         assert!(!config_from_upgrade(&upgrade("/?patches=0")).patches);
         assert!(!config_from_upgrade(&upgrade("/")).patches);
+    }
+
+    #[test]
+    fn presentation_updates_keep_upgrade_identity_and_bounds() {
+        let viewer = uuid::Uuid::new_v4();
+        let original = ClientConfig {
+            presentation: Some(PresentationConfig {
+                viewer,
+                width: 800,
+                height: 600,
+            }),
+            binary: true,
+            ..ClientConfig::default()
+        };
+        let changed = updated_presentation(
+            original,
+            &json!({"type":"presentation","width":390,"height":844,"viewer":"different"}),
+        )
+        .unwrap();
+        assert_eq!(
+            changed.presentation.unwrap(),
+            PresentationConfig {
+                viewer,
+                width: 390,
+                height: 844
+            }
+        );
+        assert!(changed.binary);
+        assert!(
+            updated_presentation(ClientConfig::default(), &json!({"width":390,"height":844}))
+                .is_none()
+        );
+        for message in [
+            json!({"width":0,"height":844}),
+            json!({"width":2049,"height":844}),
+            json!({"width":390,"height":-1}),
+            json!({"width":"390","height":844}),
+        ] {
+            assert!(updated_presentation(original, &message).is_none());
+        }
+        assert!(config_from_upgrade(&upgrade("/?frames=binary")).binary);
+        assert!(!config_from_upgrade(&upgrade("/?frames=other")).binary);
     }
 
     #[test]

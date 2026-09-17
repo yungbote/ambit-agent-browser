@@ -298,6 +298,7 @@ pub(super) async fn cdp_event_loop(
                                     frame_watch.send_replace(Some(Arc::new(super::StreamFrame {
                                         seq: Some(seq), json: message.to_string(), patch,
                                         base_seq: if patch { published_seq } else { None },
+                                        binary: std::sync::OnceLock::new(),
                                     })));
                                     published_seq = Some(seq);
                                 }
@@ -503,6 +504,7 @@ pub(super) async fn cdp_event_loop(
                                                     json: msg.to_string(),
                                                     patch: false,
                                                     base_seq: None,
+                                                    binary: std::sync::OnceLock::new(),
                                                 },
                                             )));
                                         }

@@ -16,7 +16,7 @@ Stream a session's viewport over WebSocket and drive it with remote input. This 
 
 ## Owned Chromium window
 
-While a primary presenter is connected, native capture and its delivery are capped at 20 fps. Secondary viewers stay capped at 10 fps, and capture returns to 10 fps after primary disconnect. Lower per-client limits apply to delivery; capture cadence follows primary presence. Existing acknowledgment pacing and latest-frame replacement bound work for a slow viewer; the raster limit is not a promise of constant frame rate.
+Native capture targets 30 fps under a human lease, 15 fps with a presenter and 10 fps for secondary viewers. Unchanged frames are skipped. A slow viewer receives a fresh whole frame if it missed the base of a damage patch; frame rate remains a measured result under the available CPU and network capacity.
 
 `AGENT_BROWSER_WINDOW_STREAM=1` selects a private authenticated Linux Xvfb display for the same locally launched Chromium process used by CLI/MCP automation. Its frame includes native tabs, the address bar, menus, dialogs and the XFixes cursor. The host supplies a `browser-display` executable beside the native driver, or an absolute `AGENT_BROWSER_DISPLAY_HELPER` path. The helper and private display share the Chrome process lifetime. This mode refuses an inherited display; it does not attach to a global desktop.
 
@@ -39,6 +39,14 @@ Owned-window mouse commands move the captured native cursor and send buttons thr
 Acknowledged agent input can carry a display-pixel action marker with `source: "agent"` and `surfaceGeneration`. The captured native cursor moves with the action. The marker describes dispatched input, not whether a website accepted its effect. Page-only CDP sessions keep their existing input path. Neither telemetry path exposes typed text or clipboard content.
 
 Before ordinary page actions, the driver observes native window focus and actual page visibility. Ambiguous focus and pinned-tab mismatches require explicit tab selection. After human handback or a layout change, CLI callers must obtain a new snapshot or screenshot; host-bound MCP supplies fresh feedback with `browser_observation_required`. Queued actions admitted before the layout change cannot use a later observation to replay stale coordinates. Native window closure leaves the existing daemon available for an explicit `open`, which creates a new browser with a fresh target. `close` ends that session and reaps its display. Unlabelled stream loss still does not prove permanent closure.
+
+## Incremental and binary window frames
+
+A presenter can update its requested size on the existing connection with `{"type":"presentation","width":733,"height":896}`. Width and height retain the upgrade limits. The viewer UUID stays bound to the upgrade; this message neither grants input nor changes identity. The existing presentation owner emits the applied surface when the real window is ready. Human control still uses an ordered controller viewport event; passive presentation waits while that lease is active.
+
+Append `patches=1` to opt into damage patches. The driver sends them only while every connected viewer supports composition. A patch frame has `baseSeq` and `patches` instead of `data`. Its base must equal the last applied frame, with the same surface generation and geometry. A new viewer always starts with a whole frame; a writer that skipped a dependency requests another whole frame. Each patch contains `x`, `y`, `width`, `height`, JPEG `data`, and `sourceX`/`sourceY`. Draw its source crop at the destination rectangle. The encoded JPEG includes up to 16 pixels of neighboring context per side to avoid chroma seams; drawn rectangles are at most 512 pixels per side and encoded images at most 544. `cursorIncluded:false` means the controlling interface draws a local pointer instead.
+
+Append `frames=binary` to receive JPEG bytes without base64. Each binary WebSocket message contains a four-byte unsigned big-endian header length, the UTF-8 JSON header, then JPEG bytes in declaration order. The header is at most 64 KiB and the entire message at most 12 MiB. Whole-frame metadata replaces `data` with `byteLength`; each patch replaces its own `data` with `byteLength`. The length sum must exactly match the remaining bytes. Other metadata, including `seq`, `baseSeq`, surface and source crops, is unchanged. Status, presentation and activity remain text JSON. Negotiate `pacing=ack` and acknowledge the frame only after decoding and painting it. Existing text viewers remain compatible and do not need to opt in.
 
 ## Enabling the stream
 

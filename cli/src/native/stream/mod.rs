@@ -5,6 +5,7 @@ mod discovery;
 mod http;
 pub(crate) mod presentation;
 mod websocket;
+mod wire;
 
 pub use cdp_loop::{ack_screencast_frame, start_screencast, stop_screencast};
 pub use dashboard::{
@@ -114,6 +115,23 @@ pub(super) struct StreamFrame {
     pub(super) patch: bool,
     /// Exact frame this delta amends. Whole frames have no dependency.
     pub(super) base_seq: Option<u64>,
+    binary: std::sync::OnceLock<Option<Vec<u8>>>,
+}
+
+impl StreamFrame {
+    /// Binary JPEGs are derived once and shared by viewers. Text peers retain
+    /// their existing envelope; negotiation never changes another viewer.
+    fn message(&self, binary: bool) -> Option<tokio_tungstenite::tungstenite::Message> {
+        use tokio_tungstenite::tungstenite::Message;
+        if binary {
+            self.binary
+                .get_or_init(|| wire::binary_frame(&self.json))
+                .as_ref()
+                .map(|data| Message::Binary(data.clone()))
+        } else {
+            Some(Message::Text(self.json.clone()))
+        }
+    }
 }
 
 /// Frame id inside an already-serialized frame. Only the legacy
@@ -527,6 +545,7 @@ impl StreamServer {
             json: frame_json.to_string(),
             patch: false,
             base_seq: None,
+            binary: std::sync::OnceLock::new(),
         })));
     }
 
@@ -552,6 +571,7 @@ impl StreamServer {
             json: msg.to_string(),
             patch: false,
             base_seq: None,
+            binary: std::sync::OnceLock::new(),
         })));
     }
 
@@ -905,6 +925,74 @@ mod tests {
         server.shutdown().await;
     }
 
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn binary_viewer_preserves_text_peer_and_resizes_without_reconnecting() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let (server, _slot) = StreamServer::start_without_client(
+            0,
+            "binary-presentation".into(),
+            true,
+            Arc::new(IdleActivity::new()),
+        )
+        .await
+        .unwrap();
+        server.broadcast_frame(r#"{"type":"frame","seq":7,"data":"/9j/2Q=="}"#);
+        let mut request = format!(
+            "ws://127.0.0.1:{}/?frames=binary&width=800&height=600",
+            server.port()
+        )
+        .into_client_request()
+        .unwrap();
+        let viewer = uuid::Uuid::new_v4();
+        request.headers_mut().insert(
+            "X-Ambit-Browser-Viewer",
+            viewer.to_string().parse().unwrap(),
+        );
+        let (mut binary, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+        let mut text = connect_client(server.port()).await;
+        assert_eq!(next_frame(&mut text).await["data"], "/9j/2Q==");
+        loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(2), binary.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let Message::Binary(bytes) = message {
+                let end = 4 + u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+                let header: Value = serde_json::from_slice(&bytes[4..end]).unwrap();
+                assert_eq!(header["seq"], 7);
+                assert_eq!(header["byteLength"], 4);
+                assert_eq!(&bytes[end..], &[255, 216, 255, 217]);
+                break;
+            }
+        }
+        binary
+            .send(Message::Text(
+                json!({"type":"presentation","width":390,"height":844}).to_string(),
+            ))
+            .await
+            .unwrap();
+        loop {
+            let message = tokio::time::timeout(std::time::Duration::from_secs(2), binary.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let Message::Text(raw) = message else {
+                continue;
+            };
+            let response: Value = serde_json::from_str(&raw).unwrap();
+            if response["type"] == "presentation" && response["requested"]["width"] == 390 {
+                assert_eq!(response["requested"]["height"], 844);
+                break;
+            }
+        }
+        let pending = server.presentation.pending("same-page").unwrap();
+        assert_eq!(pending.config.viewer, viewer);
+        assert_eq!((pending.config.width, pending.config.height), (390, 844));
+        server.shutdown().await;
+    }
+
     fn publish_test_patch(server: &StreamServer, seq: u64, base_seq: u64) {
         server.frame_watch.send_replace(Some(Arc::new(StreamFrame {
             seq: Some(seq),
@@ -912,6 +1000,7 @@ mod tests {
                 .to_string(),
             patch: true,
             base_seq: Some(base_seq),
+            binary: std::sync::OnceLock::new(),
         })));
     }
 

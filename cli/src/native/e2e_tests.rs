@@ -12061,3 +12061,84 @@ async fn e2e_native_controlled_stream_patches_and_input_latency() {
     );
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
+
+/// Exercise geometry updates over one read-only binary stream. This measures
+/// driver layout plus capture; production transport latency is measured in UI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_native_binary_viewer_resizes_the_same_window() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let enabled =
+        control_test_command(&json!({"action":"stream_enable","port":0}), &mut state).await;
+    assert_success(&enabled);
+    let port = enabled["data"]["port"].as_u64().unwrap();
+    assert_success(&control_test_command(&json!({"action":"navigate","url":"data:text/html,<h1>Binary resize</h1><input autofocus>"}), &mut state).await);
+    let mut request = format!(
+        "ws://127.0.0.1:{port}/?frames=binary&patches=1&pacing=ack&maxFps=60&width=733&height=896"
+    )
+    .into_client_request()
+    .unwrap();
+    request.headers_mut().insert(
+        "X-Ambit-Browser-Viewer",
+        uuid::Uuid::new_v4().to_string().parse().unwrap(),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let mut timings = Vec::new();
+    let mut previous = None;
+    for (width, height) in [(733, 896), (390, 844), (1280, 720), (733, 896)] {
+        let started = std::time::Instant::now();
+        ws.send(Message::Text(
+            json!({"type":"presentation","width":width,"height":height}).to_string(),
+        ))
+        .await
+        .unwrap();
+        let mut observed = false;
+        while started.elapsed() < std::time::Duration::from_secs(5) {
+            state.apply_pending_window_layout().await;
+            let Ok(Some(Ok(message))) =
+                tokio::time::timeout(std::time::Duration::from_millis(5), ws.next()).await
+            else {
+                continue;
+            };
+            let Message::Binary(bytes) = message else {
+                continue;
+            };
+            let end = 4 + u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+            let frame: Value = serde_json::from_slice(&bytes[4..end]).unwrap();
+            let length = frame["byteLength"].as_u64().unwrap_or_else(|| {
+                frame["patches"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|patch| patch["byteLength"].as_u64().unwrap())
+                    .sum()
+            });
+            assert_eq!(bytes.len(), end + length as usize);
+            ws.send(Message::Text(
+                json!({"type":"ack","seq":frame["seq"]}).to_string(),
+            ))
+            .await
+            .unwrap();
+            if frame["surface"]["width"] == width * 2 && frame["surface"]["height"] == height * 2 {
+                assert!(
+                    frame["byteLength"].is_number(),
+                    "new geometry must start with a whole frame"
+                );
+                assert!(previous.as_ref() != Some(&frame["surface"]["generation"]));
+                previous = Some(frame["surface"]["generation"].clone());
+                timings.push(json!({"width":width,"height":height,"firstFrameMs":started.elapsed().as_secs_f64()*1000.0,"jpegBytes":length}));
+                observed = true;
+                break;
+            }
+        }
+        assert!(observed, "new geometry did not reach the same stream");
+    }
+    println!("BINARY_RESIZE {}", json!(timings));
+    drop(ws);
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}

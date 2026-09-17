@@ -28,13 +28,13 @@ Use [Video Recording](/recording) when you need a saved WebM or MP4 artifact ins
 
 ## Owned Chromium window on Linux
 
-The primary presentation receives up to 20 fps through the existing acknowledgment-paced stream. Secondary viewers stay at 10 fps, and capture returns to 10 fps when the primary disconnects. A slow viewer receives the latest frame without accumulating a queue; large windows may capture more slowly.
+Native capture targets 30 fps under a human lease, 15 fps with a presenter and 10 fps for secondary viewers. Unchanged frames are skipped. A slow viewer receives a fresh whole frame if it missed the base of a damage patch; frame rate remains a measured result under the available CPU and network capacity.
 
 Set `AGENT_BROWSER_WINDOW_STREAM=1` to show the actual Chromium tabs, address bar, menus, dialogs and native cursor. The driver launches its automated Chromium process on a private authenticated Xvfb display and owns both until that browser closes. Install the host-built `browser-display` helper beside the native executable, or set its absolute path with `AGENT_BROWSER_DISPLAY_HELPER`. An inherited desktop display is not used for this mode.
 
 Owned-window mouse commands move the captured native cursor and send buttons through the same display input owner as human control. The ordinary pre-hover supplies a measured page-to-window position, including page zoom and native browser chrome. A position lasts for one command or held gesture and is discarded on takeover. Native input is acknowledged by the display helper; no CDP button is replayed. Native motion can produce additional pointermove events, and Chromium may coalesce moves during a drag. A failed gesture or host timeout releases held native input through an acknowledged helper reset. If release is unconfirmed, new mouse input stays blocked. Cleanup never turns the original partial or unknown action into success; that classification and the fresh-observation requirement remain in the existing host response. Check and uncheck select one activation method before acting. Visible controls and associated labels use pointer input. A non-interactable associated input with no visible activation path uses the existing DOM control action, honors disabled state, and verifies the result. Responses report the actual method (`native`, `cdp`, `dom`, or `unchanged`); no action retries through another method.
 
-The existing stream carries full-window JPEG frames with a `surface` object: `kind: "browser-window"`, `coordinateSpace: "display-pixels"`, a UUID `generation`, physical `width` and `height`, `originX: 0`, `originY: 0`, `deviceScaleFactor: 2`, and `cursorIncluded: true`. These frames omit CDP page-frame metadata. Native UI scale is fixed at 2; Chromium page zoom and page screenshots retain their independently measured CSS geometry.
+The existing stream carries full-window JPEG frames with a `surface` object: `kind: "browser-window"`, `coordinateSpace: "display-pixels"`, a UUID `generation`, physical `width` and `height`, `originX: 0`, `originY: 0`, `deviceScaleFactor: 2`, and `cursorIncluded` indicating whether the native cursor is present. These frames omit CDP page-frame metadata. Native UI scale is fixed at 2; Chromium page zoom and page screenshots retain their independently measured CSS geometry.
 
 A configured viewer supplies a stable UUID and `width`/`height` in CSS pixels, each from 1 through 2048. The first viewer owns presentation, with a two-second grace for reconnecting under the same UUID. Other viewers scale the same window. Layout changes run at existing command boundaries, wait for native geometry and unblocked-page compositor feedback, and invalidate older observations. A known native modal uses the acknowledged window surface while page feedback remains unavailable; resize does not dismiss it. A human input lease defers passive layout changes. The existing stream reports `presentation` with `role`, requested dimensions and the applied surface, or `error: "viewport_unavailable"`. Raster dimensions are bounded at 4096×4096; large surfaces have higher capture cost.
 
@@ -74,6 +74,14 @@ Orderly session closure or `stream disable` sends `{"type":"finished"}` before c
 Frame encoding is set per daemon with `AGENT_BROWSER_STREAM_QUALITY` (0 to 100), `AGENT_BROWSER_STREAM_MAX_WIDTH` and `AGENT_BROWSER_STREAM_MAX_HEIGHT`. The live stream requests jpeg. An explicit `screencast_start` reconfigures the same underlying screencast, so a client can see the format change mid-stream. Width and height cap the frame and default to the session viewport. On a busy page at 1280x720, quality 80 costs about 54 KB per frame, quality 20 about 25 KB, and quality 20 at 640x360 about 9 KB.
 
 Browser clients must load from `localhost`, `127.0.0.1`, `::1` or `file://`. Any other origin gets a 403 on the upgrade and needs a proxy.
+
+### Binary frames and presentation updates
+
+An upgrade-bound window presenter can send `{"type":"presentation","width":733,"height":896}` on the same connection. The viewer identity stays fixed, and existing presentation custody determines whether that size applies. This does not grant input. Controlled resizing still uses the host input sequence.
+
+Negotiate `patches=1` for JPEG damage rectangles and `frames=binary` to avoid base64. The binary message is a four-byte big-endian JSON-header length, the UTF-8 header, then JPEG bytes in declaration order. The header is bounded at 64 KiB and the message at 12 MiB. Whole frames carry `byteLength`; patches carry their own `byteLength` plus `x`, `y`, `width`, `height`, `sourceX` and `sourceY`. Byte lengths must exactly consume the payload. Draw the source crop at its destination; padding supplies the JPEG decoder's neighboring pixels.
+
+A delta's `baseSeq` must equal the last painted frame with matching surface generation and dimensions. Fresh viewers and skipped dependencies receive a whole frame. With `pacing=ack`, acknowledge only after the complete frame is painted. Other records remain text JSON; existing text viewers are unchanged.
 
 ### Frame messages
 

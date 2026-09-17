@@ -3234,6 +3234,12 @@ Notes:
     frames already handed to the transport are delivered in order.
   - Both settings can be declared on the URL instead, which is the only way
     to cover the opening frame: ws://127.0.0.1:<port>/?pacing=ack&maxFps=10
+  - Window viewers can opt into patches=1 for exact-base damage rectangles
+    and frames=binary for JPEG bytes after a bounded JSON metadata header.
+    Acknowledge after painting; missing patch bases require a whole frame.
+  - Upgrade-bound presenters can resize on the existing connection with
+    {"type":"presentation","width":733,"height":896}. Identity stays bound
+    to the upgrade; input still requires its existing controller lease.
   - Native frames carry pageGeneration. Acknowledged pointer records share it;
     typing/scrolling activity contains no input text. Navigation and viewport
     changes reset the identity. Display activity only on its matching frame.
