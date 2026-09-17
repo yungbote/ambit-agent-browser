@@ -74,7 +74,7 @@ impl NativeMouse {
         *self = Self::default();
     }
 
-    fn require_known(&self) -> Result<(), String> {
+    pub(super) fn require_known(&self) -> Result<(), String> {
         if self.unknown {
             return Err("browser_control_outcome_unknown: Native input release is unconfirmed. Close the browser before sending more mouse input; do not replay the original action.".into());
         }

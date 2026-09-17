@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use super::browser_control::BrowserControl;
 use super::cdp::client::CdpClient;
@@ -46,7 +46,7 @@ pub async fn click(
         iframe_sessions,
     )
     .await?;
-    if control.lock().await.has_native_mouse() && click_count > 1 {
+    if control.lock().await.has_native_display() && click_count > 1 {
         for _ in 0..click_count {
             let result = dispatch_click(
                 client,
@@ -118,7 +118,7 @@ pub async fn hover(
         iframe_sessions,
     )
     .await?;
-    if control.lock().await.has_native_mouse() {
+    if control.lock().await.has_native_display() {
         control
             .lock()
             .await
@@ -228,6 +228,28 @@ pub async fn type_text(
     delay_ms: Option<u64>,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<(), String> {
+    focus_for_typing(
+        client,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        clear,
+        iframe_sessions,
+    )
+    .await?;
+    type_text_into_active_context(client, session_id, text, delay_ms).await
+}
+
+/// Focus the target element (and optionally clear it) so that keystrokes,
+/// whether dispatched through CDP or the owned native window, reach it.
+pub async fn focus_for_typing(
+    client: &CdpClient,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector_or_ref: &str,
+    clear: bool,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<(), String> {
     let (object_id, effective_session_id) = resolve_element_object_id(
         client,
         session_id,
@@ -272,8 +294,7 @@ pub async fn type_text(
             )
             .await?;
     }
-
-    type_text_into_active_context(client, session_id, text, delay_ms).await
+    Ok(())
 }
 
 pub async fn type_text_into_active_context(
@@ -665,7 +686,7 @@ async fn set_checked(
         }
         Some("dom") => "dom",
         Some("pointer") => {
-            if control.lock().await.has_native_mouse() {
+            if control.lock().await.has_native_display() {
                 "native"
             } else {
                 "cdp"
@@ -1012,7 +1033,7 @@ async fn dispatch_mouse_or_dialog(
 ) -> Result<bool, String> {
     use tokio::sync::broadcast::error::RecvError;
 
-    if control.lock().await.has_native_mouse() {
+    if control.lock().await.has_native_display() {
         return control
             .lock()
             .await
@@ -1174,7 +1195,7 @@ pub async fn dispatch_pending_release(
     control: &Mutex<BrowserControl>,
     release: &PendingRelease,
 ) -> Result<(), String> {
-    if control.lock().await.has_native_mouse() {
+    if control.lock().await.has_native_display() {
         return control.lock().await.finish_native_dialog().await;
     }
     client
@@ -1277,6 +1298,64 @@ fn key_text(key_name: &str) -> Option<String> {
     }
 }
 
+/// Keyboard events for the owned native window, in the shape the display
+/// helper accepts. Characters a US keymap types are sent as key presses with
+/// their text; any other run of characters becomes one explicit text
+/// insertion, which the helper performs as a single native paste.
+pub(crate) fn native_text_events(text: &str) -> Vec<Value> {
+    let mut events = Vec::new();
+    let mut pending_insert = String::new();
+    let flush = |pending: &mut String, events: &mut Vec<Value>| {
+        if !pending.is_empty() {
+            events.push(json!({
+                "type": "input_keyboard", "eventType": "insertText", "text": std::mem::take(pending),
+            }));
+        }
+    };
+    for ch in text.chars() {
+        // A US keymap types every ASCII graphic character; the helper
+        // resolves the native key and level from the character itself.
+        let typed_natively = matches!(ch, '\n' | '\r' | '\t' | ' ') || ch.is_ascii_graphic();
+        if !typed_natively {
+            pending_insert.push(ch);
+            continue;
+        }
+        flush(&mut pending_insert, &mut events);
+        let (key, code, _) = char_to_key_info(ch);
+        events.extend(native_key_events(&key, &code, 0));
+    }
+    flush(&mut pending_insert, &mut events);
+    events
+}
+
+/// A single key press through the owned native window, with the CDP
+/// modifier mask (1 Alt, 2 Control, 4 Meta, 8 Shift) the helper shares.
+pub(crate) fn native_key_chord_events(key: &str, modifiers: Option<i32>) -> Vec<Value> {
+    let (key_name, code, _) = named_key_info(key);
+    native_key_events(&key_name, &code, modifiers.unwrap_or(0))
+}
+
+fn native_key_events(key: &str, code: &str, modifiers: i32) -> Vec<Value> {
+    let mut down = json!({
+        "type": "input_keyboard", "eventType": "keyDown", "key": key, "code": code,
+        "modifiers": modifiers,
+    });
+    // Text rides only with an unmodified printable key; a chord names its
+    // physical key, and the helper resolves the native level itself.
+    if modifiers & 7 == 0 {
+        if let Some(text) = key_text(key).filter(|text| text != "\r" && text != "\t") {
+            down["text"] = json!(text);
+        }
+    }
+    vec![
+        down,
+        json!({
+            "type": "input_keyboard", "eventType": "keyUp", "key": key, "code": code,
+            "modifiers": modifiers,
+        }),
+    ]
+}
+
 fn named_key_info(key: &str) -> (String, String, i32) {
     match key.to_lowercase().as_str() {
         "enter" | "return" => ("Enter".to_string(), "Enter".to_string(), 13),
@@ -1307,6 +1386,68 @@ fn named_key_info(key: &str) -> (String, String, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_text_types_keymap_characters_and_pastes_the_rest() {
+        let events = native_text_events("a1.\né漢字!");
+        let kinds: Vec<(String, String)> = events
+            .iter()
+            .map(|event| {
+                (
+                    event["eventType"].as_str().unwrap().to_string(),
+                    event["key"]
+                        .as_str()
+                        .or(event["text"].as_str())
+                        .unwrap()
+                        .to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("keyDown", "a"),
+                ("keyUp", "a"),
+                ("keyDown", "1"),
+                ("keyUp", "1"),
+                ("keyDown", "."),
+                ("keyUp", "."),
+                ("keyDown", "Enter"),
+                ("keyUp", "Enter"),
+                ("insertText", "é漢字"),
+                ("keyDown", "!"),
+                ("keyUp", "!"),
+            ]
+            .map(|(kind, key)| (kind.to_string(), key.to_string()))
+        );
+        assert_eq!(events[0]["text"], "a");
+        assert_eq!(events[0]["code"], "KeyA");
+        assert_eq!(events[0]["modifiers"], 0);
+        assert!(events[1].get("text").is_none());
+        // Enter carries no text: the helper presses the physical key.
+        assert!(events[6].get("text").is_none());
+        assert_eq!(events[6]["code"], "Enter");
+        assert_eq!(native_text_events("").len(), 0);
+    }
+
+    #[test]
+    fn native_chords_name_the_physical_key_without_text() {
+        let events = native_key_chord_events("a", Some(2));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["eventType"], "keyDown");
+        assert_eq!(events[0]["key"], "a");
+        assert_eq!(events[0]["code"], "KeyA");
+        assert_eq!(events[0]["modifiers"], 2);
+        assert!(events[0].get("text").is_none());
+        assert_eq!(events[1]["eventType"], "keyUp");
+        assert_eq!(events[1]["modifiers"], 2);
+        let shifted = native_key_chord_events("Enter", Some(8));
+        assert_eq!(shifted[0]["code"], "Enter");
+        assert_eq!(shifted[0]["modifiers"], 8);
+        let space = native_key_chord_events("Space", None);
+        assert_eq!(space[0]["key"], " ");
+        assert_eq!(space[0]["text"], " ");
+    }
 
     /// Verify that `char_to_key_info` returns the correct (key, code,
     /// windowsVirtualKeyCode) triple for every character in Playwright's

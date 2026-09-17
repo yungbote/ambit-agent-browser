@@ -322,7 +322,7 @@ async fn e2e_native_agent_mouse_click_drag_dialog_and_takeover() {
     let mut state = DaemonState::new();
     let html = r#"<!doctype html><style>body{margin:0}button{position:absolute;left:100px;top:120px;width:140px;height:60px}#box{position:absolute;left:320px;top:140px}#drag{position:absolute;left:450px;top:140px;width:80px;height:80px;background:blue}#end{position:absolute;left:650px;top:140px;width:80px;height:80px;background:green}</style><button id=button>Click</button><input id=box type=checkbox><div id=drag></div><div id=end></div><script>window.events=[];window.clicks=0;window.doubles=0;window.ask=false;window.held=false;for(const type of ['pointermove','pointerdown','pointerup','click','dblclick'])addEventListener(type,e=>{events.push({type,trusted:e.isTrusted,buttons:e.buttons,target:e.target.id,x:e.clientX,y:e.clientY,screenX:e.screenX,screenY:e.screenY});if(type==='pointerdown'){held=true;if(ask){ask=false;confirm('Continue native mouse?')}}if(type==='pointerup')held=false;if(type==='click'&&e.target.id==='button')clicks++;if(type==='dblclick'&&e.target.id==='button')doubles++;},true);drag.onpointerdown=e=>drag.setPointerCapture(e.pointerId)</script>"#;
     assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
-    assert!(state.browser_control.lock().await.has_native_mouse());
+    assert!(state.browser_control.lock().await.has_native_display());
     for action in ["click", "tap", "dblclick", "hover"] {
         assert_success(
             &control_test_command(&json!({"action":action,"selector":"#button"}), &mut state).await,

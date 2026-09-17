@@ -6137,6 +6137,20 @@ async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     let clear = cmd.get("clear").and_then(|v| v.as_bool()).unwrap_or(false);
     let delay = cmd.get("delay").and_then(|v| v.as_u64());
 
+    if state.browser_control.lock().await.has_native_display() {
+        interaction::focus_for_typing(
+            &mgr.client,
+            &session_id,
+            &state.ref_map,
+            selector,
+            clear,
+            &state.iframe_sessions,
+        )
+        .await?;
+        native_type(state, text, delay).await?;
+        return Ok(json!({ "typed": text }));
+    }
+
     interaction::type_text(
         &mgr.client,
         &session_id,
@@ -6151,6 +6165,33 @@ async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     Ok(json!({ "typed": text }))
 }
 
+/// Keystrokes through the owned native window. A per-key delay keeps the
+/// requested cadence by sending one character per batch.
+async fn native_type(state: &DaemonState, text: &str, delay_ms: Option<u64>) -> Result<(), String> {
+    match delay_ms.filter(|delay| *delay > 0) {
+        None => {
+            state
+                .browser_control
+                .lock()
+                .await
+                .agent_native_keys(&interaction::native_text_events(text))
+                .await
+        }
+        Some(delay) => {
+            for ch in text.chars() {
+                state
+                    .browser_control
+                    .lock()
+                    .await
+                    .agent_native_keys(&interaction::native_text_events(&ch.to_string()))
+                    .await?;
+                tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+            }
+            Ok(())
+        }
+    }
+}
+
 async fn handle_press(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
@@ -6161,6 +6202,19 @@ async fn handle_press(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 
     // Parse modifier+key chords like "Control+a", "Shift+Enter", "Control+Shift+a"
     let (actual_key, modifiers) = parse_key_chord(key);
+
+    if state.browser_control.lock().await.has_native_display() {
+        state
+            .browser_control
+            .lock()
+            .await
+            .agent_native_keys(&interaction::native_key_chord_events(
+                &actual_key,
+                modifiers,
+            ))
+            .await?;
+        return Ok(json!({ "pressed": key }));
+    }
 
     interaction::press_key_with_modifiers(&mgr.client, &session_id, &actual_key, modifiers).await?;
     Ok(json!({ "pressed": key }))
@@ -7235,6 +7289,7 @@ async fn handle_mouse(cmd: &Value, state: &DaemonState) -> Result<Value, String>
 async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
+    let native = state.browser_control.lock().await.has_native_display();
 
     match cmd.get("subaction").and_then(|v| v.as_str()) {
         Some("type") => {
@@ -7242,8 +7297,12 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
                 .get("text")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'text' parameter")?;
-            interaction::type_text_into_active_context(&mgr.client, &session_id, text, None)
-                .await?;
+            if native {
+                native_type(state, text, None).await?;
+            } else {
+                interaction::type_text_into_active_context(&mgr.client, &session_id, text, None)
+                    .await?;
+            }
             return Ok(json!({ "typed": text }));
         }
         Some("insertText") => {
@@ -7251,6 +7310,17 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
                 .get("text")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'text' parameter")?;
+            if native {
+                state
+                    .browser_control
+                    .lock()
+                    .await
+                    .agent_native_keys(&[json!({
+                        "type": "input_keyboard", "eventType": "insertText", "text": text,
+                    })])
+                    .await?;
+                return Ok(json!({ "inserted": true }));
+            }
             mgr.client
                 .send_command(
                     "Input.insertText",
@@ -7280,6 +7350,24 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
     }
     if let Some(t) = text {
         params["text"] = Value::String(t.to_string());
+    }
+
+    if native {
+        // One raw key transition, in the helper's event shape.
+        let mut event =
+            json!({ "type": "input_keyboard", "eventType": event_type, "modifiers": 0 });
+        for field in ["key", "code", "text"] {
+            if let Some(value) = params.get(field) {
+                event[field] = value.clone();
+            }
+        }
+        state
+            .browser_control
+            .lock()
+            .await
+            .agent_native_keys(&[event])
+            .await?;
+        return Ok(json!({ "dispatched": event_type }));
     }
 
     mgr.client
@@ -8190,7 +8278,7 @@ async fn handle_tap(cmd: &Value, state: &mut DaemonState) -> Result<Value, Strin
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
 
-    if state.browser_control.lock().await.has_native_mouse() {
+    if state.browser_control.lock().await.has_native_display() {
         let result = interaction::click(
             &mgr.client,
             &state.browser_control,
@@ -8454,7 +8542,7 @@ async fn handle_dialog(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     state.pending_dialog = None;
     result?;
 
-    if state.browser_control.lock().await.has_native_mouse() {
+    if state.browser_control.lock().await.has_native_display() {
         state
             .browser_control
             .lock()
@@ -10653,7 +10741,7 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     )
     .await?;
 
-    if state.browser_control.lock().await.has_native_mouse() {
+    if state.browser_control.lock().await.has_native_display() {
         let dialog_opened = state
             .browser_control
             .lock()

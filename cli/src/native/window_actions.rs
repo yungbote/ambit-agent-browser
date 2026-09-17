@@ -113,7 +113,7 @@ impl DaemonState {
             return;
         };
         let control = self.browser_control.clone();
-        let mut control = control.lock().await;
+        let control = control.lock().await;
         if control.agent_error().is_some() {
             return;
         }

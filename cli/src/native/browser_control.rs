@@ -424,8 +424,42 @@ impl BrowserControl {
         });
     }
 
-    pub(crate) fn has_native_mouse(&self) -> bool {
+    /// The browser owns a native window: agent pointer and keyboard input
+    /// reach it through the display helper rather than CDP.
+    pub(crate) fn has_native_display(&self) -> bool {
         self.display.is_some()
+    }
+
+    /// Agent keyboard through the owned display. Each batch is one ordered
+    /// native sequence at the helper; a batch that may have started leaves
+    /// an uncertain outcome and releases whatever the helper still holds.
+    pub(crate) async fn agent_native_keys(&mut self, events: &[Value]) -> Result<(), String> {
+        if let Some(error) = self.agent_error() {
+            return Err(format!("{}: {}", error.code, error.message));
+        }
+        self.native_mouse
+            .require_known()
+            .map_err(|error| error.replace("mouse input", "keyboard input"))?;
+        let display = self.display.as_ref().ok_or("No owned browser display")?;
+        for batch in events.chunks(MAX_EVENTS) {
+            if let Err(error) = display.input(batch).await {
+                if error.operation_performed == Some(json!(false)) {
+                    return Err(format!(
+                        "The native browser window did not accept this keyboard input ({error})."
+                    ));
+                }
+                self.needs_observation = true;
+                let mut message = format!(
+                    "browser_control_outcome_unknown: Native keyboard input may have executed ({error}). Inspect the page before retrying; do not replay the text."
+                );
+                if let Err(release) = self.native_mouse.release(display).await {
+                    message.push(' ');
+                    message.push_str(&release);
+                }
+                return Err(message);
+            }
+        }
+        Ok(())
     }
 
     /// A modal may navigate or replace the page when dismissed. Release at
@@ -513,9 +547,6 @@ impl BrowserControl {
         result
     }
 
-    pub(crate) fn require_observation(&mut self) {
-        self.needs_observation = true;
-    }
     pub(crate) fn needs_observation(&self) -> bool {
         self.needs_observation
     }
