@@ -34,11 +34,11 @@ const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(2);
 struct ClientConfig {
     /// Frames per second ceiling. 0 means uncapped.
     max_fps: u32,
-    /// Keep at most one frame in flight, awaiting the client's ack.
+    /// Bound in-flight frames until the client acknowledges painting them.
     ///
-    /// Invariant: latest-frame-wins holds only above the socket. Frames already
-    /// handed to the transport are delivered in order, so only an ack proves the
-    /// client kept up. Mirrors CDP's own `Page.screencastFrameAck`.
+    /// Latest-frame-wins applies before delivery. Already delivered frames
+    /// remain ordered and counted until a cumulative acknowledgment releases
+    /// their prefix. The default window preserves one-frame CDP-style pacing.
     ack_pacing: bool,
     presentation: Option<PresentationConfig>,
     /// The client composites damage patches over its last whole frame.
@@ -214,8 +214,8 @@ fn updated_presentation(mut config: ClientConfig, message: &Value) -> Option<Cli
 }
 
 /// Read the acknowledged frame id from a client `ack` message. Acks are
-/// cumulative: a client that skipped intermediate ids still unblocks the
-/// writer by acknowledging the newest one it rendered.
+/// cumulative: acknowledging the newest painted frame also releases the
+/// preceding delivered frames represented by that composed image.
 fn parse_ack_seq(parsed: &Value) -> Option<u64> {
     parsed.get("seq").and_then(|v| v.as_u64())
 }
