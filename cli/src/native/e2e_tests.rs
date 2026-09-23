@@ -1996,6 +1996,55 @@ async fn e2e_snapshot_and_click_ref() {
 // Screenshot
 // ---------------------------------------------------------------------------
 
+// Production 2026-09-23: a screenshot path under a directory that did not
+// exist yet failed with "No such file or directory" after the capture.
+#[tokio::test]
+#[ignore]
+async fn e2e_explicit_output_paths_create_their_directories() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({ "action": "launch", "headless": true }), &mut state).await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "action": "navigate", "url": "data:text/html,<title>Output</title><h1>Output</h1>" }),
+            &mut state,
+        )
+        .await,
+    );
+    let root = tempfile::tempdir().unwrap();
+    let shot = root.path().join("work/wikirace/stop-00.jpg");
+    let resp = execute_command(
+        &json!({ "action": "screenshot", "path": shot, "format": "jpeg", "quality": 82 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["path"], json!(shot));
+    assert!(std::fs::metadata(&shot).unwrap().len() > 100);
+
+    let pdf = root.path().join("exports/nested/page.pdf");
+    let resp = execute_command(&json!({ "action": "pdf", "path": pdf }), &mut state).await;
+    assert_success(&resp);
+    assert!(std::fs::metadata(&pdf).unwrap().len() > 100);
+
+    // A relative path names the daemon's working directory; the result says
+    // exactly where the file went.
+    let relative = format!("agent-browser-e2e-{}/shot.png", std::process::id());
+    let resp = execute_command(
+        &json!({ "action": "screenshot", "path": relative }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let written = std::path::PathBuf::from(get_data(&resp)["path"].as_str().unwrap());
+    assert!(written.is_absolute() && written.ends_with(&relative));
+    assert!(written.exists());
+    std::fs::remove_dir_all(written.parent().unwrap()).unwrap();
+
+    assert_success(&execute_command(&json!({ "action": "close" }), &mut state).await);
+}
+
 #[tokio::test]
 #[ignore]
 async fn e2e_screenshot() {

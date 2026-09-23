@@ -157,7 +157,9 @@ pub async fn trace_stop(
     tracing_state.active = false;
 
     let save_path = match path {
-        Some(p) => p.to_string(),
+        Some(p) => super::output_file::prepare(p)?
+            .to_string_lossy()
+            .to_string(),
         None => {
             let dir = get_traces_dir();
             let _ = std::fs::create_dir_all(&dir);
@@ -272,7 +274,9 @@ pub async fn profiler_stop(
     tracing_state.active = false;
 
     let save_path = match path {
-        Some(p) => p.to_string(),
+        Some(p) => super::output_file::prepare(p)?
+            .to_string_lossy()
+            .to_string(),
         None => {
             let dir = get_profiles_dir();
             let _ = std::fs::create_dir_all(&dir);

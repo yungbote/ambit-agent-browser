@@ -5871,7 +5871,8 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
                     &base64_data,
                 )
                 .map_err(|e| format!("Base64 decode error: {}", e))?;
-                std::fs::write(p, bytes)
+                let p = super::output_file::prepare(p)?;
+                std::fs::write(&p, bytes)
                     .map_err(|e| format!("Failed to write screenshot: {}", e))?;
                 return Ok(json!({ "path": p }));
             }
@@ -8110,7 +8111,9 @@ async fn handle_pdf(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
 
     let path = cmd.get("path").and_then(|v| v.as_str());
     let save_path = match path {
-        Some(p) => p.to_string(),
+        Some(p) => super::output_file::prepare(p)?
+            .to_string_lossy()
+            .to_string(),
         None => {
             let dir = dirs::home_dir()
                 .unwrap_or_else(std::env::temp_dir)
