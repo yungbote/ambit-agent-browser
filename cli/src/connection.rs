@@ -1247,6 +1247,11 @@ fn read_timeout_for(cmd: &Value) -> Duration {
         .get("timeout")
         .and_then(|v| v.as_u64())
         .unwrap_or(0)
+        .max(if cmd["action"] == "run_playwright" {
+            cmd["timeoutMs"].as_u64().unwrap_or(0)
+        } else {
+            0
+        })
         .max(
             cmd.get(crate::native::feedback::REQUEST_FIELD)
                 .and_then(|feedback| feedback.get("timeoutMs"))

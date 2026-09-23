@@ -1,6 +1,6 @@
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, Read};
 
 use crate::color;
 use crate::flags::Flags;
@@ -124,6 +124,7 @@ pub fn is_top_level_command(value: &str) -> bool {
             | "pdf"
             | "snapshot"
             | "eval"
+            | "run-playwright"
             | "daemon"
             | "close"
             | "quit"
@@ -953,6 +954,70 @@ fn parse_command_inner(
                 i += 1;
             }
             Ok(cmd)
+        }
+
+        // The program is data, never global flags. The MCP surface uses this
+        // same parser with an explicit stdin body.
+        "run-playwright" => {
+            let usage = "run-playwright [--target <id>] [--timeout-ms <ms>] <code|--stdin>";
+            let mut target = None;
+            let mut timeout = 30_000_u64;
+            let mut index = 0;
+            while let Some(option) = rest.get(index) {
+                match *option {
+                    "--target" | "--timeout-ms" => {
+                        let value =
+                            rest.get(index + 1)
+                                .ok_or_else(|| ParseError::InvalidValue {
+                                    message: format!("{option} requires a value"),
+                                    usage,
+                                })?;
+                        if *option == "--target" {
+                            target = Some(*value);
+                        } else {
+                            timeout = value
+                                .parse()
+                                .ok()
+                                .filter(|ms| (1..=120_000).contains(ms))
+                                .ok_or_else(|| ParseError::InvalidValue {
+                                    message: "timeout-ms must be between 1 and 120000".into(),
+                                    usage,
+                                })?;
+                        }
+                        index += 2;
+                    }
+                    _ => break,
+                }
+            }
+            let code = if rest.get(index) == Some(&"--stdin") && rest.len() == index + 1 {
+                match input {
+                    Some(value) => value.to_owned(),
+                    None => {
+                        let mut code = String::new();
+                        std::io::Read::read_to_string(
+                            &mut io::stdin().lock().take(1_048_577),
+                            &mut code,
+                        )
+                        .map_err(|_| ParseError::InvalidValue {
+                            message: "Cannot read Playwright code".into(),
+                            usage,
+                        })?;
+                        code
+                    }
+                }
+            } else {
+                rest[index..].join(" ")
+            };
+            if code.trim().is_empty() || code.len() > 1_048_576 || target.is_some_and(str::is_empty)
+            {
+                return Err(ParseError::InvalidValue { message: "Playwright code must be nonempty and at most 1 MiB; target must be nonempty when supplied".into(), usage });
+            }
+            let mut command =
+                json!({ "id": id, "action": "run_playwright", "code": code, "timeoutMs": timeout });
+            if let Some(target) = target {
+                command["targetId"] = json!(target);
+            }
+            Ok(command)
         }
 
         // === Eval ===
@@ -5255,6 +5320,41 @@ mod tests {
         let cmd = parse_command(&args("eval document.title"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "evaluate");
         assert_eq!(cmd["script"], "document.title");
+    }
+
+    #[test]
+    fn test_run_playwright_keeps_code_out_of_global_options() {
+        let code = "return { text: '--session other --no-sandbox', value: await page.title() };";
+        let command = parse_command_with_input(
+            &[
+                "run-playwright".into(),
+                "--target".into(),
+                "ABC".into(),
+                "--timeout-ms".into(),
+                "120000".into(),
+                "--stdin".into(),
+            ],
+            &default_flags(),
+            Some(code),
+        )
+        .unwrap();
+        assert_eq!(command["action"], "run_playwright");
+        assert_eq!(command["targetId"], "ABC");
+        assert_eq!(command["timeoutMs"], 120000);
+        assert_eq!(command["code"], code);
+        for value in ["0", "120001", "-1", "forever"] {
+            assert!(parse_command(
+                &[
+                    "run-playwright".into(),
+                    "--timeout-ms".into(),
+                    value.into(),
+                    "return 1".into()
+                ],
+                &default_flags()
+            )
+            .is_err());
+        }
+        assert!(parse_command(&["run-playwright".into()], &default_flags()).is_err());
     }
 
     #[test]

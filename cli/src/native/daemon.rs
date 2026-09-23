@@ -1,4 +1,5 @@
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -16,6 +17,7 @@ use super::actions::{
     execute_command_received, maybe_autosave_restore_state, DaemonState,
 };
 use super::cdp::client::CdpClient;
+use super::playwright::{InterruptReason, Operations};
 use super::state;
 use super::stream::{IdleActivity, StreamServer};
 use crate::connection::{DaemonSession, INTERNAL_DAEMON_SHUTDOWN_ACTION};
@@ -215,6 +217,7 @@ async fn run_socket_server(
             stream_server,
             idle_activity.clone(),
         )));
+    let playwright_operations = state.lock().await.playwright_operations.clone();
 
     // Notifier used by handle_connection to signal the daemon loop to exit
     // after a "close" command, instead of calling process::exit() which skips
@@ -238,8 +241,9 @@ async fn run_socket_server(
                         let idle_activity = idle_activity.clone();
                         let sf = stream_file.clone();
                         let cn = close_notify.clone();
+                        let operations = playwright_operations.clone();
                         tasks.spawn(async move {
-                            handle_connection(stream, state, idle_activity, sf, cn).await;
+                            handle_connection(stream, state, idle_activity, sf, cn, operations).await;
                         });
                     }
                     Err(e) => {
@@ -303,6 +307,8 @@ async fn run_socket_server(
     // navigation or maintenance tick must not hold the state lock through the
     // supervisor's termination grace period.
     drop(listener);
+    let _stop_programs = playwright_operations.interrupt(InterruptReason::Shutdown);
+    let _ = tokio::time::timeout(Duration::from_secs(7), playwright_operations.settled()).await;
     tasks.shutdown().await;
     let mut state = state.lock().await;
     // Normal close/idle saves keep their existing behavior. A termination
@@ -426,16 +432,24 @@ async fn handle_connection<S>(
     idle_activity: Arc<IdleActivity>,
     stream_file_cleanup: Option<PathBuf>,
     close_notify: Arc<Notify>,
+    playwright_operations: Operations,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
     let (reader, mut writer) = tokio::io::split(stream);
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
+    let mut queued = VecDeque::new();
 
     loop {
         line.clear();
-        match buf_reader.read_line(&mut line).await {
+        let read = if let Some(next) = queued.pop_front() {
+            line = next;
+            Ok(line.len())
+        } else {
+            buf_reader.read_line(&mut line).await
+        };
+        match read {
             Ok(0) => break,
             Ok(_) => {
                 let trimmed = line.trim();
@@ -471,15 +485,32 @@ async fn handle_connection<S>(
                     .unwrap_or_default()
                     .to_string();
 
-                let response = match command_state(&state, &cmd).await {
+                let mut disconnected = false;
+                let response = match command_state(&state, &cmd, &playwright_operations).await {
                     Ok(mut s) => {
-                        let response = execute_command_received(&cmd, &mut s, received_at).await;
+                        let response = if action == "run_playwright" {
+                            let execution = execute_command_received(&cmd, &mut s, received_at);
+                            tokio::pin!(execution);
+                            tokio::select! {
+                                response = &mut execution => response,
+                                _ = read_until_disconnect(&mut buf_reader, &mut queued) => {
+                                    disconnected = true;
+                                    let _stop = playwright_operations.interrupt(InterruptReason::CallerDisconnected);
+                                    execution.await
+                                }
+                            }
+                        } else {
+                            execute_command_received(&cmd, &mut s, received_at).await
+                        };
                         // Refresh while command custody is still held.
                         idle_activity.mark();
                         response
                     }
                     Err(response) => response,
                 };
+                if disconnected {
+                    break;
+                }
 
                 let mut resp = serde_json::to_string(&response).unwrap_or_default();
                 resp.push('\n');
@@ -504,6 +535,28 @@ async fn handle_connection<S>(
     }
 }
 
+/// Preserve pipelined requests while observing EOF during a long operation.
+/// Input is bounded so a peer cannot turn cancellation detection into a queue.
+async fn read_until_disconnect<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut BufReader<R>,
+    queued: &mut VecDeque<String>,
+) {
+    let mut bytes = queued.iter().map(String::len).sum::<usize>();
+    loop {
+        let mut line = String::new();
+        match reader.read_line(&mut line).await {
+            Ok(0) | Err(_) => return,
+            Ok(count) => {
+                bytes += count;
+                if bytes > 2 * 1024 * 1024 {
+                    return;
+                }
+                queued.push_back(line);
+            }
+        }
+    }
+}
+
 fn looks_like_http(line: &str) -> bool {
     let prefixes = [
         "GET ", "POST ", "PUT ", "DELETE ", "PATCH ", "HEAD ", "OPTIONS ", "CONNECT ", "TRACE ",
@@ -517,8 +570,12 @@ fn looks_like_http(line: &str) -> bool {
 async fn command_state<'a>(
     state: &'a tokio::sync::Mutex<DaemonState>,
     command: &Value,
+    operations: &Operations,
 ) -> Result<tokio::sync::MutexGuard<'a, DaemonState>, Value> {
     if command["action"] == super::browser_control::ACTION && command["op"] == "acquire" {
+        let _stop = super::browser_control::ControlRequest::parse(command)
+            .ok()
+            .map(|_| operations.interrupt(InterruptReason::HumanControl));
         tokio::time::timeout(Duration::from_secs(2), state.lock()).await.map_err(|_| serde_json::json!({
             "id": command["id"], "success": false, "code": "browser_control_unavailable",
             "error": "The browser is finishing its current operation. Try taking control again when it finishes.",
@@ -646,13 +703,14 @@ mod tests {
         let held = state.lock().await;
         let command =
             serde_json::json!({ "action": super::super::browser_control::ACTION, "op": "acquire" });
-        let response = match command_state(&state, &command).await {
+        let operations = Operations::default();
+        let response = match command_state(&state, &command, &operations).await {
             Ok(_) => panic!("acquisition passed an active command"),
             Err(response) => response,
         };
         assert_eq!(response["code"], "browser_control_unavailable");
         drop(held);
-        assert!(command_state(&state, &command).await.is_ok());
+        assert!(command_state(&state, &command, &operations).await.is_ok());
         assert!(state
             .lock()
             .await

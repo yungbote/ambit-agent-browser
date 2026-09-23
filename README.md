@@ -138,6 +138,7 @@ agent-browser screenshot --screenshot-format jpeg --screenshot-quality 80
 agent-browser pdf <path>              # Save as PDF
 agent-browser snapshot                # Accessibility tree with refs (best for AI)
 agent-browser eval <js>               # Run JavaScript (-b for base64, --stdin for piped input)
+agent-browser run-playwright <code>    # Async Playwright body in the existing browser (--stdin, --target, --timeout-ms)
 agent-browser connect <port>          # Connect to browser via CDP
 agent-browser stream enable [--port <port>]  # Start runtime WebSocket streaming
 agent-browser webmcp list                     # List experimental page tools
@@ -2033,3 +2034,11 @@ When enabled, agent-browser connects to an AgentCore cloud browser session inste
 ## License
 
 Apache-2.0
+
+### Playwright in the existing browser
+
+`agent-browser run-playwright --stdin` runs an async JavaScript body with the actual `page`, `context`, and `browser` from the current native Chromium session. Return a JSON-serializable value. `--target <id>` selects another existing CDP target; `--timeout-ms <ms>` bounds execution to 1 through 120000 milliseconds (default 30000). The MCP equivalent is `agent_browser_run_playwright` with `code`, optional `targetId`, and optional `timeoutMs`.
+
+The Unix host supplies Node and installed `playwright-core` (1.62.1 supports the required `noDefaults` attachment). `AGENT_BROWSER_PLAYWRIGHT_MODULE` selects its absolute `index.mjs`; `AGENT_BROWSER_NODE_PATH` selects Node and `AGENT_BROWSER_PLAYWRIGHT_RUNNER` optionally selects the installed runner module. The binary includes the runner by default. No packages or browsers are downloaded during execution.
+
+The same profile, tabs, native window and human-control owner remain in use. Actual Playwright mouse input goes through the native display owner without simulated gliding; DOM evaluation does not create pointer activity. Programs return up to 2 MiB of JSON and 64 KiB of explicitly bounded console diagnostics. `process.stdout` is reserved for the runner result. The native owner cancels and settles the operation on human takeover, caller disconnect or timeout without closing the retained Chrome process. A failed or interrupted program may already have performed external effects and must never be replayed automatically. Existing workspace isolation remains the security boundary. See [the execution contract](skill-data/core/references/playwright.md).

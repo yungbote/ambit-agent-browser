@@ -202,7 +202,9 @@ pub fn to_ai_friendly_error(error: &str) -> String {
     // This is the existing input outcome classification. Rewriting a word
     // such as "timeout" inside it must not turn a partial action into a
     // definite failure that the host could retry automatically.
-    if error.starts_with("browser_control_outcome_unknown: ") {
+    if error.starts_with("browser_control_outcome_unknown: ")
+        || error.starts_with("browser_operation_")
+    {
         return error.to_string();
     }
     let lower = error.to_lowercase();

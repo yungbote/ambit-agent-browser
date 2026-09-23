@@ -200,6 +200,7 @@ const TOOL_INSTALL: &str = "agent_browser_install";
 const TOOL_UPGRADE: &str = "agent_browser_upgrade";
 const TOOL_CHAT: &str = "agent_browser_chat";
 const TOOL_EVAL: &str = "agent_browser_eval";
+const TOOL_RUN_PLAYWRIGHT: &str = "agent_browser_run_playwright";
 const TOOL_CLOSE: &str = "agent_browser_close";
 const TOOL_TOOLS_PROFILES: &str = "agent_browser_tools_profiles";
 const DEFAULT_TIMEOUT_MS: u64 = 120_000;
@@ -409,6 +410,7 @@ const CORE_PROFILE_TOOLS: &[&str] = &[
     TOOL_TAB_SWITCH,
     TOOL_TAB_CLOSE,
     TOOL_EVAL,
+    TOOL_RUN_PLAYWRIGHT,
     TOOL_CLOSE,
 ];
 
@@ -1022,6 +1024,16 @@ fn tools() -> Vec<Value> {
                 "script": { "type": "string", "description": "JavaScript expression or script to evaluate." }
             }),
             &["script"],
+        ),
+        tool(
+            TOOL_RUN_PLAYWRIGHT,
+            "Run Playwright",
+            "Run an async JavaScript body with the existing page, context and browser. Return a JSON-serializable result. Uses the current tab unless targetId selects another existing tab. Human takeover cancels the program; interrupted or failed code may already have changed the page and is never replayed.",
+            json!({
+                "code": { "type": "string", "minLength": 1, "maxLength": 1048576 },
+                "targetId": { "type": "string", "minLength": 1 }
+            }),
+            &["code"],
         ),
         tool(
             TOOL_CLOSE,
@@ -2274,7 +2286,11 @@ fn call_tool(params: Option<&Value>, config: &McpConfig) -> Result<Value, Protoc
     let run = run_cli(
         &invocation.cli_args,
         invocation.stdin_body,
-        invocation.timeout_ms,
+        if name == TOOL_RUN_PLAYWRIGHT {
+            invocation.timeout_ms.saturating_add(15_000)
+        } else {
+            invocation.timeout_ms
+        },
     )
     .map_err(|error| {
         ProtocolError::invalid_params(format!("Failed to run agent-browser: {}", error))
@@ -2458,6 +2474,7 @@ fn prepare_tool(name: &str, arguments: &Value) -> Result<CliInvocation, Protocol
         TOOL_UPGRADE => call_literal(arguments, &["upgrade"]),
         TOOL_CHAT => call_chat(arguments),
         TOOL_EVAL => call_eval(arguments),
+        TOOL_RUN_PLAYWRIGHT => call_run_playwright(arguments),
         TOOL_CLOSE => call_close(arguments),
         _ => unreachable!("known MCP tool missing call handler: {}", name),
     }
@@ -3682,6 +3699,26 @@ fn call_eval(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
         vec!["eval".to_string(), "--stdin".to_string()],
         Some(script),
     )
+}
+
+fn call_run_playwright(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
+    let code = required_string(arguments, "code")?;
+    let timeout = optional_timeout(arguments)?;
+    if timeout > 120_000 {
+        return Err(ProtocolError::invalid_params(
+            "timeoutMs must be at most 120000.",
+        ));
+    }
+    let mut args = vec![
+        "run-playwright".into(),
+        "--timeout-ms".into(),
+        timeout.to_string(),
+    ];
+    if let Some(target) = optional_string(arguments, "targetId")? {
+        args.extend(["--target".into(), target]);
+    }
+    args.push("--stdin".into());
+    call_cli_tool(arguments, args, Some(code))
 }
 
 fn call_close(arguments: &Value) -> Result<CliInvocation, ProtocolError> {

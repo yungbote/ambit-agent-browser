@@ -487,6 +487,19 @@ impl BrowserControl {
         Ok(())
     }
 
+    /// Programs may leave explicit key/button down calls outstanding. Settle
+    /// their existing input owners before another command or human acquires
+    /// custody, including on normal return. Never replay the original input.
+    pub(crate) async fn finish_agent_program(&mut self, client: &CdpClient) -> Result<(), String> {
+        self.drain_stream()
+            .await
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+        neutralize_held(client, &mut self.stream_held)
+            .await
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+        self.finish_native_dialog().await
+    }
+
     fn observe_native_result(&mut self, result: &Result<bool, String>) {
         if result
             .as_ref()

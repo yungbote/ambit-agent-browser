@@ -194,6 +194,14 @@ impl Drop for PendingGuard {
 }
 
 impl CdpClient {
+    /// End a temporary attachment without closing its browser. Its owner first
+    /// settles request tasks; aborting the read/keepalive loops then releases
+    /// the connection when its final handle is dropped.
+    pub(crate) fn disconnect(&self) {
+        self._reader_handle.abort();
+        self._keepalive_handle.abort();
+    }
+
     pub async fn connect(url: &str) -> Result<Self, String> {
         Self::connect_with_headers(url, None).await
     }

@@ -29,6 +29,7 @@ pub mod inspect_server;
 pub mod interaction;
 #[allow(dead_code)]
 pub mod network;
+pub(crate) mod playwright;
 #[allow(dead_code)]
 pub mod policy;
 #[allow(dead_code)]

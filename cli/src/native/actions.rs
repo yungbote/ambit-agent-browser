@@ -663,6 +663,7 @@ pub struct DaemonState {
     /// Shared only with the stream input reader; daemon commands retain their
     /// existing outer mutex. Never broadcast controller credentials.
     pub(crate) browser_control: Arc<tokio::sync::Mutex<BrowserControl>>,
+    pub(crate) playwright_operations: super::playwright::Operations,
     /// Exact startup configuration; never serialized in the command protocol.
     launch_configuration: Option<Arc<Value>>,
     /// Same-daemon ownership only. Chrome is dropped before these private
@@ -799,6 +800,7 @@ impl DaemonState {
             stream_server: None,
             idle_activity: Arc::new(IdleActivity::new()),
             browser_control: Arc::new(tokio::sync::Mutex::new(BrowserControl::default())),
+            playwright_operations: super::playwright::Operations::default(),
             launch_configuration: None,
             retained_profile: None,
             effective_ca_cert: None,
@@ -2533,6 +2535,7 @@ fn skip_launch_action(action: &str) -> bool {
         "" | "launch"
             | "close"
             | "read"
+            | "run_playwright"
             | "har_stop"
             | "credentials_set"
             | "credentials_get"
@@ -2683,26 +2686,33 @@ pub(crate) async fn execute_command_received(
             }
             Box::pin(execute_command_inner(&command, state)).await
         };
-        match tokio::time::timeout(
-            std::time::Duration::from_millis(request.timeout_ms),
-            operation,
-        )
-        .await
-        {
-            Ok(response) => response,
-            Err(_) => {
-                let mut error = "The browser command exceeded its host deadline. It may have executed; inspect the current page before retrying.".to_string();
-                if let Err(cleanup) = state
-                    .browser_control
-                    .lock()
-                    .await
-                    .cancel_native_input()
-                    .await
-                {
-                    error.push(' ');
-                    error.push_str(&cleanup);
+        // Playwright owns a deadline followed by process/input settlement.
+        // Dropping that future at the generic deadline would release command
+        // custody before its child group has been reaped.
+        if command["action"] == "run_playwright" {
+            operation.await
+        } else {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(request.timeout_ms),
+                operation,
+            )
+            .await
+            {
+                Ok(response) => response,
+                Err(_) => {
+                    let mut error = "The browser command exceeded its host deadline. It may have executed; inspect the current page before retrying.".to_string();
+                    if let Err(cleanup) = state
+                        .browser_control
+                        .lock()
+                        .await
+                        .cancel_native_input()
+                        .await
+                    {
+                        error.push(' ');
+                        error.push_str(&cleanup);
+                    }
+                    json!({ "id": command["id"], "success": false, "code": "command_outcome_unknown", "error": error })
                 }
-                json!({ "id": command["id"], "success": false, "code": "command_outcome_unknown", "error": error })
             }
         }
     };
@@ -3132,6 +3142,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         "title" => handle_title(state).await,
         "content" => handle_content(state).await,
         "evaluate" => handle_evaluate(cmd, state).await,
+        "run_playwright" => super::playwright::run(cmd, state).await,
         "close" => handle_close(state).await,
         "snapshot" => handle_snapshot(cmd, state).await,
         "screenshot" => handle_screenshot(cmd, state).await,
@@ -13141,7 +13152,10 @@ fn error_response(id: &str, error: &str) -> Value {
     if error.starts_with(super::browser::TAB_GONE_PREFIX) {
         resp["code"] = json!("tab_gone");
     } else if let Some((code, _)) = error.split_once(": ") {
-        if code.starts_with("webmcp_") || code == "browser_control_outcome_unknown" {
+        if code.starts_with("webmcp_")
+            || code == "browser_control_outcome_unknown"
+            || code.starts_with("browser_operation_")
+        {
             resp["code"] = json!(code);
         }
     }

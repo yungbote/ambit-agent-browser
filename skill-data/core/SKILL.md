@@ -64,6 +64,8 @@ Host-authorized control can navigate or resize the viewport within the same sequ
 
 ## MCP integration
 
+Use `agent-browser run-playwright --stdin` or MCP `agent_browser_run_playwright` for ordinary async JavaScript bodies using the existing `page`, `context`, and `browser`. Open the native browser first. Use `return` for a JSON result; the default page is the actual current native tab, and `targetId` selects an exact existing tab. Do not launch another browser or copy its profile. Locators, frames, popups, network listeners and async composition retain Playwright semantics. Real mouse input follows the same native window owner; `page.evaluate(() => element.click())` does not invent mouse movement. Read [references/playwright.md](references/playwright.md) for runtime requirements, outputs and cancellation. A failed or interrupted program may already have changed external state and must never be replayed automatically.
+
 For tools that support Model Context Protocol servers, start the stdio server:
 
 ```bash

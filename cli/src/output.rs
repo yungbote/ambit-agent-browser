@@ -2160,6 +2160,40 @@ Examples:
 "##
         }
 
+        "run-playwright" => {
+            r##"
+agent-browser run-playwright - Run Playwright in the existing browser
+
+Usage: agent-browser run-playwright [--target <id>] [--timeout-ms <ms>] <code|--stdin>
+
+Run an async JavaScript body with page, context and browser. Return a JSON value.
+The default page is the native driver's current tab. Open the browser first.
+Requires Node and installed playwright-core 1.62.1 or a qualified newer version.
+
+Options:
+  --target <id>        Exact existing CDP target ID (default: current native tab)
+  --timeout-ms <ms>    Program deadline, 1 through 120000 (default: 30000)
+  --stdin             Read the body from stdin without shell escaping
+
+Environment:
+  AGENT_BROWSER_PLAYWRIGHT_MODULE  Absolute path to installed playwright-core/index.mjs
+  AGENT_BROWSER_PLAYWRIGHT_RUNNER  Optional installed runner module; default is bundled
+  AGENT_BROWSER_NODE_PATH          Node executable (default: node)
+
+Programs use the same profile, tabs and native window. Human takeover, caller
+disconnect and deadline stop the operation's process group without closing Chrome.
+A failed or interrupted program may have performed effects; never replay it.
+Console output is bounded diagnostics. Returned JSON is limited to 2 MiB.
+
+Examples:
+  agent-browser run-playwright 'return await page.title()'
+  agent-browser run-playwright --stdin <<'JS'
+  await page.getByRole('textbox', { name: 'Search' }).fill('reference');
+  return await page.locator('a').allTextContents();
+  JS
+"##
+        }
+
         // === Eval ===
         "eval" => {
             r##"
@@ -3804,6 +3838,7 @@ Core Commands:
   pdf <path>                 Save as PDF
   snapshot                   Accessibility tree with refs (for AI)
   eval <js>                  Run JavaScript
+  run-playwright <code>       Run async Playwright code in the existing browser
   connect <port|url>         Connect to browser via CDP
   close [--all]              Close browser (--all closes every session)
 
@@ -4075,6 +4110,9 @@ Configuration:
 
 Environment:
   AGENT_BROWSER_REQUIRE_SANDBOX  Require sandboxed local Chrome (1 or true)
+  AGENT_BROWSER_PLAYWRIGHT_MODULE Installed playwright-core/index.mjs path
+  AGENT_BROWSER_PLAYWRIGHT_RUNNER Optional installed Playwright runner module
+  AGENT_BROWSER_NODE_PATH        Node executable for Playwright (default: node)
   AGENT_BROWSER_REQUIRE_DAEMON   Require an existing compatible daemon (1 or true)
   AGENT_BROWSER_CONFIG           Path to config file (or use --config)
   AGENT_BROWSER_SESSION          Session name (default: "default")
