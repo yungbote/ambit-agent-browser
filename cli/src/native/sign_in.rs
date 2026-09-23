@@ -7,10 +7,15 @@
 //! Tabs, cookies and the profile survive both relaunches. Isolated windows
 //! (CDP browser contexts), unsaved page state and a temporary download
 //! directory's contents do not; this is why sign-in is an explicit mode.
+//!
+//! Both transitions relaunch Chrome, so they return boxed futures: their
+//! large state machines live on the heap while they run instead of inside
+//! every command's future, which awaits the watchdog.
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::future::{BoxFuture, FutureExt};
 use serde_json::Value;
 use tokio::time::Instant;
 
@@ -95,115 +100,122 @@ impl Transition {
 
 /// Enter sign-in mode on the controller's `sign_in` input. The lease keeps
 /// its controller and sequence line; the acknowledgment names the new window.
-pub(super) async fn enter(
-    state: &mut DaemonState,
-    request: &ControlRequest,
+pub(super) fn enter<'a>(
+    state: &'a mut DaemonState,
+    request: &'a ControlRequest,
     event: Result<Duration, ControlError>,
-) -> Result<Value, ControlError> {
-    let started = Instant::now();
-    let admission = state
-        .browser_control
-        .lock()
-        .await
-        .admit_sign_in(request, event)?;
-    let (sequence, idle_timeout) = match admission {
-        SignInAdmission::Duplicate(acknowledgment) => return Ok(acknowledgment),
-        SignInAdmission::Admitted {
-            sequence,
-            idle_timeout,
-        } => (sequence, idle_timeout),
-    };
-    let Transition {
-        automation,
-        sign_in,
-        window,
-    } = Transition::plan(state)
-        .await
-        .map_err(ControlError::invalid)?;
-
-    // The stream keeps showing the retired window, without failing, until
-    // the sign-in window replaces it.
-    if let Some(mut browser) = state.browser.take() {
-        let _ = browser.close_within(STOP).await;
-    }
-    super::forget_browser_session(state);
-    let ready_by = started + SIGN_IN_READY;
-    let entered = async {
-        // A launch that runs out of time is awaited, not dropped: a sign-in
-        // browser that never showed its window is gone before automation
-        // relaunches into the same profile.
-        let chrome = chrome::launch_chrome_by(sign_in, ready_by).await?;
-        state.sign_in = Some(SignInBrowser { chrome });
-        tokio::time::timeout_at(
-            ready_by,
-            state.apply_window_layout(window.0, window.1, None),
-        )
-        .await
-        .unwrap_or_else(|_| Err("The sign-in window was not laid out in time".to_string()))
-    }
-    .await;
-    let admitted = match entered {
-        Ok(_) => {
-            state.update_stream_client().await;
-            state.browser_control.lock().await.begin_sign_in(
-                request.controller_id(),
+) -> BoxFuture<'a, Result<Value, ControlError>> {
+    async move {
+        let started = Instant::now();
+        let admission = state
+            .browser_control
+            .lock()
+            .await
+            .admit_sign_in(request, event)?;
+        let (sequence, idle_timeout) = match admission {
+            SignInAdmission::Duplicate(acknowledgment) => return Ok(acknowledgment),
+            SignInAdmission::Admitted {
                 sequence,
                 idle_timeout,
+            } => (sequence, idle_timeout),
+        };
+        let Transition {
+            automation,
+            sign_in,
+            window,
+        } = Transition::plan(state)
+            .await
+            .map_err(ControlError::invalid)?;
+
+        // The stream keeps showing the retired window, without failing, until
+        // the sign-in window replaces it.
+        if let Some(mut browser) = state.browser.take() {
+            let _ = browser.close_within(STOP).await;
+        }
+        super::forget_browser_session(state);
+        let ready_by = started + SIGN_IN_READY;
+        let entered = async {
+            // A launch that runs out of time is awaited, not dropped: a sign-in
+            // browser that never showed its window is gone before automation
+            // relaunches into the same profile.
+            let chrome = chrome::launch_chrome_by(sign_in, ready_by).await?;
+            state.sign_in = Some(SignInBrowser { chrome });
+            tokio::time::timeout_at(
+                ready_by,
+                state.apply_window_layout(window.0, window.1, None),
             )
+            .await
+            .unwrap_or_else(|_| Err("The sign-in window was not laid out in time".to_string()))
         }
-        Err(error) => Err(ControlError::new("browser_control_unavailable", error)),
-    };
-    if let Err(error) = &admitted {
-        eprintln!("[sign-in] could not start: {}", error.message);
-        if let Some(sign_in) = state.sign_in.take() {
-            sign_in.stop().await;
+        .await;
+        let admitted = match entered {
+            Ok(_) => {
+                state.update_stream_client().await;
+                state.browser_control.lock().await.begin_sign_in(
+                    request.controller_id(),
+                    sequence,
+                    idle_timeout,
+                )
+            }
+            Err(error) => Err(ControlError::new("browser_control_unavailable", error)),
+        };
+        if let Err(error) = &admitted {
+            eprintln!("[sign-in] could not start: {}", error.message);
+            if let Some(sign_in) = state.sign_in.take() {
+                sign_in.stop().await;
+            }
+            let restored = relaunch_automation(state, automation, window, started + TRANSITION).await;
+            state.browser_control.lock().await.end_lease();
+            return Err(ControlError::new(
+                "browser_control_unavailable",
+                if restored {
+                    "Sign-in mode could not start. The browser is back under the agent's control."
+                } else {
+                    "Sign-in mode could not start, and the browser could not be restarted. The agent's next action starts it again."
+                },
+            ));
         }
-        let restored = relaunch_automation(state, automation, window, started + TRANSITION).await;
-        state.browser_control.lock().await.end_lease();
-        return Err(ControlError::new(
-            "browser_control_unavailable",
-            if restored {
-                "Sign-in mode could not start. The browser is back under the agent's control."
-            } else {
-                "Sign-in mode could not start, and the browser could not be restarted. The agent's next action starts it again."
-            },
-        ));
+        admitted
+
     }
-    admitted
+    .boxed()
 }
 
 /// Hand the browser back to the agent: close the sign-in browser as a person
 /// would, relaunch automation into the same profile and window, require a
 /// fresh observation and end the lease. If the relaunch fails, custody still
 /// returns and the agent's next command launches the browser normally.
-pub(super) async fn hand_back(state: &mut DaemonState) {
-    let deadline = Instant::now() + TRANSITION;
-    if let Some(sign_in) = state.sign_in.take() {
-        let window = sign_in
-            .display()
-            .map(|display| display.surface())
-            .map(|surface| {
-                (
-                    surface.width / DEVICE_SCALE_FACTOR,
-                    surface.height / DEVICE_SCALE_FACTOR,
-                )
-            });
-        let automation = sign_in.chrome.relaunch_options();
-        sign_in.stop().await;
-        match (automation, window) {
-            (Ok(options), Some(window)) => {
-                let options = LaunchOptions {
-                    remote_debugging: true,
-                    ..options
-                };
-                relaunch_automation(state, options, window, deadline).await;
-            }
-            _ => {
-                let _ = close_current_browser(state).await;
+pub(super) fn hand_back(state: &mut DaemonState) -> BoxFuture<'_, ()> {
+    async move {
+        let deadline = Instant::now() + TRANSITION;
+        if let Some(sign_in) = state.sign_in.take() {
+            let window = sign_in
+                .display()
+                .map(|display| display.surface())
+                .map(|surface| {
+                    (
+                        surface.width / DEVICE_SCALE_FACTOR,
+                        surface.height / DEVICE_SCALE_FACTOR,
+                    )
+                });
+            let automation = sign_in.chrome.relaunch_options();
+            sign_in.stop().await;
+            match (automation, window) {
+                (Ok(options), Some(window)) => {
+                    let options = LaunchOptions {
+                        remote_debugging: true,
+                        ..options
+                    };
+                    relaunch_automation(state, options, window, deadline).await;
+                }
+                _ => {
+                    let _ = close_current_browser(state).await;
+                }
             }
         }
+        state.browser_control.lock().await.end_lease();
     }
-    state.browser_control.lock().await.end_lease();
+    .boxed()
 }
 
 /// The watchdog, run by every command and maintenance tick: a person closing
@@ -214,7 +226,7 @@ pub(super) async fn maintain(state: &mut DaemonState) {
         return;
     };
     if sign_in.has_exited() {
-        let _ = close_current_browser(state).await;
+        let _ = close_current_browser(state).boxed().await;
     } else if state
         .browser_control
         .lock()

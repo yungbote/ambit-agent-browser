@@ -18,7 +18,7 @@ pub struct ChromeProcess {
     devtools_url: Option<String>,
     /// The effective options that launched this browser and its resolved
     /// executable; a relaunch starts from exactly these.
-    launch: LaunchOptions,
+    launch: Box<LaunchOptions>,
     executable: PathBuf,
     temp_user_data_dir: Option<Arc<TemporaryBrowserDirectory>>,
     temp_nss_home: Option<PreparedNssHome>,
@@ -115,7 +115,7 @@ impl ChromeProcess {
             // Storage state is loaded by the daemon into a fresh launch; a
             // relaunch restores this browser's own session instead.
             storage_state: None,
-            ..self.launch.clone()
+            ..(*self.launch).clone()
         })
     }
 
@@ -1222,7 +1222,7 @@ fn try_launch_chrome(
     let mut process = ChromeProcess {
         child,
         devtools_url: None,
-        launch: options.clone(),
+        launch: Box::new(options.clone()),
         executable: chrome_path.to_path_buf(),
         temp_user_data_dir,
         temp_nss_home,
@@ -2231,7 +2231,7 @@ mod tests {
         ChromeProcess {
             child,
             devtools_url: None,
-            launch,
+            launch: Box::new(launch),
             executable: PathBuf::from("/opt/ambit/browser/chrome/chrome"),
             temp_user_data_dir: None,
             temp_nss_home: None,
@@ -3271,7 +3271,7 @@ mod tests {
             let _process = ChromeProcess {
                 child,
                 devtools_url: None,
-                launch: LaunchOptions::default(),
+                launch: Box::default(),
                 executable: PathBuf::new(),
                 temp_user_data_dir: Some(Arc::new(TemporaryBrowserDirectory { path: dir.clone() })),
                 temp_nss_home: None,
@@ -3298,7 +3298,7 @@ mod tests {
         let process = ChromeProcess {
             child: spawn_noop_child(),
             devtools_url: None,
-            launch: LaunchOptions::default(),
+            launch: Box::default(),
             executable: PathBuf::new(),
             temp_user_data_dir: Some(Arc::new(TemporaryBrowserDirectory { path: dir.clone() })),
             temp_nss_home: None,
