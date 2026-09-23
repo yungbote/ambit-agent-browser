@@ -68,3 +68,6 @@ mod downloads_e2e_tests;
 
 #[cfg(test)]
 mod browser_files_e2e_tests;
+
+#[cfg(test)]
+mod sign_in_e2e_tests;
