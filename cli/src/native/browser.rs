@@ -2400,8 +2400,10 @@ impl BrowserManager {
             .as_str()
             .ok_or("Failed to create browser context")?
             .to_owned();
-        self.inherit_downloads(&context).await?;
+        // Recorded before anything that can still fail, so a window that
+        // never opens leaves no context behind.
         self.window_contexts.insert(context.clone());
+        self.inherit_downloads(&context).await?;
         Ok(context)
     }
 
