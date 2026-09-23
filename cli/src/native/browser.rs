@@ -462,6 +462,9 @@ fn tab_gone_error(target_id: &str, last_url: &str) -> String {
     )
 }
 
+/// The owned window's size at a first launch, in CSS pixels.
+const DEFAULT_WINDOW_SIZE: (u32, u32) = (1280, 720);
+
 const LIGHTPANDA_CDP_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const LIGHTPANDA_CDP_CONNECT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const LIGHTPANDA_TARGET_INIT_TIMEOUT: Duration = Duration::from_secs(10);
@@ -484,7 +487,26 @@ impl BrowserManager {
         self.browser_process.is_none() || !self.headless
     }
 
+    /// Options that relaunch this locally launched Chrome exactly, into its
+    /// own profile and private display.
+    pub(crate) fn relaunch_options(&self) -> Result<LaunchOptions, String> {
+        match self.browser_process.as_ref() {
+            Some(BrowserProcess::Chrome(process)) => process.relaunch_options(),
+            _ => Err("The browser is not a locally launched Chrome".to_string()),
+        }
+    }
+
     pub async fn launch(options: LaunchOptions, engine: Option<&str>) -> Result<Self, String> {
+        Self::launch_window(options, engine, DEFAULT_WINDOW_SIZE).await
+    }
+
+    /// Launch with the owned window, if any, laid out at `window_size` CSS
+    /// pixels. A relaunch passes the size the window had.
+    pub(crate) async fn launch_window(
+        options: LaunchOptions,
+        engine: Option<&str>,
+        window_size: (u32, u32),
+    ) -> Result<Self, String> {
         let engine = engine.unwrap_or("chrome");
 
         match engine {
@@ -520,7 +542,6 @@ impl BrowserManager {
         let color_scheme = options.color_scheme.clone();
         let download_path = options.download_path.clone();
         let headless = options.effectively_headless();
-        let window_stream = options.window_stream;
 
         let (ws_url, process) = match engine {
             "lightpanda" => {
@@ -534,14 +555,11 @@ impl BrowserManager {
                 (url, BrowserProcess::Lightpanda(lp))
             }
             _ => {
-                let mut chrome = launch_chrome(options).await?;
-                if window_stream {
-                    #[cfg(target_os = "linux")]
-                    chrome.start_window_display()?;
-                    #[cfg(not(target_os = "linux"))]
-                    return Err("Private window streaming is supported on Linux".into());
-                }
-                let url = chrome.ws_url.clone();
+                let chrome = launch_chrome(options).await?;
+                let url = chrome
+                    .devtools_url()
+                    .ok_or("This Chrome was launched without DevTools and cannot be automated")?
+                    .to_string();
                 (url, BrowserProcess::Chrome(chrome))
             }
         };
@@ -588,7 +606,7 @@ impl BrowserManager {
                 .ok_or("The browser window is not observable")?
                 .id;
             manager
-                .resize_window(1280, 720, window, false, layout_events)
+                .resize_window(window_size.0, window_size.1, window, false, layout_events)
                 .await?;
             manager.client.enable_window_pointer();
         }
@@ -1353,20 +1371,32 @@ impl BrowserManager {
     }
 
     pub async fn close(&mut self) -> Result<(), String> {
+        self.close_within(Duration::from_secs(5)).await
+    }
+
+    /// Close gracefully within `timeout`, then kill what remains of an owned
+    /// browser. It is gone when this returns.
+    pub(crate) async fn close_within(&mut self, timeout: Duration) -> Result<(), String> {
+        let deadline = tokio::time::Instant::now() + timeout;
+        // The window's end is this owner's choice, not a display failure.
+        if let Some(display) = self.display_client() {
+            display.retire();
+        }
         if self.browser_process.is_some() {
             // Only send Browser.close when we launched the browser ourselves.
             // For external connections (--auto-connect, --cdp) we just disconnect
             // without shutting down the user's browser.
-            let _ = self
-                .client
-                .send_command_no_params("Browser.close", None)
-                .await;
+            let _ = tokio::time::timeout_at(
+                deadline,
+                self.client.send_command_no_params("Browser.close", None),
+            )
+            .await;
         }
 
         if let Some(mut process) = self.browser_process.take() {
-            let timeout = std::time::Duration::from_secs(5);
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             let _ = tokio::task::spawn_blocking(move || {
-                process.wait_or_kill(timeout);
+                process.wait_or_kill(remaining);
             })
             .await;
         }

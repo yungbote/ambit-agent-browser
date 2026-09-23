@@ -17,6 +17,8 @@ use super::auth;
 use super::browser::{should_track_target, BrowserManager, WaitUntil};
 use super::browser_control::{self, BrowserControl, ControlRequest};
 
+#[path = "sign_in.rs"]
+mod sign_in;
 #[path = "window_actions.rs"]
 mod window_actions;
 use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
@@ -573,6 +575,9 @@ impl SessionSetup {
 
 pub struct DaemonState {
     pub browser: Option<BrowserManager>,
+    /// The owned window while a person signs in: the same browser without
+    /// DevTools. Never set together with `browser`.
+    sign_in: Option<sign_in::SignInBrowser>,
     pub appium: Option<AppiumManager>,
     pub safari_driver: Option<safari::SafariDriverProcess>,
     pub webdriver_backend: Option<super::webdriver::backend::WebDriverBackend>,
@@ -712,7 +717,22 @@ fn default_idle_shutdown_is_blocked(
 }
 
 impl DaemonState {
-    pub(crate) async fn expire_browser_control(&self) -> Result<(), browser_control::ControlError> {
+    /// The owned browser window, whichever browser holds it: the automation
+    /// browser, or the browser a person is signing in to.
+    pub(crate) fn window_display(&self) -> Option<Arc<super::display::DisplayClient>> {
+        match (self.browser.as_ref(), self.sign_in.as_ref()) {
+            (Some(browser), _) => browser.display_client(),
+            (None, Some(sign_in)) => sign_in.display(),
+            (None, None) => None,
+        }
+    }
+
+    /// The expiry path every command and maintenance tick runs. A sign-in
+    /// ends here too, so no agent command can reach a browser a person holds.
+    pub(crate) async fn expire_browser_control(
+        &mut self,
+    ) -> Result<(), browser_control::ControlError> {
+        sign_in::maintain(self).await;
         let browser = self.browser.as_ref().and_then(|manager| {
             manager
                 .active_session_id()
@@ -736,6 +756,7 @@ impl DaemonState {
             .is_some_and(|b| b.pinned);
         Self {
             browser: None,
+            sign_in: None,
             appium: None,
             safari_driver: None,
             webdriver_backend: None,
@@ -833,9 +854,11 @@ impl DaemonState {
         default_idle_shutdown_is_blocked(
             matches!(self.backend_type, BackendType::WebDriver),
             self.active_provider_connection,
-            self.browser
-                .as_ref()
-                .is_some_and(BrowserManager::blocks_default_idle_shutdown),
+            self.sign_in.is_some()
+                || self
+                    .browser
+                    .as_ref()
+                    .is_some_and(BrowserManager::blocks_default_idle_shutdown),
         )
     }
 
@@ -1135,14 +1158,16 @@ impl DaemonState {
         }));
     }
 
-    /// Update the stream server's CDP client slot when browser is set or cleared.
+    /// Update the stream server's sources when a browser is set or cleared.
+    /// A browser a person signs in to is still an owned browser: its window
+    /// streams, and its lease survives.
     pub async fn update_stream_client(&self) {
-        self.browser_control.lock().await.set_display(
-            self.browser
-                .as_ref()
-                .and_then(|browser| browser.display_client()),
-        );
-        if self.browser.is_none() {
+        let display = self.window_display();
+        self.browser_control
+            .lock()
+            .await
+            .set_display(display.clone());
+        if self.browser.is_none() && self.sign_in.is_none() {
             self.browser_control.lock().await.reset_browser();
         }
         if let Some(ref slot) = self.stream_client {
@@ -1150,19 +1175,13 @@ impl DaemonState {
             *guard = self.browser.as_ref().map(|m| Arc::clone(&m.client));
         }
         if let Some(ref server) = self.stream_server {
-            server
-                .set_display(
-                    self.browser
-                        .as_ref()
-                        .and_then(|browser| browser.display_client()),
-                )
-                .await;
+            let connected = self.browser.is_some() || display.is_some();
+            server.set_display(display).await;
             // Update the CDP page session ID so screencast commands target the right page
             let session_id = self
                 .browser
                 .as_ref()
                 .and_then(|m| m.active_session_id().ok().map(|s| s.to_string()));
-            let connected = self.browser.is_some();
             let sc = server.is_screencasting().await;
             let (vw, vh) = server.viewport().await;
             if let Some(ref mgr) = self.browser {
@@ -2455,22 +2474,34 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
     } else {
         None
     };
+    if let Some(sign_in) = state.sign_in.take() {
+        sign_in.stop().await;
+    }
 
     close_active_provider_session(state).await;
     state.launch_configuration = None;
     state.webmcp_enabled = false;
-    state.network_auto_attach_installed = false;
-    state.iframe_sessions.clear();
-    state.active_iframe_sessions.clear();
-    state.webmcp.clear_all();
-    state.screencasting = false;
-    state.reset_input_state();
+    forget_browser_session(state);
     state.update_stream_client().await;
 
     if let Some(err) = close_error {
         return Err(err);
     }
     Ok(())
+}
+
+/// Forget what belonged to one browser process: its network attachment,
+/// iframe sessions, WebMCP registrations, open dialog and input state. The
+/// launch configuration and session setup describe the session and stay.
+fn forget_browser_session(state: &mut DaemonState) {
+    state.network_auto_attach_installed = false;
+    state.iframe_sessions.clear();
+    state.active_iframe_sessions.clear();
+    state.webmcp.clear_all();
+    state.screencasting = false;
+    state.pending_dialog = None;
+    state.pending_pointer_release = None;
+    state.reset_input_state();
 }
 
 /// Close every browser backend owned by the daemon.
@@ -2743,6 +2774,34 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
                 return json!({ "id": id, "success": false, "code": error.code, "error": error.message })
             }
         };
+        // The sign-in watchdog runs before any controller operation too.
+        sign_in::maintain(state).await;
+        if let Some(event) = request.sign_in() {
+            let result = sign_in::enter(state, &request, event).await;
+            if let (Some(server), Some(display)) =
+                (state.stream_server.as_ref(), state.window_display())
+            {
+                server.presentation.update_surface(&display.surface());
+            }
+            state.last_command_finished = Some(std::time::Instant::now());
+            return match result {
+                Ok(data) => success_response(&id, data),
+                Err(error) => {
+                    json!({ "id": id, "success": false, "code": error.code, "error": error.message })
+                }
+            };
+        }
+        // The owner's release of a sign-in hands the browser back first; the
+        // ordinary release then answers for the ended lease.
+        if request.releases()
+            && state
+                .browser_control
+                .lock()
+                .await
+                .signs_in_for(request.controller_id())
+        {
+            sign_in::hand_back(state).await;
+        }
         let browser = state.browser.as_ref().and_then(|manager| {
             manager
                 .active_session_id()
@@ -2750,18 +2809,19 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
                 .map(|session| (manager.client.clone(), session.to_string()))
         });
         let control = state.browser_control.clone();
-        let display = state
-            .browser
-            .as_ref()
-            .and_then(|browser| browser.display_client());
+        let display = state.window_display();
         let resizes_window = display.is_some()
             && cmd["events"]
                 .as_array()
                 .is_some_and(|events| events.iter().any(|event| event["type"] == "viewport"));
         let operation = async {
-            let layout_events =
-                resizes_window.then(|| state.browser.as_ref().unwrap().client.subscribe());
-            if resizes_window {
+            // A window without DevTools has no page renderer to observe.
+            let layout_events = state
+                .browser
+                .as_ref()
+                .filter(|_| resizes_window)
+                .map(|browser| browser.client.subscribe());
+            if layout_events.is_some() {
                 // Observe the exact existing dialog owner before deciding
                 // whether a renderer readback can participate in readiness.
                 state.drain_cdp_events_background().await.map_err(|_| {
@@ -2803,14 +2863,10 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
                 server.notify_client_changed();
             }
         }
-        if let Some(display) = state
-            .browser
-            .as_ref()
-            .and_then(|browser| browser.display_client())
+        if let (Some(server), Some(display)) =
+            (state.stream_server.as_ref(), state.window_display())
         {
-            if let Some(server) = state.stream_server.as_ref() {
-                server.presentation.update_surface(&display.surface());
-            }
+            server.presentation.update_surface(&display.surface());
         }
         state.last_command_finished = Some(std::time::Instant::now());
         return match result {
@@ -4133,6 +4189,29 @@ async fn apply_session_setup(state: &mut DaemonState, session_id: &str) -> Resul
     Ok(())
 }
 
+/// The post-launch sequence every locally launched browser shares, a
+/// sign-in relaunch included: the daemon owns it, follows its events and
+/// dialogs, shows it, then installs network containment before any state
+/// loads or user script runs. Failure closes the browser, so a requested
+/// allowlist never degrades to an unrestricted session.
+async fn adopt_launched_browser(
+    state: &mut DaemonState,
+    browser: BrowserManager,
+    configuration: Arc<Value>,
+    retain_profile: bool,
+    has_proxy_auth: bool,
+) -> Result<(), String> {
+    state.reset_input_state();
+    state.browser = Some(browser);
+    state.launch_configuration = Some(configuration.clone());
+    state.retain_private_profile(configuration, retain_profile);
+    state.subscribe_to_browser_events();
+    state.start_fetch_handler();
+    state.start_dialog_handler();
+    state.update_stream_client().await;
+    install_network_controls_or_close(state, has_proxy_auth).await
+}
+
 async fn auto_launch(
     state: &mut DaemonState,
     plugins: Vec<crate::plugins::PluginConfig>,
@@ -4387,16 +4466,8 @@ async fn auto_launch(
     }
     state.session_setup = SessionSetup::from_launch_options(&options);
     let mgr = BrowserManager::launch(options, engine.as_deref()).await?;
-    state.reset_input_state();
-    state.browser = Some(mgr);
-    state.launch_configuration = Some(configuration.clone());
-    state.retain_private_profile(configuration, retain_profile);
     state.effective_ca_cert = effective_ca_cert;
-    state.subscribe_to_browser_events();
-    state.start_fetch_handler();
-    state.start_dialog_handler();
-    state.update_stream_client().await;
-    install_network_controls_or_close(state, has_proxy_auth).await?;
+    adopt_launched_browser(state, mgr, configuration, retain_profile, has_proxy_auth).await?;
 
     apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
     try_auto_restore_state(state).await;
@@ -4614,6 +4685,9 @@ fn launch_options_from_env() -> LaunchOptions {
         no_xvfb: no_xvfb_from_env(),
         restrict_webrtc: env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
             .is_ok_and(|domains| !domains.trim().is_empty()),
+        remote_debugging: true,
+        restore_last_session: false,
+        retained_display: None,
     }
 }
 
@@ -5092,6 +5166,9 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             }),
         no_xvfb: no_xvfb_from_launch_cmd(cmd),
         restrict_webrtc,
+        remote_debugging: true,
+        restore_last_session: false,
+        retained_display: None,
     };
     apply_effective_ca_cert(&mut launch_options, &effective_ca_cert);
 
@@ -5375,20 +5452,9 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     state.engine = engine.as_deref().unwrap_or("chrome").to_string();
     write_engine_file(&state.session_id, &state.engine);
     write_extensions_file_from_paths(&state.session_id, launch_options.extensions.as_deref());
-    state.reset_input_state();
     state.session_setup = SessionSetup::from_launch_options(&launch_options);
-    state.browser = Some(BrowserManager::launch(launch_options, engine.as_deref()).await?);
-    state.launch_configuration = Some(configuration.clone());
-    state.retain_private_profile(configuration, retain_profile);
-    state.subscribe_to_browser_events();
-    state.start_fetch_handler();
-    state.start_dialog_handler();
-    state.update_stream_client().await;
-
-    // Install containment before loading state or running user init scripts.
-    // Failure closes the browser so a requested allowlist never degrades to an
-    // unrestricted session.
-    install_network_controls_or_close(state, has_proxy_auth).await?;
+    let mgr = BrowserManager::launch(launch_options, engine.as_deref()).await?;
+    adopt_launched_browser(state, mgr, configuration, retain_profile, has_proxy_auth).await?;
 
     apply_launch_init_scripts(state, &enable_features, &init_script_paths).await;
     try_auto_restore_state(state).await;
@@ -7649,12 +7715,7 @@ impl ControlPage<'_> {
     pub(crate) async fn validate_events(&self, events: &[Value]) -> Result<(), String> {
         let filter = self.0.domain_filter.read().await;
         for event in events {
-            if self
-                .0
-                .browser
-                .as_ref()
-                .is_some_and(|browser| browser.display_client().is_some())
-            {
+            if self.0.window_display().is_some() {
                 if event["type"] == "input_touch" {
                     return Err("Window input uses native mouse and wheel gestures; direct touch input requires a page viewport".into());
                 }
@@ -7677,12 +7738,7 @@ impl ControlPage<'_> {
 
     pub(crate) async fn apply(&mut self, event: &Value) -> Result<(), String> {
         if event["type"] == "viewport" {
-            if self
-                .0
-                .browser
-                .as_ref()
-                .is_some_and(|browser| browser.display_client().is_some())
-            {
+            if self.0.window_display().is_some() {
                 self.0
                     .apply_window_layout(
                         event["width"].as_u64().unwrap() as u32,
@@ -7734,12 +7790,7 @@ impl ControlPage<'_> {
     pub(crate) async fn selected_text(
         &mut self,
     ) -> Result<String, super::selection::SelectionError> {
-        if let Some(display) = self
-            .0
-            .browser
-            .as_ref()
-            .and_then(|browser| browser.display_client())
-        {
+        if let Some(display) = self.0.window_display() {
             let result = display
                 .request(json!({"op":"copy"}))
                 .await

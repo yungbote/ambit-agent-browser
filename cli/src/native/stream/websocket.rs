@@ -15,6 +15,7 @@ use tokio_tungstenite::WebSocketStream;
 
 use crate::native::browser_control::{custody_active, BrowserControl};
 use crate::native::cdp::client::CdpClient;
+use crate::native::display::DisplayClient;
 #[cfg(test)]
 use crate::native::input::keyboard_params;
 
@@ -239,6 +240,7 @@ pub(super) async fn accept_loop(
     client_count: Arc<Mutex<usize>>,
     patch_clients: Arc<AtomicUsize>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
+    display_slot: Arc<RwLock<Option<Arc<DisplayClient>>>>,
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
     browser_control: Arc<Mutex<BrowserControl>>,
@@ -276,6 +278,7 @@ pub(super) async fn accept_loop(
                 let client_count = client_count.clone();
                 let patch_clients = patch_clients.clone();
                 let client_slot = client_slot.clone();
+                let display_slot = display_slot.clone();
                 let client_notify = client_notify.clone();
                 let idle_activity = idle_activity.clone();
                 let browser_control = browser_control.clone();
@@ -299,6 +302,7 @@ pub(super) async fn accept_loop(
                         client_count,
                         patch_clients,
                         client_slot,
+                        display_slot,
                         client_notify,
                         idle_activity,
                         browser_control,
@@ -350,6 +354,7 @@ async fn handle_connection(
     client_count: Arc<Mutex<usize>>,
     patch_clients: Arc<AtomicUsize>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
+    display_slot: Arc<RwLock<Option<Arc<DisplayClient>>>>,
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
     browser_control: Arc<Mutex<BrowserControl>>,
@@ -383,6 +388,7 @@ async fn handle_connection(
             client_count,
             patch_clients,
             client_slot,
+            display_slot,
             client_notify,
             idle_activity,
             browser_control,
@@ -416,6 +422,7 @@ async fn handle_ws_client(
     client_count: Arc<Mutex<usize>>,
     patch_clients: Arc<AtomicUsize>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
+    display_slot: Arc<RwLock<Option<Arc<DisplayClient>>>>,
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
     browser_control: Arc<Mutex<BrowserControl>>,
@@ -505,8 +512,7 @@ async fn handle_ws_client(
     }
 
     {
-        let guard = client_slot.read().await;
-        let connected = guard.is_some();
+        let connected = super::source_connected(&client_slot, &display_slot).await;
         let sc = *screencasting.lock().await;
         let vw = *viewport_width.lock().await;
         let vh = *viewport_height.lock().await;

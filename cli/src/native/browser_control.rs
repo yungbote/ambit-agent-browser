@@ -27,6 +27,9 @@ const MAX_EVENTS: usize = 64;
 const MAX_SAFE_INTEGER: u64 = 9_007_199_254_740_991;
 const MAX_PENDING_STREAM_INPUTS: usize = 256;
 const ACK_TIMEOUT: Duration = Duration::from_secs(5);
+const MIN_SIGN_IN_IDLE_MS: u64 = 10_000;
+const MAX_SIGN_IN_IDLE_MS: u64 = 3_600_000;
+const SIGN_IN_MESSAGE: &str = "A person is signing in to a site in this browser. The agent can act again after they hand back control; do not retry this action until then.";
 
 #[derive(Debug)]
 pub(crate) struct ControlError {
@@ -70,6 +73,10 @@ pub(crate) struct ControlRequest {
     y: Option<f64>,
     #[serde(skip)]
     large_paste: bool,
+    /// The idle timeout of a sign-in batch. Its shape is judged after the
+    /// sequence is ordered, so a replayed request still reads as a duplicate.
+    #[serde(skip)]
+    sign_in: Option<Result<Duration, &'static str>>,
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -270,12 +277,33 @@ impl ControlRequest {
                     .ok_or_else(|| {
                         ControlError::invalid("Input requires between 1 and 64 events.")
                     })?;
-                for event in events {
-                    validate_event(event)?;
+                let sign_in = events
+                    .iter()
+                    .any(|event| event["type"] == "sign_in")
+                    .then(|| sign_in_event(events));
+                if sign_in.is_none() {
+                    for event in events {
+                        validate_event(event)?;
+                    }
                 }
+                request.sign_in = sign_in;
             }
         }
         Ok(request)
+    }
+
+    pub(crate) fn controller_id(&self) -> &str {
+        &self.controller_id
+    }
+
+    pub(crate) fn releases(&self) -> bool {
+        self.op == Operation::Release
+    }
+
+    /// The idle timeout a sign-in batch asks for, or why its event is invalid.
+    pub(crate) fn sign_in(&self) -> Option<Result<Duration, ControlError>> {
+        self.sign_in
+            .map(|event| event.map_err(ControlError::invalid))
     }
 
     fn deadline(&self, now: Instant) -> Result<(u64, Instant), ControlError> {
@@ -307,11 +335,33 @@ struct Lease {
     held: HeldInputs,
     native_input_pending: bool,
     download_cursor: u64,
+    sign_in: Option<SignIn>,
+}
+
+/// The lease's browser runs without DevTools while a person signs in. Its
+/// custody lasts until the daemon hands the browser back, not until the
+/// lease deadline: no agent command may launch another browser meanwhile.
+struct SignIn {
+    idle_timeout: Duration,
+    idle_deadline: Instant,
+}
+
+/// A sign-in request that passed the controller checks.
+pub(crate) enum SignInAdmission {
+    /// This sequence was already applied; the acknowledgment repeats it.
+    Duplicate(Value),
+    Admitted {
+        sequence: u64,
+        idle_timeout: Duration,
+    },
 }
 
 impl Lease {
     fn holds_custody(&self, now: Instant) -> bool {
-        self.deadline > now || self.native_input_pending || self.held.next_release().is_some()
+        self.sign_in.is_some()
+            || self.deadline > now
+            || self.native_input_pending
+            || self.held.next_release().is_some()
     }
 
     fn response(&self, status: &str) -> Value {
@@ -354,6 +404,13 @@ impl Default for BrowserControl {
 /// Whether a published lease deadline still grants a human custody now.
 pub(crate) fn custody_active(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| deadline > Instant::now())
+}
+
+/// Where one human input batch goes: the owned window's native devices, or
+/// the page through its DevTools session.
+enum InputTarget<'a> {
+    Window(std::sync::Arc<super::display::DisplayClient>),
+    Page(&'a CdpClient, &'a str),
 }
 
 struct PendingStreamInput {
@@ -668,10 +725,131 @@ impl BrowserControl {
     }
     pub(crate) fn agent_error(&self) -> Option<ControlError> {
         self.lease.as_ref().filter(|lease| lease.holds_custody(Instant::now())).map(|lease| {
-            if lease.outcome_unknown { ControlError::unknown() } else {
+            if lease.sign_in.is_some() {
+                ControlError::new("browser_controlled_by_user", SIGN_IN_MESSAGE)
+            } else if lease.outcome_unknown { ControlError::unknown() } else {
                 ControlError::new("browser_controlled_by_user", "The user is controlling this browser. Wait until they release control before continuing.")
             }
         })
+    }
+
+    /// The lease's browser runs without DevTools while a person signs in.
+    pub(crate) fn signing_in(&self) -> bool {
+        self.lease
+            .as_ref()
+            .is_some_and(|lease| lease.sign_in.is_some())
+    }
+
+    /// Whether `controller_id` owns a sign-in lease, whose release hands the
+    /// browser back to automation.
+    pub(crate) fn signs_in_for(&self, controller_id: &str) -> bool {
+        self.lease.as_ref().is_some_and(|lease| {
+            lease.sign_in.is_some() && lease.controller_id == controller_id
+        })
+    }
+
+    /// A sign-in the watchdog ends: its lease lapsed, or no human input
+    /// arrived within the idle timeout. Renewal never resets the idle clock.
+    pub(crate) fn sign_in_due(&self, now: Instant) -> bool {
+        self.lease.as_ref().is_some_and(|lease| {
+            lease
+                .sign_in
+                .as_ref()
+                .is_some_and(|sign_in| lease.deadline <= now || sign_in.idle_deadline <= now)
+        })
+    }
+
+    /// Checks a sign-in request in the control contract's order: owner,
+    /// expiry and unknown outcome, an applied sequence (duplicate), a gap,
+    /// the named surface, then the event and the lease's own state.
+    pub(crate) fn admit_sign_in(
+        &self,
+        request: &ControlRequest,
+        event: Result<Duration, ControlError>,
+    ) -> Result<SignInAdmission, ControlError> {
+        let lease = self.require_owner(&request.controller_id)?;
+        let sequence = request
+            .sequence
+            .ok_or_else(|| ControlError::invalid("Sign-in requires an input sequence."))?;
+        if sequence <= lease.last_sequence {
+            return Ok(SignInAdmission::Duplicate(
+                self.acknowledge(lease.response("duplicate")),
+            ));
+        }
+        if sequence != lease.last_sequence + 1 {
+            return Err(ControlError::new(
+                "browser_control_sequence_gap",
+                format!("Expected input sequence {}.", lease.last_sequence + 1),
+            ));
+        }
+        if let (Some(expected), Some(display)) = (
+            request.expected_surface_generation.as_deref(),
+            self.display.as_ref(),
+        ) {
+            if expected != display.surface().generation {
+                return Err(ControlError::new("browser_control_surface_stale", "The browser window changed. Use its current frame before sending input."));
+            }
+        }
+        let idle_timeout = event?;
+        if lease.sign_in.is_some() {
+            return Err(ControlError::invalid(
+                "This browser is already in sign-in mode.",
+            ));
+        }
+        Ok(SignInAdmission::Admitted {
+            sequence,
+            idle_timeout,
+        })
+    }
+
+    /// The browser now runs without DevTools: the same lease keeps its
+    /// controller and sequence line, consumes `sequence` and starts the idle
+    /// clock. The replaced display took any native input it held with it.
+    pub(crate) fn begin_sign_in(
+        &mut self,
+        controller_id: &str,
+        sequence: u64,
+        idle_timeout: Duration,
+    ) -> Result<Value, ControlError> {
+        let lease = self
+            .lease
+            .as_mut()
+            .filter(|lease| lease.controller_id == controller_id)
+            .ok_or_else(|| {
+                ControlError::new(
+                    "browser_control_stale",
+                    "This controller does not own the browser.",
+                )
+            })?;
+        lease.sign_in = Some(SignIn {
+            idle_timeout,
+            idle_deadline: Instant::now() + idle_timeout,
+        });
+        lease.last_sequence = sequence;
+        lease.native_input_pending = false;
+        let response = lease.response("applied");
+        self.needs_observation = true;
+        self.publish_custody();
+        Ok(self.acknowledge(response))
+    }
+
+    /// Custody returns to the agent: the lease ends, its controller becomes
+    /// the last released one, and the agent must observe the browser first.
+    pub(crate) fn end_lease(&mut self) -> Option<Value> {
+        self.needs_observation = true;
+        let lease = self.lease.take()?;
+        let response = self.acknowledge(lease.response("released"));
+        self.last_released = Some(lease);
+        self.publish_custody();
+        Some(response)
+    }
+
+    /// A success names the owned window's current surface, if there is one.
+    fn acknowledge(&self, mut response: Value) -> Value {
+        if let Some(display) = self.display.as_ref() {
+            response["surface"] = json!(display.surface());
+        }
+        response
     }
 
     pub(crate) fn reset_browser(&mut self) {
@@ -817,11 +995,7 @@ impl BrowserControl {
     ) -> Result<Value, ControlError> {
         let result = self.execute_operation(request, browser, page).await;
         self.publish_custody();
-        let mut response = result?;
-        if let Some(display) = self.display.as_ref() {
-            response["surface"] = json!(display.surface());
-        }
-        Ok(response)
+        Ok(self.acknowledge(result?))
     }
 
     async fn execute_operation(
@@ -832,10 +1006,16 @@ impl BrowserControl {
     ) -> Result<Value, ControlError> {
         let now = Instant::now();
         match request.op {
-            Operation::Inspect => Ok(
-                json!({ "supported": true, "controlled": self.agent_error().is_some(),
-                    "filesSupported": page.as_ref().is_some_and(|page| page.files_supported()) }),
-            ),
+            Operation::Inspect => {
+                let mut inspected =
+                    json!({ "supported": true, "controlled": self.agent_error().is_some() });
+                // A browser without DevTools has no file pickers to report on.
+                if !self.signing_in() {
+                    inspected["filesSupported"] =
+                        json!(page.as_ref().is_some_and(|page| page.files_supported()));
+                }
+                Ok(inspected)
+            }
             Operation::Downloads => {
                 let page = page.as_mut().ok_or_else(|| {
                     ControlError::new(
@@ -917,6 +1097,7 @@ impl BrowserControl {
                     download_cursor: browser
                         .map(|(client, _)| client.downloads.cursor())
                         .unwrap_or(0),
+                    sign_in: None,
                 });
                 if let Some(page) = page.as_mut().filter(|page| page.files_supported()) {
                     if let Err(error) = page.prepare_files(&request.controller_id).await {
@@ -1121,35 +1302,59 @@ impl BrowserControl {
                         format!("Expected input sequence {}.", lease.last_sequence + 1),
                     ));
                 }
-                if let Some(display) = self.display.as_ref() {
-                    if request.expected_surface_generation.as_deref()
-                        != Some(display.surface().generation.as_str())
-                    {
-                        return Err(ControlError::new("browser_control_surface_stale", "The browser window changed. Use its current frame before sending input."));
+                // The owned window takes native input with or without a
+                // DevTools session; page input needs the page session.
+                let target = match (self.display.clone(), browser) {
+                    (Some(display), _) => {
+                        if request.expected_surface_generation.as_deref()
+                            != Some(display.surface().generation.as_str())
+                        {
+                            return Err(ControlError::new("browser_control_surface_stale", "The browser window changed. Use its current frame before sending input."));
+                        }
+                        let events = request.events.as_ref().unwrap();
+                        if events.iter().any(|event| event["type"] == "viewport")
+                            && events.len() != 1
+                        {
+                            return Err(ControlError::invalid(
+                                "Window resizing must be acknowledged before sending other input.",
+                            ));
+                        }
+                        InputTarget::Window(display)
                     }
-                    let events = request.events.as_ref().unwrap();
-                    if events.iter().any(|event| event["type"] == "viewport") && events.len() != 1 {
-                        return Err(ControlError::invalid(
-                            "Window resizing must be acknowledged before sending other input.",
-                        ));
+                    (None, Some((client, session_id))) => {
+                        if !lease.held.accepts(
+                            request
+                                .events
+                                .as_ref()
+                                .unwrap()
+                                .iter()
+                                .map(|event| (session_id, event)),
+                        ) {
+                            return Err(ControlError::invalid(
+                                "At most 256 inputs may be held at once.",
+                            ));
+                        }
+                        InputTarget::Page(client, session_id)
                     }
-                }
-                let (client, session_id) = browser.ok_or_else(|| {
-                    ControlError::new(
-                        "browser_control_unavailable",
-                        "The controlled browser is no longer connected.",
-                    )
-                })?;
-                if !lease.held.accepts(
-                    request
+                    (None, None) => {
+                        return Err(ControlError::new(
+                            "browser_control_unavailable",
+                            "The controlled browser is no longer connected.",
+                        ))
+                    }
+                };
+                // Navigation is a DevTools command. A person signing in has
+                // the browser's own address bar instead.
+                if lease.sign_in.is_some()
+                    && request
                         .events
                         .as_ref()
                         .unwrap()
                         .iter()
-                        .map(|event| (session_id, event)),
-                ) {
+                        .any(|event| event["type"] == "navigation")
+                {
                     return Err(ControlError::invalid(
-                        "At most 256 inputs may be held at once.",
+                        "Use the browser's own address bar while signing in.",
                     ));
                 }
                 if let Some(page) = page.as_ref() {
@@ -1172,7 +1377,7 @@ impl BrowserControl {
                             }
                             if matches!(event["type"].as_str(), Some("viewport" | "navigation")) {
                                 if event["type"] == "viewport" {
-                                    if let Some(display) = self.display.as_ref() {
+                                    if let InputTarget::Window(display) = &target {
                                         display.reset().await.map_err(|_| ControlError::unknown())?;
                                         lease.native_input_pending = false;
                                     }
@@ -1184,37 +1389,39 @@ impl BrowserControl {
                                 applied_any = true;
                                 continue;
                             }
-                            if let Some(display) = self.display.as_ref() {
-                                // Keep the helper's ordered native batch in
-                                // one RPC so video capture cannot interleave
-                                // between its keys. Page commands delimit it.
-                                let mut native_events = vec![event];
-                                while events.peek().is_some_and(|event| !matches!(event["type"].as_str(), Some("viewport" | "navigation"))) {
-                                    native_events.push(events.next().unwrap());
+                            match &target {
+                                InputTarget::Window(display) => {
+                                    // Keep the helper's ordered native batch in
+                                    // one RPC so video capture cannot interleave
+                                    // between its keys. Page commands delimit it.
+                                    let mut native_events = vec![event];
+                                    while events.peek().is_some_and(|event| !matches!(event["type"].as_str(), Some("viewport" | "navigation"))) {
+                                        native_events.push(events.next().unwrap());
+                                    }
+                                    lease.native_input_pending = true;
+                                    if let Err(error) = display.input(&native_events).await {
+                                        return Err(if !applied_any && error.operation_performed == Some(json!(false)) {
+                                            ControlError::invalid("The native browser window did not accept this input.")
+                                        } else { ControlError::unknown() });
+                                    }
                                 }
-                                lease.native_input_pending = true;
-                                if let Err(error) = display.input(&native_events).await {
-                                    return Err(if !applied_any && error.operation_performed == Some(json!(false)) {
-                                        ControlError::invalid("The native browser window did not accept this input.")
-                                    } else { ControlError::unknown() });
+                                InputTarget::Page(client, session_id) => {
+                                    lease.held.before_send(session_id, &event);
+                                    let (method, params) = lease
+                                        .held
+                                        .command(session_id, event["type"].as_str().unwrap(), &event, None)
+                                        .unwrap();
+                                    client
+                                        .send_command_from(
+                                            method,
+                                            Some(params),
+                                            Some(session_id),
+                                            InputSource::Human,
+                                        )
+                                        .await.map_err(|_| ControlError::unknown())?;
+                                    lease.held.acknowledged(session_id, &event);
                                 }
-                                applied_any = true;
-                                continue;
                             }
-                            lease.held.before_send(session_id, &event);
-                            let (method, params) = lease
-                                .held
-                                .command(session_id, event["type"].as_str().unwrap(), &event, None)
-                                .unwrap();
-                            client
-                                .send_command_from(
-                                    method,
-                                    Some(params),
-                                    Some(session_id),
-                                    InputSource::Human,
-                                )
-                                .await.map_err(|_| ControlError::unknown())?;
-                            lease.held.acknowledged(session_id, &event);
                             applied_any = true;
                         }
                         Ok::<_, ControlError>(())
@@ -1231,6 +1438,10 @@ impl BrowserControl {
                 }
                 lease.last_sequence = sequence;
                 lease.outcome_unknown = false;
+                // A person signing in is present while their input applies.
+                if let Some(sign_in) = lease.sign_in.as_mut() {
+                    sign_in.idle_deadline = Instant::now() + sign_in.idle_timeout;
+                }
                 Ok(lease.response("applied"))
             }
         }
@@ -1303,6 +1514,27 @@ fn number(
         }
         _ => Err(ControlError::invalid(format!("Invalid input {}.", key))),
     }
+}
+
+/// The one event of a sign-in batch: `{"type":"sign_in","idleTimeoutMs":N}`.
+fn sign_in_event(events: &[Value]) -> Result<Duration, &'static str> {
+    let [event] = events else {
+        return Err("Sign-in must be the only event in its input batch.");
+    };
+    let fields = event
+        .as_object()
+        .filter(|fields| {
+            fields
+                .keys()
+                .all(|key| matches!(key.as_str(), "type" | "idleTimeoutMs"))
+        })
+        .ok_or("The sign-in event accepts only type and idleTimeoutMs.")?;
+    fields
+        .get("idleTimeoutMs")
+        .and_then(Value::as_u64)
+        .filter(|ms| (MIN_SIGN_IN_IDLE_MS..=MAX_SIGN_IN_IDLE_MS).contains(ms))
+        .map(Duration::from_millis)
+        .ok_or("idleTimeoutMs must be an integer from 10000 to 3600000.")
 }
 
 fn validate_event(event: &Value) -> Result<(), ControlError> {

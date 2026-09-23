@@ -1,7 +1,7 @@
 //! Reconcile native window visibility with the browser's CDP page owner.
 
 use super::BrowserManager;
-use crate::native::display::{DisplayInfo, Surface, DEVICE_SCALE_FACTOR, MAX_DISPLAY_SIZE};
+use crate::native::display::{window_pixels, DisplayInfo, Surface};
 use base64::{engine::general_purpose::STANDARD, Engine};
 use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
@@ -125,22 +125,13 @@ impl BrowserManager {
         page_blocked: bool,
         mut events: tokio::sync::broadcast::Receiver<crate::native::cdp::types::CdpEvent>,
     ) -> Result<(Surface, bool), String> {
-        let maximum = MAX_DISPLAY_SIZE / DEVICE_SCALE_FACTOR;
-        if !(1..=maximum).contains(&width) || !(1..=maximum).contains(&height) {
-            return Err(format!(
-                "Window dimensions must be between 1 and {maximum} CSS pixels"
-            ));
-        }
+        let (display_width, display_height) = window_pixels(width, height)?;
         let display = self
             .display_client()
             .ok_or("The browser has no owned window display")?;
         self.client.rotate_all_page_generations();
         display
-            .resize(
-                width * DEVICE_SCALE_FACTOR,
-                height * DEVICE_SCALE_FACTOR,
-                Some(window_id),
-            )
+            .resize(display_width, display_height, Some(window_id))
             .await
             .map_err(|error| error.to_string())?;
         if page_blocked {
