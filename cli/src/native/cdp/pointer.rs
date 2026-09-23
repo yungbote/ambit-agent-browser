@@ -1,6 +1,10 @@
 //! Find the renderer that receives a page-coordinate pointer event. CDP hit
 //! testing stops at remote frame owners; descend through their actual content
 //! quads, retaining the correct coordinate space across process boundaries.
+//!
+//! Input and box-model quads use client (layout viewport) coordinates, while
+//! `DOM.getNodeForLocation` hit-tests document coordinates of the session's
+//! local root. Each hit test therefore adds that root's current scroll offset.
 
 use serde_json::{json, Value};
 use std::collections::HashSet;
@@ -30,13 +34,26 @@ pub(super) async fn locate(
         y,
     };
     let mut session_point = (x, y);
+    let mut session_scroll = scroll_offset(
+        &client
+            .send_command(
+                "Runtime.evaluate",
+                Some(json!({"expression":"({scrollX,scrollY})","contextId":context,"returnByValue":true})),
+                Some(session),
+            )
+            .await?,
+    )?;
     let mut current_frame = frame.to_owned();
     let mut frames = HashSet::from([frame.to_owned()]);
     loop {
         // Native hit testing pierces shadow trees and local frames, stopping
         // at a remote frame's owner. The hit's frame and the node's owned
         // frame are distinct protocol fields; neither is inferred from markup.
-        let hit = client.send_command("DOM.getNodeForLocation", Some(json!({"x":session_point.0.round() as i64,"y":session_point.1.round() as i64,"includeUserAgentShadowDOM":true})), Some(&current.session)).await?;
+        let document_point = (
+            session_point.0 + session_scroll.0,
+            session_point.1 + session_scroll.1,
+        );
+        let hit = client.send_command("DOM.getNodeForLocation", Some(json!({"x":document_point.0.round() as i64,"y":document_point.1.round() as i64,"includeUserAgentShadowDOM":true})), Some(&current.session)).await?;
         let described = client
             .send_command(
                 "DOM.describeNode",
@@ -86,7 +103,7 @@ pub(super) async fn locate(
         let child_context = world["executionContextId"]
             .as_i64()
             .ok_or("The hit frame has no observation realm")?;
-        let size = client.send_command("Runtime.evaluate", Some(json!({"expression":"({width:innerWidth,height:innerHeight})","contextId":child_context,"returnByValue":true})), Some(&child_session)).await?;
+        let size = client.send_command("Runtime.evaluate", Some(json!({"expression":"({width:innerWidth,height:innerHeight,scrollX,scrollY})","contextId":child_context,"returnByValue":true})), Some(&child_session)).await?;
         let width = size["result"]["value"]["width"]
             .as_f64()
             .filter(|size| size.is_finite() && *size > 0.0)
@@ -96,8 +113,11 @@ pub(super) async fn locate(
             .filter(|size| size.is_finite() && *size > 0.0)
             .ok_or("The hit frame has no viewport height")?;
         let point = (u * width, v * height);
+        // A local child shares its parent's hit-testing root; an
+        // out-of-process frame is the local root of its own session.
         if child_session != current.session {
             session_point = point;
+            session_scroll = scroll_offset(&size)?;
         }
         current_frame = child_frame.into();
         current = PointerFrame {
@@ -106,6 +126,16 @@ pub(super) async fn locate(
             x: point.0,
             y: point.1,
         };
+    }
+}
+
+/// The layout viewport's scroll offset in CSS pixels, from an evaluation that
+/// returned `scrollX` and `scrollY` by value.
+fn scroll_offset(evaluation: &Value) -> Result<(f64, f64), String> {
+    let value = &evaluation["result"]["value"];
+    match (value["scrollX"].as_f64(), value["scrollY"].as_f64()) {
+        (Some(x), Some(y)) if x.is_finite() && y.is_finite() => Ok((x, y)),
+        _ => Err("The pointer frame's scroll offset is unavailable.".into()),
     }
 }
 
@@ -151,6 +181,16 @@ fn unit_point(quad: &Value, point: (f64, f64)) -> Option<(f64, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scroll_offsets_are_finite_css_pixels() {
+        assert_eq!(
+            scroll_offset(&json!({"result":{"value":{"scrollX":12.5,"scrollY":300}}})),
+            Ok((12.5, 300.0))
+        );
+        assert!(scroll_offset(&json!({"result":{"value":{"scrollX":0}}})).is_err());
+        assert!(scroll_offset(&json!({"exceptionDetails":{}})).is_err());
+    }
 
     #[test]
     fn frame_coordinates_cover_scaled_rotated_and_perspective_quads() {
