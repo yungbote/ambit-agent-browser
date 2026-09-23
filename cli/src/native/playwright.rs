@@ -364,14 +364,14 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
             None => browser.active_target_id()?,
         }
         .to_owned();
-        // The runner learns how many explicit isolated contexts exist. A
+        // The runner learns how many explicit isolated contexts hold tabs. A
         // client without shared-context adoption would fold them into the
         // default profile and misreport cookies, so it refuses before start.
         let (download_context, isolated_contexts) = tokio::select! {
             biased;
             _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start()),
             result = tokio::time::timeout_at(deadline, async {
-                let isolated = browser.isolated_context_ids().await?.len();
+                let isolated = browser.occupied_isolated_context_count().await?;
                 let context = browser.download_context_for_target(&target).await?;
                 browser.configure_downloads(context.as_deref()).await?;
                 Ok::<_, String>((context, isolated))
@@ -529,7 +529,17 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
         } else {
             Ok(())
         };
-        let outcome = program_outcome(ended, started).map(|value| {
+        let outcome = match ended {
+            // Stock Playwright attaches to every tab in the browser and waits
+            // for each to commit its first navigation. One that never will
+            // (a popup whose navigation was refused) keeps any program from
+            // starting, whichever tab it selects; name it.
+            Ended::Deadline if !started => Err(not_started_by_deadline(
+                &stalled_tabs(&state.browser.as_ref().unwrap().client).await,
+            )),
+            ended => program_outcome(ended, started),
+        }
+        .map(|value| {
             json!({ "result": value, "diagnostics": diagnostics, "diagnosticsTruncated": diagnostics_truncated, "targetId": target })
         });
         after_cleanup(outcome, started, cleanup.and(release))
@@ -553,6 +563,36 @@ fn after_cleanup(
     }
 }
 
+/// Page targets that have not committed a first navigation: Playwright's
+/// initial empty page. Best effort; the roster is only a diagnosis.
+async fn stalled_tabs(client: &CdpClient) -> Vec<String> {
+    let roster = tokio::time::timeout(
+        Duration::from_secs(1),
+        client.send_command_no_params("Target.getTargets", None),
+    )
+    .await;
+    let Ok(Ok(roster)) = roster else {
+        return Vec::new();
+    };
+    roster["targetInfos"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|target| target["type"] == "page" && target["url"] == "")
+        .filter_map(|target| target["targetId"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn not_started_by_deadline(stalled: &[String]) -> String {
+    if stalled.is_empty() {
+        return "browser_operation_rejected: The program did not start before its deadline.".into();
+    }
+    format!(
+        "browser_operation_rejected: The program did not start before its deadline. Playwright attaches to every tab and waits for each to finish its first navigation; these tabs have not: {}. Close or navigate them, then run the program again.",
+        stalled.join(", ")
+    )
+}
+
 /// What the program's own end proves, before any cleanup failure. `started`
 /// is the daemon's start record; a program cannot report itself not started.
 fn program_outcome(ended: Ended, started: bool) -> Result<Value, String> {
@@ -561,11 +601,7 @@ fn program_outcome(ended: Ended, started: bool) -> Result<Value, String> {
         Ended::Interrupted(reason) if started => return Err(reason.stopped()),
         Ended::Interrupted(reason) => return Err(reason.before_start()),
         Ended::Deadline if started => return Err(unknown("The program reached its deadline.")),
-        Ended::Deadline => {
-            return Err(
-                "browser_operation_rejected: The program did not start before its deadline.".into(),
-            )
-        }
+        Ended::Deadline => return Err(not_started_by_deadline(&[])),
         Ended::Failed(error) if started => return Err(unknown(error)),
         Ended::Failed(error) => {
             return Err(format!(
@@ -1150,14 +1186,22 @@ try {
                 assert!(!error.contains("PROGRAM MUST NOT START"), "{read}");
             }
         }
-        client
-            .send_command(
-                "Target.disposeBrowserContext",
-                Some(json!({"browserContextId":isolated_context})),
-                None,
-            )
+        // Closing the isolated window through the native tools is enough:
+        // Chrome keeps its empty context, which no client can misrepresent.
+        let closed = Box::pin(execute_command(
+            &json!({"action":"tab_close","tabId":isolated_target}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(closed["success"], true, "{closed}");
+        assert!(state
+            .browser
+            .as_ref()
+            .unwrap()
+            .isolated_context_ids()
             .await
-            .unwrap();
+            .unwrap()
+            .contains(&isolated_context.as_str().unwrap().to_owned()));
         let selected = Box::pin(execute_command(
             &json!({"action":"tab_switch","tabId":target}),
             &mut state,
@@ -1173,6 +1217,12 @@ try {
             .as_array()
             .unwrap()
             .contains(&json!("persistent")));
+        if let Ok(stock) = std::env::var("AGENT_BROWSER_TEST_STOCK_PLAYWRIGHT_MODULE") {
+            let env = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_PLAYWRIGHT_MODULE"]);
+            env.set("AGENT_BROWSER_PLAYWRIGHT_MODULE", &stock);
+            let read = Box::pin(execute_command(&json!({"action":"run_playwright","targetId":target,"code":cookie_values,"timeoutMs":15000}), &mut state)).await;
+            assert_eq!(read["success"], true, "{read}");
+        }
         Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
     }
 
@@ -1215,6 +1265,71 @@ try {
         Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
         server.abort();
         assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// Stock Playwright waits for every tab's first navigation before any
+    /// program starts. A popup that never navigates is named, closing it
+    /// through the native tools recovers, and nothing ran meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
+    async fn e2e_playwright_names_a_tab_that_never_navigated_and_recovers_after_closing_it() {
+        use crate::native::actions::execute_command;
+        let mut state = DaemonState::new();
+        let opened = Box::pin(execute_command(
+            &json!({"action":"navigate","url":"data:text/html,<title>Main</title><p>main</p>"}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(opened["success"], true, "{opened}");
+        let main = state
+            .browser
+            .as_ref()
+            .unwrap()
+            .active_target_id()
+            .unwrap()
+            .to_owned();
+        // Chrome refuses a renderer-initiated top-level data: navigation, so
+        // this popup stays on its initial empty document.
+        let opener = Box::pin(execute_command(&json!({"action":"run_playwright","targetId":main,"timeoutMs":15000,"code":"await page.evaluate(() => { window.open('data:text/html,<p>never</p>'); }); return true;"}), &mut state)).await;
+        assert_eq!(opener["success"], true, "{opener}");
+        let client = state.browser.as_ref().unwrap().client.clone();
+        let stalled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let found = stalled_tabs(&client).await;
+                if !found.is_empty() {
+                    break found;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(stalled.len(), 1, "{stalled:?}");
+        let blocked = Box::pin(execute_command(&json!({"action":"run_playwright","targetId":main,"timeoutMs":3000,"code":"await page.evaluate(() => { document.title = 'RAN'; }); return true;"}), &mut state)).await;
+        assert_eq!(blocked["code"], "browser_operation_rejected", "{blocked}");
+        assert!(
+            blocked["error"].as_str().unwrap().contains(&stalled[0]),
+            "{blocked}"
+        );
+        let closed = Box::pin(execute_command(
+            &json!({"action":"tab_close","tabId":stalled[0]}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(closed["success"], true, "{closed}");
+        let selected = Box::pin(execute_command(
+            &json!({"action":"tab_switch","tabId":main}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(selected["success"], true, "{selected}");
+        let read = Box::pin(execute_command(&json!({"action":"run_playwright","targetId":main,"timeoutMs":15000,"code":"return await page.title();"}), &mut state)).await;
+        assert_eq!(read["success"], true, "{read}");
+        assert_eq!(
+            read["data"]["result"], "Main",
+            "the blocked program ran: {read}"
+        );
+        Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
     }
 
     /// Serves `/` and `/frame` from one port; `PORT` in a body becomes that

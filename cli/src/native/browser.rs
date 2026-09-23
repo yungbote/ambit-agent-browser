@@ -2363,6 +2363,28 @@ impl BrowserManager {
             .collect()
     }
 
+    /// Explicit contexts that still hold a target. Closing an isolated
+    /// window's last tab leaves its context in Chrome until disposal, but an
+    /// empty context has nothing a client could misrepresent.
+    pub(crate) async fn occupied_isolated_context_count(&self) -> Result<usize, String> {
+        let contexts = self.isolated_context_ids().await?;
+        let targets = self
+            .client
+            .send_command_no_params("Target.getTargets", None)
+            .await?;
+        let targets = targets["targetInfos"]
+            .as_array()
+            .ok_or("Browser target roster is unavailable")?;
+        Ok(contexts
+            .iter()
+            .filter(|context| {
+                targets
+                    .iter()
+                    .any(|target| target["browserContextId"].as_str() == Some(context.as_str()))
+            })
+            .count())
+    }
+
     pub(crate) async fn download_context_for_target(
         &self,
         target: &str,
