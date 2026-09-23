@@ -805,54 +805,148 @@ mod tests {
         assert!(held.browser.is_none());
     }
 
+    /// One daemon connection carrying one request, as a host helper would.
+    async fn connect(
+        state: Arc<tokio::sync::Mutex<DaemonState>>,
+        operations: Operations,
+        command: Value,
+    ) -> (
+        BufReader<tokio::io::DuplexStream>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let (mut client, server) = tokio::io::duplex(64 << 10);
+        let activity = Arc::new(IdleActivity::new());
+        let task = tokio::spawn(handle_connection(
+            server,
+            state,
+            activity,
+            None,
+            Arc::new(Notify::new()),
+            operations,
+        ));
+        client
+            .write_all(format!("{command}\n").as_bytes())
+            .await
+            .unwrap();
+        (BufReader::new(client), task)
+    }
+
+    async fn reply(reader: &mut BufReader<tokio::io::DuplexStream>) -> Value {
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+            .await
+            .unwrap()
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    async fn value(client: &CdpClient, session: &str, expression: &str) -> Value {
+        client
+            .send_command(
+                "Runtime.evaluate",
+                Some(serde_json::json!({"expression":expression,"returnByValue":true})),
+                Some(session),
+            )
+            .await
+            .unwrap()["result"]["value"]
+            .clone()
+    }
+
+    /// A stop that lands while the runner is still loading Playwright and
+    /// attaching proves that no program code ran: human control reports the
+    /// ordinary refusal and a deadline reports rejection, never an
+    /// interrupted or unknown outcome. The page shows no program effect.
+    #[tokio::test]
+    #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
+    async fn e2e_playwright_stop_before_program_code_reports_that_nothing_ran() {
+        use crate::test_utils::EnvGuard;
+        use serde_json::json;
+        let real = std::env::var("AGENT_BROWSER_PLAYWRIGHT_MODULE")
+            .expect("AGENT_BROWSER_PLAYWRIGHT_MODULE selects playwright-core");
+        let directory = tempfile::tempdir().unwrap();
+        let slow = directory.path().join("slow-playwright.mjs");
+        std::fs::write(
+            &slow,
+            format!(
+                "await new Promise(resolve => setTimeout(resolve, 3000));\nexport * from {};\n",
+                serde_json::to_string(url::Url::from_file_path(&real).unwrap().as_str()).unwrap()
+            ),
+        )
+        .unwrap();
+        let env = EnvGuard::new(&["AGENT_BROWSER_PLAYWRIGHT_MODULE"]);
+        env.set("AGENT_BROWSER_PLAYWRIGHT_MODULE", slow.to_str().unwrap());
+
+        let mut initial = DaemonState::new();
+        let opened = Box::pin(execute_command_received(
+            &json!({"action":"navigate","url":"data:text/html,<title>Untouched</title>"}),
+            &mut initial,
+            std::time::Instant::now(),
+        ))
+        .await;
+        assert_eq!(opened["success"], true, "{opened}");
+        let browser = initial.browser.as_ref().unwrap();
+        let client = browser.client.clone();
+        let session = browser.active_session_id().unwrap().to_owned();
+        let operations = initial.playwright_operations.clone();
+        let state = Arc::new(tokio::sync::Mutex::new(initial));
+        let program = "await page.evaluate(() => document.title = 'Program ran');";
+
+        let (mut late, task) = connect(
+            state.clone(),
+            operations.clone(),
+            json!({"action":"run_playwright","timeoutMs":1000,"code":program}),
+        )
+        .await;
+        let refused = reply(&mut late).await;
+        assert_eq!(refused["code"], "browser_operation_rejected", "{refused}");
+        assert!(
+            refused["error"]
+                .as_str()
+                .unwrap()
+                .contains("did not start before its deadline"),
+            "{refused}"
+        );
+        drop(late);
+        task.await.unwrap();
+
+        let (mut waiting, program_task) = connect(
+            state.clone(),
+            operations.clone(),
+            json!({"action":"run_playwright","timeoutMs":30000,"code":program}),
+        )
+        .await;
+        // The runner is spawned and still loading its client.
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        let controller = uuid::Uuid::new_v4().to_string();
+        let expires = crate::native::stream::timestamp_ms() + 30_000;
+        let (mut human, human_task) = connect(state.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"acquire","controllerId":controller,"expiresAt":expires})).await;
+        let acquired = reply(&mut human).await;
+        assert_eq!(acquired["success"], true, "{acquired}");
+        let stopped = reply(&mut waiting).await;
+        assert_eq!(stopped["code"], "browser_controlled_by_user", "{stopped}");
+        assert!(stopped.get("data").is_none_or(Value::is_null), "{stopped}");
+        tokio::time::sleep(Duration::from_millis(3500)).await;
+        assert_eq!(
+            value(&client, &session, "document.title").await,
+            "Untouched"
+        );
+        drop(human);
+        human_task.await.unwrap();
+        drop(waiting);
+        program_task.await.unwrap();
+        let (mut release, task) = connect(state.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"release","controllerId":controller})).await;
+        assert_eq!(reply(&mut release).await["success"], true);
+        drop(release);
+        task.await.unwrap();
+        close_current_browser(&mut *state.lock().await)
+            .await
+            .unwrap();
+    }
+
     #[tokio::test]
     #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
     async fn e2e_playwright_takeover_and_caller_disconnect_settle_before_releasing_custody() {
         use serde_json::json;
-        use tokio::io::DuplexStream;
-
-        async fn connect(
-            state: Arc<tokio::sync::Mutex<DaemonState>>,
-            operations: Operations,
-            command: Value,
-        ) -> (BufReader<DuplexStream>, tokio::task::JoinHandle<()>) {
-            let (mut client, server) = tokio::io::duplex(64 << 10);
-            let activity = Arc::new(IdleActivity::new());
-            let task = tokio::spawn(handle_connection(
-                server,
-                state,
-                activity,
-                None,
-                Arc::new(Notify::new()),
-                operations,
-            ));
-            client
-                .write_all(format!("{command}\n").as_bytes())
-                .await
-                .unwrap();
-            (BufReader::new(client), task)
-        }
-
-        async fn reply(reader: &mut BufReader<DuplexStream>) -> Value {
-            let mut line = String::new();
-            tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
-                .await
-                .unwrap()
-                .unwrap();
-            serde_json::from_str(&line).unwrap()
-        }
-
-        async fn value(client: &CdpClient, session: &str, expression: &str) -> Value {
-            client
-                .send_command(
-                    "Runtime.evaluate",
-                    Some(json!({"expression":expression,"returnByValue":true})),
-                    Some(session),
-                )
-                .await
-                .unwrap()["result"]["value"]
-                .clone()
-        }
 
         let mut initial = DaemonState::new();
         let opened = Box::pin(execute_command_received(

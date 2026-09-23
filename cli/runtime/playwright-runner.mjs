@@ -53,6 +53,9 @@ try {
   }
   if (!selected) throw new Error('The selected browser tab is no longer available.');
   started = true;
+  // The daemon's proof that program code may have run. Written before the
+  // program is invoked; a stop without this record performed no program work.
+  writeFileSync(3, '{"started":true}\n');
   const value = await program(selected.page, selected.context, browser, semanticJudgement);
   result = { success: true, result: value === undefined ? null : value };
   // Reject cyclic values/BigInt before declaring the program complete.

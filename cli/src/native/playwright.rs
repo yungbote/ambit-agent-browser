@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Notify};
 
@@ -207,16 +207,89 @@ fn unknown(message: impl AsRef<str>) -> String {
     format!("browser_operation_outcome_unknown: {} Earlier effects may have executed. Inspect the browser before continuing; do not replay the program.", message.as_ref())
 }
 
-async fn result_bytes(reader: impl AsyncRead + Unpin) -> Result<Vec<u8>, String> {
-    let mut bytes = Vec::new();
-    BufReader::new(reader.take((MAX_RESULT + 1) as u64))
-        .read_until(b'\n', &mut bytes)
-        .await
-        .map_err(|_| unknown("The program result could not be read."))?;
-    if bytes.len() > MAX_RESULT {
-        return Err(unknown("The program result exceeded 2 MiB."));
+/// Written by the runner on its private channel immediately before program
+/// code runs. The runner ships with this daemon from one source revision.
+const START_RECORD: &[u8] = b"{\"started\":true}\n";
+
+/// The runner's private channel: an optional start record, then one result
+/// record, each newline-terminated. Bytes read stay here across a canceled
+/// read, so a stop can still tell whether program code was invoked.
+struct RunnerChannel<R> {
+    reader: R,
+    received: Vec<u8>,
+}
+
+impl<R: AsyncRead + Unpin> RunnerChannel<R> {
+    fn new(reader: R) -> Self {
+        Self {
+            reader,
+            received: Vec::new(),
+        }
     }
-    Ok(bytes)
+
+    /// The next record including its newline, or the remaining bytes at end
+    /// of stream. A record is at most 2 MiB.
+    async fn record(&mut self) -> Result<Vec<u8>, String> {
+        loop {
+            if let Some(end) = self.received.iter().position(|byte| *byte == b'\n') {
+                if end >= MAX_RESULT {
+                    return Err(unknown("The program result exceeded 2 MiB."));
+                }
+                return Ok(self.received.drain(..=end).collect());
+            }
+            if self.received.len() >= MAX_RESULT {
+                return Err(unknown("The program result exceeded 2 MiB."));
+            }
+            // Cancel-safe: a canceled read consumed nothing. Reading into the
+            // retained buffer keeps this future, part of every command's,
+            // small.
+            self.received.reserve(8192);
+            let count = self
+                .reader
+                .read_buf(&mut self.received)
+                .await
+                .map_err(|_| unknown("The program result could not be read."))?;
+            if count == 0 {
+                return Ok(std::mem::take(&mut self.received));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+impl RunnerChannel<tokio::net::UnixStream> {
+    /// After the runner group is stopped, whether it had delivered the start
+    /// record. Reads only what the kernel already holds, never waiting: a
+    /// descendant that left the group may still hold the channel open. The
+    /// reactor's cached readiness is not consulted, so delivered bytes it has
+    /// not observed yet still count.
+    fn started_before_stop(&mut self) -> bool {
+        use std::os::fd::AsRawFd;
+        let mut chunk = [0u8; 64];
+        while self.received.len() < START_RECORD.len() {
+            let count = unsafe {
+                libc::recv(
+                    self.reader.as_raw_fd(),
+                    chunk.as_mut_ptr().cast(),
+                    chunk.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if count <= 0 {
+                break;
+            }
+            self.received.extend_from_slice(&chunk[..count as usize]);
+        }
+        self.received.starts_with(START_RECORD)
+    }
+}
+
+/// How the supervised program's execution phase ended.
+enum Ended {
+    Record(Vec<u8>),
+    Interrupted(InterruptReason),
+    Deadline,
+    Failed(String),
 }
 
 async fn diagnostics(mut reader: impl AsyncRead + Unpin) -> (String, bool) {
@@ -365,25 +438,39 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
         let stderr = process.child.stderr.take().unwrap();
         let mut logs =
             tokio::spawn(async move { tokio::join!(diagnostics(stdout), diagnostics(stderr)) });
+        let mut channel = RunnerChannel::new(result_reader);
+        let mut started = false;
         let execution = async {
             stdin
                 .write_all(&serde_json::to_vec(&request).unwrap())
                 .await
                 .map_err(|_| unknown("The runner did not accept its invocation."))?;
             drop(stdin);
-            result_bytes(result_reader).await
+            let mut record = channel.record().await?;
+            if record == START_RECORD {
+                started = true;
+                record = channel.record().await?;
+            }
+            Ok::<_, String>(record)
         };
-        let result = tokio::select! {
+        let ended = tokio::select! {
             biased;
-            _ = operation.canceled.changed() => Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).stopped()),
-            _ = tokio::time::sleep_until(deadline) => Err(unknown("The program reached its deadline.")),
-            result = execution => result,
+            _ = operation.canceled.changed() => Ended::Interrupted(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown)),
+            _ = tokio::time::sleep_until(deadline) => Ended::Deadline,
+            result = execution => match result {
+                Ok(record) => Ended::Record(record),
+                Err(error) => Ended::Failed(error),
+            },
         };
         // Stop accepting protocol input first. A native event already admitted
         // is allowed to finish before reset; cancellation never poisons the
         // display helper by dropping its in-flight input request.
         tunnel.stop();
         let process_cleanup = process.settle().await;
+        // Program code runs only after the runner delivers its start record,
+        // and the runner group is stopped now: no record means no program.
+        let started =
+            started || (!matches!(ended, Ended::Record(_)) && channel.started_before_stop());
         let tunnel_cleanup = tunnel.finish().await;
         let input_cleanup = control
             .lock()
@@ -416,20 +503,49 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
         input_cleanup.map_err(unknown)?;
         state.ref_map.clear();
         state.active_frame_id = None;
-        if result.is_err() {
-            control.lock().await.cancel_native_input().await?;
-        }
-        let bytes = result?;
-        let result: Value = serde_json::from_slice(&bytes)
-            .map_err(|_| unknown("The runner did not produce a complete JSON result."))?;
+        let bytes = match ended {
+            Ended::Record(bytes) => bytes,
+            ended => {
+                // A program that never ran sent no input and left the last
+                // observation current; one that ran must be observed afresh.
+                if started {
+                    control
+                        .lock()
+                        .await
+                        .cancel_native_input()
+                        .await
+                        .map_err(unknown)?;
+                }
+                return Err(match ended {
+                    Ended::Interrupted(reason) if started => reason.stopped(),
+                    Ended::Interrupted(reason) => reason.before_start(),
+                    Ended::Deadline if started => unknown("The program reached its deadline."),
+                    Ended::Deadline => {
+                        "browser_operation_rejected: The program did not start before its deadline."
+                            .into()
+                    }
+                    Ended::Failed(error) => error,
+                    Ended::Record(_) => unreachable!(),
+                });
+            }
+        };
+        let result: Value = serde_json::from_slice(&bytes).map_err(|_| {
+            if started {
+                unknown("The runner did not produce a complete JSON result.")
+            } else {
+                "browser_operation_rejected: The Playwright runner stopped before starting the program.".into()
+            }
+        })?;
         if result["success"] != true {
             let message = result["error"]
                 .as_str()
                 .unwrap_or("The Playwright program failed.");
-            return Err(if result["started"] == false {
-                format!("browser_operation_rejected: {message}")
-            } else {
+            // The daemon's own start record decides; a program cannot report
+            // its failure as never started.
+            return Err(if started {
                 unknown(message)
+            } else {
+                format!("browser_operation_rejected: {message}")
             });
         }
         Ok(
@@ -461,10 +577,54 @@ mod tests {
 
     #[tokio::test]
     async fn results_and_diagnostics_have_independent_byte_bounds() {
-        assert!(result_bytes(&vec![b'x'; MAX_RESULT + 1][..]).await.is_err());
+        assert!(RunnerChannel::new(&vec![b'x'; MAX_RESULT + 1][..])
+            .record()
+            .await
+            .is_err());
+        let mut exact = vec![b'x'; MAX_RESULT - 1];
+        exact.push(b'\n');
+        assert_eq!(
+            RunnerChannel::new(&exact[..]).record().await.unwrap().len(),
+            MAX_RESULT
+        );
         let (logs, truncated) = diagnostics(&vec![b'x'; MAX_DIAGNOSTICS + 1][..]).await;
         assert_eq!(logs.len(), MAX_DIAGNOSTICS);
         assert!(truncated);
+    }
+
+    #[tokio::test]
+    async fn runner_records_arrive_split_and_merged_across_reads() {
+        let (mut writer, reader) = tokio::io::duplex(64);
+        let mut channel = RunnerChannel::new(reader);
+        let reading = tokio::spawn(async move {
+            let first = channel.record().await.unwrap();
+            let second = channel.record().await.unwrap();
+            (first, second)
+        });
+        writer.write_all(&START_RECORD[..5]).await.unwrap();
+        writer.write_all(&START_RECORD[5..]).await.unwrap();
+        writer.write_all(b"{\"success\":true}\n").await.unwrap();
+        drop(writer);
+        let (first, second) = reading.await.unwrap();
+        assert_eq!(first, START_RECORD);
+        assert_eq!(second, b"{\"success\":true}\n");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stopped_runner_started_only_if_its_record_was_delivered() {
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let mut channel = RunnerChannel::new(tokio::net::UnixStream::from_std(reader).unwrap());
+        assert!(!channel.started_before_stop());
+        std::io::Write::write_all(&mut writer, START_RECORD).unwrap();
+        // The writer stays open, as a surviving descendant could keep it.
+        assert!(channel.started_before_stop());
+        let (reader, mut writer) = std::os::unix::net::UnixStream::pair().unwrap();
+        reader.set_nonblocking(true).unwrap();
+        let mut channel = RunnerChannel::new(tokio::net::UnixStream::from_std(reader).unwrap());
+        std::io::Write::write_all(&mut writer, b"{\"success\":false}\n").unwrap();
+        assert!(!channel.started_before_stop());
     }
 
     #[tokio::test]
