@@ -1001,6 +1001,12 @@ fn try_launch_chrome(
     if let Some(ref x) = xvfb {
         cmd.env("DISPLAY", &x.display);
         cmd.env("XAUTHORITY", &x.auth_file);
+        // The private display is X11. Inheriting a workstation's Wayland
+        // selection can open Chrome on another surface than the one we own.
+        // Scope this choice to Chrome; never alter the host desktop session.
+        cmd.env_remove("WAYLAND_DISPLAY");
+        cmd.env_remove("WAYLAND_SOCKET");
+        cmd.env("XDG_SESSION_TYPE", "x11");
     }
     #[cfg(target_os = "linux")]
     if let Some(ref home) = temp_nss_home {
