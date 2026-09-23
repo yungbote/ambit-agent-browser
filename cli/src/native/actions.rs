@@ -16778,6 +16778,11 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
 
     #[tokio::test]
     async fn test_execute_unknown_command() {
+        // The daemon reads AGENT_BROWSER_CDP on auto-launch; another test
+        // sets it to an invalid target under the environment lock, so this
+        // one holds the lock too instead of observing that value.
+        let env = EnvGuard::new(&["AGENT_BROWSER_CDP"]);
+        env.remove("AGENT_BROWSER_CDP");
         let mut state = DaemonState::new();
         let cmd = json!({ "action": "unknown_action_xyz", "id": "test-1" });
         let result = execute_command(&cmd, &mut state).await;
