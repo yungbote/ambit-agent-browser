@@ -614,30 +614,7 @@ async fn take_snapshot_internal(
 
         // Insert each child snapshot after its Iframe line in the output
         for (ref_id, child_text) in iframe_snapshots {
-            let marker = format!("[ref={}]", ref_id);
-            if let Some(pos) = output.text.find(&marker) {
-                // Find the end of the Iframe line
-                let line_end = output.text[pos..]
-                    .find('\n')
-                    .map(|i| pos + i)
-                    .unwrap_or(output.text.len());
-                // Determine the indent of the Iframe line
-                let line_start = output.text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                let iframe_line = &output.text[line_start..line_end];
-                let iframe_indent = iframe_line.len() - iframe_line.trim_start().len();
-                let child_indent = iframe_indent + 2; // one level deeper
-                let prefix = " ".repeat(child_indent);
-
-                let indented_child = child_text.lines(None, &prefix, true);
-
-                // Ensure there's a newline to insert after
-                if line_end == output.text.len() {
-                    output.append("\n", None);
-                    output.insert(output.text.len(), &indented_child);
-                } else {
-                    output.insert(line_end + 1, &indented_child);
-                }
-            }
+            insert_iframe_snapshot(&mut output, &ref_id, &child_text, projection.collector);
         }
     } else {
         projection.collector.unexpanded_frames += tree_nodes
@@ -662,6 +639,36 @@ async fn take_snapshot_internal(
     }
 
     Ok(trimmed)
+}
+
+/// Preserve legacy frame placement, including its exact-marker behavior. An
+/// observed child is not necessarily included in the rendered snapshot: filters
+/// or other iframe attributes can prevent insertion. Report that in coverage.
+fn insert_iframe_snapshot(
+    output: &mut ProjectedText,
+    ref_id: &str,
+    child: &ProjectedText,
+    collector: &mut ProjectionCollector,
+) {
+    let marker = format!("[ref={}]", ref_id);
+    let Some(pos) = output.text.find(&marker) else {
+        collector.unexpanded_frames += 1;
+        return;
+    };
+    let line_end = output.text[pos..]
+        .find('\n')
+        .map(|i| pos + i)
+        .unwrap_or(output.text.len());
+    let line_start = output.text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+    let iframe_line = &output.text[line_start..line_end];
+    let iframe_indent = iframe_line.len() - iframe_line.trim_start().len();
+    let indented_child = child.lines(None, &" ".repeat(iframe_indent + 2), true);
+    if line_end == output.text.len() {
+        output.append("\n", None);
+        output.insert(output.text.len(), &indented_child);
+    } else {
+        output.insert(line_end + 1, &indented_child);
+    }
 }
 
 /// Resolve the child frame ID for an iframe element given its backendNodeId.

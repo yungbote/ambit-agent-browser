@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use serde_json::json;
 
-use super::super::{build_tree, compact_line_mask, render_tree};
+use super::super::{build_tree, compact_line_mask, insert_iframe_snapshot, render_tree};
 use super::*;
 
 fn node(role: &str, name: &str, reference: Option<&str>, children: &[usize]) -> TreeNode {
@@ -316,10 +316,12 @@ fn frame_ids_and_parent_ids_survive_indentation_and_insertion() {
             &options,
             &mut FrameProjection::new(&mut collector, Some(owner)),
         );
-        let marker = format!("[ref=e{}]", idx + 1);
-        let pos = text.text.find(&marker).unwrap();
-        let end = pos + text.text[pos..].find('\n').unwrap() + 1;
-        text.insert(end, &child.trim().lines(None, "  ", true));
+        insert_iframe_snapshot(
+            &mut text,
+            &format!("e{}", idx + 1),
+            &child.trim(),
+            &mut collector,
+        );
     }
     collector.observed_frames = 3;
     collector.unexpanded_frames = 1;
@@ -366,7 +368,7 @@ fn wire_fixture_matches_the_native_serialization_contract() {
         &options,
         &mut FrameProjection::new(&mut collector, Some(owner)),
     );
-    text.insert(text.text.len(), &child.trim().lines(None, "    ", true));
+    insert_iframe_snapshot(&mut text, "e2", &child.trim(), &mut collector);
     collector.observed_frames = 2;
     let observation = collector.finish(text.trim(), &options);
     assert_complete_projection(&observation);
@@ -398,8 +400,7 @@ fn source_ownership_refuses_noncontiguous_ranges_instead_of_swallowing_another_n
         &options,
         &mut FrameProjection::new(&mut collector, Some(owner)),
     );
-    let position = text.text.find('\n').unwrap() + 1;
-    text.insert(position, &child.trim().lines(None, "  ", true));
+    insert_iframe_snapshot(&mut text, "e2", &child.trim(), &mut collector);
     let expected = text.text.trim().to_string();
     let observation = collector.finish(text.trim(), &options);
     assert_eq!(observation.snapshot, expected);
@@ -409,6 +410,38 @@ fn source_ownership_refuses_noncontiguous_ranges_instead_of_swallowing_another_n
         Some("noncontiguous_source_range")
     );
     assert!(observation.projection.nodes.is_empty());
+}
+
+#[test]
+fn observed_but_uninserted_frames_are_counted_and_never_projected() {
+    let options = SnapshotOptions::default();
+    let mut collector = ProjectionCollector::new(true, false);
+    let mut iframe = node("Iframe", "Child", Some("e1"), &[]);
+    iframe.expanded = Some(false);
+    let mut main = FrameProjection::new(&mut collector, None);
+    let mut text = render_frame(&[iframe], &[0], &options, &mut main);
+    let owner = main.rendered_nodes[&0];
+    let child = render_frame(
+        &[node("button", "Child save", Some("e2"), &[])],
+        &[0],
+        &options,
+        &mut FrameProjection::new(&mut collector, Some(owner)),
+    );
+    collector.observed_frames = 2;
+    insert_iframe_snapshot(&mut text, "e1", &child.trim(), &mut collector);
+    let observation = collector.finish(text.trim(), &options);
+    assert_eq!(
+        observation.snapshot,
+        "- Iframe \"Child\" [expanded=false, ref=e1]"
+    );
+    assert_complete_projection(&observation);
+    assert_eq!(observation.projection.coverage.observed_frame_count, 2);
+    assert_eq!(observation.projection.coverage.unexpanded_frame_count, 1);
+    assert_eq!(observation.projection.nodes.len(), 1);
+    assert_eq!(
+        observation.projection.nodes[0].ref_id.as_deref(),
+        Some("e1")
+    );
 }
 
 #[test]
