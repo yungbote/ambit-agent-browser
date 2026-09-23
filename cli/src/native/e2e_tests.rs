@@ -2045,6 +2045,171 @@ async fn e2e_open_reports_a_committed_page_that_never_fires_load() {
     assert_success(&execute_command(&json!({ "action": "close" }), &mut state).await);
 }
 
+/// Serves each connection on its own thread, so a response that is held
+/// back does not block the others. The handler receives the request path.
+fn serve_each_connection(
+    handle: impl Fn(&str, std::net::TcpStream) + Send + Sync + 'static,
+) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = Arc::new(handle);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let handle = Arc::clone(&handle);
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut request = [0u8; 2048];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..read]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                handle(&path, stream);
+            });
+        }
+    });
+    port
+}
+
+fn write_html(mut stream: std::net::TcpStream, body: &str) {
+    use std::io::Write;
+    let _ = write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+}
+
+// Chrome answers Page.navigate before the commit, and a renderer busy with
+// the previous page's script holds the commit back. At the deadline nothing
+// has been opened, yet the first fix (2026-09-23) reported success with an
+// empty URL and the previous page's title.
+#[tokio::test]
+#[ignore]
+async fn e2e_open_fails_when_the_busy_previous_page_holds_the_commit_past_the_wait() {
+    let loop_started = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let signal = Arc::clone(&loop_started);
+    let port = serve_each_connection(move |path, stream| match path {
+        "/busy" => write_html(stream, "<!doctype html><title>Busy</title><h1>Busy</h1>"),
+        "/loop-started" => {
+            let (started, wake) = &*signal;
+            *started.lock().unwrap() = true;
+            wake.notify_all();
+            write_html(stream, "");
+        }
+        _ => {
+            // The next page answers only once the previous page's script is
+            // blocking, so the commit has to wait for that script.
+            let (started, wake) = &*signal;
+            let mut started = started.lock().unwrap();
+            while !*started {
+                started = wake.wait(started).unwrap();
+            }
+            drop(started);
+            write_html(stream, "<!doctype html><title>Next</title><h1>Next</h1>");
+        }
+    });
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({ "action": "launch", "headless": true }), &mut state).await,
+    );
+    let busy = format!("http://127.0.0.1:{port}/busy");
+    assert_success(
+        &execute_command(&json!({ "action": "navigate", "url": busy }), &mut state).await,
+    );
+    // The previous page blocks for longer than the 25 s wait, starting after
+    // the driver has prepared the next navigation but before its commit.
+    let scheduled = execute_command(
+        &json!({
+            "action": "evaluate",
+            "script": "setTimeout(() => { fetch('/loop-started'); const end = Date.now() + 31000; while (Date.now() < end) {} }, 1000); 'scheduled'",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&scheduled);
+    let next = format!("http://127.0.0.1:{port}/next");
+    let started = std::time::Instant::now();
+    let opened = execute_command(&json!({ "action": "navigate", "url": next }), &mut state).await;
+    assert_eq!(
+        opened["success"],
+        json!(false),
+        "the commit was still pending: {opened}"
+    );
+    assert_eq!(
+        opened["error"],
+        "Operation timed out. The page may still be loading or the element may not exist."
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(20),
+        "failed before the wait deadline: {opened}"
+    );
+    // Nothing was cancelled: the navigation commits once the script ends.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let location = execute_command(
+            &json!({ "action": "evaluate", "script": "location.href" }),
+            &mut state,
+        )
+        .await;
+        if location["data"]["result"] == json!(next) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the page never reached {next}: {location}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert_success(&execute_command(&json!({ "action": "close" }), &mut state).await);
+}
+
+// A page whose load is still pending when the agent opens the next one fires
+// that late load while the next navigation waits. It is not the next page:
+// counting it reported the previous page as the one opened.
+#[tokio::test]
+#[ignore]
+async fn e2e_open_waits_for_its_own_document_not_the_previous_pages_late_load() {
+    let port = serve_each_connection(|path, stream| match path {
+        "/first" => write_html(
+            stream,
+            "<!doctype html><title>First</title><img src='/late'>",
+        ),
+        "/late" => {
+            // The first page's load fires while the second page's response
+            // is still held back.
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            write_html(stream, "");
+        }
+        _ => {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            write_html(
+                stream,
+                "<!doctype html><title>Second</title><h1>Second</h1>",
+            );
+        }
+    });
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({ "action": "launch", "headless": true }), &mut state).await,
+    );
+    let first = format!("http://127.0.0.1:{port}/first");
+    let opened = execute_command(
+        &json!({ "action": "navigate", "url": first, "waitUntil": "domcontentloaded" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&opened);
+    assert_eq!(get_data(&opened)["title"], "First");
+    let second = format!("http://127.0.0.1:{port}/second");
+    let opened = execute_command(&json!({ "action": "navigate", "url": second }), &mut state).await;
+    assert_success(&opened);
+    let data = get_data(&opened);
+    assert_eq!(data["url"], json!(second), "{opened}");
+    assert_eq!(data["title"], "Second");
+    assert!(data.get("loadWait").is_none(), "{opened}");
+    assert_success(&execute_command(&json!({ "action": "close" }), &mut state).await);
+}
+
 // ---------------------------------------------------------------------------
 // Screenshot
 // ---------------------------------------------------------------------------

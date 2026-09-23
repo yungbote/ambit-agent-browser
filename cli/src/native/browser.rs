@@ -371,6 +371,65 @@ fn lifecycle_timeout(wait_until: WaitUntil) -> String {
     }
 }
 
+/// Watches a page session for the main frame committing one navigation's
+/// document. Chrome answers `Page.navigate` with the navigation's loader
+/// identifier before the commit; the commit is the main-frame
+/// `Page.frameNavigated` that carries the same identifier, and a renderer
+/// busy with the previous page's script holds it back for as long as that
+/// script runs.
+struct CommitWatch<'a> {
+    loader_id: &'a str,
+    committed_url: Option<String>,
+}
+
+impl<'a> CommitWatch<'a> {
+    fn new(loader_id: &'a str) -> Self {
+        Self {
+            loader_id,
+            committed_url: None,
+        }
+    }
+
+    fn observe(&mut self, event: &CdpEvent) {
+        if self.committed_url.is_some() || event.method != "Page.frameNavigated" {
+            return;
+        }
+        let frame = &event.params["frame"];
+        let main_frame = frame["parentId"].as_str().is_none_or(str::is_empty);
+        if main_frame && frame["loaderId"].as_str() == Some(self.loader_id) {
+            self.committed_url = Some(frame["url"].as_str().unwrap_or_default().to_string());
+        }
+    }
+
+    fn committed(&self) -> bool {
+        self.committed_url.is_some()
+    }
+}
+
+/// How far a page got before a lifecycle wait's deadline.
+#[derive(Debug, PartialEq, Eq)]
+enum LifecycleWait {
+    /// The page reached the awaited state.
+    Reached,
+    /// The main frame committed the awaited navigation's document at this
+    /// URL, but the page did not reach the awaited state before the deadline.
+    Committed { url: String },
+    /// The deadline passed first.
+    TimedOut,
+}
+
+impl LifecycleWait {
+    fn conclude(reached: bool, commit: Option<CommitWatch<'_>>) -> Self {
+        if reached {
+            return Self::Reached;
+        }
+        match commit.and_then(|watch| watch.committed_url) {
+            Some(url) => Self::Committed { url },
+            None => Self::TimedOut,
+        }
+    }
+}
+
 impl WaitUntil {
     fn name(self) -> &'static str {
         match self {
@@ -1186,61 +1245,48 @@ impl BrowserManager {
     }
 
     pub async fn navigate(&mut self, url: &str, wait_until: WaitUntil) -> Result<Value, String> {
-        if !self.navigate_and_wait(url, wait_until).await? {
-            return Err(lifecycle_timeout(wait_until));
+        match self.navigate_and_wait(url, wait_until).await? {
+            LifecycleWait::Reached => Ok(self.record_navigated_page(url).await),
+            LifecycleWait::Committed { .. } | LifecycleWait::TimedOut => {
+                Err(lifecycle_timeout(wait_until))
+            }
         }
-        Ok(self.record_navigated_page(url).await)
     }
 
-    /// Navigates for an agent's open/navigate request. A committed navigation
-    /// has happened even when the page does not reach `wait_until` before the
+    /// Navigates for an agent's open/navigate request. Once the main frame
+    /// has committed the document, the navigation the agent asked for has
+    /// happened even when the page does not reach `wait_until` before the
     /// deadline (pages with endless ads or long polls never fire `load`), so
     /// the result reports the open page and that it may still be loading
-    /// instead of a failure the agent would repeat.
+    /// instead of a failure the agent would repeat. Until that commit nothing
+    /// has happened yet: a renderer busy with the previous page's script
+    /// holds the commit back, and the deadline is then the strict failure.
     pub async fn open(&mut self, url: &str, wait_until: WaitUntil) -> Result<Value, String> {
-        if self.navigate_and_wait(url, wait_until).await? {
-            return Ok(self.record_navigated_page(url).await);
+        match self.navigate_and_wait(url, wait_until).await? {
+            LifecycleWait::Reached => Ok(self.record_navigated_page(url).await),
+            LifecycleWait::Committed { url: page_url } => {
+                // The renderer may still be busy loading the document; the
+                // browser process knows the committed page's title without it.
+                let title = self.target_title().await.unwrap_or_default();
+                let mut page = self.record_open_page(page_url, title);
+                page["loadWait"] = json!(format!(
+                    "The page is open at this URL but did not reach {} within {} ms, so parts of it may still be loading. Inspect it instead of opening it again.",
+                    wait_until.name(),
+                    self.default_timeout_ms
+                ));
+                Ok(page)
+            }
+            LifecycleWait::TimedOut => Err(lifecycle_timeout(wait_until)),
         }
-        // The renderer may be too busy to evaluate script; the browser process
-        // still knows the committed URL and title.
-        let target_id = self.active_target_id()?.to_string();
-        let info = self
-            .client
-            .send_command(
-                "Target.getTargetInfo",
-                Some(json!({ "targetId": target_id })),
-                None,
-            )
-            .await?;
-        let page_url = info["targetInfo"]["url"]
-            .as_str()
-            .unwrap_or(url)
-            .to_string();
-        let title = info["targetInfo"]["title"]
-            .as_str()
-            .unwrap_or("")
-            .to_string();
-        if let Some(page) = self.pages.get_mut(self.active_page_index) {
-            page.url = page_url.clone();
-            page.title = title.clone();
-        }
-        Ok(json!({
-            "url": page_url, "title": title, "targetId": target_id,
-            "loadWait": format!(
-                "The page is open at this URL but did not reach {} within {} ms, so parts of it may still be loading. Inspect it instead of opening it again.",
-                wait_until.name(),
-                self.default_timeout_ms
-            ),
-        }))
     }
 
-    /// Starts a navigation and reports whether the page reached `wait_until`
-    /// before the deadline. Any other failure is an error.
+    /// Starts a navigation and reports how far the page got by the deadline.
+    /// Any other failure is an error.
     async fn navigate_and_wait(
         &mut self,
         url: &str,
         wait_until: WaitUntil,
-    ) -> Result<bool, String> {
+    ) -> Result<LifecycleWait, String> {
         let session_id = self.active_session_id()?.to_string();
         let mut lifecycle_rx = self.client.subscribe();
 
@@ -1250,21 +1296,26 @@ impl BrowserManager {
             return Err(format!("Navigation failed: {}", error_text));
         }
 
-        // Only wait for lifecycle events if Chrome created a new loader (full navigation).
-        // If loader_id is None, it was a same-document navigation (e.g., hash routing)
-        // which does not fire Page.loadEventFired or Page.domContentEventFired.
-        if nav_result.loader_id.is_some() && wait_until != WaitUntil::None {
-            return self
-                .wait_for_lifecycle(wait_until, &session_id, &mut lifecycle_rx)
-                .await;
+        // Chrome creates a loader only for a new document. A same-document
+        // navigation (e.g., hash routing) has none and fires neither
+        // Page.loadEventFired nor Page.domContentEventFired.
+        match nav_result.loader_id.as_deref() {
+            None => Ok(LifecycleWait::Reached),
+            Some(loader_id) => {
+                self.wait_for_lifecycle(wait_until, &session_id, Some(loader_id), &mut lifecycle_rx)
+                    .await
+            }
         }
-        Ok(true)
     }
 
     async fn record_navigated_page(&mut self, url: &str) -> Value {
         let page_url = self.get_url().await.unwrap_or_else(|_| url.to_string());
         let title = self.get_title().await.unwrap_or_default();
+        self.record_open_page(page_url, title)
+    }
 
+    /// Records the page a navigation left open and describes it.
+    fn record_open_page(&mut self, page_url: String, title: String) -> Value {
         // Track visited origin for cross-origin localStorage collection in save_state
         if let Ok(parsed) = url::Url::parse(&page_url) {
             let origin = parsed.origin().ascii_serialization();
@@ -1285,30 +1336,63 @@ impl BrowserManager {
         json!({ "url": page_url, "title": title, "targetId": target_id })
     }
 
-    /// True when the page reached `wait_until`, false when the deadline passed.
+    /// The active page's title as the browser process knows it, which does
+    /// not need the renderer to answer.
+    async fn target_title(&self) -> Result<String, String> {
+        let target_id = self.active_target_id()?;
+        let info = self
+            .client
+            .send_command(
+                "Target.getTargetInfo",
+                Some(json!({ "targetId": target_id })),
+                None,
+            )
+            .await?;
+        Ok(info["targetInfo"]["title"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string())
+    }
+
+    /// Waits for the page to reach `wait_until` and reports how far it got by
+    /// the deadline. With `loader_id`, the loader Chrome created for the
+    /// navigation just requested, lifecycle events count only once the main
+    /// frame has committed that navigation's document: the previous
+    /// document's late `load` is not the awaited page.
     async fn wait_for_lifecycle(
         &self,
         wait_until: WaitUntil,
         session_id: &str,
+        loader_id: Option<&str>,
         rx: &mut broadcast::Receiver<CdpEvent>,
-    ) -> Result<bool, String> {
+    ) -> Result<LifecycleWait, String> {
         let timeout = tokio::time::Duration::from_millis(self.default_timeout_ms);
+        let mut commit = loader_id.map(CommitWatch::new);
         let event_name = match wait_until {
             WaitUntil::Load => "Page.loadEventFired",
             WaitUntil::DomContentLoaded => "Page.domContentEventFired",
             // Its only failure is its deadline.
             WaitUntil::NetworkIdle => {
-                return Ok(poll_network_idle(session_id, rx, timeout).await.is_ok())
+                let reached = poll_network_idle(session_id, rx, timeout, commit.as_mut())
+                    .await
+                    .is_ok();
+                return Ok(LifecycleWait::conclude(reached, commit));
             }
-            WaitUntil::None => return Ok(true),
+            WaitUntil::None => return Ok(LifecycleWait::Reached),
         };
 
-        match tokio::time::timeout(timeout, async {
+        let reached = tokio::time::timeout(timeout, async {
             loop {
                 match rx.recv().await {
                     Ok(event) => {
+                        if event.session_id.as_deref() != Some(session_id) {
+                            continue;
+                        }
+                        if let Some(watch) = commit.as_mut() {
+                            watch.observe(&event);
+                        }
                         if event.method == event_name
-                            && event.session_id.as_deref() == Some(session_id)
+                            && commit.as_ref().is_none_or(CommitWatch::committed)
                         {
                             return Ok(());
                         }
@@ -1319,10 +1403,10 @@ impl BrowserManager {
             }
             Err("Event stream closed".to_string())
         })
-        .await
-        {
-            Ok(result) => result.map(|()| true),
-            Err(_) => Ok(false),
+        .await;
+        match reached {
+            Ok(result) => result.map(|()| LifecycleWait::Reached),
+            Err(_) => Ok(LifecycleWait::conclude(false, commit)),
         }
     }
 
@@ -1419,9 +1503,10 @@ impl BrowserManager {
             }
         }
 
-        if !self
-            .wait_for_lifecycle(wait_until, session_id, &mut rx)
+        if self
+            .wait_for_lifecycle(wait_until, session_id, None, &mut rx)
             .await?
+            != LifecycleWait::Reached
         {
             return Err(lifecycle_timeout(wait_until));
         }
@@ -2487,10 +2572,13 @@ impl BrowserManager {
 ///
 /// Returns `Ok(())` once no network requests have been in-flight for at least
 /// 500 ms, or `Err` if `overall_timeout` elapses first.
+/// With `commit`, the network is idle only once that navigation's document
+/// has committed: a quiet network before the commit is the previous page's.
 async fn poll_network_idle(
     session_id: &str,
     rx: &mut broadcast::Receiver<CdpEvent>,
     overall_timeout: tokio::time::Duration,
+    mut commit: Option<&mut CommitWatch<'_>>,
 ) -> Result<(), String> {
     let pending = Arc::new(Mutex::new(HashSet::<String>::new()));
 
@@ -2503,6 +2591,9 @@ async fn poll_network_idle(
 
             match recv_result {
                 Ok(Ok(event)) if event.session_id.as_deref() == Some(session_id) => {
+                    if let Some(watch) = commit.as_deref_mut() {
+                        watch.observe(&event);
+                    }
                     let mut p = pending.lock().await;
                     match event.method.as_str() {
                         "Network.requestWillBeSent" => {
@@ -2544,7 +2635,9 @@ async fn poll_network_idle(
             }
 
             if let Some(start) = idle_start {
-                if start.elapsed() >= tokio::time::Duration::from_millis(500) {
+                if start.elapsed() >= tokio::time::Duration::from_millis(500)
+                    && commit.as_deref().is_none_or(CommitWatch::committed)
+                {
                     return Ok(());
                 }
             }
@@ -2723,6 +2816,51 @@ async fn resolve_cdp_url(input: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use tokio::time::sleep;
+
+    fn frame_navigated(frame: Value) -> CdpEvent {
+        CdpEvent {
+            method: "Page.frameNavigated".into(),
+            params: json!({ "frame": frame }),
+            session_id: Some("page".into()),
+        }
+    }
+
+    #[test]
+    fn commit_watch_takes_only_the_main_frame_commit_of_its_loader() {
+        let mut watch = CommitWatch::new("loader-2");
+        watch.observe(&frame_navigated(
+            json!({ "id": "main", "loaderId": "loader-1", "url": "http://previous/" }),
+        ));
+        watch.observe(&frame_navigated(
+            json!({ "id": "child", "parentId": "main", "loaderId": "loader-2", "url": "http://frame/" }),
+        ));
+        watch.observe(&CdpEvent {
+            method: "Page.loadEventFired".into(),
+            params: json!({}),
+            session_id: Some("page".into()),
+        });
+        assert!(!watch.committed());
+
+        watch.observe(&frame_navigated(
+            json!({ "id": "main", "loaderId": "loader-2", "url": "http://committed/" }),
+        ));
+        assert!(watch.committed());
+        // A later document does not replace the one the navigation committed.
+        watch.observe(&frame_navigated(
+            json!({ "id": "main", "loaderId": "loader-3", "url": "http://later/" }),
+        ));
+        assert_eq!(
+            LifecycleWait::conclude(false, Some(watch)),
+            LifecycleWait::Committed {
+                url: "http://committed/".into()
+            }
+        );
+        assert_eq!(
+            LifecycleWait::conclude(false, Some(CommitWatch::new("loader-4"))),
+            LifecycleWait::TimedOut
+        );
+        assert_eq!(LifecycleWait::conclude(true, None), LifecycleWait::Reached);
+    }
 
     #[test]
     fn test_format_tab_id() {
@@ -3169,7 +3307,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            poll_network_idle(session, &mut rx, Duration::from_secs(5)),
+            poll_network_idle(session, &mut rx, Duration::from_secs(5), None),
         )
         .await
         .expect("outer timeout should not fire");
@@ -3211,7 +3349,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            poll_network_idle(session, &mut rx, Duration::from_secs(5)),
+            poll_network_idle(session, &mut rx, Duration::from_secs(5), None),
         )
         .await
         .expect("outer timeout should not fire");
@@ -3263,7 +3401,7 @@ mod tests {
         let start = tokio::time::Instant::now();
         let result = tokio::time::timeout(
             Duration::from_secs(5),
-            poll_network_idle(session, &mut rx, Duration::from_secs(5)),
+            poll_network_idle(session, &mut rx, Duration::from_secs(5), None),
         )
         .await
         .expect("outer timeout should not fire");
@@ -3815,7 +3953,7 @@ mod tests {
             }
         });
 
-        let result = poll_network_idle(session, &mut rx, Duration::from_millis(800)).await;
+        let result = poll_network_idle(session, &mut rx, Duration::from_millis(800), None).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
