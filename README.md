@@ -610,7 +610,7 @@ Window viewers can opt into `patches=1&frames=binary` for exact-base JPEG damage
 
 For a viewer across a network, negotiate `pacing=ack&frameWindow=8` to allow up to eight delivered frames and at most 12 MiB awaiting acknowledgment. The default window is one for compatibility. A cumulative ACK names the newest frame actually painted; it also retires the preceding delivered frames whose pixels that composed frame includes. A slow viewer stops at the count or byte bound, and skipped delta dependencies still require a whole frame.
 
-An attached primary presentation can receive up to 20 frames per second through the existing acknowledgment-paced stream. Secondary viewers remain capped at 10, and native capture returns to 10 when the primary disconnects. Only the latest frame is retained while a viewer is busy; actual throughput depends on capture size and available CPU.
+Native capture samples at 60 frames per second under a human lease, 30 with a connected primary presentation and 15 otherwise; secondary viewers are capped at 15. Only damage is encoded, so an unchanged window costs no frames. Only the latest frame is retained while a viewer is busy; actual throughput depends on capture size and available CPU.
 
 Linux hosts can set `AGENT_BROWSER_WINDOW_STREAM=1` to stream the actual Chromium window, including its tabs, address bar, menus, dialogs and native cursor. This launches the same automated Chromium process on a private authenticated Xvfb display. It requires the `browser-display` helper beside the native executable, or an absolute `AGENT_BROWSER_DISPLAY_HELPER` path. The normal CLI and MCP page tools keep their existing commands. Window capture and human input use the existing stream and host control lease.
 

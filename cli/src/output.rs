@@ -4152,7 +4152,7 @@ Environment:
   AGENT_BROWSER_ENCRYPTION_KEY   64-char hex key for AES-256-GCM session encryption
   AGENT_BROWSER_STREAM_PORT      Override WebSocket streaming port (default: OS-assigned)
   AGENT_BROWSER_WINDOW_STREAM    1 = stream the owned Chromium window on private Linux X11
-                                Primary presentation up to 20 fps; secondary viewers 10 fps
+                                Human control 60 fps, presenter 30, secondary viewers 15
                                 Mouse tools move the real cursor; headless/CDP input is unchanged
                                 Failed gestures release held input; uncertain actions are never replayed
   AGENT_BROWSER_DISPLAY_HELPER   Native window helper path (default: beside agent-browser)

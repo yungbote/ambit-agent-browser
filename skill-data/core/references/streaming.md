@@ -16,7 +16,7 @@ Stream a session's viewport over WebSocket and drive it with remote input. This 
 
 ## Owned Chromium window
 
-Native capture targets 30 fps under a human lease, 15 fps with a presenter and 10 fps for secondary viewers. Unchanged frames are skipped. A slow viewer receives a fresh whole frame if it missed the base of a damage patch; frame rate remains a measured result under the available CPU and network capacity.
+Native capture targets 60 fps under a human lease, 30 fps with a presenter and 15 fps for secondary viewers. Unchanged frames are skipped. A slow viewer receives a fresh whole frame if it missed the base of a damage patch; frame rate remains a measured result under the available CPU and network capacity.
 
 `AGENT_BROWSER_WINDOW_STREAM=1` selects a private authenticated Linux Xvfb display for the same locally launched Chromium process used by CLI/MCP automation. Its frame includes native tabs, the address bar, menus, dialogs and the XFixes cursor. The host supplies a `browser-display` executable beside the native driver, or an absolute `AGENT_BROWSER_DISPLAY_HELPER` path. The helper and private display share the Chrome process lifetime. This mode refuses an inherited display; it does not attach to a global desktop.
 
