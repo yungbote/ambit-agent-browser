@@ -21,9 +21,15 @@ try {
   const program = new AsyncFunction('page', 'context', 'browser', 'semanticJudgement', request.code);
   let semanticJudgement;
   if (request.environment?.semanticJudgementConfigPath) {
-    const environment = JSON.parse(readFileSync(request.environment.semanticJudgementConfigPath, 'utf8'));
-    const { createAmbitSemanticJudgementClient } = createRequire(import.meta.url)(request.environment.semanticJudgementClientModulePath);
-    semanticJudgement = createAmbitSemanticJudgementClient(Object.freeze(environment));
+    // The host-written relay map holds this Action's credentials. JSON and
+    // loader errors can quote their input, so none of them reach the result.
+    try {
+      const environment = JSON.parse(readFileSync(request.environment.semanticJudgementConfigPath, 'utf8'));
+      const { createAmbitSemanticJudgementClient } = createRequire(import.meta.url)(request.environment.semanticJudgementClientModulePath);
+      semanticJudgement = createAmbitSemanticJudgementClient(Object.freeze(environment));
+    } catch {
+      throw new Error('The semantic judgement binding for this program is unavailable.');
+    }
   }
   const modulePath = process.env.AGENT_BROWSER_PLAYWRIGHT_MODULE;
   const { chromium, ambitCdpContextAdoptionVersion } = await import(modulePath ? pathToFileURL(modulePath).href : 'playwright-core');

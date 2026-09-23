@@ -30,14 +30,22 @@ impl Host {
     }
 
     fn configure(&self, expected: Option<Value>) {
+        self.configure_with(json!({ "expectedObservation": expected }));
+    }
+
+    /// Host configuration for the next call; `extra` adds host-only fields.
+    fn configure_with(&self, extra: Value) {
+        let mut config = json!({
+            "version": 1, "namespace": "host-mcp-test", "session": "browser",
+            "requireSandbox": true, "captureDirectory": self.path("captures"),
+        });
+        config
+            .as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
         fs::write(
             self.path("config.json"),
-            serde_json::to_vec(&json!({
-                "version": 1, "namespace": "host-mcp-test", "session": "browser",
-                "requireSandbox": true, "captureDirectory": self.path("captures"),
-                "expectedObservation": expected,
-            }))
-            .unwrap(),
+            serde_json::to_vec(&config).unwrap(),
         )
         .unwrap();
     }
@@ -62,6 +70,17 @@ impl Host {
             .stderr(Stdio::piped());
         if let Ok(chrome) = std::env::var("AMBIT_TEST_CHROME_EXECUTABLE") {
             command.env("AGENT_BROWSER_EXECUTABLE_PATH", chrome);
+        }
+        for (test, runtime) in [
+            ("AMBIT_TEST_NODE", "AGENT_BROWSER_NODE_PATH"),
+            (
+                "AMBIT_TEST_PLAYWRIGHT_MODULE",
+                "AGENT_BROWSER_PLAYWRIGHT_MODULE",
+            ),
+        ] {
+            if let Ok(value) = std::env::var(test) {
+                command.env(runtime, value);
+            }
         }
         command
     }
@@ -301,6 +320,120 @@ fn host_human_handoff_requires_fresh_observation_and_rejects_old_image_coordinat
     );
     let count = host.call("agent_browser_eval", json!({ "script": "window.clicks" }));
     assert_eq!(count["structuredContent"]["response"]["data"]["result"], 1);
+    assert_eq!(
+        host.call("agent_browser_close", json!({}))["isError"],
+        false
+    );
+}
+
+/// The per-Action semantic binding reaches only its own Playwright program:
+/// page text chooses a later click in the same browser, successive Actions
+/// get their own bindings, a call without one gets none, and credentials
+/// never appear in tool results, even when the relay map is corrupt.
+#[test]
+#[cfg(unix)]
+#[ignore = "requires AMBIT_TEST_CHROME_EXECUTABLE, AMBIT_TEST_NODE and AMBIT_TEST_PLAYWRIGHT_MODULE"]
+fn host_playwright_program_uses_only_its_own_semantic_binding() {
+    use std::os::unix::fs::PermissionsExt;
+    let host = Host::new();
+    // Stands in for the host SDK factory: it reports which binding it was
+    // created with and, like the real client, never echoes its credential.
+    fs::write(
+        host.path("client.cjs"),
+        r#"exports.createAmbitSemanticJudgementClient = (environment) => {
+  if (typeof environment.AMBIT_TEST_BEARER !== 'string') throw new Error('unavailable');
+  return async ({ state, questions }) => ({
+    binding: environment.AMBIT_TEST_BINDING,
+    answers: questions.map((question) => state.text.includes(question.contains)),
+  });
+};
+"#,
+    )
+    .unwrap();
+    let secrets = ["relay-secret-a-7f3a91", "relay-secret-b-c04e22"];
+    let relay = |name: &str, content: String| {
+        let path = host.path(name);
+        fs::write(&path, content).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        path
+    };
+    let bind = |path: &Path| {
+        host.configure_with(json!({
+            "semanticJudgementConfigPath": path,
+            "semanticJudgementClientModulePath": host.path("client.cjs"),
+        }));
+    };
+    let assert_private = |reply: &Value| {
+        let text = reply.to_string();
+        for secret in secrets {
+            assert!(!text.contains(secret), "credential leaked: {text}");
+        }
+        assert!(!text.contains("relay-"), "relay path leaked: {text}");
+    };
+    let opened = host.call(
+        "agent_browser_open",
+        json!({ "url": "data:text/html,<h1>Invoice 255 is overdue</h1><button onclick=\"document.title='Escalated'\">Escalate</button>" }),
+    );
+    assert_eq!(opened["isError"], false, "{opened}");
+    let program = "const text = await page.locator('h1').innerText(); const judged = await semanticJudgement({ state: { text }, questions: [{ contains: 'overdue' }] }); if (judged.answers[0]) await page.getByRole('button', { name: 'Escalate' }).click(); return { judged, title: await page.title(), inherited: ['AMBIT_TEST_BINDING', 'AMBIT_TEST_BEARER'].filter((key) => key in process.env) };";
+
+    bind(&relay(
+        "relay-a.json",
+        json!({ "AMBIT_TEST_BINDING": "action-a", "AMBIT_TEST_BEARER": secrets[0] }).to_string(),
+    ));
+    let first = host.call("agent_browser_run_playwright", json!({ "code": program }));
+    assert_eq!(first["isError"], false, "{first}");
+    let result = &first["structuredContent"]["response"]["data"]["result"];
+    assert_eq!(
+        result["judged"],
+        json!({ "binding": "action-a", "answers": [true] })
+    );
+    assert_eq!(result["title"], "Escalated");
+    assert_eq!(result["inherited"], json!([]));
+    assert_private(&first);
+
+    bind(&relay(
+        "relay-b.json",
+        json!({ "AMBIT_TEST_BINDING": "action-b", "AMBIT_TEST_BEARER": secrets[1] }).to_string(),
+    ));
+    let second = host.call(
+        "agent_browser_run_playwright",
+        json!({ "code": "return (await semanticJudgement({ state: { text: 'none' }, questions: [] })).binding;" }),
+    );
+    assert_eq!(
+        second["structuredContent"]["response"]["data"]["result"], "action-b",
+        "{second}"
+    );
+    assert_private(&second);
+
+    host.configure(None);
+    let unbound = host.call(
+        "agent_browser_run_playwright",
+        json!({ "code": "return typeof semanticJudgement;" }),
+    );
+    assert_eq!(
+        unbound["structuredContent"]["response"]["data"]["result"], "undefined",
+        "{unbound}"
+    );
+
+    // A corrupt map: JSON errors would quote these bytes.
+    bind(&relay("relay-corrupt.json", format!("{} {{", secrets[0])));
+    let corrupt = host.call(
+        "agent_browser_run_playwright",
+        json!({ "code": "await page.evaluate(() => document.title = 'Program ran');" }),
+    );
+    assert_eq!(corrupt["isError"], true, "{corrupt}");
+    assert_eq!(
+        corrupt["structuredContent"]["response"]["code"], "browser_operation_rejected",
+        "{corrupt}"
+    );
+    assert_private(&corrupt);
+    host.configure(None);
+    let title = host.call("agent_browser_get_title", json!({}));
+    assert_eq!(
+        title["structuredContent"]["response"]["data"]["title"], "Escalated",
+        "{title}"
+    );
     assert_eq!(
         host.call("agent_browser_close", json!({}))["isError"],
         false

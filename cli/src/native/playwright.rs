@@ -558,6 +558,44 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
 mod tests {
     use super::*;
 
+    #[test]
+    fn program_environment_is_host_paths_only() {
+        let read = |value: Value| ProgramEnvironment::read(&json!({ ENVIRONMENT_FIELD: value }));
+        assert!(ProgramEnvironment::read(&json!({})).is_ok());
+        let paired = read(json!({
+            "semanticJudgementConfigPath": "/actions/a/relay.json",
+            "semanticJudgementClientModulePath": "/runtime/client.cjs",
+            "nodeNetworkBootstrapPath": "/runtime/bootstrap.cjs",
+        }))
+        .unwrap();
+        assert_eq!(
+            serde_json::to_value(&paired).unwrap()["semanticJudgementConfigPath"],
+            "/actions/a/relay.json"
+        );
+        // Absent host paths arrive as nulls from the host-bound profile.
+        assert!(read(json!({
+            "semanticJudgementConfigPath": null,
+            "semanticJudgementClientModulePath": null,
+            "nodeNetworkBootstrapPath": null,
+        }))
+        .is_ok());
+        for invalid in [
+            json!({ "semanticJudgementConfigPath": "/actions/a/relay.json" }),
+            json!({ "semanticJudgementClientModulePath": "/runtime/client.cjs" }),
+            json!({ "semanticJudgementConfigPath": "relay.json", "semanticJudgementClientModulePath": "/runtime/client.cjs" }),
+            json!({ "nodeNetworkBootstrapPath": "bootstrap.cjs" }),
+            json!({ "bearer": "not-a-path" }),
+            json!("relay.json"),
+        ] {
+            let error = read(invalid.clone()).err().unwrap_or_default();
+            assert!(
+                error.starts_with("browser_operation_rejected: "),
+                "{invalid}"
+            );
+            assert!(!error.contains("not-a-path"), "{error}");
+        }
+    }
+
     #[tokio::test]
     async fn takeover_cancels_current_and_excludes_queued_programs_until_admitted() {
         let operations = Operations::default();
