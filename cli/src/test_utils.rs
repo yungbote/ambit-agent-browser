@@ -1,4 +1,4 @@
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Mutex, MutexGuard, PoisonError};
 
 /// Global mutex shared across all test modules to prevent parallel tests from
 /// interfering with each other when mutating environment variables.
@@ -12,7 +12,9 @@ pub struct EnvGuard<'a> {
 
 impl<'a> EnvGuard<'a> {
     pub fn new(var_names: &[&str]) -> Self {
-        let lock = ENV_MUTEX.lock().unwrap();
+        // A panicking test already restored its variables in Drop; later
+        // tests keep their own isolation instead of failing on the poison.
+        let lock = ENV_MUTEX.lock().unwrap_or_else(PoisonError::into_inner);
         let vars = var_names
             .iter()
             .map(|&name| (name.to_string(), std::env::var(name).ok()))
