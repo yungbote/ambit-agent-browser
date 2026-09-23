@@ -7782,12 +7782,14 @@ async fn handle_viewport(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         if mobile || (cmd.get("deviceScaleFactor").is_some() && scale != 1.0) {
             return Err("The browser window renders at its native device scale factor and does not emulate mobile devices".into());
         }
-        if state
+        if let Some((layout_width, layout_height)) = state
             .stream_server
             .as_ref()
-            .is_some_and(|server| server.presentation.configured())
+            .and_then(|server| server.presentation.layout())
         {
-            return Err("The browser window follows the connected viewer's layout; resize that view instead of the viewport".into());
+            // The person's view owns the window size; the agent cannot resize
+            // that view, so it is told the size it will keep working at.
+            return Err(format!("Not changed: a person's open view of this browser sets its window to {layout_width}x{layout_height} CSS pixels. Keep working at that size; set_viewport applies only while no view is open."));
         }
         let surface = state
             .apply_window_layout(width as u32, height as u32, None)

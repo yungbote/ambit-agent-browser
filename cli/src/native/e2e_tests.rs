@@ -12188,6 +12188,18 @@ async fn e2e_native_binary_viewer_resizes_the_same_window() {
         assert!(observed, "new geometry did not reach the same stream");
     }
     println!("BINARY_RESIZE {}", json!(timings));
+    // Production 2026-09-23: the refusal told the agent to resize a view it
+    // cannot reach. It now states the size the window keeps.
+    let refused = control_test_command(
+        &json!({"action":"viewport","width":1600,"height":1000}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(refused["success"], false, "{refused}");
+    assert_eq!(
+        refused["error"],
+        "Not changed: a person's open view of this browser sets its window to 733x896 CSS pixels. Keep working at that size; set_viewport applies only while no view is open."
+    );
     drop(ws);
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
