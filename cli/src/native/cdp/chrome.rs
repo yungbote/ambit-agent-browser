@@ -2291,7 +2291,7 @@ mod tests {
                 args: vec![arg.into()],
                 ..Default::default()
             };
-            let error = options.clone().without_automation().unwrap_err();
+            let error = options.clone().without_automation().err().unwrap();
             assert!(error.contains(arg), "{arg}: {error}");
             // With DevTools the same launch is unchanged.
             assert!(build_chrome_args(&options).is_ok(), "{arg}");
