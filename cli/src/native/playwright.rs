@@ -665,7 +665,7 @@ mod tests {
         assert!(!channel.started_before_stop());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
     async fn e2e_playwright_uses_existing_target_and_retains_browser_after_timeout() {
         use crate::native::actions::execute_command;
@@ -718,7 +718,7 @@ mod tests {
     /// is lost while it waits for an event, settle promptly as unknown
     /// outcomes rather than at their deadlines. The retained browser keeps
     /// its tab after the first.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
     async fn e2e_playwright_lost_transports_settle_before_the_deadline() {
         use crate::native::actions::execute_command;
@@ -783,7 +783,7 @@ mod tests {
         let _ = Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
     async fn e2e_playwright_frames_popups_files_and_real_pointer_share_native_owners() {
         use crate::native::actions::execute_command;
@@ -914,7 +914,7 @@ try {
         Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
     async fn e2e_playwright_windows_share_profile_and_isolated_contexts_are_never_misrepresented() {
         use crate::native::actions::execute_command;
@@ -1051,6 +1051,47 @@ try {
         Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
     }
 
+    /// Playwright pipelines each page's setup (Runtime.enable before
+    /// Runtime.runIfWaitingForDebugger) and relies on Chrome running it in
+    /// order. Sent out of order on the daemon's multi-threaded runtime, an
+    /// attachment occasionally lost the main context and hung to its deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
+    async fn e2e_playwright_repeated_attachments_keep_every_page_context() {
+        use crate::native::actions::execute_command;
+        let (port, server) = serve_pages(
+            "<title>Main</title><p>main text</p>",
+            "<title>Popup</title><p>popup text</p>",
+        )
+        .await;
+        let mut state = DaemonState::new();
+        let opened = Box::pin(execute_command(
+            &json!({"action":"navigate","url":format!("http://127.0.0.1:{port}/")}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(opened["success"], true, "{opened}");
+        let code = format!("const title = await page.evaluate(() => document.title); const text = await page.locator('p').innerText(); const [popup] = await Promise.all([page.waitForEvent('popup'), page.evaluate(() => {{ window.open('http://127.0.0.1:{port}/frame'); }})]); await popup.waitForLoadState('load'); const popupText = await popup.locator('p').innerText(); await popup.close(); return {{ title, text, popupText }};");
+        let mut failures = Vec::new();
+        for run in 0..64 {
+            let result = Box::pin(execute_command(
+                &json!({"action":"run_playwright","timeoutMs":8000,"code":code}),
+                &mut state,
+            ))
+            .await;
+            if result["data"]["result"]
+                != json!({"title":"Main","text":"main text","popupText":"popup text"})
+            {
+                failures.push((run, result));
+                // An unknown outcome requires a fresh observation first.
+                Box::pin(execute_command(&json!({"action":"snapshot"}), &mut state)).await;
+            }
+        }
+        Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
+        server.abort();
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
     /// Serves `/` and `/frame` from one port; `PORT` in a body becomes that
     /// port. Requesting the frame through another host name makes Chrome
     /// place it in its own renderer process.
@@ -1086,7 +1127,7 @@ try {
     /// out-of-process frame and after the native window is resized, lands at
     /// the requested client points and is published as the owner's activity.
     /// DOM `element.click()` publishes nothing.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires local Chromium, the browser display helper and installed playwright-core 1.62.1"]
     async fn e2e_playwright_pointer_reaches_scrolled_frames_after_resize_and_is_published() {
         use crate::native::actions::execute_command;
@@ -1224,7 +1265,7 @@ return {main: await page.evaluate(() => pointerLog), frame: await frame.evaluate
     /// One Chrome process, profile and tab across native commands, Playwright
     /// programs, a human click and new tabs, in the native window mode that
     /// production uses.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires local Chromium, the browser display helper and installed playwright-core 1.62.1"]
     async fn e2e_playwright_and_native_share_one_chrome_across_human_control_and_new_tabs() {
         use crate::native::actions::execute_command;
