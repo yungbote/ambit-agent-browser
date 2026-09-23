@@ -1381,8 +1381,8 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_WINDOW_NEW,
             "Window new",
-            "Open a new window in the existing profile. Set isolated to create a separate native cookie context.",
-            json!({ "isolated": { "type": "boolean", "default": false } }),
+            "Open a new window with its own empty cookie context, apart from the signed-in profile; closing its last tab discards that context. Set shared to open it in the profile instead.",
+            json!({ "shared": { "type": "boolean", "default": false } }),
             &[],
         ),
         tool(
@@ -2398,8 +2398,8 @@ fn prepare_tool(name: &str, arguments: &Value) -> Result<CliInvocation, Protocol
         TOOL_TAB_CLOSE => call_optional_one(arguments, &["tab", "close"], "tab"),
         TOOL_WINDOW_NEW => {
             let mut args = vec!["window".into(), "new".into()];
-            if optional_bool(arguments, "isolated")?.unwrap_or(false) {
-                args.push("--isolated".into());
+            if optional_bool(arguments, "shared")?.unwrap_or(false) {
+                args.push("--shared".into());
             }
             call_cli_tool(arguments, args, None)
         }

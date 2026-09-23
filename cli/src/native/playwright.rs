@@ -364,14 +364,14 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
             None => browser.active_target_id()?,
         }
         .to_owned();
-        // The runner learns how many explicit isolated contexts hold tabs. A
+        // The runner learns how many explicit isolated contexts exist. A
         // client without shared-context adoption would fold them into the
         // default profile and misreport cookies, so it refuses before start.
         let (download_context, isolated_contexts) = tokio::select! {
             biased;
             _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start()),
             result = tokio::time::timeout_at(deadline, async {
-                let isolated = browser.occupied_isolated_context_count().await?;
+                let isolated = browser.isolated_context_ids().await?.len();
                 let context = browser.download_context_for_target(&target).await?;
                 browser.configure_downloads(context.as_deref()).await?;
                 Ok::<_, String>((context, isolated))
@@ -1095,9 +1095,14 @@ try {
             .to_owned();
         let client = state.browser.as_ref().unwrap().client.clone();
         client.send_command("Storage.setCookies", Some(json!({"cookies":[{"name":"account","value":"persistent","url":"https://account.example/"}]})), None).await.unwrap();
-        let created = Box::pin(execute_command(&json!({"action":"window_new"}), &mut state)).await;
+        // A shared window is a second tab of the profile's own context.
+        let created = Box::pin(execute_command(
+            &json!({"action":"window_new","shared":true}),
+            &mut state,
+        ))
+        .await;
         assert_eq!(created["success"], true, "{created}");
-        assert_eq!(created["data"]["isolated"], false);
+        assert_eq!(created["data"]["shared"], true);
         let target = state
             .browser
             .as_ref()
@@ -1118,13 +1123,10 @@ try {
             .as_array()
             .unwrap()
             .contains(&json!("account=persistent")));
-        let isolated = Box::pin(execute_command(
-            &json!({"action":"window_new","isolated":true}),
-            &mut state,
-        ))
-        .await;
+        // The default window has its own context, without the profile's cookies.
+        let isolated = Box::pin(execute_command(&json!({"action":"window_new"}), &mut state)).await;
         assert_eq!(isolated["success"], true, "{isolated}");
-        assert_eq!(isolated["data"]["isolated"], true);
+        assert_eq!(isolated["data"]["shared"], false);
         let isolated_target = state
             .browser
             .as_ref()
@@ -1186,15 +1188,15 @@ try {
                 assert!(!error.contains("PROGRAM MUST NOT START"), "{read}");
             }
         }
-        // Closing the isolated window through the native tools is enough:
-        // Chrome keeps its empty context, which no client can misrepresent.
+        // Closing the isolated window through the native tools discards its
+        // context with it, so no client is left with anything to misrepresent.
         let closed = Box::pin(execute_command(
             &json!({"action":"tab_close","tabId":isolated_target}),
             &mut state,
         ))
         .await;
         assert_eq!(closed["success"], true, "{closed}");
-        assert!(state
+        assert!(!state
             .browser
             .as_ref()
             .unwrap()

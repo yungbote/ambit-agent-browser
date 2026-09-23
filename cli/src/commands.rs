@@ -1665,15 +1665,15 @@ fn parse_command_inner(
             const VALID: &[&str] = &["new"];
             match rest.first().copied() {
                 Some("new") => {
-                    if rest[1..].iter().any(|arg| *arg != "--isolated") {
+                    if rest[1..].iter().any(|arg| *arg != "--shared") {
                         return Err(ParseError::InvalidValue {
-                            message: "window new accepts only --isolated".into(),
-                            usage: "window new [--isolated]",
+                            message: "window new accepts only --shared".into(),
+                            usage: "window new [--shared]",
                         });
                     }
                     let mut command = json!({ "id": id, "action": "window_new" });
-                    if rest[1..].contains(&"--isolated") {
-                        command["isolated"] = json!(true);
+                    if rest[1..].contains(&"--shared") {
+                        command["shared"] = json!(true);
                     }
                     Ok(command)
                 }
