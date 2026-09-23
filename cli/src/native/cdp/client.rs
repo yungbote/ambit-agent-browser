@@ -1091,6 +1091,11 @@ mod tests {
                     let result = match command["method"].as_str().unwrap() {
                         "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"frame"}}}),
                         "Page.createIsolatedWorld" => json!({"executionContextId":1}),
+                        "Runtime.evaluate"
+                            if command["params"]["expression"] == "({scrollX,scrollY})" =>
+                        {
+                            json!({"result":{"value":{"scrollX":0,"scrollY":0}}})
+                        }
                         "Runtime.evaluate" => json!({"result":{"value":true}}),
                         _ => json!({}),
                     };
