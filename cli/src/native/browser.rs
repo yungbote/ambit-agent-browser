@@ -2261,14 +2261,23 @@ impl BrowserManager {
     /// Chrome enables download events per DevTools connection. A temporary
     /// local observer must affirm this owner's identical policy to receive
     /// those events; it does not choose another destination or context.
-    pub(crate) async fn observe_owned_downloads(&self, observer: &CdpClient, context: Option<&str>) -> Result<(), String> {
+    pub(crate) async fn observe_owned_downloads(
+        &self,
+        observer: &CdpClient,
+        context: Option<&str>,
+    ) -> Result<(), String> {
         let directory = self
             .downloads_directory
             .as_ref()
             .ok_or("The native download owner is unavailable")?;
-        let mut params = json!({"behavior":"allowAndName","downloadPath":directory.path,"eventsEnabled":true});
-        if let Some(context) = context { params["browserContextId"] = json!(context); }
-        observer.send_command("Browser.setDownloadBehavior", Some(params), None).await?;
+        let mut params =
+            json!({"behavior":"allowAndName","downloadPath":directory.path,"eventsEnabled":true});
+        if let Some(context) = context {
+            params["browserContextId"] = json!(context);
+        }
+        observer
+            .send_command("Browser.setDownloadBehavior", Some(params), None)
+            .await?;
         Ok(())
     }
 
@@ -2354,7 +2363,10 @@ impl BrowserManager {
             .collect()
     }
 
-    pub(crate) async fn download_context_for_target(&self, target: &str) -> Result<Option<String>, String> {
+    pub(crate) async fn download_context_for_target(
+        &self,
+        target: &str,
+    ) -> Result<Option<String>, String> {
         // Chrome exposes a synthetic ID for its default context in TargetInfo,
         // but setDownloadBehavior accepts only the explicit context roster.
         let contexts = self.isolated_context_ids().await?;

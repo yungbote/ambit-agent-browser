@@ -187,9 +187,7 @@ async fn serve(
             if *input_stop.borrow() {
                 break;
             }
-            if std::env::var("AGENT_BROWSER_PW_TRACE").is_ok() { eprintln!("[pwtrace] input begin id={} method={}", command["id"], command["method"]); }
             let response = input_response(&command, &input_client, &control).await;
-            if std::env::var("AGENT_BROWSER_PW_TRACE").is_ok() { eprintln!("[pwtrace] input done id={} response={}", command["id"], response); }
             if input_output
                 .send(Message::Text(response.to_string()))
                 .await
@@ -218,7 +216,6 @@ async fn serve(
                     Err(_) => break Err("Invalid Playwright protocol message.".into()),
                 };
                 let Some(method) = command["method"].as_str() else { break Err("Missing Playwright protocol method.".into()); };
-                if std::env::var("AGENT_BROWSER_PW_TRACE").is_ok() { eprintln!("[pwtrace] tunnel recv id={} method={}", command["id"], method); }
                 if is_input(method) {
                     if inputs.try_send(command).is_err() { break Err("Too many pending Playwright input events.".into()); }
                 } else {
@@ -314,9 +311,7 @@ async fn native_input(
         .as_str()
         .ok_or("Playwright input has no page session")?;
     let params = command.get("params").cloned().unwrap_or_else(|| json!({}));
-    if std::env::var("AGENT_BROWSER_PW_TRACE").is_ok() { eprintln!("[pwtrace] native_input waiting for control lock id={}", command["id"]); }
     let mut control = control.lock().await;
-    if std::env::var("AGENT_BROWSER_PW_TRACE").is_ok() { eprintln!("[pwtrace] native_input holds control lock id={}", command["id"]); }
     if let Some(error) = control.agent_error() {
         return Err(format!("{}: {}", error.code, error.message));
     }

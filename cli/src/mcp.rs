@@ -5162,15 +5162,21 @@ mod tests {
     fn tool_text_states_completion_and_facts_for_settled_actions() {
         let text = |response: Value| tool_text(Some(&response), "", "");
         assert_eq!(
-            text(json!({"success": true, "data": {"clicked": "@e3", "lifecycle": {"launched": false}}})),
+            text(
+                json!({"success": true, "data": {"clicked": "@e3", "lifecycle": {"launched": false}}})
+            ),
             "Done.\nclicked: @e3"
         );
         assert_eq!(
-            text(json!({"success": true, "data": {"clicked": "@e3", "newTab": true, "url": "https://example.com/next"}})),
+            text(
+                json!({"success": true, "data": {"clicked": "@e3", "newTab": true, "url": "https://example.com/next"}})
+            ),
             "Done.\nclicked: @e3\nnewTab: true\nurl: https://example.com/next"
         );
         assert_eq!(
-            text(json!({"success": true, "data": {"targetId": "T1", "title": "", "url": "about:blank"}})),
+            text(
+                json!({"success": true, "data": {"targetId": "T1", "title": "", "url": "about:blank"}})
+            ),
             "Done.\ntargetId: T1\ntitle: (empty)\nurl: about:blank"
         );
         assert_eq!(text(json!({"success": true, "data": null})), "Done.");
@@ -5179,12 +5185,20 @@ mod tests {
             text(json!({"success": true, "data": {"title": "Example Domain"}})),
             "Example Domain"
         );
-        assert_eq!(text(json!({"success": true, "data": {"title": ""}})), "(empty)");
         assert_eq!(
-            text(json!({"success": true, "data": {"snapshot": "- button \"Go\" [ref=e1]", "origin": "https://example.com", "refs": {}}})),
+            text(json!({"success": true, "data": {"title": ""}})),
+            "(empty)"
+        );
+        assert_eq!(
+            text(
+                json!({"success": true, "data": {"snapshot": "- button \"Go\" [ref=e1]", "origin": "https://example.com", "refs": {}}})
+            ),
             "- button \"Go\" [ref=e1]"
         );
-        assert_eq!(text(json!({"success": true, "data": {"result": [1, 2]}})), "[\n  1,\n  2\n]");
+        assert_eq!(
+            text(json!({"success": true, "data": {"result": [1, 2]}})),
+            "[\n  1,\n  2\n]"
+        );
         assert_eq!(
             text(json!({"success": true, "data": {"result": null, "diagnostics": "step one\n", "diagnosticsTruncated": false, "targetId": "T1"}})),
             "Playwright program completed.\nReturn value: null (the program returned no value).\nConsole output:\nstep one"
@@ -5194,7 +5208,9 @@ mod tests {
             "Playwright program completed.\nReturn value:\n{\n  \"rows\": 3\n}\n[console output was not captured]"
         );
         assert_eq!(
-            text(json!({"success": false, "error": "browser_controlled_by_user: The user is controlling this browser."})),
+            text(
+                json!({"success": false, "error": "browser_controlled_by_user: The user is controlling this browser."})
+            ),
             "browser_controlled_by_user: The user is controlling this browser."
         );
     }

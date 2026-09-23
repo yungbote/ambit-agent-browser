@@ -8,8 +8,8 @@ use std::process::Stdio;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::{json, Value};
 use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Notify};
@@ -38,10 +38,23 @@ struct ProgramEnvironment {
 
 impl ProgramEnvironment {
     fn read(command: &Value) -> Result<Self, String> {
-        let value = command.get(ENVIRONMENT_FIELD).cloned().unwrap_or_else(|| json!({}));
-        let environment: Self = serde_json::from_value(value).map_err(|_| "browser_operation_rejected: The host program environment is invalid.")?;
-        if environment.semantic_judgement_config_path.is_some() != environment.semantic_judgement_client_module_path.is_some()
-            || [&environment.semantic_judgement_config_path, &environment.semantic_judgement_client_module_path, &environment.node_network_bootstrap_path].into_iter().flatten().any(|path| !path.is_absolute()) {
+        let value = command
+            .get(ENVIRONMENT_FIELD)
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        let environment: Self = serde_json::from_value(value)
+            .map_err(|_| "browser_operation_rejected: The host program environment is invalid.")?;
+        if environment.semantic_judgement_config_path.is_some()
+            != environment.semantic_judgement_client_module_path.is_some()
+            || [
+                &environment.semantic_judgement_config_path,
+                &environment.semantic_judgement_client_module_path,
+                &environment.node_network_bootstrap_path,
+            ]
+            .into_iter()
+            .flatten()
+            .any(|path| !path.is_absolute())
+        {
             return Err("browser_operation_rejected: Host program paths must be absolute and the semantic client must have its paired configuration.".into());
         }
         Ok(environment)
@@ -298,7 +311,9 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
             std::env::var("AGENT_BROWSER_NODE_PATH").unwrap_or_else(|_| "node".into()),
         );
         if let Some(path) = environment.node_network_bootstrap_path.as_ref() {
-            node.arg("--require").arg(path).env("AMBIT_WORKSPACE_NODE_NETWORK_BOOTSTRAP_ENABLED", "true");
+            node.arg("--require")
+                .arg(path)
+                .env("AMBIT_WORKSPACE_NODE_NETWORK_BOOTSTRAP_ENABLED", "true");
         }
         if let Ok(path) = std::env::var("AGENT_BROWSER_PLAYWRIGHT_RUNNER") {
             node.arg(path);
@@ -601,7 +616,10 @@ try {
         let moved = Box::pin(execute_command(&json!({"action":"run_playwright","code":"await page.mouse.move(150, 90); return {pointer: await page.evaluate(() => pointers.at(-1)), width: await page.evaluate(() => innerWidth)};","timeoutMs":15000}), &mut state)).await;
         assert_eq!(moved["success"], true, "{moved}");
         assert_eq!(moved["data"]["result"]["width"], 900, "{moved}");
-        assert_eq!(moved["data"]["result"]["pointer"]["trusted"], true, "{moved}");
+        assert_eq!(
+            moved["data"]["result"]["pointer"]["trusted"], true,
+            "{moved}"
+        );
         assert_eq!(moved["data"]["result"]["pointer"]["x"], 150, "{moved}");
         assert_eq!(moved["data"]["result"]["pointer"]["y"], 90, "{moved}");
         if let Some(display) = state.browser.as_ref().unwrap().display_client() {
@@ -711,10 +729,17 @@ try {
             assert_eq!(*adopted.get_or_insert(outcome), outcome, "{read}");
             if outcome {
                 let values = read["data"]["result"].as_array().unwrap();
-                assert_eq!(values.contains(&json!("persistent")), expects_persistent, "{read}");
+                assert_eq!(
+                    values.contains(&json!("persistent")),
+                    expects_persistent,
+                    "{read}"
+                );
             } else {
                 assert_eq!(read["code"], "browser_operation_rejected", "{read}");
-                assert!(read["error"].as_str().unwrap().contains("isolated window"), "{read}");
+                assert!(
+                    read["error"].as_str().unwrap().contains("isolated window"),
+                    "{read}"
+                );
             }
         }
         if let Ok(stock) = std::env::var("AGENT_BROWSER_TEST_STOCK_PLAYWRIGHT_MODULE") {
@@ -804,13 +829,26 @@ try {
         let filled = Box::pin(execute_command(&json!({"action":"run_playwright","timeoutMs":15000,"code":"await page.getByLabel('Name').fill('Ada'); return {title: await page.title(), cookies: (await context.cookies('https://journey.example/')).map(cookie => cookie.name + '=' + cookie.value)};"}), &mut state)).await;
         assert_eq!(filled["success"], true, "{filled}");
         assert_eq!(filled["data"]["result"]["title"], "Journey");
-        assert_eq!(filled["data"]["result"]["cookies"], json!(["journey=shared"]));
+        assert_eq!(
+            filled["data"]["result"]["cookies"],
+            json!(["journey=shared"])
+        );
         assert_eq!(filled["data"]["targetId"], target);
 
         let observed = Box::pin(execute_command(&json!({"action":"snapshot"}), &mut state)).await;
         assert_eq!(observed["success"], true, "{observed}");
-        assert!(observed["data"]["snapshot"].as_str().unwrap().contains("Name"), "{observed}");
-        let typed = Box::pin(execute_command(&json!({"action":"evaluate","script":"visitor.value"}), &mut state)).await;
+        assert!(
+            observed["data"]["snapshot"]
+                .as_str()
+                .unwrap()
+                .contains("Name"),
+            "{observed}"
+        );
+        let typed = Box::pin(execute_command(
+            &json!({"action":"evaluate","script":"visitor.value"}),
+            &mut state,
+        ))
+        .await;
         assert_eq!(typed["data"]["result"], "Ada", "{typed}");
 
         // A human takes control and clicks the button in the same window.
@@ -818,14 +856,25 @@ try {
         let expires = crate::native::stream::timestamp_ms() + 30_000;
         let acquired = Box::pin(execute_command(&json!({"action":crate::native::browser_control::ACTION,"op":"acquire","controllerId":controller,"expiresAt":expires}), &mut state)).await;
         assert_eq!(acquired["success"], true, "{acquired}");
-        let refused = Box::pin(execute_command(&json!({"action":"run_playwright","timeoutMs":15000,"code":"return 1;"}), &mut state)).await;
+        let refused = Box::pin(execute_command(
+            &json!({"action":"run_playwright","timeoutMs":15000,"code":"return 1;"}),
+            &mut state,
+        ))
+        .await;
         assert_eq!(refused["code"], "browser_controlled_by_user", "{refused}");
         let click = |event: &str| json!({"type":"input_mouse","eventType":event,"x":120,"y":144,"button":"left","clickCount":1});
         let input = Box::pin(execute_command(&json!({"action":crate::native::browser_control::ACTION,"op":"input","controllerId":controller,"sequence":1,"events":[click("mousePressed"), click("mouseReleased")]}), &mut state)).await;
         assert_eq!(input["success"], true, "{input}");
         tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                let title = client.send_command("Runtime.evaluate", Some(json!({"expression":"document.title","returnByValue":true})), Some(&session)).await.unwrap();
+                let title = client
+                    .send_command(
+                        "Runtime.evaluate",
+                        Some(json!({"expression":"document.title","returnByValue":true})),
+                        Some(&session),
+                    )
+                    .await
+                    .unwrap();
                 if title["result"]["value"] == "Human Ada" {
                     break;
                 }
@@ -842,10 +891,17 @@ try {
         // Playwright continues on the page the human changed.
         let continued = Box::pin(execute_command(&json!({"action":"run_playwright","timeoutMs":15000,"code":"return {title: await page.title(), value: await page.getByLabel('Name').inputValue()};"}), &mut state)).await;
         assert_eq!(continued["success"], true, "{continued}");
-        assert_eq!(continued["data"]["result"], json!({"title":"Human Ada","value":"Ada"}));
+        assert_eq!(
+            continued["data"]["result"],
+            json!({"title":"Human Ada","value":"Ada"})
+        );
 
         // A native new tab and a program-created page share the profile.
-        let tab = Box::pin(execute_command(&json!({"action":"tab_new","url":"about:blank"}), &mut state)).await;
+        let tab = Box::pin(execute_command(
+            &json!({"action":"tab_new","url":"about:blank"}),
+            &mut state,
+        ))
+        .await;
         assert_eq!(tab["success"], true, "{tab}");
         let second = state
             .browser
@@ -860,12 +916,19 @@ try {
         assert_eq!(read["data"]["result"]["title"], "Second");
         assert_eq!(read["data"]["result"]["third"], "Third");
         assert_eq!(read["data"]["result"]["cookies"], json!(["shared"]));
-        let switched = Box::pin(execute_command(&json!({"action":"tab_switch","tabId":target}), &mut state)).await;
+        let switched = Box::pin(execute_command(
+            &json!({"action":"tab_switch","tabId":target}),
+            &mut state,
+        ))
+        .await;
         assert_eq!(switched["success"], true, "{switched}");
         let title = Box::pin(execute_command(&json!({"action":"title"}), &mut state)).await;
         assert_eq!(title["data"]["title"], "Human Ada", "{title}");
         assert_eq!(browser_pid(&client).await, pid);
-        assert!(Arc::ptr_eq(&client, &state.browser.as_ref().unwrap().client));
+        assert!(Arc::ptr_eq(
+            &client,
+            &state.browser.as_ref().unwrap().client
+        ));
         Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
     }
 }
