@@ -3,6 +3,8 @@
 // boundary, not a hostile-code sandbox. Never launch or install a browser here.
 import { Console } from 'node:console';
 import { pathToFileURL } from 'node:url';
+import { readFileSync, writeFileSync, closeSync } from 'node:fs';
+import { createRequire } from 'node:module';
 
 const chunks = [];
 for await (const chunk of process.stdin) chunks.push(chunk);
@@ -16,11 +18,25 @@ let started = false;
 let result;
 try {
   // Compile before attachment so syntax errors cannot perform browser work.
-  const program = new AsyncFunction('page', 'context', 'browser', request.code);
+  const program = new AsyncFunction('page', 'context', 'browser', 'semanticJudgement', request.code);
+  let semanticJudgement;
+  if (request.environment?.semanticJudgementConfigPath) {
+    const environment = JSON.parse(readFileSync(request.environment.semanticJudgementConfigPath, 'utf8'));
+    const { createAmbitSemanticJudgementClient } = createRequire(import.meta.url)(request.environment.semanticJudgementClientModulePath);
+    semanticJudgement = createAmbitSemanticJudgementClient(Object.freeze(environment));
+  }
   const modulePath = process.env.AGENT_BROWSER_PLAYWRIGHT_MODULE;
-  const { chromium } = await import(modulePath ? pathToFileURL(modulePath).href : 'playwright-core');
+  const { chromium, ambitCdpContextAdoptionVersion } = await import(modulePath ? pathToFileURL(modulePath).href : 'playwright-core');
+  // Stock Playwright 1.62.1 folds every existing Chromium context into the
+  // default one. With an isolated window open that would misreport cookies,
+  // pages and context identity, so only the adoption build may attach then.
+  if (ambitCdpContextAdoptionVersion !== 1 && request.isolatedContexts > 0) {
+    throw new Error(`The installed Playwright client cannot represent ${request.isolatedContexts} open isolated window context(s) faithfully. Close those isolated windows or use native browser tools for them.`);
+  }
   browser = await chromium.connectOverCDP(request.endpoint, {
     noDefaults: true,
+    isLocal: true,
+    artifactsDir: request.artifactsDir ?? undefined,
     timeout: request.timeoutMs,
   });
   let selected;
@@ -37,7 +53,7 @@ try {
   }
   if (!selected) throw new Error('The selected browser tab is no longer available.');
   started = true;
-  const value = await program(selected.page, selected.context, browser);
+  const value = await program(selected.page, selected.context, browser, semanticJudgement);
   result = { success: true, result: value === undefined ? null : value };
   // Reject cyclic values/BigInt before declaring the program complete.
   JSON.stringify(result);
@@ -53,4 +69,5 @@ try {
 // group and reaped it. Background timers or child processes cannot extend a
 // successful program into the next owner's turn.
 setInterval(() => {}, 60_000);
-process.stdout.end(`${JSON.stringify(result)}\n`);
+writeFileSync(3, `${JSON.stringify(result)}\n`);
+closeSync(3);

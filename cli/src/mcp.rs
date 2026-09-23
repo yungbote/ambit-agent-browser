@@ -1028,7 +1028,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_RUN_PLAYWRIGHT,
             "Run Playwright",
-            "Run an async JavaScript body with the existing page, context and browser. Return a JSON-serializable result. Uses the current tab unless targetId selects another existing tab. Human takeover cancels the program; interrupted or failed code may already have changed the page and is never replayed.",
+            "Run an async JavaScript body with the existing page, context and browser. Return a JSON-serializable result; the tool result reports completion, the returned value and captured console output. Uses the current tab unless targetId selects another existing tab. Human takeover cancels the program; interrupted or failed code may already have changed the page and is never replayed.",
             json!({
                 "code": { "type": "string", "minLength": 1, "maxLength": 1048576 },
                 "targetId": { "type": "string", "minLength": 1 }
@@ -1381,8 +1381,8 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_WINDOW_NEW,
             "Window new",
-            "Open a new browser window.",
-            json!({}),
+            "Open a new window in the existing profile. Set isolated to create a separate native cookie context.",
+            json!({ "isolated": { "type": "boolean", "default": false } }),
             &[],
         ),
         tool(
@@ -2396,7 +2396,13 @@ fn prepare_tool(name: &str, arguments: &Value) -> Result<CliInvocation, Protocol
         TOOL_TAB_LIST => call_literal(arguments, &["tab", "list"]),
         TOOL_TAB_SWITCH => call_one_string(arguments, "tab", "tab"),
         TOOL_TAB_CLOSE => call_optional_one(arguments, &["tab", "close"], "tab"),
-        TOOL_WINDOW_NEW => call_literal(arguments, &["window", "new"]),
+        TOOL_WINDOW_NEW => {
+            let mut args = vec!["window".into(), "new".into()];
+            if optional_bool(arguments, "isolated")?.unwrap_or(false) {
+                args.push("--isolated".into());
+            }
+            call_cli_tool(arguments, args, None)
+        }
         TOOL_FRAME_SWITCH => call_one_string(arguments, "frame", "frame"),
         TOOL_FRAME_MAIN => call_literal(arguments, &["frame", "main"]),
         TOOL_DIALOG_STATUS => call_literal(arguments, &["dialog", "status"]),
@@ -4113,43 +4119,103 @@ fn tool_text(parsed: Option<&Value>, stdout: &str, stderr: &str) -> String {
     }
 }
 
+/// The text a model reads. Content results (snapshots, text, values) are the
+/// content itself; every other success states that the command completed and
+/// lists its facts, so a settled action is never mistaken for an unverified one.
 fn response_text(value: &Value) -> Option<String> {
-    if let Some(obj) = value.as_object() {
-        if obj.get("success").and_then(|v| v.as_bool()) == Some(false) {
-            return obj
-                .get("error")
-                .and_then(|v| v.as_str())
-                .map(ToString::to_string);
-        }
-
-        if let Some(data) = obj.get("data") {
-            // Accessibility reports carry a URL alongside their findings. Use
-            // the same report formatter as the CLI before the generic string
-            // field fallback turns the MCP text content into only that URL.
-            if data.get("axeVersion").is_some()
-                && data
-                    .get("violations")
-                    .and_then(|value| value.as_array())
-                    .is_some()
-            {
-                return Some(crate::output::format_a11y_text(data));
-            }
-            for key in [
-                "snapshot", "text", "html", "report", "value", "content", "title", "url", "path",
-            ] {
-                if let Some(s) = data.get(key).and_then(|v| v.as_str()) {
-                    return Some(s.to_string());
-                }
-            }
-            if let Some(result) = data.get("result") {
-                return Some(
-                    serde_json::to_string_pretty(result).unwrap_or_else(|_| result.to_string()),
-                );
-            }
+    let obj = value.as_object()?;
+    if obj.get("success").and_then(Value::as_bool) == Some(false) {
+        return obj
+            .get("error")
+            .and_then(Value::as_str)
+            .map(ToString::to_string);
+    }
+    if obj.get("success").and_then(Value::as_bool) != Some(true) {
+        return None;
+    }
+    let data = match obj.get("data") {
+        Some(Value::Null) | None => return Some("Done.".to_string()),
+        Some(data) => data,
+    };
+    // Accessibility reports carry a URL alongside their findings. Use the
+    // same report formatter as the CLI before the generic fallback turns the
+    // MCP text content into only that URL.
+    if data.get("axeVersion").is_some()
+        && data
+            .get("violations")
+            .and_then(|value| value.as_array())
+            .is_some()
+    {
+        return Some(crate::output::format_a11y_text(data));
+    }
+    for key in ["snapshot", "text", "html", "report", "content"] {
+        if let Some(s) = data.get(key).and_then(Value::as_str) {
+            return Some(s.to_string());
         }
     }
+    let facts: Vec<(&String, &Value)> = data
+        .as_object()?
+        .iter()
+        .filter(|(key, _)| key.as_str() != "lifecycle")
+        .collect();
+    // Single-value getters answer with the value itself.
+    if let [(key, Value::String(text))] = facts.as_slice() {
+        if matches!(key.as_str(), "title" | "url" | "value" | "path") {
+            return Some(fact_text(text));
+        }
+    }
+    if data.get("diagnostics").is_some() && data.get("result").is_some() {
+        return Some(program_text(data));
+    }
+    if let Some(result) = data.get("result") {
+        return Some(pretty_json(result));
+    }
+    let mut lines = vec!["Done.".to_string()];
+    for (key, value) in facts {
+        let rendered = match value {
+            Value::String(text) => fact_text(text),
+            other => other.to_string(),
+        };
+        lines.push(format!("{key}: {rendered}"));
+    }
+    Some(lines.join("\n"))
+}
 
-    None
+fn fact_text(text: &str) -> String {
+    if text.is_empty() {
+        "(empty)".to_string()
+    } else {
+        text.to_string()
+    }
+}
+
+fn pretty_json(value: &Value) -> String {
+    serde_json::to_string_pretty(value).unwrap_or_else(|_| value.to_string())
+}
+
+/// A Playwright program's completion, return value and captured console
+/// output. The value alone would read as an unexplained literal.
+fn program_text(data: &Value) -> String {
+    let mut text = String::from("Playwright program completed.\n");
+    match &data["result"] {
+        Value::Null => text.push_str("Return value: null (the program returned no value)."),
+        result => {
+            text.push_str("Return value:\n");
+            text.push_str(&pretty_json(result));
+        }
+    }
+    let diagnostics = data["diagnostics"].as_str().unwrap_or_default().trim_end();
+    let truncated = data["diagnosticsTruncated"] == true;
+    if !diagnostics.is_empty() {
+        text.push_str("\nConsole output:\n");
+        text.push_str(diagnostics);
+        if truncated {
+            text.push_str("\n[console output truncated]");
+        }
+    } else if truncated {
+        text.push_str("\n[console output was not captured]");
+    }
+    text
 }
 
 fn image_content_from_response(value: &Value) -> Option<Value> {
@@ -4466,10 +4532,42 @@ mod tests {
         assert!(names.contains(&TOOL_SNAPSHOT));
         assert!(names.contains(&TOOL_CLICK));
         assert!(names.contains(&TOOL_SCREENSHOT));
+        assert!(names.contains(&TOOL_RUN_PLAYWRIGHT));
         assert!(!names.contains(&TOOL_NETWORK_HAR_START));
         assert!(!names.contains(&TOOL_PLUGIN_LIST));
         assert!(!names.contains(&TOOL_REACT_TREE));
         assert!(result.get("nextCursor").is_none());
+    }
+
+    #[test]
+    fn playwright_cli_mcp_and_host_bound_share_one_parser_and_schema() {
+        let code =
+            "await page.locator('#field').fill('--session foreign'); return await page.title();";
+        let invocation = call_run_playwright(
+            &json!({"code":code,"targetId":"existing-target","timeoutMs":120000}),
+        )
+        .unwrap();
+        let command = crate::commands::parse_command_with_input(
+            &invocation.command_args,
+            &crate::flags::parse_flags_from_config(&[], crate::flags::Config::default()),
+            invocation.stdin_body.as_deref(),
+        )
+        .unwrap();
+        assert_eq!(command["action"], "run_playwright");
+        assert_eq!(command["code"], code);
+        assert_eq!(command["targetId"], "existing-target");
+        assert_eq!(command["timeoutMs"], 120000);
+        assert!(call_run_playwright(&json!({"code":code,"timeoutMs":120001})).is_err());
+        let tool = host_bound::tools()
+            .into_iter()
+            .find(|tool| tool["name"] == TOOL_RUN_PLAYWRIGHT)
+            .unwrap();
+        assert!(tool["inputSchema"]["properties"].get("session").is_none());
+        assert!(tool["inputSchema"]["properties"].get("extraArgs").is_none());
+        assert_eq!(
+            tool["inputSchema"]["properties"]["timeoutMs"]["maximum"],
+            120000
+        );
     }
 
     #[test]
@@ -5057,6 +5155,47 @@ mod tests {
         assert_eq!(
             result["structuredContent"]["response"]["data"]["lastUrl"],
             "https://example.com/path"
+        );
+    }
+
+    #[test]
+    fn tool_text_states_completion_and_facts_for_settled_actions() {
+        let text = |response: Value| tool_text(Some(&response), "", "");
+        assert_eq!(
+            text(json!({"success": true, "data": {"clicked": "@e3", "lifecycle": {"launched": false}}})),
+            "Done.\nclicked: @e3"
+        );
+        assert_eq!(
+            text(json!({"success": true, "data": {"clicked": "@e3", "newTab": true, "url": "https://example.com/next"}})),
+            "Done.\nclicked: @e3\nnewTab: true\nurl: https://example.com/next"
+        );
+        assert_eq!(
+            text(json!({"success": true, "data": {"targetId": "T1", "title": "", "url": "about:blank"}})),
+            "Done.\ntargetId: T1\ntitle: (empty)\nurl: about:blank"
+        );
+        assert_eq!(text(json!({"success": true, "data": null})), "Done.");
+        assert_eq!(text(json!({"success": true})), "Done.");
+        assert_eq!(
+            text(json!({"success": true, "data": {"title": "Example Domain"}})),
+            "Example Domain"
+        );
+        assert_eq!(text(json!({"success": true, "data": {"title": ""}})), "(empty)");
+        assert_eq!(
+            text(json!({"success": true, "data": {"snapshot": "- button \"Go\" [ref=e1]", "origin": "https://example.com", "refs": {}}})),
+            "- button \"Go\" [ref=e1]"
+        );
+        assert_eq!(text(json!({"success": true, "data": {"result": [1, 2]}})), "[\n  1,\n  2\n]");
+        assert_eq!(
+            text(json!({"success": true, "data": {"result": null, "diagnostics": "step one\n", "diagnosticsTruncated": false, "targetId": "T1"}})),
+            "Playwright program completed.\nReturn value: null (the program returned no value).\nConsole output:\nstep one"
+        );
+        assert_eq!(
+            text(json!({"success": true, "data": {"result": {"rows": 3}, "diagnostics": "", "diagnosticsTruncated": true, "targetId": "T1"}})),
+            "Playwright program completed.\nReturn value:\n{\n  \"rows\": 3\n}\n[console output was not captured]"
+        );
+        assert_eq!(
+            text(json!({"success": false, "error": "browser_controlled_by_user: The user is controlling this browser."})),
+            "browser_controlled_by_user: The user is controlling this browser."
         );
     }
 

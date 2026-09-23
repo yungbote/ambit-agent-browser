@@ -493,6 +493,7 @@ fn should_send_local_launch_config(flags: &Flags, command: &serde_json::Value) -
         && flags.provider.is_none()
         && !flags.auto_connect
         && !command_is_external_launch(command)
+        && command["action"] != "run_playwright"
 }
 
 fn attach_restore_config_to_command(cmd: &mut serde_json::Value, flags: &Flags) {

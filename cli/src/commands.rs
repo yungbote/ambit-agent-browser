@@ -1664,7 +1664,19 @@ fn parse_command_inner(
         "window" => {
             const VALID: &[&str] = &["new"];
             match rest.first().copied() {
-                Some("new") => Ok(json!({ "id": id, "action": "window_new" })),
+                Some("new") => {
+                    if rest[1..].iter().any(|arg| *arg != "--isolated") {
+                        return Err(ParseError::InvalidValue {
+                            message: "window new accepts only --isolated".into(),
+                            usage: "window new [--isolated]",
+                        });
+                    }
+                    let mut command = json!({ "id": id, "action": "window_new" });
+                    if rest[1..].contains(&"--isolated") {
+                        command["isolated"] = json!(true);
+                    }
+                    Ok(command)
+                }
                 Some(sub) => Err(ParseError::UnknownSubcommand {
                     subcommand: sub.to_string(),
                     valid_options: VALID,

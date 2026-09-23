@@ -14,7 +14,6 @@ use tokio_tungstenite::tungstenite::Message;
 
 use crate::native::browser_control::BrowserControl;
 use crate::native::cdp::client::CdpClient;
-use crate::native::input::stream_event;
 
 pub(super) struct Tunnel {
     endpoint: String,
@@ -31,8 +30,9 @@ impl Tunnel {
         let listener = TcpListener::bind("127.0.0.1:0").await.map_err(|_| {
             "browser_operation_rejected: The local Playwright transport could not start."
         })?;
+        let path = format!("/{}", uuid::Uuid::new_v4().simple());
         let endpoint = format!(
-            "ws://127.0.0.1:{}",
+            "ws://127.0.0.1:{}{path}",
             listener
                 .local_addr()
                 .map_err(|error| error.to_string())?
@@ -42,7 +42,7 @@ impl Tunnel {
         if control.lock().await.has_native_display() {
             client.enable_window_pointer();
         }
-        let task = tokio::spawn(serve(listener, client.clone(), control, stop.clone()));
+        let task = tokio::spawn(serve(listener, client.clone(), control, stop.clone(), path));
         Ok(Self {
             endpoint,
             client,
@@ -109,19 +109,43 @@ async fn serve(
     client: Arc<CdpClient>,
     control: Arc<Mutex<BrowserControl>>,
     stopped: watch::Sender<bool>,
+    path: String,
 ) -> Result<(), String> {
     let mut stop = stopped.subscribe();
-    let socket = tokio::select! {
-        biased;
-        _ = stop.changed() => return Ok(()),
-        accepted = listener.accept() => accepted.map_err(|error| error.to_string())?.0,
+    if *stop.borrow() {
+        return Ok(());
+    }
+    let socket = loop {
+        let socket = tokio::select! {
+            biased;
+            _ = stop.changed() => return Ok(()),
+            accepted = listener.accept() => accepted.map_err(|error| error.to_string())?.0,
+        };
+        let handshake = tokio_tungstenite::accept_hdr_async(
+            socket,
+            |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response| {
+                if request.headers().contains_key("origin") || request.uri().path() != path {
+                    return Err(tokio_tungstenite::tungstenite::http::Response::builder()
+                        .status(403)
+                        .body(Some(
+                            "Browser-origin and foreign operation connections are not permitted."
+                                .to_owned(),
+                        ))
+                        .unwrap());
+                }
+                Ok(response)
+            },
+        );
+        let accepted = tokio::select! {
+            biased;
+            _ = stop.changed() => return Ok(()),
+            accepted = tokio::time::timeout(Duration::from_secs(1), handshake) => accepted,
+        };
+        if let Ok(Ok(socket)) = accepted {
+            break socket;
+        }
     };
     drop(listener);
-    let socket = tokio::select! {
-        biased;
-        _ = stop.changed() => return Ok(()),
-        socket = tokio_tungstenite::accept_async(socket) => socket.map_err(|error| error.to_string())?,
-    };
     let (mut writer, mut reader) = socket.split();
     let (outgoing, mut replies) = mpsc::channel::<Message>(256);
     let (inputs, mut input_requests) = mpsc::channel::<Value>(64);
@@ -163,7 +187,9 @@ async fn serve(
             if *input_stop.borrow() {
                 break;
             }
+            if std::env::var("AGENT_BROWSER_PW_TRACE").is_ok() { eprintln!("[pwtrace] input begin id={} method={}", command["id"], command["method"]); }
             let response = input_response(&command, &input_client, &control).await;
+            if std::env::var("AGENT_BROWSER_PW_TRACE").is_ok() { eprintln!("[pwtrace] input done id={} response={}", command["id"], response); }
             if input_output
                 .send(Message::Text(response.to_string()))
                 .await
@@ -192,6 +218,7 @@ async fn serve(
                     Err(_) => break Err("Invalid Playwright protocol message.".into()),
                 };
                 let Some(method) = command["method"].as_str() else { break Err("Missing Playwright protocol method.".into()); };
+                if std::env::var("AGENT_BROWSER_PW_TRACE").is_ok() { eprintln!("[pwtrace] tunnel recv id={} method={}", command["id"], method); }
                 if is_input(method) {
                     if inputs.try_send(command).is_err() { break Err("Too many pending Playwright input events.".into()); }
                 } else {
@@ -270,7 +297,9 @@ async fn input_response(
     let result = native_input(command, client, control).await;
     match result {
         Ok(()) => response["result"] = json!({}),
-        Err(error) => response["error"] = json!({ "code": -32000, "message": error }),
+        Err(error) => {
+            response["error"] = json!({ "code": -32000, "message": error });
+        }
     }
     response
 }
@@ -285,7 +314,9 @@ async fn native_input(
         .as_str()
         .ok_or("Playwright input has no page session")?;
     let params = command.get("params").cloned().unwrap_or_else(|| json!({}));
+    if std::env::var("AGENT_BROWSER_PW_TRACE").is_ok() { eprintln!("[pwtrace] native_input waiting for control lock id={}", command["id"]); }
     let mut control = control.lock().await;
+    if std::env::var("AGENT_BROWSER_PW_TRACE").is_ok() { eprintln!("[pwtrace] native_input holds control lock id={}", command["id"]); }
     if let Some(error) = control.agent_error() {
         return Err(format!("{}: {}", error.code, error.message));
     }
@@ -303,16 +334,20 @@ async fn native_input(
                 .await?;
         }
         match method {
-            "Input.dispatchMouseEvent" => { control.agent_native_mouse(params, client, session, &[session]).await?; }
+            "Input.dispatchMouseEvent" => {
+                // A new unheld gesture remeasures its page/window mapping;
+                // held gestures keep the native owner's established mapping.
+                control.begin_agent_command();
+                control.agent_native_mouse(native_mouse_params(&params), client, session, &[session]).await?;
+            }
             "Input.insertText" => control.agent_native_keys(&[json!({ "type": "input_keyboard", "eventType": "insertText", "text": params["text"] })]).await?,
             "Input.dispatchKeyEvent" => {
-                let mut event = stream_event("input_keyboard", &params);
+                let event = native_keyboard_event(&params);
                 // CDP commands are browser editing commands, not key names.
                 // Keep composition/IME traffic on its original protocol path.
                 if params.get("commands").is_some_and(|commands| commands.as_array().is_some_and(|values| !values.is_empty())) {
                     client.send_command(method, Some(params), Some(session)).await?;
                 } else {
-                    event["modifiers"] = json!(params["modifiers"].as_i64().unwrap_or(0));
                     control.agent_native_keys(&[event]).await?;
                 }
             }
@@ -335,6 +370,36 @@ async fn native_input(
     Ok(())
 }
 
+fn native_mouse_params(params: &Value) -> Value {
+    let mut value = json!({});
+    for field in [
+        "type",
+        "x",
+        "y",
+        "button",
+        "buttons",
+        "modifiers",
+        "clickCount",
+        "deltaX",
+        "deltaY",
+    ] {
+        if let Some(item) = params.get(field) {
+            value[field] = item.clone();
+        }
+    }
+    value
+}
+
+fn native_keyboard_event(params: &Value) -> Value {
+    let mut value = json!({ "type": "input_keyboard", "eventType": params["type"], "modifiers": params["modifiers"].as_i64().unwrap_or(0) });
+    for field in ["key", "code", "text", "windowsVirtualKeyCode"] {
+        if let Some(item) = params.get(field) {
+            value[field] = item.clone();
+        }
+    }
+    value
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -346,5 +411,60 @@ mod tests {
         assert!(!is_input("Runtime.evaluate"));
         assert!(!is_input("Runtime.callFunctionOn"));
         assert!(!is_input("Input.imeSetComposition"));
+    }
+
+    #[test]
+    fn native_projection_preserves_input_and_excludes_protocol_only_fields() {
+        assert_eq!(
+            native_mouse_params(
+                &json!({"type":"mousePressed","x":5,"y":8,"force":0.5,"button":"left"})
+            ),
+            json!({"type":"mousePressed","x":5,"y":8,"button":"left"})
+        );
+        assert_eq!(
+            native_keyboard_event(
+                &json!({"type":"keyDown","key":"A","code":"KeyA","text":"A","modifiers":8,"commands":[],"autoRepeat":false,"location":0,"unmodifiedText":"A","windowsVirtualKeyCode":65})
+            ),
+            json!({"type":"input_keyboard","eventType":"keyDown","key":"A","code":"KeyA","text":"A","modifiers":8,"windowsVirtualKeyCode":65})
+        );
+    }
+    #[tokio::test]
+    async fn browser_origins_and_foreign_paths_cannot_consume_the_native_connection() {
+        use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = upstream.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while socket.next().await.is_some() {}
+        });
+        let client = Arc::new(
+            CdpClient::connect(&format!("ws://{address}"))
+                .await
+                .unwrap(),
+        );
+        let mut tunnel = Tunnel::start(client, Arc::new(Mutex::new(BrowserControl::default())))
+            .await
+            .unwrap();
+        let mut foreign = tunnel.endpoint().into_client_request().unwrap();
+        foreign
+            .headers_mut()
+            .insert("Origin", "https://untrusted.example".parse().unwrap());
+        assert!(tokio_tungstenite::connect_async(foreign).await.is_err());
+        let mut other_path = url::Url::parse(tunnel.endpoint()).unwrap();
+        other_path.set_path("/another-operation");
+        assert!(tokio_tungstenite::connect_async(other_path.as_str())
+            .await
+            .is_err());
+        let (mut native, _) = tokio_tungstenite::connect_async(tunnel.endpoint())
+            .await
+            .unwrap();
+        native.close(None).await.unwrap();
+        tunnel.finish().await.unwrap();
+        drop(tunnel);
+        tokio::time::timeout(Duration::from_secs(1), server)
+            .await
+            .unwrap()
+            .unwrap();
     }
 }

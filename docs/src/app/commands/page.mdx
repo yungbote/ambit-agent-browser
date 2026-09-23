@@ -47,6 +47,10 @@ Successful `open <url>` and `navigate` commands advertise when WebMCP tools are 
 
 ## Playwright in the current browser
 
+Ordinary new windows share the persistent profile. `window new --isolated`, or MCP `agent_browser_window_new` with `isolated: true`, retains separate native cookies. Playwright cannot represent pre-existing isolated contexts correctly and refuses attachment while their windows remain open. Native tools still work in those windows; closing them permits Playwright attachment again. Existing windows and credentials are never moved or copied.
+
+On Linux, private window streaming defaults to ANGLE software GLES for WebGL. Explicit browser arguments override this preset, and `--webgpu` keeps its existing backend. Fresh driver-owned profiles open `about:blank`; retained profiles and caller-selected startup behavior are preserved.
+
 `run-playwright` executes an async JavaScript body using the real `page`, `context`, and `browser` objects from the already-open Chromium instance. Its default page is the native driver's current target. The MCP equivalent is `agent_browser_run_playwright` with `code`, optional `targetId`, and optional `timeoutMs`.
 
 ```bash
@@ -56,7 +60,7 @@ return await page.getByRole('link').allTextContents();
 JS
 ```
 
-Use `--target <id>` to select another existing CDP target and `--timeout-ms <ms>` for a deadline from 1 through 120000 milliseconds (default 30000). Return a JSON value of at most 2 MiB. Console output is returned separately as diagnostics, capped at 64 KiB. The body is limited to 1 MiB. `process.stdout` is reserved for the result protocol.
+Use `--target <id>` to select another existing CDP target and `--timeout-ms <ms>` for a deadline from 1 through 120000 milliseconds (default 30000). Return a JSON value of at most 2 MiB. Console output is returned separately as diagnostics, capped at 64 KiB. The body is limited to 1 MiB.
 
 The host must provide Node and a qualified `playwright-core` installation. Version 1.62.1 supports the required `noDefaults` CDP attachment, which retains native focus, media and download settings. Set `AGENT_BROWSER_PLAYWRIGHT_MODULE` to its absolute `index.mjs` path; `AGENT_BROWSER_NODE_PATH` and `AGENT_BROWSER_PLAYWRIGHT_RUNNER` optionally select the installed executable and runner. Execution never downloads a browser or installs dependencies.
 
@@ -251,7 +255,8 @@ agent-browser tab new [url]                    # New tab
 agent-browser tab new --label docs [url]       # New tab with a user-assigned label
 agent-browser tab <t<N>|label>                 # Switch to a tab by id or label
 agent-browser tab close [t<N>|label]           # Close a tab (defaults to active)
-agent-browser window new                       # Open new browser window
+agent-browser window new                       # New window in the persistent profile
+agent-browser window new --isolated            # Separate native cookie context
 agent-browser frame <sel>                      # Switch to iframe by CSS selector
 agent-browser frame @e3                        # Switch to iframe by element ref
 agent-browser frame main                       # Back to main frame

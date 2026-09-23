@@ -603,12 +603,15 @@ impl BrowserControl {
             .ok_or("Unsupported input type")?;
         self.stream_held.before_send(session_id, &event);
         self.stream_outcome_unknown = true;
+        if std::env::var("AGENT_BROWSER_PW_TRACE").is_ok() { eprintln!("[pwtrace] agent_input enqueue {method}"); }
         let mut pending = client
             .enqueue_command(method, Some(params), Some(session_id))
             .await?;
+        if std::env::var("AGENT_BROWSER_PW_TRACE").is_ok() { eprintln!("[pwtrace] agent_input awaiting ack {method}"); }
         let response = tokio::time::timeout(Duration::from_secs(30), pending.acknowledgment())
             .await
             .map_err(|_| format!("CDP command timed out: {}", method))??;
+        if std::env::var("AGENT_BROWSER_PW_TRACE").is_ok() { eprintln!("[pwtrace] agent_input acked {method}"); }
         self.stream_outcome_unknown = false;
         if let Some(error) = response.error {
             return Err(format!("CDP error ({}): {}", method, error));
@@ -780,6 +783,7 @@ impl BrowserControl {
     }
 
     async fn drain_stream(&mut self) -> Result<(), ControlError> {
+        if std::env::var("AGENT_BROWSER_PW_TRACE").is_ok() { eprintln!("[pwtrace] drain_stream pending={} unknown={}", self.pending_stream.len(), self.stream_outcome_unknown); }
         if self.stream_outcome_unknown {
             return Err(ControlError::unknown());
         }

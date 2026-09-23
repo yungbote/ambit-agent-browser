@@ -120,6 +120,9 @@ struct HostConfig {
     require_sandbox: bool,
     capture_directory: PathBuf,
     expected_observation: Option<ObservationId>,
+    semantic_judgement_config_path: Option<PathBuf>,
+    semantic_judgement_client_module_path: Option<PathBuf>,
+    node_network_bootstrap_path: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -217,6 +220,13 @@ impl HostBinding {
         }
         let launch = crate::should_send_local_launch_config(&flags, &command)
             .then(|| crate::build_local_launch_command(&flags));
+        if command["action"] == "run_playwright" {
+            command[crate::native::playwright::ENVIRONMENT_FIELD] = json!({
+                "semanticJudgementConfigPath": self.config.semantic_judgement_config_path,
+                "semanticJudgementClientModulePath": self.config.semantic_judgement_client_module_path,
+                "nodeNetworkBootstrapPath": self.config.node_network_bootstrap_path,
+            });
+        }
         command[REQUEST_FIELD] = json!({ "namespace": self.config.namespace,
             "session": self.config.session, "captureDirectory": self.config.capture_directory,
             "timeoutMs": invocation.timeout_ms, "expectedObservation": self.config.expected_observation,

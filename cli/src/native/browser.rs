@@ -203,6 +203,7 @@ pub fn to_ai_friendly_error(error: &str) -> String {
     // such as "timeout" inside it must not turn a partial action into a
     // definite failure that the host could retry automatically.
     if error.starts_with("browser_control_outcome_unknown: ")
+        || error.starts_with("browser_controlled_by_user: ")
         || error.starts_with("browser_operation_")
     {
         return error.to_string();
@@ -2249,6 +2250,28 @@ impl BrowserManager {
         &self.visited_origins
     }
 
+    /// Share the owner's actual artifact directory with a temporary local
+    /// programming attachment without replacing its download policy.
+    pub(crate) fn downloads_path(&self) -> Option<&std::path::Path> {
+        self.downloads_directory
+            .as_ref()
+            .map(|directory| directory.path.as_path())
+    }
+
+    /// Chrome enables download events per DevTools connection. A temporary
+    /// local observer must affirm this owner's identical policy to receive
+    /// those events; it does not choose another destination or context.
+    pub(crate) async fn observe_owned_downloads(&self, observer: &CdpClient, context: Option<&str>) -> Result<(), String> {
+        let directory = self
+            .downloads_directory
+            .as_ref()
+            .ok_or("The native download owner is unavailable")?;
+        let mut params = json!({"behavior":"allowAndName","downloadPath":directory.path,"eventsEnabled":true});
+        if let Some(context) = context { params["browserContextId"] = json!(context); }
+        observer.send_command("Browser.setDownloadBehavior", Some(params), None).await?;
+        Ok(())
+    }
+
     /// Configure only the context the caller owns or explicitly acts upon.
     /// Attaching to somebody else's browser never changes download behavior.
     pub(crate) async fn configure_downloads(
@@ -2308,15 +2331,33 @@ impl BrowserManager {
             );
         }
         let target = self.active_target_id()?.to_string();
-        // Chrome exposes a synthetic ID for its default context in TargetInfo,
-        // but setDownloadBehavior accepts only the explicit context roster.
+        let context = self.download_context_for_target(&target).await?;
+        self.configure_downloads(context.as_deref()).await
+    }
+
+    /// The explicit non-default context roster. Chrome's default context has
+    /// no explicit protocol identity and is never part of this list.
+    pub(crate) async fn isolated_context_ids(&self) -> Result<Vec<String>, String> {
         let contexts = self
             .client
             .send_command_no_params("Target.getBrowserContexts", None)
             .await?;
-        let contexts = contexts["browserContextIds"]
+        contexts["browserContextIds"]
             .as_array()
-            .ok_or("Browser context roster is unavailable")?;
+            .ok_or("Browser context roster is unavailable")?
+            .iter()
+            .map(|id| {
+                id.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| "Browser context roster is unavailable".to_string())
+            })
+            .collect()
+    }
+
+    pub(crate) async fn download_context_for_target(&self, target: &str) -> Result<Option<String>, String> {
+        // Chrome exposes a synthetic ID for its default context in TargetInfo,
+        // but setDownloadBehavior accepts only the explicit context roster.
+        let contexts = self.isolated_context_ids().await?;
         let info = self
             .client
             .send_command(
@@ -2325,13 +2366,13 @@ impl BrowserManager {
                 None,
             )
             .await?;
-        if info["targetInfo"]["targetId"].as_str() != Some(target.as_str()) {
+        if info["targetInfo"]["targetId"].as_str() != Some(target) {
             return Err("Cannot identify the download's browser context".into());
         }
         let context = info["targetInfo"]["browserContextId"]
             .as_str()
-            .filter(|id| contexts.iter().any(|context| context.as_str() == Some(*id)));
-        self.configure_downloads(context).await
+            .filter(|id| contexts.iter().any(|context| context == id));
+        Ok(context.map(str::to_owned))
     }
 
     /// New contexts inherit an existing download setup. Opening a window in an

@@ -440,6 +440,7 @@ async fn handle_connection<S>(
     let mut buf_reader = BufReader::new(reader);
     let mut line = String::new();
     let mut queued = VecDeque::new();
+    let mut partial = Vec::new();
 
     loop {
         line.clear();
@@ -447,7 +448,16 @@ async fn handle_connection<S>(
             line = next;
             Ok(line.len())
         } else {
-            buf_reader.read_line(&mut line).await
+            match buf_reader.read_until(b'\n', &mut partial).await {
+                Ok(count) => match String::from_utf8(std::mem::take(&mut partial)) {
+                    Ok(text) => {
+                        line = text;
+                        Ok(count)
+                    }
+                    Err(_) => break,
+                },
+                Err(error) => Err(error),
+            }
         };
         match read {
             Ok(0) => break,
@@ -486,18 +496,28 @@ async fn handle_connection<S>(
                     .to_string();
 
                 let mut disconnected = false;
-                let response = match command_state(&state, &cmd, &playwright_operations).await {
+                let admitted = if action == "run_playwright" {
+                    tokio::select! {
+                        biased;
+                        _ = read_until_disconnect(&mut buf_reader, &mut queued, &mut partial) => break,
+                        admitted = command_state(&state, &cmd, &playwright_operations) => admitted,
+                    }
+                } else {
+                    command_state(&state, &cmd, &playwright_operations).await
+                };
+                let response = match admitted {
                     Ok(mut s) => {
                         let response = if action == "run_playwright" {
                             let execution = execute_command_received(&cmd, &mut s, received_at);
                             tokio::pin!(execution);
                             tokio::select! {
-                                response = &mut execution => response,
-                                _ = read_until_disconnect(&mut buf_reader, &mut queued) => {
+                                biased;
+                                _ = read_until_disconnect(&mut buf_reader, &mut queued, &mut partial) => {
                                     disconnected = true;
                                     let _stop = playwright_operations.interrupt(InterruptReason::CallerDisconnected);
                                     execution.await
                                 }
+                                response = &mut execution => response,
                             }
                         } else {
                             execute_command_received(&cmd, &mut s, received_at).await
@@ -540,18 +560,29 @@ async fn handle_connection<S>(
 async fn read_until_disconnect<R: tokio::io::AsyncRead + Unpin>(
     reader: &mut BufReader<R>,
     queued: &mut VecDeque<String>,
+    partial: &mut Vec<u8>,
 ) {
-    let mut bytes = queued.iter().map(String::len).sum::<usize>();
+    let mut bytes = queued.iter().map(String::len).sum::<usize>() + partial.len();
     loop {
-        let mut line = String::new();
-        match reader.read_line(&mut line).await {
-            Ok(0) | Err(_) => return,
-            Ok(count) => {
-                bytes += count;
-                if bytes > 2 * 1024 * 1024 {
-                    return;
-                }
-                queued.push_back(line);
+        let available = match reader.fill_buf().await {
+            Ok([]) | Err(_) => return,
+            Ok(bytes) => bytes,
+        };
+        let count = available
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .map_or(available.len(), |index| index + 1);
+        bytes += count;
+        if bytes > 2 * 1024 * 1024 {
+            return;
+        }
+        partial.extend_from_slice(&available[..count]);
+        let complete = partial.last() == Some(&b'\n');
+        reader.consume(count);
+        if complete {
+            match String::from_utf8(std::mem::take(partial)) {
+                Ok(line) => queued.push_back(line),
+                Err(_) => return,
             }
         }
     }
@@ -719,6 +750,293 @@ mod tests {
             .await
             .agent_error()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn disconnect_observer_preserves_partial_pipelined_input_when_canceled() {
+        let (mut client, server) = tokio::io::duplex(256);
+        let mut reader = BufReader::new(server);
+        let mut queued = VecDeque::new();
+        let mut partial = Vec::new();
+        client
+            .write_all(b"{\"action\":\"title\"}\n{\"action\":")
+            .await
+            .unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_millis(10),
+            read_until_disconnect(&mut reader, &mut queued, &mut partial)
+        )
+        .await
+        .is_err());
+        assert_eq!(queued.pop_front().unwrap(), "{\"action\":\"title\"}\n");
+        assert_eq!(partial, b"{\"action\":");
+        client.write_all(b"\"url\"}\n").await.unwrap();
+        drop(client);
+        read_until_disconnect(&mut reader, &mut queued, &mut partial).await;
+        assert_eq!(queued.pop_front().unwrap(), "{\"action\":\"url\"}\n");
+        assert!(partial.is_empty());
+    }
+
+    #[tokio::test]
+    async fn disconnected_queued_program_never_waits_for_or_interrupts_command_custody() {
+        let state = Arc::new(tokio::sync::Mutex::new(DaemonState::new()));
+        let held = state.lock().await;
+        let operations = held.playwright_operations.clone();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let task = tokio::spawn(handle_connection(
+            server,
+            state.clone(),
+            Arc::new(IdleActivity::new()),
+            None,
+            Arc::new(Notify::new()),
+            operations,
+        ));
+        client
+            .write_all(
+                b"{\"action\":\"run_playwright\",\"code\":\"return 1\",\"timeoutMs\":1000}\n",
+            )
+            .await
+            .unwrap();
+        drop(client);
+        tokio::time::timeout(Duration::from_millis(100), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(held.browser.is_none());
+    }
+
+    #[tokio::test]
+    #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
+    async fn e2e_playwright_takeover_and_caller_disconnect_settle_before_releasing_custody() {
+        use serde_json::json;
+        use tokio::io::DuplexStream;
+
+        async fn connect(
+            state: Arc<tokio::sync::Mutex<DaemonState>>,
+            operations: Operations,
+            command: Value,
+        ) -> (BufReader<DuplexStream>, tokio::task::JoinHandle<()>) {
+            let (mut client, server) = tokio::io::duplex(64 << 10);
+            let activity = Arc::new(IdleActivity::new());
+            let task = tokio::spawn(handle_connection(
+                server,
+                state,
+                activity,
+                None,
+                Arc::new(Notify::new()),
+                operations,
+            ));
+            client
+                .write_all(format!("{command}\n").as_bytes())
+                .await
+                .unwrap();
+            (BufReader::new(client), task)
+        }
+
+        async fn reply(reader: &mut BufReader<DuplexStream>) -> Value {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(10), reader.read_line(&mut line))
+                .await
+                .unwrap()
+                .unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+
+        async fn value(client: &CdpClient, session: &str, expression: &str) -> Value {
+            client
+                .send_command(
+                    "Runtime.evaluate",
+                    Some(json!({"expression":expression,"returnByValue":true})),
+                    Some(session),
+                )
+                .await
+                .unwrap()["result"]["value"]
+                .clone()
+        }
+
+        let mut initial = DaemonState::new();
+        let opened = Box::pin(execute_command_received(
+            &json!({"action":"navigate","url":"data:text/html,<title>Custody</title>"}),
+            &mut initial,
+            std::time::Instant::now(),
+        ))
+        .await;
+        assert_eq!(opened["success"], true, "{opened}");
+        let browser = initial.browser.as_ref().unwrap();
+        let client = browser.client.clone();
+        let session = browser.active_session_id().unwrap().to_owned();
+        let target = browser.active_target_id().unwrap().to_owned();
+        let operations = initial.playwright_operations.clone();
+        let state = Arc::new(tokio::sync::Mutex::new(initial));
+        let (mut program, program_task) = connect(state.clone(), operations.clone(), json!({"action":"run_playwright","timeoutMs":60000,"code":"await page.evaluate(() => {globalThis.holds={buttons:0,shift:false};addEventListener('pointerdown',e=>holds.buttons=e.buttons);addEventListener('pointerup',e=>holds.buttons=e.buttons);addEventListener('keydown',e=>holds.shift=e.shiftKey);addEventListener('keyup',e=>holds.shift=e.shiftKey)}); await page.mouse.move(40,40); await page.mouse.down(); await page.keyboard.down('Shift'); await page.evaluate(() => globalThis.programStarted = true); await page.waitForTimeout(60000);"})).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while value(&client, &session, "globalThis.programStarted").await != true {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let controller = uuid::Uuid::new_v4().to_string();
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 30000;
+        let (mut human, human_task) = connect(state.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"acquire","controllerId":controller,"expiresAt":expires})).await;
+        let acquired = reply(&mut human).await;
+        assert_eq!(acquired["success"], true, "{acquired}");
+        assert_eq!(
+            value(&client, &session, "globalThis.holds").await,
+            json!({"buttons":0,"shift":false})
+        );
+        assert_eq!(
+            reply(&mut program).await["code"],
+            "browser_operation_interrupted"
+        );
+        assert_eq!(
+            state
+                .lock()
+                .await
+                .browser
+                .as_ref()
+                .unwrap()
+                .active_target_id()
+                .unwrap(),
+            target
+        );
+        drop(human);
+        human_task.await.unwrap();
+        drop(program);
+        program_task.await.unwrap();
+        let (mut release, task) = connect(state.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"release","controllerId":controller})).await;
+        assert_eq!(reply(&mut release).await["success"], true);
+        drop(release);
+        task.await.unwrap();
+
+        let code = "const {spawn} = await import('node:child_process'); const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {stdio:'ignore'}); await page.evaluate(pid => {globalThis.childPid=pid;globalThis.ticks=0}, child.pid); for (;;) { await page.evaluate(() => globalThis.ticks++); await page.waitForTimeout(20); }";
+        let (mut observation, task) = connect(
+            state.clone(),
+            operations.clone(),
+            json!({"action":"snapshot"}),
+        )
+        .await;
+        assert_eq!(reply(&mut observation).await["success"], true);
+        drop(observation);
+        task.await.unwrap();
+        let (program, task) = connect(
+            state.clone(),
+            operations.clone(),
+            json!({"action":"run_playwright","timeoutMs":60000,"code":code}),
+        )
+        .await;
+        let child = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Some(pid) = value(&client, &session, "globalThis.childPid")
+                    .await
+                    .as_u64()
+                {
+                    break pid;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        drop(program);
+        tokio::time::timeout(Duration::from_secs(5), task)
+            .await
+            .unwrap()
+            .unwrap();
+        let ticks = value(&client, &session, "globalThis.ticks").await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(value(&client, &session, "globalThis.ticks").await, ticks);
+        #[cfg(target_os = "linux")]
+        {
+            let status = std::fs::read_to_string(format!("/proc/{child}/stat"));
+            assert!(
+                status.is_err()
+                    || status
+                        .unwrap()
+                        .rsplit_once(')')
+                        .unwrap()
+                        .1
+                        .split_whitespace()
+                        .next()
+                        == Some("Z"),
+                "The program's child remained executable after disconnect"
+            );
+        }
+        assert_eq!(
+            state
+                .lock()
+                .await
+                .browser
+                .as_ref()
+                .unwrap()
+                .active_target_id()
+                .unwrap(),
+            target
+        );
+
+        // Takeover during a mutating loop: the loop is stopped and settled
+        // before control is granted, and no program input lands afterwards.
+        let (mut observation, task) = connect(
+            state.clone(),
+            operations.clone(),
+            json!({"action":"snapshot"}),
+        )
+        .await;
+        assert_eq!(reply(&mut observation).await["success"], true);
+        drop(observation);
+        task.await.unwrap();
+        let (mut program, program_task) = connect(state.clone(), operations.clone(), json!({"action":"run_playwright","timeoutMs":60000,"code":"await page.evaluate(() => {globalThis.ticks=0;globalThis.typed='';addEventListener('keydown',e=>typed+=e.key)}); for (;;) { await page.keyboard.press('x'); await page.evaluate(() => globalThis.ticks++); await page.waitForTimeout(20); }"})).await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while value(&client, &session, "globalThis.ticks").await.as_u64() < Some(3) {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let controller = uuid::Uuid::new_v4().to_string();
+        let (mut human, human_task) = connect(state.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"acquire","controllerId":controller,"expiresAt":expires})).await;
+        let acquired = reply(&mut human).await;
+        assert_eq!(acquired["success"], true, "{acquired}");
+        let interrupted = reply(&mut program).await;
+        assert_eq!(
+            interrupted["code"], "browser_operation_interrupted",
+            "{interrupted}"
+        );
+        assert_eq!(interrupted["data"]["executionStopped"], true);
+        assert_eq!(interrupted["data"]["effectsMayHaveOccurred"], true);
+        let settled = value(&client, &session, "({ticks, typed})").await;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(value(&client, &session, "({ticks, typed})").await, settled);
+        assert!(
+            settled["typed"].as_str().unwrap().contains('x'),
+            "{settled}"
+        );
+        drop(human);
+        human_task.await.unwrap();
+        drop(program);
+        program_task.await.unwrap();
+        let (mut release, task) = connect(state.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"release","controllerId":controller})).await;
+        assert_eq!(reply(&mut release).await["success"], true);
+        drop(release);
+        task.await.unwrap();
+        assert_eq!(
+            state
+                .lock()
+                .await
+                .browser
+                .as_ref()
+                .unwrap()
+                .active_target_id()
+                .unwrap(),
+            target
+        );
+        close_current_browser(&mut *state.lock().await)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -2854,6 +2854,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
     if let Some(ref server) = state.stream_server {
         let mut broadcast_cmd;
         let has_internal_fields = cmd.get("plugins").is_some()
+            || cmd.get(super::playwright::ENVIRONMENT_FIELD).is_some()
             || cmd.get("pinTab").is_some()
             || cmd.get("restoreKey").is_some()
             || cmd.get("restoreSave").is_some()
@@ -2864,6 +2865,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
             broadcast_cmd = cmd.clone();
             if let Some(obj) = broadcast_cmd.as_object_mut() {
                 obj.remove("plugins");
+                obj.remove(super::playwright::ENVIRONMENT_FIELD);
                 obj.remove("pinTab");
                 obj.remove("restoreKey");
                 obj.remove("restoreSave");
@@ -5832,7 +5834,7 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     };
 
     state.ref_map.clear();
-    let tree = snapshot::take_snapshot(
+    let observation = snapshot::take_snapshot_with_projection(
         &mgr.client,
         &session_id,
         &options,
@@ -5856,7 +5858,9 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         })
         .collect();
 
-    Ok(json!({ "snapshot": tree, "origin": url, "refs": refs }))
+    Ok(
+        json!({ "snapshot": observation.snapshot, "origin": url, "refs": refs, "projection": observation.projection }),
+    )
 }
 
 async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -10991,28 +10995,34 @@ async fn handle_waitfordownload(cmd: &Value, state: &DaemonState) -> Result<Valu
 }
 
 async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let isolated = match cmd.get("isolated") {
+        None => false,
+        Some(Value::Bool(value)) => *value,
+        _ => return Err("isolated must be a boolean".into()),
+    };
     let (tab_id, session_id) = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
 
-        // Create a new browser context
-        let context_result = mgr
-            .client
-            .send_command_no_params("Target.createBrowserContext", None)
-            .await?;
-        let context_id = context_result
-            .get("browserContextId")
-            .and_then(|v| v.as_str())
-            .ok_or("Failed to create browser context")?
-            .to_string();
-        mgr.inherit_downloads(&context_id).await?;
+        let mut target = json!({ "url": "about:blank", "newWindow": true });
+        // An ordinary window shares the current profile. Isolation is an
+        // explicit native capability and never requires copying credentials.
+        if isolated {
+            let context_result = mgr
+                .client
+                .send_command_no_params("Target.createBrowserContext", None)
+                .await?;
+            let context_id = context_result
+                .get("browserContextId")
+                .and_then(|v| v.as_str())
+                .ok_or("Failed to create browser context")?
+                .to_string();
+            mgr.inherit_downloads(&context_id).await?;
+            target["browserContextId"] = json!(context_id);
+        }
 
         let create_result: super::cdp::types::CreateTargetResult = mgr
             .client
-            .send_command_typed(
-                "Target.createTarget",
-                &json!({ "url": "about:blank", "browserContextId": context_id }),
-                None,
-            )
+            .send_command_typed("Target.createTarget", &target, None)
             .await?;
 
         let attach: super::cdp::types::AttachToTargetResult = mgr
@@ -11075,6 +11085,7 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
     Ok(json!({
         "tabId": super::browser::format_tab_id(tab_id),
         "total": total,
+        "isolated": isolated,
     }))
 }
 
@@ -13154,9 +13165,13 @@ fn error_response(id: &str, error: &str) -> Value {
     } else if let Some((code, _)) = error.split_once(": ") {
         if code.starts_with("webmcp_")
             || code == "browser_control_outcome_unknown"
+            || code == "browser_controlled_by_user"
             || code.starts_with("browser_operation_")
         {
             resp["code"] = json!(code);
+            if code == "browser_operation_interrupted" {
+                resp["data"] = json!({"interruptedBy":"human","executionStopped":true,"effectsMayHaveOccurred":true});
+            }
         }
     }
     resp

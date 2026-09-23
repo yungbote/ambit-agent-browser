@@ -371,7 +371,8 @@ agent-browser tab new [url]                    # New tab (optionally with URL)
 agent-browser tab new --label docs [url]       # New tab with a user-assigned label
 agent-browser tab <t<N>|label>                 # Switch to a tab by id or label
 agent-browser tab close [t<N>|label]           # Close a tab (defaults to active)
-agent-browser window new                       # New window
+agent-browser window new                       # New window in the persistent profile
+agent-browser window new --isolated            # Separate native cookie context
 ```
 
 Tab ids are stable strings of the form `t1`, `t2`, `t3`. They're never reused within a session, so scripts and agents can keep referring to the same tab even after other tabs are opened or closed. Positional integers like `tab 2` are **not** accepted; the `t` prefix disambiguates handles from indices and mirrors the `@e1` convention used for element refs.
@@ -2037,8 +2038,12 @@ Apache-2.0
 
 ### Playwright in the existing browser
 
+Ordinary `window new` now shares the browser's persistent profile and authentication state. Use `window new --isolated` (MCP `isolated: true`) for separate native cookies. Existing isolated windows are retained without migration or cookie copying. Playwright cannot faithfully adopt those pre-existing contexts, so attachment is refused while they are open; native browser tools remain available. Close those isolated windows before returning to Playwright. New contexts created within a Playwright program retain normal Playwright semantics.
+
+Linux private window streaming uses ANGLE software GLES for WebGL by default. Explicit browser arguments override that preset, and the existing `--webgpu` preset keeps its backend. A fresh driver-owned profile opens `about:blank`; retained profiles and caller-selected startup arguments keep their existing startup behavior.
+
 `agent-browser run-playwright --stdin` runs an async JavaScript body with the actual `page`, `context`, and `browser` from the current native Chromium session. Return a JSON-serializable value. `--target <id>` selects another existing CDP target; `--timeout-ms <ms>` bounds execution to 1 through 120000 milliseconds (default 30000). The MCP equivalent is `agent_browser_run_playwright` with `code`, optional `targetId`, and optional `timeoutMs`.
 
 The Unix host supplies Node and installed `playwright-core` (1.62.1 supports the required `noDefaults` attachment). `AGENT_BROWSER_PLAYWRIGHT_MODULE` selects its absolute `index.mjs`; `AGENT_BROWSER_NODE_PATH` selects Node and `AGENT_BROWSER_PLAYWRIGHT_RUNNER` optionally selects the installed runner module. The binary includes the runner by default. No packages or browsers are downloaded during execution.
 
-The same profile, tabs, native window and human-control owner remain in use. Actual Playwright mouse input goes through the native display owner without simulated gliding; DOM evaluation does not create pointer activity. Programs return up to 2 MiB of JSON and 64 KiB of explicitly bounded console diagnostics. `process.stdout` is reserved for the runner result. The native owner cancels and settles the operation on human takeover, caller disconnect or timeout without closing the retained Chrome process. A failed or interrupted program may already have performed external effects and must never be replayed automatically. Existing workspace isolation remains the security boundary. See [the execution contract](skill-data/core/references/playwright.md).
+The same profile, tabs, native window and human-control owner remain in use. Actual Playwright mouse input goes through the native display owner without simulated gliding; DOM evaluation does not create pointer activity. Programs return up to 2 MiB of JSON and 64 KiB of explicitly bounded console diagnostics. The native owner cancels and settles the operation on human takeover, caller disconnect or timeout without closing the retained Chrome process. A failed or interrupted program may already have performed external effects and must never be replayed automatically. Existing workspace isolation remains the security boundary. See [the execution contract](skill-data/core/references/playwright.md).
