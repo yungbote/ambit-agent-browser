@@ -8,6 +8,10 @@ use super::cdp::types::{
 };
 use super::element::{resolve_ax_session, RefMap};
 
+mod projection;
+pub use projection::SnapshotObservation;
+use projection::{FrameProjection, ProjectedText, ProjectionCollector};
+
 const INTERACTIVE_ROLES: &[&str] = &[
     "button",
     "link",
@@ -221,6 +225,56 @@ pub async fn take_snapshot(
     frame_id: Option<&str>,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<String, String> {
+    let mut collector = ProjectionCollector::new(false, false);
+    let rendered = take_snapshot_internal(
+        client,
+        session_id,
+        options,
+        ref_map,
+        frame_id,
+        iframe_sessions,
+        &mut FrameProjection::new(&mut collector, None),
+    )
+    .await?;
+    Ok(rendered.text)
+}
+
+/// Capture the same text and refs as `take_snapshot`, with a bounded, optional
+/// producer-authored projection. Unavailable projection never truncates text or
+/// samples nodes. IDs and ranges belong only to this exact snapshot's SHA-256;
+/// they are not durable selectors and do not extend current ref authority.
+pub async fn take_snapshot_with_projection(
+    client: &CdpClient,
+    session_id: &str,
+    options: &SnapshotOptions,
+    ref_map: &mut RefMap,
+    frame_id: Option<&str>,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<SnapshotObservation, String> {
+    let mut collector =
+        ProjectionCollector::new(true, frame_id.is_some() || options.selector.is_some());
+    let rendered = take_snapshot_internal(
+        client,
+        session_id,
+        options,
+        ref_map,
+        frame_id,
+        iframe_sessions,
+        &mut FrameProjection::new(&mut collector, None),
+    )
+    .await?;
+    Ok(collector.finish(rendered, options))
+}
+
+async fn take_snapshot_internal(
+    client: &CdpClient,
+    session_id: &str,
+    options: &SnapshotOptions,
+    ref_map: &mut RefMap,
+    frame_id: Option<&str>,
+    iframe_sessions: &HashMap<String, String>,
+    projection: &mut FrameProjection<'_>,
+) -> Result<ProjectedText, String> {
     client
         .send_command_no_params("DOM.enable", Some(session_id))
         .await?;
@@ -317,6 +371,7 @@ pub async fn take_snapshot(
             Some(effective_session_id),
         )
         .await?;
+    projection.collector.observed_frames += 1;
 
     let (mut tree_nodes, root_indices) = build_tree(&ax_tree.nodes);
 
@@ -497,9 +552,17 @@ pub async fn take_snapshot(
         }
     }
 
-    let mut output = String::new();
+    let mut output = ProjectedText::default();
     for &root_idx in &effective_roots {
-        render_tree(&tree_nodes, root_idx, 0, &mut output, options);
+        render_tree(
+            &tree_nodes,
+            root_idx,
+            0,
+            projection.parent,
+            &mut output,
+            options,
+            projection,
+        );
     }
 
     // Recurse into child iframes: for each Iframe node with a backend_node_id,
@@ -507,81 +570,95 @@ pub async fn take_snapshot(
     // We only recurse from the main frame (frame_id == None) to avoid
     // unbounded depth; nested iframes within iframes are not expanded.
     if frame_id.is_none() {
-        let mut iframe_snapshots: Vec<(String, String)> = Vec::new(); // (ref_id, child_snapshot)
-        for node in tree_nodes.iter() {
+        let mut iframe_snapshots: Vec<(String, ProjectedText)> = Vec::new();
+        for (idx, node) in tree_nodes.iter().enumerate() {
             if node.role != "Iframe" || !node.has_ref {
                 continue;
             }
             let Some(bid) = node.backend_node_id else {
+                projection.collector.unavailable_frames += 1;
                 continue;
             };
             let ref_id = node.ref_id.as_deref().unwrap_or("");
             if let Ok(child_fid) = resolve_iframe_frame_id(client, session_id, bid).await {
                 // Snapshot the child frame; errors are silently ignored
                 // (e.g. cross-origin iframes)
-                if let Ok(child_text) = Box::pin(take_snapshot(
+                let owner = projection.rendered_nodes.get(&idx).copied();
+                let child = Box::pin(take_snapshot_internal(
                     client,
                     session_id,
                     options,
                     ref_map,
                     Some(&child_fid),
                     iframe_sessions,
+                    &mut FrameProjection::new(projection.collector, owner),
                 ))
-                .await
-                {
-                    if !child_text.is_empty()
-                        && child_text != "(empty page)"
-                        && child_text != "(no interactive elements)"
+                .await;
+                if let Ok(child_text) = child {
+                    if !child_text.text.is_empty()
+                        && child_text.text != "(empty page)"
+                        && child_text.text != "(no interactive elements)"
                     {
+                        if owner.is_none() {
+                            projection.collector.unknown_ancestry = true;
+                        }
                         iframe_snapshots.push((ref_id.to_string(), child_text));
                     }
+                } else {
+                    projection.collector.unavailable_frames += 1;
                 }
+            } else {
+                projection.collector.unavailable_frames += 1;
             }
         }
 
         // Insert each child snapshot after its Iframe line in the output
         for (ref_id, child_text) in iframe_snapshots {
             let marker = format!("[ref={}]", ref_id);
-            if let Some(pos) = output.find(&marker) {
+            if let Some(pos) = output.text.find(&marker) {
                 // Find the end of the Iframe line
-                let line_end = output[pos..]
+                let line_end = output.text[pos..]
                     .find('\n')
                     .map(|i| pos + i)
-                    .unwrap_or(output.len());
+                    .unwrap_or(output.text.len());
                 // Determine the indent of the Iframe line
-                let line_start = output[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
-                let iframe_line = &output[line_start..line_end];
+                let line_start = output.text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
+                let iframe_line = &output.text[line_start..line_end];
                 let iframe_indent = iframe_line.len() - iframe_line.trim_start().len();
                 let child_indent = iframe_indent + 2; // one level deeper
                 let prefix = " ".repeat(child_indent);
 
-                let indented_child: String = child_text
-                    .lines()
-                    .map(|line| format!("{}{}\n", prefix, line))
-                    .collect();
+                let indented_child = child_text.lines(None, &prefix, true);
 
                 // Ensure there's a newline to insert after
-                if line_end == output.len() {
-                    output.push('\n');
-                    output.push_str(&indented_child);
+                if line_end == output.text.len() {
+                    output.append("\n", None);
+                    output.insert(output.text.len(), &indented_child);
                 } else {
-                    output.insert_str(line_end + 1, &indented_child);
+                    output.insert(line_end + 1, &indented_child);
                 }
             }
         }
+    } else {
+        projection.collector.unexpanded_frames += tree_nodes
+            .iter()
+            .filter(|node| node.role == "Iframe")
+            .count();
     }
 
     if options.compact {
-        output = compact_tree(&output, options.interactive);
+        let keep = compact_line_mask(&output.text.lines().collect::<Vec<_>>());
+        output = output.lines(Some(&keep), "", false);
     }
 
-    let trimmed = output.trim().to_string();
+    let mut trimmed = output.trim();
 
-    if trimmed.is_empty() {
+    if trimmed.text.is_empty() {
         if options.interactive {
-            return Ok("(no interactive elements)".to_string());
+            trimmed.append("(no interactive elements)", None);
+        } else {
+            trimmed.append("(empty page)", None);
         }
-        return Ok("(empty page)".to_string());
     }
 
     Ok(trimmed)
@@ -1076,8 +1153,10 @@ fn render_tree(
     nodes: &[TreeNode],
     idx: usize,
     indent: usize,
-    output: &mut String,
+    parent: Option<usize>,
+    output: &mut ProjectedText,
     options: &SnapshotOptions,
+    projection: &mut FrameProjection<'_>,
 ) {
     let node = &nodes[idx];
 
@@ -1088,7 +1167,7 @@ fn render_tree(
     {
         // Ignored node -- still render children
         for &child in &node.children {
-            render_tree(nodes, child, indent, output, options);
+            render_tree(nodes, child, indent, parent, output, options, projection);
         }
         return;
     }
@@ -1104,7 +1183,7 @@ fn render_tree(
     // Skip root WebArea wrapper
     if role == "RootWebArea" || role == "WebArea" {
         for &child in &node.children {
-            render_tree(nodes, child, indent, output, options);
+            render_tree(nodes, child, indent, parent, output, options, projection);
         }
         return;
     }
@@ -1112,7 +1191,7 @@ fn render_tree(
     if options.interactive && !node.has_ref {
         // In interactive mode, skip non-interactive but render children
         for &child in &node.children {
-            render_tree(nodes, child, indent, output, options);
+            render_tree(nodes, child, indent, parent, output, options, projection);
         }
         return;
     }
@@ -1194,20 +1273,34 @@ fn render_tree(
         }
     }
 
-    output.push_str(&line);
-    output.push('\n');
+    let owner = projection.record(idx, node, unescaped_display_name, parent);
+    output.append(&line, owner);
+    output.append("\n", owner);
 
     for &child in &node.children {
-        render_tree(nodes, child, indent + 1, output, options);
+        render_tree(nodes, child, indent + 1, owner, output, options, projection);
     }
 }
 
+#[cfg(test)]
 fn compact_tree(tree: &str, interactive: bool) -> String {
     let lines: Vec<&str> = tree.lines().collect();
-    if lines.is_empty() {
-        return String::new();
-    }
+    let keep = compact_line_mask(&lines);
 
+    let output = lines
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| keep[*i])
+        .map(|(_, line)| *line)
+        .collect::<Vec<_>>()
+        .join("\n");
+    if output.trim().is_empty() && interactive && !lines.is_empty() {
+        return "(no interactive elements)".to_string();
+    }
+    output
+}
+
+fn compact_line_mask(lines: &[&str]) -> Vec<bool> {
     let mut keep = vec![false; lines.len()];
 
     for (i, line) in lines.iter().enumerate() {
@@ -1227,18 +1320,7 @@ fn compact_tree(tree: &str, interactive: bool) -> String {
         }
     }
 
-    let result: Vec<&str> = lines
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| keep[*i])
-        .map(|(_, line)| *line)
-        .collect();
-
-    let output = result.join("\n");
-    if output.trim().is_empty() && interactive {
-        return "(no interactive elements)".to_string();
-    }
-    output
+    keep
 }
 
 fn count_indent(line: &str) -> usize {

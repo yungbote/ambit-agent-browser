@@ -1,0 +1,81 @@
+{
+  "snapshot": "- form \"設定\"\n  - checkbox \"Accept\" [checked=mixed, expanded=false, required, ref=e1]\n  - Iframe \"Child\" [ref=e2]\n    - button \"保存\" [ref=e3]",
+  "projection": {
+    "schemaVersion": 1,
+    "snapshotSha256": "e909943619a5fd412e67363e74c53c6e81b0e021b0031737b5265096835fe2b4",
+    "sourceByteLength": 146,
+    "coverage": {
+      "status": "complete",
+      "options": {
+        "selectorApplied": false,
+        "interactive": false,
+        "compact": false,
+        "depth": null,
+        "urls": false
+      },
+      "observedFrameCount": 2,
+      "unavailableFrameCount": 0,
+      "unexpandedFrameCount": 0,
+      "unknownAncestry": false
+    },
+    "nodes": [
+      {
+        "id": "n0",
+        "parentId": null,
+        "sourceByteRange": {
+          "start": 0,
+          "end": 16
+        },
+        "role": "form",
+        "name": "設定",
+        "states": {},
+        "frameId": "f0"
+      },
+      {
+        "id": "n1",
+        "parentId": "n0",
+        "ref": "e1",
+        "sourceByteRange": {
+          "start": 16,
+          "end": 88
+        },
+        "role": "checkbox",
+        "name": "Accept",
+        "states": {
+          "checked": "mixed",
+          "disabled": false,
+          "required": true,
+          "selected": false,
+          "expanded": false
+        },
+        "frameId": "f0"
+      },
+      {
+        "id": "n2",
+        "parentId": "n0",
+        "ref": "e2",
+        "sourceByteRange": {
+          "start": 88,
+          "end": 116
+        },
+        "role": "Iframe",
+        "name": "Child",
+        "states": {},
+        "frameId": "f0"
+      },
+      {
+        "id": "n3",
+        "parentId": "n2",
+        "ref": "e3",
+        "sourceByteRange": {
+          "start": 116,
+          "end": 146
+        },
+        "role": "button",
+        "name": "保存",
+        "states": {},
+        "frameId": "f1"
+      }
+    ]
+  }
+}
