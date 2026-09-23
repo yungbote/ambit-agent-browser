@@ -2248,6 +2248,10 @@ mod tests {
     /// every other managed flag stays byte-identical and in order.
     #[test]
     fn sign_in_launch_drops_only_the_automation_switch() {
+        // Both launches are built under one environment: the dev-shm
+        // fallback reads `CI`, which other tests set under the same guard.
+        let guard = crate::test_utils::EnvGuard::new(&["CI"]);
+        guard.remove("CI");
         let automation = LaunchOptions {
             window_stream: true,
             require_sandbox: true,
