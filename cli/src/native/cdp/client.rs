@@ -123,6 +123,8 @@ pub struct CdpClient {
     native_pointer_enabled: Arc<AtomicBool>,
     native_pointer_lock: Arc<Mutex<()>>,
     activity_owner: std::sync::OnceLock<ActivityOwner>,
+    /// Becomes true, or loses its sender, once the reader has stopped.
+    closed: tokio::sync::watch::Receiver<bool>,
     _reader_handle: tokio::task::JoinHandle<()>,
     _keepalive_handle: tokio::task::JoinHandle<()>,
 }
@@ -226,6 +228,18 @@ impl CdpClient {
         self._keepalive_handle.abort();
     }
 
+    /// Resolves once the reader has stopped: the browser closed or broke the
+    /// WebSocket, or this attachment was disconnected. Replies and events
+    /// received before that remain available to raw subscribers.
+    pub(crate) async fn closed(&self) {
+        let mut closed = self.closed.clone();
+        while !*closed.borrow_and_update() {
+            if closed.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
     pub async fn connect(url: &str) -> Result<Self, String> {
         Self::connect_with_headers(url, None).await
     }
@@ -289,6 +303,7 @@ impl CdpClient {
 
         // Notify used to stop the keepalive task when the reader loop exits.
         let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        let closed = cancel_rx.clone();
 
         let reader_handle = tokio::spawn(async move {
             while let Some(msg) = ws_rx.next().await {
@@ -542,6 +557,7 @@ impl CdpClient {
             native_pointer_enabled: Arc::new(AtomicBool::new(false)),
             native_pointer_lock: Arc::new(Mutex::new(())),
             activity_owner: std::sync::OnceLock::new(),
+            closed,
             _reader_handle: reader_handle,
             _keepalive_handle: keepalive_handle,
         })
@@ -594,16 +610,58 @@ impl CdpClient {
         session_id: Option<&str>,
         source: InputSource,
     ) -> Result<PendingCommand, String> {
-        let mut observation = session_id.and_then(|session| {
+        let observation = session_id.and_then(|session| {
             activity::from_command(method, params.as_ref()?).map(|value| {
                 self.observe_activity(value, session, self.page_generation(session), source)
             })
         });
+        let id = self.reserve_command_id();
+        self.enqueue_observed(id, method, params, session_id, observation)
+            .await
+    }
+
+    /// Allocate the id of a command before sending it, so a raw subscriber
+    /// can correlate its reply with no race against the reply itself.
+    pub(crate) fn reserve_command_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    /// Send one command under an id from [`reserve_command_id`]. Every other
+    /// effect of this connection (page generations, pointer measurement for
+    /// input) applies exactly as for [`enqueue_command`].
+    pub(crate) async fn enqueue_reserved_command(
+        &self,
+        id: u64,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+    ) -> Result<PendingCommand, String> {
+        let observation = session_id.and_then(|session| {
+            activity::from_command(method, params.as_ref()?).map(|value| {
+                self.observe_activity(
+                    value,
+                    session,
+                    self.page_generation(session),
+                    InputSource::Agent,
+                )
+            })
+        });
+        self.enqueue_observed(id, method, params, session_id, observation)
+            .await
+    }
+
+    async fn enqueue_observed(
+        &self,
+        id: u64,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        mut observation: Option<ActivityObservation>,
+    ) -> Result<PendingCommand, String> {
         let reset_page = (method == "Emulation.setDeviceMetricsOverride"
             || method == "Emulation.clearDeviceMetricsOverride")
             .then(|| session_id.map(String::from))
             .flatten();
-        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let pointer_guard = if method == "Input.dispatchMouseEvent"
             && self.native_pointer_enabled.load(Ordering::Acquire)
         {

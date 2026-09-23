@@ -2,6 +2,7 @@
 //! session identities. Actual input alone joins the existing native owner;
 //! DOM evaluation never manufactures pointer movement or user-input events.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -159,22 +160,45 @@ async fn serve(
         }
         Ok::<_, String>(())
     });
-    let mut events = client.subscribe_raw();
-    let event_output = outgoing.clone();
+    // Program command ids, by the reserved browser command id carrying each.
+    let forwarded = Arc::new(std::sync::Mutex::new(HashMap::<u64, Value>::new()));
+    // One reader forwards the browser's replies and events in the order the
+    // browser sent them. Playwright registers listeners while handling some
+    // replies, so a reply that overtakes or trails its surrounding events
+    // loses them (for example, the main execution context).
+    let mut browser = client.subscribe_raw();
+    let replies = forwarded.clone();
+    let browser_output = outgoing.clone();
+    let connection = client.clone();
     tasks.spawn(async move {
         loop {
-            let event = events
-                .recv()
+            let message = tokio::select! {
+                biased;
+                message = browser.recv() => message
+                    .map_err(|_| "The Playwright protocol event stream was interrupted.".to_string())?,
+                _ = connection.closed() => {
+                    return Err("The browser connection closed.".to_string());
+                }
+            };
+            let mut value: Value =
+                serde_json::from_str(&message.text).map_err(|error| error.to_string())?;
+            let text = match value.get("id") {
+                None => message.text,
+                Some(id) => {
+                    let program = id
+                        .as_u64()
+                        .and_then(|id| replies.lock().unwrap().remove(&id));
+                    // Replies to the operation's own measurement commands
+                    // are not the program's.
+                    let Some(program) = program else { continue };
+                    value["id"] = program;
+                    value.to_string()
+                }
+            };
+            browser_output
+                .send(Message::Text(text))
                 .await
-                .map_err(|_| "The Playwright protocol event stream was interrupted.".to_string())?;
-            let value: Value =
-                serde_json::from_str(&event.text).map_err(|error| error.to_string())?;
-            if value.get("id").is_none() {
-                event_output
-                    .send(Message::Text(event.text))
-                    .await
-                    .map_err(|_| "Playwright transport closed".to_string())?;
-            }
+                .map_err(|_| "Playwright transport closed".to_string())?;
         }
     });
     // One input worker preserves wire order even when Playwright pipelines a
@@ -220,11 +244,14 @@ async fn serve(
                     if inputs.try_send(command).is_err() { break Err("Too many pending Playwright input events.".into()); }
                 } else {
                     if tasks.len() >= 258 { break Err("Too many pending Playwright protocol commands.".into()); }
+                    let Some(program) = command.get("id").cloned() else { break Err("Missing Playwright protocol id.".into()); };
+                    let id = client.reserve_command_id();
+                    forwarded.lock().unwrap().insert(id, program);
                     let client = client.clone();
                     let outgoing = outgoing.clone();
+                    let forwarded = forwarded.clone();
                     tasks.spawn(async move {
-                        let response = protocol_response(&command, &client).await;
-                        outgoing.send(Message::Text(response.to_string())).await.map_err(|_| "Playwright transport closed".to_string())
+                        forward_command(id, command, &client, &forwarded, &outgoing).await
                     });
                 }
             }
@@ -249,37 +276,46 @@ async fn serve(
     outcome
 }
 
-async fn protocol_response(command: &Value, client: &CdpClient) -> Value {
-    let mut response = json!({ "id": command["id"] });
-    if let Some(session) = command.get("sessionId") {
-        response["sessionId"] = session.clone();
-    }
-    let result = async {
-        let mut pending = client
-            .enqueue_command(
-                command["method"].as_str().unwrap(),
-                command.get("params").cloned(),
-                command["sessionId"].as_str(),
-            )
-            .await?;
-        pending.acknowledgment().await
-    }
-    .await;
-    match result {
-        Ok(message) => {
-            if let Some(error) = message.error {
-                response["error"] =
-                    json!({ "code": error.code.unwrap_or(-32000), "message": error.message });
-                if let Some(data) = error.data {
-                    response["error"]["data"] = json!(data);
-                }
-            } else {
-                response["result"] = message.result.unwrap_or_else(|| json!({}));
+/// Send one program command under its reserved id. The ordered reader
+/// forwards the browser's reply; this task holds the pending entry until
+/// then so the connection's own reply effects still apply. A command that
+/// could not be sent is answered here, and a lost connection ends the
+/// transport instead of leaving the program waiting.
+async fn forward_command(
+    id: u64,
+    command: Value,
+    client: &CdpClient,
+    forwarded: &std::sync::Mutex<HashMap<u64, Value>>,
+    outgoing: &mpsc::Sender<Message>,
+) -> Result<(), String> {
+    let sent = client
+        .enqueue_reserved_command(
+            id,
+            command["method"].as_str().unwrap(),
+            command.get("params").cloned(),
+            command["sessionId"].as_str(),
+        )
+        .await;
+    match sent {
+        Ok(mut pending) => pending
+            .acknowledgment()
+            .await
+            .map(|_| ())
+            .map_err(|_| "The browser connection closed.".to_string()),
+        Err(error) => {
+            let Some(program) = forwarded.lock().unwrap().remove(&id) else {
+                return Ok(());
+            };
+            let mut reply = json!({ "id": program, "error": { "code": -32000, "message": error } });
+            if let Some(session) = command.get("sessionId") {
+                reply["sessionId"] = session.clone();
             }
+            outgoing
+                .send(Message::Text(reply.to_string()))
+                .await
+                .map_err(|_| "Playwright transport closed".to_string())
         }
-        Err(error) => response["error"] = json!({ "code": -32000, "message": error }),
     }
-    response
 }
 
 async fn input_response(
@@ -423,6 +459,82 @@ mod tests {
             json!({"type":"input_keyboard","eventType":"keyDown","key":"A","code":"KeyA","text":"A","modifiers":8,"windowsVirtualKeyCode":65})
         );
     }
+    /// Playwright registers context listeners while handling a reply, so a
+    /// reply must never overtake or trail events the browser sent around it.
+    #[tokio::test]
+    async fn program_receives_replies_and_events_in_browser_order() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = upstream.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            loop {
+                let text = match socket.next().await {
+                    Some(Ok(Message::Text(text))) => text,
+                    Some(Ok(_)) => continue,
+                    _ => break,
+                };
+                let command: Value = serde_json::from_str(&text).unwrap();
+                let n = &command["params"]["n"];
+                for message in [
+                    json!({"method":"Test.before","params":{"n":n},"sessionId":"S"}),
+                    json!({"id":command["id"],"result":{"n":n},"sessionId":"S"}),
+                    json!({"method":"Test.after","params":{"n":n},"sessionId":"S"}),
+                ] {
+                    socket
+                        .send(Message::Text(message.to_string()))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let client = Arc::new(
+            CdpClient::connect(&format!("ws://{address}"))
+                .await
+                .unwrap(),
+        );
+        let mut tunnel = Tunnel::start(client, Arc::new(Mutex::new(BrowserControl::default())))
+            .await
+            .unwrap();
+        let (mut program, _) = tokio_tungstenite::connect_async(tunnel.endpoint())
+            .await
+            .unwrap();
+        const COMMANDS: u64 = 200;
+        for n in 0..COMMANDS {
+            let command =
+                json!({"id":1000 + n,"method":"Test.command","params":{"n":n},"sessionId":"S"});
+            program
+                .send(Message::Text(command.to_string()))
+                .await
+                .unwrap();
+        }
+        let mut received = Vec::new();
+        while received.len() < 3 * COMMANDS as usize {
+            let message = tokio::time::timeout(Duration::from_secs(10), program.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let Message::Text(text) = message {
+                received.push(serde_json::from_str::<Value>(&text).unwrap());
+            }
+        }
+        let expected: Vec<Value> = (0..COMMANDS)
+            .flat_map(|n| {
+                [
+                    json!({"method":"Test.before","params":{"n":n},"sessionId":"S"}),
+                    json!({"id":1000 + n,"result":{"n":n},"sessionId":"S"}),
+                    json!({"method":"Test.after","params":{"n":n},"sessionId":"S"}),
+                ]
+            })
+            .collect();
+        assert_eq!(received, expected);
+        program.close(None).await.unwrap();
+        tunnel.finish().await.unwrap();
+        drop(tunnel);
+        server.abort();
+    }
+
     #[tokio::test]
     async fn browser_origins_and_foreign_paths_cannot_consume_the_native_connection() {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;
