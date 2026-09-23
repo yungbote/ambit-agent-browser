@@ -994,6 +994,30 @@ pub async fn launch_chrome(options: LaunchOptions) -> Result<ChromeProcess, Stri
         .map_err(|e| format!("Chrome launch task failed: {}", e))?
 }
 
+/// Launch Chrome, canceling a launch that is still running at `deadline`.
+/// Unlike dropping the future, the cancellation is awaited: when this
+/// returns, a canceled launch has already stopped the browser it started, so
+/// its profile is free for whoever launches into it next.
+pub(crate) async fn launch_chrome_by(
+    options: LaunchOptions,
+    deadline: tokio::time::Instant,
+) -> Result<ChromeProcess, String> {
+    let canceled = Arc::new(AtomicBool::new(false));
+    let _cancel_on_drop = CancelLaunchOnDrop(canceled.clone());
+    let mut launch = tokio::task::spawn_blocking({
+        let canceled = canceled.clone();
+        move || launch_chrome_blocking(&options, &canceled)
+    });
+    let finished = tokio::select! {
+        finished = &mut launch => finished,
+        _ = tokio::time::sleep_until(deadline) => {
+            canceled.store(true, Ordering::Relaxed);
+            launch.await
+        }
+    };
+    finished.map_err(|e| format!("Chrome launch task failed: {}", e))?
+}
+
 fn launch_chrome_blocking(
     options: &LaunchOptions,
     canceled: &AtomicBool,
@@ -2364,7 +2388,8 @@ mod tests {
             },
         );
         process.devtools_url = Some("ws://127.0.0.1:1/devtools/browser/test".into());
-        process.temp_user_data_dir = Some(Arc::new(TemporaryBrowserDirectory { path: dir.clone() }));
+        process.temp_user_data_dir =
+            Some(Arc::new(TemporaryBrowserDirectory { path: dir.clone() }));
         process.temp_nss_home = Some(nss.clone());
         process.xvfb = Some(display.clone());
 
@@ -2377,7 +2402,10 @@ mod tests {
         assert_eq!(profile.directory.path, dir);
         assert_eq!(profile.nss_home.as_ref().unwrap().path(), nss.path());
         assert_eq!(
-            resolve_prepared_nss_home(&relaunch).unwrap().unwrap().path(),
+            resolve_prepared_nss_home(&relaunch)
+                .unwrap()
+                .unwrap()
+                .path(),
             nss.path()
         );
         assert!(Arc::ptr_eq(
@@ -2426,7 +2454,10 @@ mod tests {
         graceful.terminate(Duration::from_secs(5));
         assert!(started.elapsed() < Duration::from_secs(2));
         let status = graceful.child.try_wait().unwrap().unwrap();
-        assert!(status.success(), "SIGTERM let it exit on its own: {status:?}");
+        assert!(
+            status.success(),
+            "SIGTERM let it exit on its own: {status:?}"
+        );
 
         let mut stubborn = test_process(
             started_shell("trap '' TERM; while :; do sleep 0.05; done"),
@@ -2446,9 +2477,15 @@ mod tests {
     #[test]
     fn startup_waits_for_its_probe_and_fails_fast_with_the_stderr_tail() {
         let canceled = AtomicBool::new(false);
-        let messages = ("Chrome exited before showing its window", "Timeout waiting for the Chrome window");
+        let messages = (
+            "Chrome exited before showing its window",
+            "Timeout waiting for the Chrome window",
+        );
         let (lines, stderr) = mpsc::sync_channel(64);
-        let mut alive = Command::new("/bin/sh").args(["-c", "sleep 5"]).spawn().unwrap();
+        let mut alive = Command::new("/bin/sh")
+            .args(["-c", "sleep 5"])
+            .spawn()
+            .unwrap();
         let mut polls = 0;
         let ready = wait_for_startup(
             &mut alive,

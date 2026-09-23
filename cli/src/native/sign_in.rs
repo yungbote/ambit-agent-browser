@@ -127,13 +127,21 @@ pub(super) async fn enter(
         let _ = browser.close_within(STOP).await;
     }
     super::forget_browser_session(state);
-    let entered = tokio::time::timeout_at(started + SIGN_IN_READY, async {
-        let chrome = chrome::launch_chrome(sign_in).await?;
+    let ready_by = started + SIGN_IN_READY;
+    let entered = async {
+        // A launch that runs out of time is awaited, not dropped: a sign-in
+        // browser that never showed its window is gone before automation
+        // relaunches into the same profile.
+        let chrome = chrome::launch_chrome_by(sign_in, ready_by).await?;
         state.sign_in = Some(SignInBrowser { chrome });
-        state.apply_window_layout(window.0, window.1, None).await
-    })
-    .await
-    .unwrap_or_else(|_| Err("The sign-in window did not open in time".to_string()));
+        tokio::time::timeout_at(
+            ready_by,
+            state.apply_window_layout(window.0, window.1, None),
+        )
+        .await
+        .unwrap_or_else(|_| Err("The sign-in window was not laid out in time".to_string()))
+    }
+    .await;
     let admitted = match entered {
         Ok(_) => {
             state.update_stream_client().await;
@@ -249,7 +257,14 @@ async fn adopt(state: &mut DaemonState, browser: BrowserManager) -> Result<(), S
     let configuration = state.launch_configuration.clone().ok_or(NOT_OWNED)?;
     let retain_profile = state.retained_profile.is_some();
     let has_proxy_auth = state.proxy_credentials.read().await.is_some();
-    adopt_launched_browser(state, browser, configuration, retain_profile, has_proxy_auth).await?;
+    adopt_launched_browser(
+        state,
+        browser,
+        configuration,
+        retain_profile,
+        has_proxy_auth,
+    )
+    .await?;
     let sessions: Vec<String> = state
         .browser
         .as_ref()
