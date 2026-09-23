@@ -569,9 +569,11 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
     // The native window stream owns a private virtual display. Its ordinary
     // Linux workspace has no GPU render device, so select software GLES for
     // WebGL without opting into Chromium's unsafe automatic WebGL fallback.
-    // Compositing stays in software: GPU-composited presentation replaces
-    // the whole window on every frame, and the stream would lose its damage
-    // patches. WebGL output is read back into the software compositor.
+    // The display compositor stays in software as well: a GL compositor
+    // swaps the whole window on every frame, so the display reports the
+    // entire window as damaged and every keystroke or hover ships as a whole
+    // frame instead of a patch; software presents only what changed, and
+    // WebGL output is read back into it from the selected GLES backend.
     // User/config arguments are appended later and retain normal precedence;
     // the WebGPU preset owns its own graphics backend.
     if cfg!(target_os = "linux") && options.window_stream && !options.webgpu {
@@ -2227,6 +2229,7 @@ mod tests {
         if cfg!(target_os = "linux") {
             assert!(arguments.iter().any(|arg| arg == "--use-gl=angle"));
             assert!(arguments.iter().any(|arg| arg == "--use-angle=swiftshader"));
+            // Damage-limited presents keep window capture incremental.
             assert!(arguments
                 .iter()
                 .any(|arg| arg == "--disable-gpu-compositing"));

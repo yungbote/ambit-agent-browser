@@ -65,11 +65,48 @@ impl Default for ClientConfig {
 
 const MAX_FRAME_WINDOW: usize = 8;
 const MAX_WINDOW_BYTES: usize = 12 * 1024 * 1024;
+/// How long a delivery-rate sample informs the in-flight bound. Longer than
+/// a typing pause, so patches between scroll bursts do not erase what the
+/// path delivered moments ago.
+const DELIVERY_RATE_WINDOW: Duration = Duration::from_secs(5);
+/// How long the shortest round trip stands, like a transport's minimum RTT:
+/// long enough that a standing queue cannot become the new floor.
+const ROUND_TRIP_WINDOW: Duration = Duration::from_secs(10);
 
+struct SentFrame {
+    seq: u64,
+    bytes: usize,
+    sent_at: Instant,
+    /// Bytes acknowledged when this frame left, for its delivery-rate sample.
+    delivered_before: u64,
+    /// A whole frame, which the delivery bound governs and so measures.
+    whole: bool,
+}
+
+/// Frames delivered but not yet acknowledged as painted, and what their
+/// acknowledgements say about the path. A viewer's newest pixels wait behind
+/// every older frame still in flight, so beyond the negotiated count and byte
+/// bounds a whole frame leaves only while the bytes ahead of it are within
+/// what the path delivers in its shortest round trip, or within one frame of
+/// its own size when that is more. About one frame then queues behind
+/// another, which keeps the path full (a frame travels while the previous
+/// one is painted) without a standing backlog, and an estimate taken from
+/// smaller frames (a sparse page before a dense one) cannot hold whole
+/// frames to one per round trip.
+/// Patches are exempt: they are small, and holding one back would strand the
+/// next patch without its base and force a whole-frame rebase. For the same
+/// reason they do not measure the path: a patch travels alone, so its paint
+/// measures what one patch needed, not what the path can deliver, and while
+/// the reader types, patch samples alone would shrink the bound to one patch.
 #[derive(Default)]
 struct InFlightFrames {
-    frames: VecDeque<(u64, usize)>,
+    frames: VecDeque<SentFrame>,
     bytes: usize,
+    delivered: u64,
+    /// (acknowledged at, bytes per second) samples, newest last.
+    rates: VecDeque<(Instant, f64)>,
+    /// (acknowledged at, send-to-paint round trip) samples, newest last.
+    round_trips: VecDeque<(Instant, Duration)>,
 }
 
 impl InFlightFrames {
@@ -81,18 +118,72 @@ impl InFlightFrames {
             .checked_add(bytes)
             .is_some_and(|total| total <= MAX_WINDOW_BYTES)
     }
-    fn sent(&mut self, seq: u64, bytes: usize) {
-        self.frames.push_back((seq, bytes));
+    /// Whether a frame of `bytes` may leave now: within the hard byte bound,
+    /// and, for a whole frame, behind no more than the delivery bound or one
+    /// frame of its own size, whichever is larger (so a frame alone on the
+    /// path always leaves). Before any whole frame is acknowledged only the
+    /// negotiated bounds apply.
+    fn admits(&self, bytes: usize, whole: bool) -> bool {
+        self.has_bytes(bytes)
+            && (!whole
+                || self
+                    .bound()
+                    .is_none_or(|bound| self.bytes <= bound.max(bytes)))
+    }
+    /// The best recent delivery rate over the shortest recent round trip.
+    fn bound(&self) -> Option<usize> {
+        let rate = self.rates.iter().map(|(_, rate)| *rate).reduce(f64::max)?;
+        let round_trip = self.round_trips.iter().map(|(_, rtt)| *rtt).min()?;
+        Some((rate * round_trip.as_secs_f64()) as usize)
+    }
+    fn sent(&mut self, seq: u64, bytes: usize, now: Instant, whole: bool) {
+        self.frames.push_back(SentFrame {
+            seq,
+            bytes,
+            sent_at: now,
+            delivered_before: self.delivered,
+            whole,
+        });
         self.bytes += bytes;
     }
-    fn acknowledge(&mut self, seq: u64) {
-        while self.frames.front().is_some_and(|(sent, _)| *sent <= seq) {
-            self.bytes -= self.frames.pop_front().unwrap().1;
+    /// Releases the acknowledged prefix. `sample` is false when the watermark
+    /// is re-applied at send time: that is bookkeeping, not a measurement.
+    fn acknowledge(&mut self, seq: u64, now: Instant, sample: bool) {
+        let mut newest_whole = None;
+        while self.frames.front().is_some_and(|frame| frame.seq <= seq) {
+            let frame = self.frames.pop_front().unwrap();
+            self.bytes -= frame.bytes;
+            self.delivered += frame.bytes as u64;
+            if frame.whole {
+                newest_whole = Some(frame);
+            }
+        }
+        let Some(frame) = newest_whole.filter(|_| sample) else {
+            return;
+        };
+        // The paint of the newest released whole frame closes one round trip;
+        // every byte acknowledged since it left crossed the path in that time.
+        let round_trip = now.saturating_duration_since(frame.sent_at);
+        if round_trip.is_zero() {
+            return;
+        }
+        let rate = (self.delivered - frame.delivered_before) as f64 / round_trip.as_secs_f64();
+        Self::record(&mut self.rates, now, rate, DELIVERY_RATE_WINDOW);
+        Self::record(&mut self.round_trips, now, round_trip, ROUND_TRIP_WINDOW);
+    }
+    /// Keeps samples within `window` of the newest, so an idle viewer keeps
+    /// its last estimate instead of starting over unbounded.
+    fn record<T>(samples: &mut VecDeque<(Instant, T)>, now: Instant, value: T, window: Duration) {
+        samples.push_back((now, value));
+        while samples
+            .front()
+            .is_some_and(|(at, _)| now.saturating_duration_since(*at) > window)
+        {
+            samples.pop_front();
         }
     }
     fn clear(&mut self) {
-        self.frames.clear();
-        self.bytes = 0;
+        *self = Self::default();
     }
 }
 
@@ -571,7 +662,7 @@ async fn handle_ws_client(
                 delivered_seq = frame.seq;
                 if initial_config.ack_pacing {
                     if let Some(seq) = frame.seq {
-                        in_flight.sent(seq, message_bytes);
+                        in_flight.sent(seq, message_bytes, Instant::now(), true);
                     }
                 }
             }
@@ -665,7 +756,7 @@ async fn handle_ws_client(
                 let acked = *ack_rx.borrow_and_update();
                 // The native relay accepts only a sequence it actually sent.
                 // Painting it also settles every earlier delivered frame.
-                in_flight.acknowledge(acked);
+                in_flight.acknowledge(acked, Instant::now(), true);
                 byte_blocked = false;
             }
             _ = tokio::time::sleep_until(next_allowed), if pending_frame && !byte_blocked && (!config_rx.borrow().ack_pacing || in_flight.has_slot(config_rx.borrow().frame_window)) => {
@@ -689,7 +780,7 @@ async fn handle_ws_client(
                     let Some(message) = frame.message(initial_config.binary) else { break; };
                     let bytes = message.len();
                     if bytes > MAX_WINDOW_BYTES { break; }
-                    if cfg.ack_pacing && !in_flight.has_bytes(bytes) {
+                    if cfg.ack_pacing && !in_flight.admits(bytes, !frame.patch) {
                         pending_frame = true;
                         byte_blocked = true;
                         continue;
@@ -698,9 +789,9 @@ async fn handle_ws_client(
                         break;
                     }
                     if cfg.ack_pacing {
-                        if let Some(seq) = frame.seq { in_flight.sent(seq, bytes); }
+                        if let Some(seq) = frame.seq { in_flight.sent(seq, bytes, Instant::now(), !frame.patch); }
                         // Preserve the existing native cumulative watermark.
-                        in_flight.acknowledge(*ack_rx.borrow());
+                        in_flight.acknowledge(*ack_rx.borrow(), Instant::now(), false);
                     }
                     last_sent = Some(Instant::now());
                     delivered_seq = frame.seq;
@@ -974,15 +1065,16 @@ mod tests {
     #[test]
     fn frame_window_is_bounded_by_count_and_bytes_and_released_cumulatively() {
         let mut flight = InFlightFrames::default();
-        flight.sent(10, MAX_WINDOW_BYTES / 2);
-        flight.sent(12, MAX_WINDOW_BYTES / 2);
+        let now = Instant::now();
+        flight.sent(10, MAX_WINDOW_BYTES / 2, now, true);
+        flight.sent(12, MAX_WINDOW_BYTES / 2, now, true);
         assert!(!flight.has_slot(2));
         assert!(flight.has_slot(8));
         assert!(!flight.has_bytes(1));
-        flight.acknowledge(10);
+        flight.acknowledge(10, now, false);
         assert!(flight.has_bytes(MAX_WINDOW_BYTES / 2));
         assert!(!flight.has_bytes(MAX_WINDOW_BYTES / 2 + 1));
-        flight.acknowledge(12);
+        flight.acknowledge(12, now, false);
         assert!(flight.frames.is_empty());
         assert_eq!(flight.bytes, 0);
         assert_eq!(
@@ -995,6 +1087,194 @@ mod tests {
                 1
             );
         }
+    }
+
+    /// What the viewer does before a run of whole frames.
+    #[derive(Clone, Copy)]
+    enum Prelude {
+        None,
+        /// Six seconds of typing: a 2 KB patch every 50 ms, each alone on the path.
+        Typing,
+        /// Six seconds of 25 KB whole frames, a sparse page before a dense one.
+        SparsePage,
+    }
+
+    /// One viewer behind a bottleneck: whole frames are produced at 60 fps
+    /// (latest wins), the link serializes at `rate` bytes/ms and a paint ACK
+    /// returns `transit` ms after a frame arrives. Returns delivered fps and
+    /// the median age (capture to paint) of the whole frames painted from
+    /// 4 s to 20 s after the prelude.
+    fn simulate_whole_frames(
+        rate: f64,
+        transit: f64,
+        bytes: usize,
+        bounded: bool,
+        prelude: Prelude,
+    ) -> (f64, f64) {
+        let origin = Instant::now();
+        let at = |ms: f64| origin + Duration::from_micros((ms * 1000.0) as u64);
+        let start = match prelude {
+            Prelude::None => 0.0,
+            Prelude::Typing | Prelude::SparsePage => 6_000.0,
+        };
+        let mut flight = InFlightFrames::default();
+        // (seq, captured at, painted/acknowledged at, whole)
+        let mut travelling: VecDeque<(u64, f64, f64, bool)> = VecDeque::new();
+        let (mut link_free, mut seq) = (0.0_f64, 0_u64);
+        let typing = matches!(prelude, Prelude::Typing);
+        let (mut next_capture, mut next_patch) = (if typing { start } else { 0.0 }, 0.0_f64);
+        let mut pending: Option<(u64, f64)> = None;
+        let mut ages = Vec::new();
+        let mut t = 0.0;
+        while t < start + 20_000.0 {
+            while travelling.front().is_some_and(|(_, _, done, _)| *done <= t) {
+                let (acked, captured, done, whole) = travelling.pop_front().unwrap();
+                flight.acknowledge(acked, at(done), true);
+                if whole && captured >= start && t > start + 4_000.0 {
+                    ages.push(done - captured);
+                }
+            }
+            // (seq, captured at, bytes, whole): a patch leaves at once while
+            // typing; otherwise the newest whole frame leaves once admitted.
+            let mut outgoing = None;
+            if t < start && typing {
+                if t >= next_patch {
+                    seq += 1;
+                    outgoing = Some((seq, t, 2_000, false));
+                    next_patch += 50.0;
+                }
+            } else {
+                let size = if t < start { 25_000 } else { bytes };
+                if t >= next_capture {
+                    seq += 1;
+                    pending = Some((seq, t));
+                    next_capture += 1000.0 / 60.0;
+                }
+                if let Some((frame, captured)) = pending {
+                    let admitted = flight.has_slot(MAX_FRAME_WINDOW)
+                        && if bounded {
+                            flight.admits(size, true)
+                        } else {
+                            flight.has_bytes(size)
+                        };
+                    if admitted {
+                        outgoing = Some((frame, captured, size, true));
+                        pending = None;
+                    }
+                }
+            }
+            if let Some((frame, captured, size, whole)) = outgoing {
+                link_free = link_free.max(t) + size as f64 / rate;
+                flight.sent(frame, size, at(t), whole);
+                travelling.push_back((frame, captured, link_free + transit, whole));
+            }
+            t += 0.25;
+        }
+        let painted = ages.len() as f64 / 16.0;
+        ages.sort_by(f64::total_cmp);
+        (painted, ages[ages.len() / 2])
+    }
+
+    #[test]
+    fn delivery_bound_keeps_throughput_and_removes_the_standing_queue() {
+        // 20 Mbit/s and 50 Mbit/s paths, 40 ms transit, 150 KB whole frames:
+        // the negotiated window alone lets eight frames queue ahead of the
+        // newest; the delivery bound keeps about one without losing a frame.
+        // After typing too: patches travel alone, and had their paints
+        // measured the path, a scroll right after would have been held to
+        // about one frame per round trip (14 of 16.6 fps at 20 Mbit/s, 32 of
+        // 42 at 50 Mbit/s) until the patch samples aged out.
+        for prelude in [Prelude::None, Prelude::Typing] {
+            for (rate, window_age) in [(2_500.0, 400.0), (6_250.0, 180.0)] {
+                let (fps, age) = simulate_whole_frames(rate, 40.0, 150_000, false, prelude);
+                let (bounded_fps, bounded_age) =
+                    simulate_whole_frames(rate, 40.0, 150_000, true, prelude);
+                assert!(age >= window_age, "window-only age {age} ms at {rate} B/ms");
+                assert!(
+                    bounded_fps >= fps * 0.97,
+                    "bounded {bounded_fps} fps vs window-only {fps} fps at {rate} B/ms"
+                );
+                assert!(
+                    bounded_age <= age * 0.55,
+                    "bounded age {bounded_age} ms vs window-only {age} ms at {rate} B/ms"
+                );
+            }
+        }
+        // A dense page after a sparse one: the estimate from 25 KB frames is
+        // below one 150 KB frame, and alone it would hold the dense frames to
+        // one per round trip (14 of 16.7 fps at 20 Mbit/s) until it aged out.
+        let (fps, _) = simulate_whole_frames(2_500.0, 40.0, 150_000, false, Prelude::SparsePage);
+        let (bounded_fps, _) =
+            simulate_whole_frames(2_500.0, 40.0, 150_000, true, Prelude::SparsePage);
+        assert!(
+            bounded_fps >= fps * 0.97,
+            "bounded {bounded_fps} fps vs window-only {fps} fps after a sparse page"
+        );
+        // A path faster than the producer never waits on the bound.
+        let (fps, age) = simulate_whole_frames(25_000.0, 40.0, 150_000, false, Prelude::None);
+        let (bounded_fps, bounded_age) =
+            simulate_whole_frames(25_000.0, 40.0, 150_000, true, Prelude::None);
+        assert!(bounded_fps >= fps * 0.99 && bounded_age <= age + 1.0);
+    }
+
+    #[test]
+    fn delivery_bound_spares_patches_and_holds_at_least_one_frame() {
+        let origin = Instant::now();
+        let mut flight = InFlightFrames::default();
+        // No acknowledgement yet: only the negotiated bounds apply.
+        flight.sent(1, 100_000, origin, true);
+        assert!(flight.admits(100_000, true));
+        // A 100 KB frame painted 100 ms after it left: 1 KB/ms over 100 ms.
+        flight.acknowledge(1, origin + Duration::from_millis(100), true);
+        assert_eq!(flight.bound(), Some(100_000));
+        let later = origin + Duration::from_millis(200);
+        flight.sent(2, 120_000, later, true);
+        // 120 KB ahead exceeds the 100 KB bound and a 110 KB frame...
+        assert!(!flight.admits(110_000, true));
+        // ...but one frame of the newest frame's own size may queue ahead,
+        // whatever the estimate says...
+        assert!(flight.admits(150_000, true));
+        flight.sent(3, 150_000, later, true);
+        assert!(!flight.admits(150_000, true));
+        // ...and a patch still leaves, so its successor keeps its base.
+        assert!(flight.admits(8_000, false));
+        // Alone on the path, any frame within the hard bound leaves.
+        flight.acknowledge(3, later + Duration::from_millis(150), true);
+        assert!(flight.frames.is_empty());
+        assert!(flight.admits(MAX_WINDOW_BYTES, true));
+        assert!(!flight.admits(MAX_WINDOW_BYTES + 1, true));
+    }
+
+    #[test]
+    fn only_paint_acknowledgements_are_delivery_samples() {
+        let origin = Instant::now();
+        let mut flight = InFlightFrames::default();
+        flight.sent(4, 50_000, origin, true);
+        // Re-applying a watermark at send time releases without measuring.
+        flight.acknowledge(4, origin + Duration::from_millis(3), false);
+        assert!(flight.bound().is_none());
+        // An acknowledgement at the send instant carries no round trip.
+        flight.sent(5, 50_000, origin, true);
+        flight.acknowledge(5, origin, true);
+        assert!(flight.bound().is_none());
+        // A patch's paint measures only what that patch needed.
+        flight.sent(6, 2_000, origin, false);
+        flight.acknowledge(6, origin + Duration::from_millis(40), true);
+        assert!(flight.bound().is_none());
+        // A cumulative paint that also releases patches measures the newest
+        // whole frame it released.
+        flight.sent(7, 50_000, origin, true);
+        flight.sent(8, 2_000, origin + Duration::from_millis(10), false);
+        flight.acknowledge(8, origin + Duration::from_millis(50), true);
+        assert_eq!(flight.round_trips.len(), 1);
+        assert_eq!(flight.round_trips[0].1, Duration::from_millis(50));
+        // Stale samples age out relative to the newest, never to nothing.
+        let late = origin + ROUND_TRIP_WINDOW + Duration::from_secs(1);
+        flight.sent(9, 10_000, late, true);
+        flight.acknowledge(9, late + Duration::from_millis(80), true);
+        assert_eq!(flight.round_trips.len(), 1);
+        assert_eq!(flight.round_trips[0].1, Duration::from_millis(80));
+        assert!(flight.bound().is_some());
     }
 
     #[test]

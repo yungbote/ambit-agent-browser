@@ -18,18 +18,22 @@ pub(crate) struct FramePacing {
 
 impl FramePacing {
     /// A human holds the input lease: input feedback must feel immediate.
+    /// Sampling at the display's 60 Hz halves the average wait between a
+    /// paint and its capture. Only damage is encoded, and the capture loop
+    /// skips ticks the helper cannot keep, so a slow encode lowers the rate
+    /// rather than queueing frames.
     pub(crate) const CONTROLLED: Self = Self {
-        fps: 30,
+        fps: 60,
         budget_bytes: 120_000,
     };
     /// A presenter is connected and watching the agent work.
     pub(crate) const PRESENTED: Self = Self {
-        fps: 15,
+        fps: 30,
         budget_bytes: 200_000,
     };
     /// Secondary viewers only.
     pub(crate) const PASSIVE: Self = Self {
-        fps: 10,
+        fps: 15,
         budget_bytes: 300_000,
     };
 
@@ -126,8 +130,9 @@ impl Presentation {
 
     /// Frame pacing follows who is looking: a controlling human gets the
     /// interactive rate, a connected presenter a reading rate, anyone else
-    /// the passive rate. The budget bounds encoded bytes per frame so the
-    /// stream's bitrate stays roughly level across rates.
+    /// the passive rate. The budget steers the helper's quality for whole
+    /// frames, smallest where frames are most frequent; what a viewer
+    /// actually receives is bounded by its acknowledged in-flight window.
     pub(crate) fn capture_pacing(&self, controlled: bool) -> FramePacing {
         if controlled {
             FramePacing::CONTROLLED
@@ -449,20 +454,20 @@ mod tests {
         assert_eq!(state.client_fps(primary, 60, false), 60);
         state.configure(primary, config);
         assert_eq!(state.capture_pacing(false), FramePacing::PRESENTED);
-        assert_eq!(state.client_fps(primary, 20, false), 15);
+        assert_eq!(state.client_fps(primary, 40, false), 30);
         assert_eq!(state.client_fps(primary, 5, false), 5);
-        assert_eq!(state.client_fps(secondary, 20, false), 10);
-        assert_eq!(state.client_fps(secondary, 0, false), 10);
+        assert_eq!(state.client_fps(secondary, 20, false), 15);
+        assert_eq!(state.client_fps(secondary, 0, false), 15);
         state.disconnect(primary);
         assert_eq!(state.capture_pacing(false), FramePacing::PASSIVE);
-        assert_eq!(state.client_fps(primary, 20, false), 10);
+        assert_eq!(state.client_fps(primary, 20, false), 15);
         state.configure(secondary, config);
-        assert_eq!(state.client_fps(primary, 20, false), 10);
-        assert_eq!(state.client_fps(secondary, 20, false), 15);
+        assert_eq!(state.client_fps(primary, 20, false), 15);
+        assert_eq!(state.client_fps(secondary, 40, false), 30);
     }
 
     /// A human lease raises the rate for the controlling presenter only, and
-    /// tightens the per-frame byte budget so the bitrate stays level.
+    /// keeps the smallest whole-frame budget where frames are most frequent.
     #[test]
     fn a_human_lease_raises_the_primary_rate_and_tightens_the_budget() {
         let state = Presentation::new();
@@ -475,18 +480,26 @@ mod tests {
         };
         assert_eq!(state.capture_pacing(true), FramePacing::CONTROLLED);
         state.configure(primary, config);
-        assert_eq!(state.capture_pacing(true).fps, 30);
+        assert_eq!(state.capture_pacing(true).fps, 60);
         const {
             assert!(
                 FramePacing::CONTROLLED.budget_bytes < FramePacing::PRESENTED.budget_bytes
                     && FramePacing::PRESENTED.budget_bytes < FramePacing::PASSIVE.budget_bytes
             );
+            assert!(
+                FramePacing::CONTROLLED.fps > FramePacing::PRESENTED.fps
+                    && FramePacing::PRESENTED.fps > FramePacing::PASSIVE.fps
+            );
         }
-        assert_eq!(state.client_fps(primary, 0, true), 30);
+        assert_eq!(state.client_fps(primary, 0, true), 60);
         assert_eq!(state.client_fps(primary, 20, true), 20);
-        assert_eq!(state.client_fps(secondary, 0, true), 10);
+        assert_eq!(state.client_fps(secondary, 0, true), 15);
         assert_eq!(
             FramePacing::CONTROLLED.period(),
+            Duration::from_micros(16_666)
+        );
+        assert_eq!(
+            FramePacing::PRESENTED.period(),
             Duration::from_micros(33_333)
         );
     }
