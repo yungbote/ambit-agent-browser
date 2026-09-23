@@ -296,6 +296,9 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
                 Arc::new(result.map_err(|_| "browser_operation_rejected: Browser attachment timed out.")?
                     .map_err(|_| "browser_operation_rejected: The existing browser could not be attached.")?),
         };
+        // Viewers follow the owner's page sessions; program input appears
+        // there exactly as native input does.
+        client.publish_activity_as(&browser.client);
         let observed = tokio::select! {
             biased;
             _ = operation.canceled.changed() => Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start()),
@@ -776,6 +779,176 @@ try {
             .as_array()
             .unwrap()
             .contains(&json!("persistent")));
+        Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
+    }
+
+    /// Serves `/` and `/frame` from one port; `PORT` in a body becomes that
+    /// port. Requesting the frame through another host name makes Chrome
+    /// place it in its own renderer process.
+    async fn serve_pages(main: &str, frame: &str) -> (u16, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (main, frame) = (
+            main.replace("PORT", &port.to_string()),
+            frame.replace("PORT", &port.to_string()),
+        );
+        let task = tokio::spawn(async move {
+            // Chrome may preconnect sockets that never send a request, so
+            // each connection is read on its own task.
+            while let Ok((mut stream, _)) = listener.accept().await {
+                let (main, frame) = (main.clone(), frame.clone());
+                tokio::spawn(async move {
+                    let mut request = vec![0u8; 8192];
+                    let count = stream.read(&mut request).await.unwrap_or(0);
+                    let body = if request[..count].starts_with(b"GET /frame ") {
+                        frame
+                    } else {
+                        main
+                    };
+                    let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+        (port, task)
+    }
+
+    /// Real Playwright pointer input on a scrolled page, inside an
+    /// out-of-process frame and after the native window is resized, lands at
+    /// the requested client points and is published as the owner's activity.
+    /// DOM `element.click()` publishes nothing.
+    #[tokio::test]
+    #[ignore = "requires local Chromium, the browser display helper and installed playwright-core 1.62.1"]
+    async fn e2e_playwright_pointer_reaches_scrolled_frames_after_resize_and_is_published() {
+        use crate::native::actions::execute_command;
+        use crate::test_utils::EnvGuard;
+        let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+        env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+        env.set("DISPLAY", "");
+        let log = "<script>window.pointerLog=[];for(const type of ['pointermove','pointerdown','pointerup'])addEventListener(type,e=>pointerLog.push({type,x:e.clientX,y:e.clientY,trusted:e.isTrusted}),true)</script>";
+        let (port, server) = serve_pages(
+            &format!("<!doctype html><title>Scrolled frames</title><body style='margin:0;height:3000px'><div style='height:400px'></div><iframe src='http://localhost:PORT/frame' style='display:block;border:0;margin-left:40px;width:400px;height:300px'></iframe><button id=dom onclick='window.domClicked=true'>DOM</button>{log}"),
+            &format!("<!doctype html><body style='margin:0;height:600px'><button id=inside style='position:absolute;left:130px;top:120px;width:120px;height:40px' onclick='window.clicked=event.isTrusted'>Inside</button>{log}"),
+        )
+        .await;
+        let mut state = DaemonState::new();
+        let opened = Box::pin(execute_command(
+            &json!({"action":"navigate","url":"about:blank"}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(opened["success"], true, "{opened}");
+        assert!(state.browser_control.lock().await.has_native_display());
+        let resized = Box::pin(execute_command(
+            &json!({"action":"viewport","width":900,"height":600}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(resized["success"], true, "{resized}");
+        let navigated = Box::pin(execute_command(
+            &json!({"action":"navigate","url":format!("http://127.0.0.1:{port}/")}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(navigated["success"], true, "{navigated}");
+        let scrolled = Box::pin(execute_command(
+            &json!({"action":"evaluate","script":"scrollTo(0, 300); [scrollY, innerWidth]"}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(scrolled["data"]["result"], json!([300, 900]), "{scrolled}");
+        let observed = Box::pin(execute_command(&json!({"action":"snapshot"}), &mut state)).await;
+        assert_eq!(observed["success"], true, "{observed}");
+        let client = state.browser.as_ref().unwrap().client.clone();
+        let session = state
+            .browser
+            .as_ref()
+            .unwrap()
+            .active_session_id()
+            .unwrap()
+            .to_owned();
+        let mut published = client.subscribe();
+        // At this scroll the iframe occupies client x 40..440, y 100..400;
+        // its button spans frame x 130..250, y 120..160.
+        let code = r#"
+const frame = page.frames().find(candidate => candidate !== page.mainFrame());
+await page.mouse.move(100, 50);
+await page.mouse.move(140, 150);
+await page.mouse.click(190, 240);
+await page.evaluate(() => document.querySelector('#dom').click());
+// The owned window's wheel is discrete: 100 units per notch.
+await page.mouse.move(600, 50);
+await page.mouse.wheel(0, 200);
+await page.waitForFunction(() => scrollY > 300);
+return {main: await page.evaluate(() => pointerLog), frame: await frame.evaluate(() => pointerLog), framePath: await frame.evaluate(() => location.pathname), clicked: await frame.evaluate(() => window.clicked === true), domClicked: await page.evaluate(() => window.domClicked === true), scrollY: await page.evaluate(() => scrollY)};
+"#;
+        let result = Box::pin(execute_command(
+            &json!({"action":"run_playwright","code":code,"timeoutMs":30000}),
+            &mut state,
+        ))
+        .await;
+        server.abort();
+        assert_eq!(result["success"], true, "{result}");
+        let values = &result["data"]["result"];
+        let trusted = |log: &Value, kind: &str, x: i64, y: i64| {
+            log.as_array().unwrap().iter().any(|event| {
+                event["type"] == kind
+                    && event["x"] == x
+                    && event["y"] == y
+                    && event["trusted"] == true
+            })
+        };
+        assert_eq!(values["framePath"], "/frame", "{values}");
+        assert!(trusted(&values["main"], "pointermove", 100, 50), "{values}");
+        assert!(trusted(&values["main"], "pointermove", 600, 50), "{values}");
+        assert!(
+            trusted(&values["frame"], "pointermove", 100, 50),
+            "{values}"
+        );
+        assert!(
+            trusted(&values["frame"], "pointerdown", 150, 140),
+            "{values}"
+        );
+        assert!(trusted(&values["frame"], "pointerup", 150, 140), "{values}");
+        assert_eq!(values["clicked"], true, "{values}");
+        assert_eq!(values["domClicked"], true, "{values}");
+        assert!(values["scrollY"].as_f64().unwrap() > 300.0, "{values}");
+        let mut activity = Vec::new();
+        while let Ok(event) = published.try_recv() {
+            if event.method == crate::native::activity::EVENT
+                && event.params["source"] == "agent"
+                && event.params["type"] == "pointer"
+                && event.session_id.as_deref() == Some(session.as_str())
+            {
+                activity.push((
+                    event.params["eventType"].as_str().unwrap().to_owned(),
+                    event.params["x"].as_f64().unwrap(),
+                    event.params["y"].as_f64().unwrap(),
+                ));
+            }
+        }
+        for (kind, x, y) in [
+            ("move", 100.0, 50.0),
+            ("move", 140.0, 150.0),
+            ("press", 190.0, 240.0),
+            ("release", 190.0, 240.0),
+            ("scroll", 600.0, 50.0),
+        ] {
+            assert!(
+                activity
+                    .iter()
+                    .any(|(k, ax, ay)| k == kind && *ax == x && *ay == y),
+                "{kind} {x},{y} missing from {activity:?}"
+            );
+        }
+        // Every published agent pointer event is one of the program's real
+        // input points; the DOM click contributed none.
+        assert!(
+            activity.iter().all(|(_, x, y)| {
+                [(100.0, 50.0), (140.0, 150.0), (190.0, 240.0), (600.0, 50.0)].contains(&(*x, *y))
+            }),
+            "{activity:?}"
+        );
         Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
     }
 

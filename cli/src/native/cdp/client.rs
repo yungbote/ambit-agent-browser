@@ -122,8 +122,31 @@ pub struct CdpClient {
     target_sessions: Arc<std::sync::Mutex<HashMap<String, String>>>,
     native_pointer_enabled: Arc<AtomicBool>,
     native_pointer_lock: Arc<Mutex<()>>,
+    activity_owner: std::sync::OnceLock<ActivityOwner>,
     _reader_handle: tokio::task::JoinHandle<()>,
     _keepalive_handle: tokio::task::JoinHandle<()>,
+}
+
+/// The connection whose pages viewers observe. Another connection to the
+/// same browser publishes acknowledged input as this owner's session for the
+/// same target, with the owner's page generation at dispatch.
+#[derive(Clone)]
+struct ActivityOwner {
+    events: broadcast::Sender<CdpEvent>,
+    targets: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    pages: PageGenerations,
+}
+
+impl ActivityOwner {
+    fn publication(&self, target: &str) -> Option<(String, String)> {
+        let session = self
+            .targets
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|(session, observed)| (observed == target).then(|| session.clone()))?;
+        Some((page_generation(&self.pages, &session), session))
+    }
 }
 
 /// How long an acknowledged pointer command waits for its trusted renderer
@@ -518,6 +541,7 @@ impl CdpClient {
             target_sessions,
             native_pointer_enabled: Arc::new(AtomicBool::new(false)),
             native_pointer_lock: Arc::new(Mutex::new(())),
+            activity_owner: std::sync::OnceLock::new(),
             _reader_handle: reader_handle,
             _keepalive_handle: keepalive_handle,
         })
@@ -802,7 +826,29 @@ impl CdpClient {
         generation: String,
         source: InputSource,
     ) -> ActivityObservation {
-        ActivityObservation::new(value, session, generation, source, self.event_tx.clone())
+        let observation =
+            ActivityObservation::new(value, session, generation, source, self.event_tx.clone());
+        let Some(owner) = self.activity_owner.get() else {
+            return observation;
+        };
+        let target = self.target_sessions.lock().unwrap().get(session).cloned();
+        match target.and_then(|target| owner.publication(&target)) {
+            Some((generation, session)) => {
+                observation.published_as(owner.events.clone(), session, generation)
+            }
+            // The owner has no view of this page; nobody observes it there.
+            None => observation,
+        }
+    }
+
+    /// Publish this connection's acknowledged input as `owner`'s, for
+    /// targets the owner is attached to. Set once, before any input.
+    pub(crate) fn publish_activity_as(&self, owner: &CdpClient) {
+        let _ = self.activity_owner.set(ActivityOwner {
+            events: owner.event_tx.clone(),
+            targets: owner.target_sessions.clone(),
+            pages: owner.page_generations.clone(),
+        });
     }
 
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {

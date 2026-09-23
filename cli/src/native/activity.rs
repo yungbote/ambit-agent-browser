@@ -60,6 +60,10 @@ impl InputSource {
 pub(crate) struct ActivityObservation {
     event: CdpEvent,
     sender: broadcast::Sender<CdpEvent>,
+    /// The owner's session and page generation for the same target, captured
+    /// at dispatch. They replace this connection's identities only when the
+    /// acknowledged observation is published.
+    published_as: Option<(String, String)>,
     /// The command expects a trusted renderer pointer event to join it.
     native_tracked: bool,
     native_context: Option<i64>,
@@ -84,6 +88,7 @@ impl ActivityObservation {
                 session_id: Some(session.into()),
             },
             sender,
+            published_as: None,
             native_tracked: false,
             native_context: None,
             native_geometry: None,
@@ -91,8 +96,26 @@ impl ActivityObservation {
         }
     }
 
+    /// Input dispatched through an operation-local connection is observed by
+    /// viewers of the owning connection's page. Native measurement still
+    /// joins renderer events of the dispatching session.
+    pub(crate) fn published_as(
+        mut self,
+        sender: broadcast::Sender<CdpEvent>,
+        session: String,
+        generation: String,
+    ) -> Self {
+        self.sender = sender;
+        self.published_as = Some((session, generation));
+        self
+    }
+
     pub(crate) fn acknowledged(mut self) {
         self.event.params["timestamp"] = json!(super::stream::timestamp_ms());
+        if let Some((session, generation)) = self.published_as.take() {
+            self.event.session_id = Some(session);
+            self.event.params["pageGeneration"] = json!(generation);
+        }
         let _ = self.sender.send(self.event.clone());
     }
 
@@ -258,6 +281,33 @@ mod tests {
             &json!({ "type": "keyDown", "key": "Shift" })
         )
         .is_none());
+    }
+
+    #[test]
+    fn delegated_observation_is_published_as_the_owner_after_acknowledgement() {
+        let (local, mut local_events) = broadcast::channel(4);
+        let (owner, mut owner_events) = broadcast::channel(4);
+        let observation = ActivityObservation::new(
+            json!({ "type": "pointer", "eventType": "move", "x": 5.0, "y": 8.0 }),
+            "operation-session",
+            "operation-generation".into(),
+            InputSource::Agent,
+            local,
+        )
+        .published_as(owner, "owner-session".into(), "owner-generation".into());
+        // Until acknowledgement the observation keeps the dispatching
+        // connection's identities, which native measurement joins.
+        assert_eq!(
+            observation.event.session_id.as_deref(),
+            Some("operation-session")
+        );
+        observation.acknowledged();
+        assert!(local_events.try_recv().is_err());
+        let event = owner_events.try_recv().unwrap();
+        assert_eq!(event.session_id.as_deref(), Some("owner-session"));
+        assert_eq!(event.params["pageGeneration"], "owner-generation");
+        assert_eq!(event.params["source"], "agent");
+        assert_eq!(event.params["x"], 5.0);
     }
 
     #[test]
