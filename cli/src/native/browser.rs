@@ -362,7 +362,25 @@ pub enum WaitUntil {
     None,
 }
 
+/// The strict wait error, unchanged for callers and the agent-facing text.
+fn lifecycle_timeout(wait_until: WaitUntil) -> String {
+    match wait_until {
+        WaitUntil::NetworkIdle => "Timeout waiting for networkidle".into(),
+        WaitUntil::DomContentLoaded => "Timeout waiting for Page.domContentEventFired".into(),
+        _ => "Timeout waiting for Page.loadEventFired".into(),
+    }
+}
+
 impl WaitUntil {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Load => "load",
+            Self::DomContentLoaded => "domcontentloaded",
+            Self::NetworkIdle => "networkidle",
+            Self::None => "none",
+        }
+    }
+
     pub fn from_str(s: &str) -> Self {
         match s {
             "domcontentloaded" => Self::DomContentLoaded,
@@ -1168,6 +1186,61 @@ impl BrowserManager {
     }
 
     pub async fn navigate(&mut self, url: &str, wait_until: WaitUntil) -> Result<Value, String> {
+        if !self.navigate_and_wait(url, wait_until).await? {
+            return Err(lifecycle_timeout(wait_until));
+        }
+        Ok(self.record_navigated_page(url).await)
+    }
+
+    /// Navigates for an agent's open/navigate request. A committed navigation
+    /// has happened even when the page does not reach `wait_until` before the
+    /// deadline (pages with endless ads or long polls never fire `load`), so
+    /// the result reports the open page and that it may still be loading
+    /// instead of a failure the agent would repeat.
+    pub async fn open(&mut self, url: &str, wait_until: WaitUntil) -> Result<Value, String> {
+        if self.navigate_and_wait(url, wait_until).await? {
+            return Ok(self.record_navigated_page(url).await);
+        }
+        // The renderer may be too busy to evaluate script; the browser process
+        // still knows the committed URL and title.
+        let target_id = self.active_target_id()?.to_string();
+        let info = self
+            .client
+            .send_command(
+                "Target.getTargetInfo",
+                Some(json!({ "targetId": target_id })),
+                None,
+            )
+            .await?;
+        let page_url = info["targetInfo"]["url"]
+            .as_str()
+            .unwrap_or(url)
+            .to_string();
+        let title = info["targetInfo"]["title"]
+            .as_str()
+            .unwrap_or("")
+            .to_string();
+        if let Some(page) = self.pages.get_mut(self.active_page_index) {
+            page.url = page_url.clone();
+            page.title = title.clone();
+        }
+        Ok(json!({
+            "url": page_url, "title": title, "targetId": target_id,
+            "loadWait": format!(
+                "The page is open at this URL but did not reach {} within {} ms, so parts of it may still be loading. Inspect it instead of opening it again.",
+                wait_until.name(),
+                self.default_timeout_ms
+            ),
+        }))
+    }
+
+    /// Starts a navigation and reports whether the page reached `wait_until`
+    /// before the deadline. Any other failure is an error.
+    async fn navigate_and_wait(
+        &mut self,
+        url: &str,
+        wait_until: WaitUntil,
+    ) -> Result<bool, String> {
         let session_id = self.active_session_id()?.to_string();
         let mut lifecycle_rx = self.client.subscribe();
 
@@ -1181,10 +1254,14 @@ impl BrowserManager {
         // If loader_id is None, it was a same-document navigation (e.g., hash routing)
         // which does not fire Page.loadEventFired or Page.domContentEventFired.
         if nav_result.loader_id.is_some() && wait_until != WaitUntil::None {
-            self.wait_for_lifecycle(wait_until, &session_id, &mut lifecycle_rx)
-                .await?;
+            return self
+                .wait_for_lifecycle(wait_until, &session_id, &mut lifecycle_rx)
+                .await;
         }
+        Ok(true)
+    }
 
+    async fn record_navigated_page(&mut self, url: &str) -> Value {
         let page_url = self.get_url().await.unwrap_or_else(|_| url.to_string());
         let title = self.get_title().await.unwrap_or_default();
 
@@ -1205,25 +1282,28 @@ impl BrowserManager {
             .pages
             .get(self.active_page_index)
             .map(|p| p.target_id.clone());
-        Ok(json!({ "url": page_url, "title": title, "targetId": target_id }))
+        json!({ "url": page_url, "title": title, "targetId": target_id })
     }
 
+    /// True when the page reached `wait_until`, false when the deadline passed.
     async fn wait_for_lifecycle(
         &self,
         wait_until: WaitUntil,
         session_id: &str,
         rx: &mut broadcast::Receiver<CdpEvent>,
-    ) -> Result<(), String> {
+    ) -> Result<bool, String> {
+        let timeout = tokio::time::Duration::from_millis(self.default_timeout_ms);
         let event_name = match wait_until {
             WaitUntil::Load => "Page.loadEventFired",
             WaitUntil::DomContentLoaded => "Page.domContentEventFired",
-            WaitUntil::NetworkIdle => return self.wait_for_network_idle(session_id, rx).await,
-            WaitUntil::None => return Ok(()),
+            // Its only failure is its deadline.
+            WaitUntil::NetworkIdle => {
+                return Ok(poll_network_idle(session_id, rx, timeout).await.is_ok())
+            }
+            WaitUntil::None => return Ok(true),
         };
 
-        let timeout = tokio::time::Duration::from_millis(self.default_timeout_ms);
-
-        tokio::time::timeout(timeout, async {
+        match tokio::time::timeout(timeout, async {
             loop {
                 match rx.recv().await {
                     Ok(event) => {
@@ -1240,16 +1320,10 @@ impl BrowserManager {
             Err("Event stream closed".to_string())
         })
         .await
-        .map_err(|_| format!("Timeout waiting for {}", event_name))?
-    }
-
-    async fn wait_for_network_idle(
-        &self,
-        session_id: &str,
-        rx: &mut broadcast::Receiver<CdpEvent>,
-    ) -> Result<(), String> {
-        let timeout = tokio::time::Duration::from_millis(self.default_timeout_ms);
-        poll_network_idle(session_id, rx, timeout).await
+        {
+            Ok(result) => result.map(|()| true),
+            Err(_) => Ok(false),
+        }
     }
 
     pub async fn get_url(&self) -> Result<String, String> {
@@ -1345,8 +1419,13 @@ impl BrowserManager {
             }
         }
 
-        self.wait_for_lifecycle(wait_until, session_id, &mut rx)
-            .await
+        if !self
+            .wait_for_lifecycle(wait_until, session_id, &mut rx)
+            .await?
+        {
+            return Err(lifecycle_timeout(wait_until));
+        }
+        Ok(())
     }
 
     pub async fn close(&mut self) -> Result<(), String> {

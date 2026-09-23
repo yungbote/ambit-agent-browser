@@ -1992,6 +1992,59 @@ async fn e2e_snapshot_and_click_ref() {
     assert_success(&resp);
 }
 
+// Production 2026-09-23: opening ad-heavy pages failed with "Operation timed
+// out" after 25 s although the page had committed and was usable; the agent
+// then reopened it with a larger timeoutMs and failed the same way.
+#[tokio::test]
+#[ignore]
+async fn e2e_open_reports_a_committed_page_that_never_fires_load() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut request = [0u8; 2048];
+            let read = stream.read(&mut request).unwrap_or(0);
+            let request = String::from_utf8_lossy(&request[..read]).to_string();
+            if request.starts_with("GET /never ") {
+                // A subresource that never answers keeps `load` from firing.
+                held.push(stream);
+                continue;
+            }
+            let body = "<!doctype html><title>Endless</title><h1>Endless</h1><img src='/never'>";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({ "action": "launch", "headless": true }), &mut state).await,
+    );
+    let url = format!("http://127.0.0.1:{port}/page");
+    let opened = execute_command(&json!({ "action": "navigate", "url": url }), &mut state).await;
+    assert_success(&opened);
+    let data = get_data(&opened);
+    assert_eq!(data["url"], json!(url));
+    assert_eq!(data["title"], "Endless");
+    assert!(data["loadWait"]
+        .as_str()
+        .unwrap()
+        .contains("did not reach load within 25000 ms"));
+    let heading = execute_command(
+        &json!({ "action": "evaluate", "script": "document.querySelector('h1').textContent" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&heading);
+    assert_eq!(get_data(&heading)["result"], "Endless");
+    assert_success(&execute_command(&json!({ "action": "close" }), &mut state).await);
+}
+
 // ---------------------------------------------------------------------------
 // Screenshot
 // ---------------------------------------------------------------------------

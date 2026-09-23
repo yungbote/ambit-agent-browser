@@ -5598,7 +5598,7 @@ async fn navigate_active_page(
 ) -> Result<Value, String> {
     clear_active_page_context(state).await;
     let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-    let result = mgr.navigate(url, wait_until).await?;
+    let result = mgr.open(url, wait_until).await?;
     state.refresh_active_iframe_sessions().await;
     Ok(result)
 }
