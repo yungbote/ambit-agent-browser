@@ -12191,3 +12191,57 @@ async fn e2e_native_binary_viewer_resizes_the_same_window() {
     drop(ws);
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
+
+// Production 2026-09-23: a native mouse move over a Cloudflare challenge
+// iframe and a click whose element was off-screen both failed with "The
+// browser did not report the native mouse position".
+#[tokio::test]
+#[ignore]
+async fn e2e_native_mouse_reaches_iframes_and_refuses_points_outside_the_page() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<!doctype html><style>body{margin:0}#frame{position:absolute;left:200px;top:200px;width:300px;height:200px;border:0}</style><a id=fixed href='#f' style='position:fixed;top:-100px;left:10px'>Fixed</a><iframe id=frame srcdoc="<body style='margin:0'><button id=inner style='width:300px;height:200px'>Inner</button><script>window.events=[];for(const type of ['pointermove','pointerdown','click'])addEventListener(type,e=>events.push({type,trusted:e.isTrusted,x:e.clientX,y:e.clientY}),true)</script></body>"></iframe><script>window.downs=0;addEventListener('pointerdown',()=>downs++,true)</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
+    assert!(state.browser_control.lock().await.has_native_display());
+    let inner = "frame.contentWindow.events.filter(e=>e.trusted&&e.type!=='pointermove'||e.trusted&&e.x===100&&e.y===100).map(e=>e.type)";
+
+    assert_success(
+        &control_test_command(&json!({"action":"mousemove","x":300,"y":300}), &mut state).await,
+    );
+    let moved =
+        control_test_command(&json!({"action":"evaluate","script":inner}), &mut state).await;
+    assert_success(&moved);
+    assert_eq!(moved["data"]["result"], json!(["pointermove"]));
+
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#frame"}), &mut state).await,
+    );
+    let clicked = control_test_command(&json!({"action":"evaluate","script":"frame.contentWindow.events.filter(e=>e.trusted&&e.type!=='pointermove').map(e=>[e.type,e.x,e.y])"}), &mut state).await;
+    assert_success(&clicked);
+    assert_eq!(
+        clicked["data"]["result"],
+        json!([["pointerdown", 150, 100], ["click", 150, 100]])
+    );
+
+    for command in [
+        json!({"action":"mousemove","x":5000,"y":50}),
+        json!({"action":"click","selector":"#fixed"}),
+    ] {
+        let refused = control_test_command(&command, &mut state).await;
+        assert_eq!(refused["success"], false, "{refused}");
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("is outside the visible page"), "{error}");
+        assert!(error.contains("No native input was sent"), "{error}");
+    }
+    // Refusals press nothing anywhere: only the iframe click pressed.
+    let downs = control_test_command(
+        &json!({"action":"evaluate","script":"downs+frame.contentWindow.events.filter(e=>e.type==='pointerdown').length"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&downs);
+    assert_eq!(downs["data"]["result"], 1);
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
