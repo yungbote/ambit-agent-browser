@@ -4551,6 +4551,19 @@ mod tests {
         assert_eq!(cmd["tabId"], "docs");
     }
 
+    /// A window has its own cookie context unless the caller opts into the
+    /// profile; there is no flag for the default.
+    #[test]
+    fn test_window_new_shared_is_the_only_flag() {
+        let cmd = parse_command(&args("window new"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "window_new");
+        assert!(cmd.get("shared").is_none());
+        let cmd = parse_command(&args("window new --shared"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "window_new");
+        assert_eq!(cmd["shared"], true);
+        assert!(parse_command(&args("window new --isolated"), &default_flags()).is_err());
+    }
+
     #[test]
     fn test_tab_sends_string_tab_id() {
         let cmd = parse_command(&args("tab t2"), &default_flags()).unwrap();
