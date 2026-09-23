@@ -558,7 +558,9 @@ fn save_screenshot(
     output_dir: Option<&str>,
 ) -> Result<String, String> {
     let save_path = match explicit_path {
-        Some(path) => path.to_string(),
+        Some(path) => super::output_file::prepare(path)?
+            .to_string_lossy()
+            .to_string(),
         None => {
             let dir = match output_dir {
                 Some(d) => PathBuf::from(d),

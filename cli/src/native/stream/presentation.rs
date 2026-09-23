@@ -107,6 +107,15 @@ impl Presentation {
         self.cell.borrow().owner.is_some()
     }
 
+    /// The window size, in CSS pixels, that the owning view has set.
+    pub(crate) fn layout(&self) -> Option<(u32, u32)> {
+        self.cell
+            .borrow()
+            .owner
+            .as_ref()
+            .map(|owner| (owner.config.width, owner.config.height))
+    }
+
     fn presented(&self) -> bool {
         self.cell
             .borrow()

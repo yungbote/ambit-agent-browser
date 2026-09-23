@@ -310,7 +310,9 @@ pub async fn save_state(
         .map_err(|e| format!("Failed to serialize state: {}", e))?;
 
     let mut save_path = match path {
-        Some(p) => p.to_string(),
+        Some(p) => super::output_file::prepare(p)?
+            .to_string_lossy()
+            .to_string(),
         None => {
             let dir = get_sessions_dir();
             let _ = fs::create_dir_all(&dir);

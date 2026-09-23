@@ -2027,9 +2027,276 @@ async fn e2e_snapshot_and_click_ref() {
     assert_success(&resp);
 }
 
+// Production 2026-09-23: opening ad-heavy pages failed with "Operation timed
+// out" after 25 s although the page had committed and was usable; the agent
+// then reopened it with a larger timeoutMs and failed the same way.
+#[tokio::test]
+#[ignore]
+async fn e2e_open_reports_a_committed_page_that_never_fires_load() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        let mut held = Vec::new();
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut request = [0u8; 2048];
+            let read = stream.read(&mut request).unwrap_or(0);
+            let request = String::from_utf8_lossy(&request[..read]).to_string();
+            if request.starts_with("GET /never ") {
+                // A subresource that never answers keeps `load` from firing.
+                held.push(stream);
+                continue;
+            }
+            let body = "<!doctype html><title>Endless</title><h1>Endless</h1><img src='/never'>";
+            let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({ "action": "launch", "headless": true }), &mut state).await,
+    );
+    let url = format!("http://127.0.0.1:{port}/page");
+    let opened = execute_command(&json!({ "action": "navigate", "url": url }), &mut state).await;
+    assert_success(&opened);
+    let data = get_data(&opened);
+    assert_eq!(data["url"], json!(url));
+    assert_eq!(data["title"], "Endless");
+    assert!(data["loadWait"]
+        .as_str()
+        .unwrap()
+        .contains("did not reach load within 25000 ms"));
+    let heading = execute_command(
+        &json!({ "action": "evaluate", "script": "document.querySelector('h1').textContent" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&heading);
+    assert_eq!(get_data(&heading)["result"], "Endless");
+    assert_success(&execute_command(&json!({ "action": "close" }), &mut state).await);
+}
+
+/// Serves each connection on its own thread, so a response that is held
+/// back does not block the others. The handler receives the request path.
+fn serve_each_connection(
+    handle: impl Fn(&str, std::net::TcpStream) + Send + Sync + 'static,
+) -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let handle = Arc::new(handle);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let handle = Arc::clone(&handle);
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut request = [0u8; 2048];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..read]).to_string();
+                let path = request.split_whitespace().nth(1).unwrap_or("").to_string();
+                handle(&path, stream);
+            });
+        }
+    });
+    port
+}
+
+fn write_html(mut stream: std::net::TcpStream, body: &str) {
+    use std::io::Write;
+    let _ = write!(
+        stream,
+        "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+        body.len()
+    );
+}
+
+// Chrome answers Page.navigate before the commit, and a renderer busy with
+// the previous page's script holds the commit back. At the deadline nothing
+// has been opened, yet the first fix (2026-09-23) reported success with an
+// empty URL and the previous page's title.
+#[tokio::test]
+#[ignore]
+async fn e2e_open_fails_when_the_busy_previous_page_holds_the_commit_past_the_wait() {
+    let loop_started = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let signal = Arc::clone(&loop_started);
+    let port = serve_each_connection(move |path, stream| match path {
+        "/busy" => write_html(stream, "<!doctype html><title>Busy</title><h1>Busy</h1>"),
+        "/loop-started" => {
+            let (started, wake) = &*signal;
+            *started.lock().unwrap() = true;
+            wake.notify_all();
+            write_html(stream, "");
+        }
+        _ => {
+            // The next page answers only once the previous page's script is
+            // blocking, so the commit has to wait for that script.
+            let (started, wake) = &*signal;
+            let mut started = started.lock().unwrap();
+            while !*started {
+                started = wake.wait(started).unwrap();
+            }
+            drop(started);
+            write_html(stream, "<!doctype html><title>Next</title><h1>Next</h1>");
+        }
+    });
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({ "action": "launch", "headless": true }), &mut state).await,
+    );
+    let busy = format!("http://127.0.0.1:{port}/busy");
+    assert_success(
+        &execute_command(&json!({ "action": "navigate", "url": busy }), &mut state).await,
+    );
+    // The previous page blocks for longer than the 25 s wait, starting after
+    // the driver has prepared the next navigation but before its commit.
+    let scheduled = execute_command(
+        &json!({
+            "action": "evaluate",
+            "script": "setTimeout(() => { fetch('/loop-started'); const end = Date.now() + 31000; while (Date.now() < end) {} }, 1000); 'scheduled'",
+        }),
+        &mut state,
+    )
+    .await;
+    assert_success(&scheduled);
+    let next = format!("http://127.0.0.1:{port}/next");
+    let started = std::time::Instant::now();
+    let opened = execute_command(&json!({ "action": "navigate", "url": next }), &mut state).await;
+    assert_eq!(
+        opened["success"],
+        json!(false),
+        "the commit was still pending: {opened}"
+    );
+    assert_eq!(
+        opened["error"],
+        "Operation timed out. The page may still be loading or the element may not exist."
+    );
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(20),
+        "failed before the wait deadline: {opened}"
+    );
+    // Nothing was cancelled: the navigation commits once the script ends.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        let location = execute_command(
+            &json!({ "action": "evaluate", "script": "location.href" }),
+            &mut state,
+        )
+        .await;
+        if location["data"]["result"] == json!(next) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the page never reached {next}: {location}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    assert_success(&execute_command(&json!({ "action": "close" }), &mut state).await);
+}
+
+// A page whose load is still pending when the agent opens the next one fires
+// that late load while the next navigation waits. It is not the next page:
+// counting it reported the previous page as the one opened.
+#[tokio::test]
+#[ignore]
+async fn e2e_open_waits_for_its_own_document_not_the_previous_pages_late_load() {
+    let port = serve_each_connection(|path, stream| match path {
+        "/first" => write_html(
+            stream,
+            "<!doctype html><title>First</title><img src='/late'>",
+        ),
+        "/late" => {
+            // The first page's load fires while the second page's response
+            // is still held back.
+            std::thread::sleep(std::time::Duration::from_millis(1500));
+            write_html(stream, "");
+        }
+        _ => {
+            std::thread::sleep(std::time::Duration::from_secs(3));
+            write_html(
+                stream,
+                "<!doctype html><title>Second</title><h1>Second</h1>",
+            );
+        }
+    });
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({ "action": "launch", "headless": true }), &mut state).await,
+    );
+    let first = format!("http://127.0.0.1:{port}/first");
+    let opened = execute_command(
+        &json!({ "action": "navigate", "url": first, "waitUntil": "domcontentloaded" }),
+        &mut state,
+    )
+    .await;
+    assert_success(&opened);
+    assert_eq!(get_data(&opened)["title"], "First");
+    let second = format!("http://127.0.0.1:{port}/second");
+    let opened = execute_command(&json!({ "action": "navigate", "url": second }), &mut state).await;
+    assert_success(&opened);
+    let data = get_data(&opened);
+    assert_eq!(data["url"], json!(second), "{opened}");
+    assert_eq!(data["title"], "Second");
+    assert!(data.get("loadWait").is_none(), "{opened}");
+    assert_success(&execute_command(&json!({ "action": "close" }), &mut state).await);
+}
+
 // ---------------------------------------------------------------------------
 // Screenshot
 // ---------------------------------------------------------------------------
+
+// Production 2026-09-23: a screenshot path under a directory that did not
+// exist yet failed with "No such file or directory" after the capture.
+#[tokio::test]
+#[ignore]
+async fn e2e_explicit_output_paths_create_their_directories() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({ "action": "launch", "headless": true }), &mut state).await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "action": "navigate", "url": "data:text/html,<title>Output</title><h1>Output</h1>" }),
+            &mut state,
+        )
+        .await,
+    );
+    let root = tempfile::tempdir().unwrap();
+    let shot = root.path().join("work/wikirace/stop-00.jpg");
+    let resp = execute_command(
+        &json!({ "action": "screenshot", "path": shot, "format": "jpeg", "quality": 82 }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    assert_eq!(get_data(&resp)["path"], json!(shot));
+    assert!(std::fs::metadata(&shot).unwrap().len() > 100);
+
+    let pdf = root.path().join("exports/nested/page.pdf");
+    let resp = execute_command(&json!({ "action": "pdf", "path": pdf }), &mut state).await;
+    assert_success(&resp);
+    assert!(std::fs::metadata(&pdf).unwrap().len() > 100);
+
+    // A relative path names the daemon's working directory; the result says
+    // exactly where the file went.
+    let relative = format!("agent-browser-e2e-{}/shot.png", std::process::id());
+    let resp = execute_command(
+        &json!({ "action": "screenshot", "path": relative }),
+        &mut state,
+    )
+    .await;
+    assert_success(&resp);
+    let written = std::path::PathBuf::from(get_data(&resp)["path"].as_str().unwrap());
+    assert!(written.is_absolute() && written.ends_with(&relative));
+    assert!(written.exists());
+    std::fs::remove_dir_all(written.parent().unwrap()).unwrap();
+
+    assert_success(&execute_command(&json!({ "action": "close" }), &mut state).await);
+}
 
 #[tokio::test]
 #[ignore]
@@ -12249,6 +12516,152 @@ async fn e2e_native_binary_viewer_resizes_the_same_window() {
         assert!(observed, "new geometry did not reach the same stream");
     }
     println!("BINARY_RESIZE {}", json!(timings));
+    // Production 2026-09-23: the refusal told the agent to resize a view it
+    // cannot reach. It now states the size the window keeps.
+    let refused = control_test_command(
+        &json!({"action":"viewport","width":1600,"height":1000}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(refused["success"], false, "{refused}");
+    assert_eq!(
+        refused["error"],
+        "Not changed: a person's open view of this browser sets its window to 733x896 CSS pixels. Keep working at that size; set_viewport applies only while no view is open."
+    );
     drop(ws);
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+// Production 2026-09-23: a native mouse move over a Cloudflare challenge
+// iframe and a click whose element was off-screen both failed with "The
+// browser did not report the native mouse position".
+#[tokio::test]
+#[ignore]
+async fn e2e_native_mouse_reaches_iframes_and_refuses_points_outside_the_page() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<!doctype html><style>body{margin:0}#frame{position:absolute;left:200px;top:200px;width:300px;height:200px;border:0}</style><a id=fixed href='#f' style='position:fixed;top:-100px;left:10px'>Fixed</a><button id=edge style='position:absolute;left:20px;top:calc(100vh - 6px);height:40px' onclick='edgeClicks++'>Edge</button><div style='height:300vh'></div><iframe id=frame srcdoc="<body style='margin:0'><button id=inner style='width:300px;height:200px'>Inner</button><script>window.events=[];for(const type of ['pointermove','pointerdown','click'])addEventListener(type,e=>events.push({type,trusted:e.isTrusted,x:e.clientX,y:e.clientY}),true)</script></body>"></iframe><script>window.downs=0;window.edgeClicks=0;addEventListener('pointerdown',()=>downs++,true)</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
+    assert!(state.browser_control.lock().await.has_native_display());
+    let inner = "frame.contentWindow.events.filter(e=>e.trusted&&e.type!=='pointermove'||e.trusted&&e.x===100&&e.y===100).map(e=>e.type)";
+
+    assert_success(
+        &control_test_command(&json!({"action":"mousemove","x":300,"y":300}), &mut state).await,
+    );
+    let moved =
+        control_test_command(&json!({"action":"evaluate","script":inner}), &mut state).await;
+    assert_success(&moved);
+    assert_eq!(moved["data"]["result"], json!(["pointermove"]));
+
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#frame"}), &mut state).await,
+    );
+    let clicked = control_test_command(&json!({"action":"evaluate","script":"frame.contentWindow.events.filter(e=>e.trusted&&e.type!=='pointermove').map(e=>[e.type,e.x,e.y])"}), &mut state).await;
+    assert_success(&clicked);
+    assert_eq!(
+        clicked["data"]["result"],
+        json!([["pointerdown", 150, 100], ["click", 150, 100]])
+    );
+
+    for command in [
+        json!({"action":"mousemove","x":5000,"y":50}),
+        json!({"action":"click","selector":"#fixed"}),
+    ] {
+        let refused = control_test_command(&command, &mut state).await;
+        assert_eq!(refused["success"], false, "{refused}");
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("is outside the visible page"), "{error}");
+        assert!(error.contains("No native input was sent"), "{error}");
+    }
+    // A partly visible element is scrolled until its click point is visible.
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#edge"}), &mut state).await,
+    );
+    let edge = control_test_command(
+        &json!({"action":"evaluate","script":"edgeClicks"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&edge);
+    assert_eq!(edge["data"]["result"], 1);
+    assert_success(
+        &control_test_command(
+            &json!({"action":"evaluate","script":"scrollTo(0,0);downs=0"}),
+            &mut state,
+        )
+        .await,
+    );
+
+    // Refusals press nothing anywhere: only the iframe click pressed.
+    let downs = control_test_command(
+        &json!({"action":"evaluate","script":"downs+frame.contentWindow.events.filter(e=>e.type==='pointerdown').length"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&downs);
+    assert_eq!(downs["data"]["result"], 1);
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+// A Cloudflare challenge is a cross-site iframe in its own renderer process.
+#[tokio::test]
+#[ignore]
+async fn e2e_native_mouse_reaches_a_cross_site_iframe() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            // Chrome may hold an idle preconnected socket; serve each apart.
+            std::thread::spawn(move || {
+                let mut request = [0u8; 2048];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..read]).to_string();
+                let body = if request.starts_with("GET /child ") {
+                    "<!doctype html><body style='margin:0'><button style='width:300px;height:200px'>Challenge</button><script>for(const type of ['pointerdown','click'])addEventListener(type,e=>parent.postMessage({type,trusted:e.isTrusted},'*'),true)</script>".to_string()
+                } else {
+                    format!("<!doctype html><style>body{{margin:0}}#frame{{position:absolute;left:200px;top:200px;width:300px;height:200px;border:0}}</style><iframe id=frame src='http://localhost:{port}/child'></iframe><script>window.got=[];addEventListener('message',e=>got.push(e.data))</script>")
+                };
+                let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            });
+        }
+    });
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"navigate","url":format!("http://127.0.0.1:{port}/")}),
+            &mut state,
+        )
+        .await,
+    );
+    assert!(state.browser_control.lock().await.has_native_display());
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !state.iframe_sessions.is_empty(),
+        "the cross-site iframe must be out of process"
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"mousemove","x":300,"y":300}), &mut state).await,
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#frame"}), &mut state).await,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let got = control_test_command(&json!({"action":"evaluate","script":"got"}), &mut state).await;
+    assert_success(&got);
+    assert_eq!(
+        got["data"]["result"],
+        json!([{"type":"pointerdown","trusted":true},{"type":"click","trusted":true}])
+    );
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }

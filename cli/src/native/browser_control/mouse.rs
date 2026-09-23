@@ -25,6 +25,98 @@ fn outcome_unknown(message: impl AsRef<str>) -> String {
     }
 }
 
+const UNMEASURED: &str =
+    "The browser did not report the native mouse position. No native button was sent.";
+
+/// A CDP move whose trusted renderer event, when this page's own document
+/// receives it, measures where page coordinates are on the native display.
+async fn pre_hover(
+    client: &CdpClient,
+    session: &str,
+    x: f64,
+    y: f64,
+) -> Result<Option<NativePointer>, String> {
+    let mut command = client
+        .enqueue_command(
+            "Input.dispatchMouseEvent",
+            Some(json!({
+                "type": "mouseMoved", "x": x, "y": y, "buttons": 0,
+            })),
+            Some(session),
+        )
+        .await?;
+    let response = tokio::time::timeout(Duration::from_secs(5), command.acknowledgment())
+        .await
+        .map_err(|_| {
+            "The browser did not acknowledge the pre-hover; inspect it before retrying."
+        })??;
+    if let Some(error) = response.error {
+        return Err(format!("Browser pre-hover failed: {error}"));
+    }
+    Ok(command.native_pointer())
+}
+
+/// Chooses the visible point of this page's own document nearest `(x, y)`.
+/// A point over an iframe, object or embed delivers its events to that
+/// document instead, so it cannot measure this page.
+fn calibration_probe(x: f64, y: f64) -> String {
+    format!(
+        r#"((x, y) => {{
+            const width = innerWidth, height = innerHeight;
+            if (!(x >= 0 && y >= 0 && x < width && y < height)) return {{ width, height, inside: false }};
+            const own = (px, py) => {{
+                const element = document.elementFromPoint(px, py);
+                return !!element && !/^(IFRAME|FRAME|OBJECT|EMBED)$/.test(element.tagName);
+            }};
+            let best = null;
+            for (let i = 0; i < 9; i++) for (let j = 0; j < 9; j++) {{
+                const px = Math.min(width - 1, Math.round((i + 0.5) * width / 9));
+                const py = Math.min(height - 1, Math.round((j + 0.5) * height / 9));
+                const distance = (px - x) ** 2 + (py - y) ** 2;
+                if ((!best || distance < best.distance) && own(px, py)) best = {{ x: px, y: py, distance }};
+            }}
+            return {{ width, height, inside: true, calibration: best && {{ x: best.x, y: best.y }} }};
+        }})({x}, {y})"#
+    )
+}
+
+/// The page-to-native mapping is one affine relation for the whole page, so a
+/// point whose events reach a child frame is measured at another visible
+/// point of the page. A point outside the page is refused before any input.
+async fn calibrate(
+    client: &CdpClient,
+    session: &str,
+    x: f64,
+    y: f64,
+) -> Result<NativePointer, String> {
+    let read = client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({ "expression": calibration_probe(x, y), "returnByValue": true })),
+            Some(session),
+        )
+        .await?;
+    let view = &read["result"]["value"];
+    if read.get("exceptionDetails").is_some() || !view.is_object() {
+        return Err(UNMEASURED.into());
+    }
+    if view["inside"] != true {
+        return Err(format!(
+            "The point ({x}, {y}) is outside the visible page ({}x{} CSS pixels). No native input was sent; scroll it into view or choose a visible point.",
+            view["width"], view["height"]
+        ));
+    }
+    let (Some(calibration_x), Some(calibration_y)) = (
+        view["calibration"]["x"].as_f64(),
+        view["calibration"]["y"].as_f64(),
+    ) else {
+        return Err(UNMEASURED.into());
+    };
+    pre_hover(client, session, calibration_x, calibration_y)
+        .await?
+        .ok_or_else(|| UNMEASURED.into())
+}
+
 #[derive(Clone)]
 struct Mapping {
     session: String,
@@ -184,26 +276,10 @@ impl NativeMouse {
             .active_window()
             .ok_or("The active browser window is unavailable")?;
         let window = (window.id, window.x, window.y, window.width, window.height);
-        let mut command = client
-            .enqueue_command(
-                "Input.dispatchMouseEvent",
-                Some(json!({
-                    "type": "mouseMoved", "x": x, "y": y, "buttons": 0,
-                })),
-                Some(session),
-            )
-            .await?;
-        let response = tokio::time::timeout(Duration::from_secs(5), command.acknowledgment())
-            .await
-            .map_err(|_| {
-                "The browser did not acknowledge the pre-hover; inspect it before retrying."
-            })??;
-        if let Some(error) = response.error {
-            return Err(format!("Browser pre-hover failed: {error}"));
-        }
-        let pointer = command.native_pointer().ok_or(
-            "The browser did not report the native mouse position. No native button was sent.",
-        )?;
+        let pointer = match pre_hover(client, session, x, y).await? {
+            Some(pointer) => pointer,
+            None => calibrate(client, session, x, y).await?,
+        };
         let mapping = Mapping {
             session: session.into(),
             pointer,
