@@ -593,31 +593,31 @@ impl CdpClient {
         Ok(response.result.unwrap_or(Value::Null))
     }
 
-    pub(crate) async fn enqueue_command(
-        &self,
-        method: &str,
+    // The wrappers return the one enqueue future directly: every CDP command
+    // awaits it, and an async wrapper would keep another copy of its arguments.
+    pub(crate) fn enqueue_command<'a>(
+        &'a self,
+        method: &'a str,
         params: Option<Value>,
-        session_id: Option<&str>,
-    ) -> Result<PendingCommand, String> {
+        session_id: Option<&'a str>,
+    ) -> impl std::future::Future<Output = Result<PendingCommand, String>> + 'a {
         self.enqueue_command_from(method, params, session_id, InputSource::Agent)
-            .await
     }
 
-    pub(crate) async fn enqueue_command_from(
-        &self,
-        method: &str,
+    pub(crate) fn enqueue_command_from<'a>(
+        &'a self,
+        method: &'a str,
         params: Option<Value>,
-        session_id: Option<&str>,
+        session_id: Option<&'a str>,
         source: InputSource,
-    ) -> Result<PendingCommand, String> {
-        let observation = session_id.and_then(|session| {
-            activity::from_command(method, params.as_ref()?).map(|value| {
-                self.observe_activity(value, session, self.page_generation(session), source)
-            })
-        });
-        let id = self.reserve_command_id();
-        self.enqueue_observed(id, method, params, session_id, observation)
-            .await
+    ) -> impl std::future::Future<Output = Result<PendingCommand, String>> + 'a {
+        self.enqueue_with_id(
+            self.reserve_command_id(),
+            method,
+            params,
+            session_id,
+            source,
+        )
     }
 
     /// Allocate the id of a command before sending it, so a raw subscriber
@@ -629,35 +629,31 @@ impl CdpClient {
     /// Send one command under an id from [`reserve_command_id`]. Every other
     /// effect of this connection (page generations, pointer measurement for
     /// input) applies exactly as for [`enqueue_command`].
-    pub(crate) async fn enqueue_reserved_command(
-        &self,
+    pub(crate) fn enqueue_reserved_command<'a>(
+        &'a self,
         id: u64,
-        method: &str,
+        method: &'a str,
         params: Option<Value>,
-        session_id: Option<&str>,
-    ) -> Result<PendingCommand, String> {
-        let observation = session_id.and_then(|session| {
-            activity::from_command(method, params.as_ref()?).map(|value| {
-                self.observe_activity(
-                    value,
-                    session,
-                    self.page_generation(session),
-                    InputSource::Agent,
-                )
-            })
-        });
-        self.enqueue_observed(id, method, params, session_id, observation)
-            .await
+        session_id: Option<&'a str>,
+    ) -> impl std::future::Future<Output = Result<PendingCommand, String>> + 'a {
+        self.enqueue_with_id(id, method, params, session_id, InputSource::Agent)
     }
 
-    async fn enqueue_observed(
+    // The observation is built here rather than passed in: an async fn keeps
+    // a moved-in argument twice, and every CDP command awaits this future.
+    async fn enqueue_with_id(
         &self,
         id: u64,
         method: &str,
         params: Option<Value>,
         session_id: Option<&str>,
-        mut observation: Option<ActivityObservation>,
+        source: InputSource,
     ) -> Result<PendingCommand, String> {
+        let mut observation = session_id.and_then(|session| {
+            activity::from_command(method, params.as_ref()?).map(|value| {
+                self.observe_activity(value, session, self.page_generation(session), source)
+            })
+        });
         let reset_page = (method == "Emulation.setDeviceMetricsOverride"
             || method == "Emulation.clearDeviceMetricsOverride")
             .then(|| session_id.map(String::from))
