@@ -714,6 +714,75 @@ mod tests {
         Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
     }
 
+    /// A program whose own attachment ends, and one whose browser connection
+    /// is lost while it waits for an event, settle promptly as unknown
+    /// outcomes rather than at their deadlines. The retained browser keeps
+    /// its tab after the first.
+    #[tokio::test]
+    #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
+    async fn e2e_playwright_lost_transports_settle_before_the_deadline() {
+        use crate::native::actions::execute_command;
+        let mut state = DaemonState::new();
+        let opened = Box::pin(execute_command(
+            &json!({"action":"navigate","url":"data:text/html,<title>Retained</title>"}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(opened["success"], true, "{opened}");
+        let target = state
+            .browser
+            .as_ref()
+            .unwrap()
+            .active_target_id()
+            .unwrap()
+            .to_owned();
+
+        let began = std::time::Instant::now();
+        let detached = Box::pin(execute_command(&json!({"action":"run_playwright","timeoutMs":30000,"code":"await browser.close(); return await page.title();"}), &mut state)).await;
+        let detached_ms = began.elapsed().as_millis();
+        assert_eq!(
+            detached["code"], "browser_operation_outcome_unknown",
+            "{detached}"
+        );
+        assert!(detached_ms < 10_000, "{detached_ms} ms");
+        let observed = Box::pin(execute_command(&json!({"action":"snapshot"}), &mut state)).await;
+        assert_eq!(observed["success"], true, "{observed}");
+        let title = Box::pin(execute_command(&json!({"action":"title"}), &mut state)).await;
+        assert_eq!(title["data"]["title"], "Retained", "{title}");
+        assert_eq!(
+            state.browser.as_ref().unwrap().active_target_id().unwrap(),
+            target
+        );
+
+        let processes = state
+            .browser
+            .as_ref()
+            .unwrap()
+            .client
+            .send_command_no_params("SystemInfo.getProcessInfo", None)
+            .await
+            .unwrap();
+        let pid = processes["processInfo"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|process| process["type"] == "browser")
+            .and_then(|process| process["id"].as_i64())
+            .unwrap();
+        let killer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        });
+        let began = std::time::Instant::now();
+        let lost = Box::pin(execute_command(&json!({"action":"run_playwright","timeoutMs":30000,"code":"await page.waitForEvent('popup', {timeout: 0}); return 'unreachable';"}), &mut state)).await;
+        let lost_ms = began.elapsed().as_millis();
+        killer.await.unwrap();
+        eprintln!("SETTLE detached={detached_ms}ms lost={lost_ms}ms");
+        assert_eq!(lost["code"], "browser_operation_outcome_unknown", "{lost}");
+        assert!(lost_ms < 10_000, "{lost_ms} ms: {lost}");
+        let _ = Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
+    }
+
     #[tokio::test]
     #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
     async fn e2e_playwright_frames_popups_files_and_real_pointer_share_native_owners() {
