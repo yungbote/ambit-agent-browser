@@ -997,7 +997,10 @@ mod tests {
         server.set_display(Some(second.clone())).await;
         let mut helper = BufReader::new(second_frames);
         let request = answer_capture(&mut helper).await;
-        assert_eq!(request["force"], true, "a new surface starts with a whole frame");
+        assert_eq!(
+            request["force"], true,
+            "a new surface starts with a whole frame"
+        );
         let frame = until_frame(&mut viewer).await;
         assert_eq!(frame["surface"]["generation"], second.surface().generation);
         assert!(server.is_screencasting().await);

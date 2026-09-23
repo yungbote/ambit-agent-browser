@@ -984,8 +984,10 @@ async fn resumed_controller_rejects_late_input_and_starts_a_fresh_sequence() {
 }
 
 fn sign_in_request(sequence: u64, events: Value) -> ControlRequest {
-    parse(json!({ "action": ACTION, "op": "input", "controllerId": OWNER,
-        "sequence": sequence, "events": events }))
+    parse(
+        json!({ "action": ACTION, "op": "input", "controllerId": OWNER,
+        "sequence": sequence, "events": events }),
+    )
 }
 
 fn sign_in_event() -> Value {
@@ -1161,7 +1163,10 @@ async fn sign_in_admission_follows_the_contract_order_without_effect() {
         .unwrap();
     assert_eq!(applied["status"], "applied");
     assert_eq!(applied["lastSequence"], 2);
-    assert_eq!(applied["surface"]["generation"], display.surface().generation);
+    assert_eq!(
+        applied["surface"]["generation"],
+        display.surface().generation
+    );
     let error = admit(&control, sign_in_request(3, sign_in_event()))
         .err()
         .unwrap();
@@ -1177,7 +1182,11 @@ async fn sign_in_admission_follows_the_contract_order_without_effect() {
 async fn sign_in_custody_outlasts_the_lease_deadline_until_the_browser_is_handed_back() {
     let (display, _ops, _frames) = acknowledging_display();
     let mut control = BrowserControl {
-        lease: Some(lease_for(OWNER, Instant::now() + Duration::from_secs(20), 0)),
+        lease: Some(lease_for(
+            OWNER,
+            Instant::now() + Duration::from_secs(20),
+            0,
+        )),
         display: Some(display),
         ..BrowserControl::default()
     };
@@ -1188,7 +1197,11 @@ async fn sign_in_custody_outlasts_the_lease_deadline_until_the_browser_is_handed
     assert!(!control.signs_in_for(OTHER));
     let refusal = control.agent_error().unwrap();
     assert_eq!(refusal.code, "browser_controlled_by_user");
-    assert!(refusal.message.contains("signing in"), "{}", refusal.message);
+    assert!(
+        refusal.message.contains("signing in"),
+        "{}",
+        refusal.message
+    );
     let inspected = control
         .execute(parse(json!({"action":ACTION,"op":"inspect"})), None)
         .await
@@ -1241,7 +1254,11 @@ async fn sign_in_custody_outlasts_the_lease_deadline_until_the_browser_is_handed
 async fn sign_in_idle_clock_restarts_on_applied_input_only() {
     let (display, mut ops, _frames) = acknowledging_display();
     let mut control = BrowserControl {
-        lease: Some(lease_for(OWNER, Instant::now() + Duration::from_secs(20), 0)),
+        lease: Some(lease_for(
+            OWNER,
+            Instant::now() + Duration::from_secs(20),
+            0,
+        )),
         display: Some(display.clone()),
         ..BrowserControl::default()
     };
@@ -1268,24 +1285,45 @@ async fn sign_in_idle_clock_restarts_on_applied_input_only() {
     assert_eq!(idle(&control), started, "renewal is not presence");
 
     let generation = display.surface().generation;
-    let typed = parse(json!({ "action": ACTION, "op": "input", "controllerId": OWNER,
+    let typed = parse(
+        json!({ "action": ACTION, "op": "input", "controllerId": OWNER,
         "sequence": 2, "expectedSurfaceGeneration": generation,
-        "events": [{ "type": "input_keyboard", "eventType": "insertText", "text": "person@example.com" }] }));
+        "events": [{ "type": "input_keyboard", "eventType": "insertText", "text": "person@example.com" }] }),
+    );
     let applied = control.execute(typed, None).await.unwrap();
     assert_eq!(applied["status"], "applied");
     assert_eq!(applied["lastSequence"], 2);
     assert_eq!(ops.recv().await.unwrap()["op"], "input");
-    assert!(idle(&control) > started, "applied input restarts the idle clock");
+    assert!(
+        idle(&control) > started,
+        "applied input restarts the idle clock"
+    );
 
-    let navigate = parse(json!({ "action": ACTION, "op": "input", "controllerId": OWNER,
+    let navigate = parse(
+        json!({ "action": ACTION, "op": "input", "controllerId": OWNER,
         "sequence": 3, "expectedSurfaceGeneration": generation,
-        "events": [{ "type": "navigation", "action": "navigate", "url": "https://example.com" }] }));
+        "events": [{ "type": "navigation", "action": "navigate", "url": "https://example.com" }] }),
+    );
     let refused = control.execute(navigate, None).await.unwrap_err();
     assert_eq!(refused.code, "browser_control_invalid");
-    assert!(refused.message.contains("address bar"), "{}", refused.message);
+    assert!(
+        refused.message.contains("address bar"),
+        "{}",
+        refused.message
+    );
     assert_eq!(control.lease.as_ref().unwrap().last_sequence, 2);
-    assert!(ops.try_recv().is_err(), "a refused batch never reaches the window");
+    assert!(
+        ops.try_recv().is_err(),
+        "a refused batch never reaches the window"
+    );
 
-    control.lease.as_mut().unwrap().sign_in.as_mut().unwrap().idle_deadline = Instant::now();
+    control
+        .lease
+        .as_mut()
+        .unwrap()
+        .sign_in
+        .as_mut()
+        .unwrap()
+        .idle_deadline = Instant::now();
     assert!(control.sign_in_due(Instant::now()));
 }

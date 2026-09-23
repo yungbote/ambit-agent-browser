@@ -743,9 +743,9 @@ impl BrowserControl {
     /// Whether `controller_id` owns a sign-in lease, whose release hands the
     /// browser back to automation.
     pub(crate) fn signs_in_for(&self, controller_id: &str) -> bool {
-        self.lease.as_ref().is_some_and(|lease| {
-            lease.sign_in.is_some() && lease.controller_id == controller_id
-        })
+        self.lease
+            .as_ref()
+            .is_some_and(|lease| lease.sign_in.is_some() && lease.controller_id == controller_id)
     }
 
     /// A sign-in the watchdog ends: its lease lapsed, or no human input
@@ -787,7 +787,10 @@ impl BrowserControl {
             self.display.as_ref(),
         ) {
             if expected != display.surface().generation {
-                return Err(ControlError::new("browser_control_surface_stale", "The browser window changed. Use its current frame before sending input."));
+                return Err(ControlError::new(
+                    "browser_control_surface_stale",
+                    "The browser window changed. Use its current frame before sending input.",
+                ));
             }
         }
         let idle_timeout = event?;
