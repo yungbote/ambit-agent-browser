@@ -100,7 +100,8 @@ impl InterruptReason {
 #[derive(Default)]
 struct OperationState {
     active: Option<watch::Sender<Option<InterruptReason>>>,
-    interruptions: usize,
+    /// Pending custody transfers, one entry per outstanding interruption.
+    interruptions: Vec<InterruptReason>,
 }
 
 #[derive(Clone, Default)]
@@ -109,11 +110,18 @@ pub(crate) struct Operations {
     finished: Arc<Notify>,
 }
 
-pub(crate) struct Interruption(Operations);
+pub(crate) struct Interruption(Operations, InterruptReason);
 
 impl Drop for Interruption {
     fn drop(&mut self) {
-        self.0.state.lock().unwrap().interruptions -= 1;
+        let mut state = self.0.state.lock().unwrap();
+        if let Some(index) = state
+            .interruptions
+            .iter()
+            .position(|reason| *reason == self.1)
+        {
+            state.interruptions.swap_remove(index);
+        }
     }
 }
 
@@ -134,17 +142,28 @@ impl Operations {
     /// start between the cancellation request and control acquisition.
     pub(crate) fn interrupt(&self, reason: InterruptReason) -> Interruption {
         let mut state = self.state.lock().unwrap();
-        state.interruptions += 1;
+        state.interruptions.push(reason);
         if let Some(active) = &state.active {
             active.send_replace(Some(reason));
         }
-        Interruption(self.clone())
+        Interruption(self.clone(), reason)
     }
 
     fn begin(&self) -> Result<Operation, String> {
         let mut state = self.state.lock().unwrap();
-        if state.interruptions > 0 || state.active.is_some() {
-            return Err("browser_operation_rejected: Browser command custody is being transferred; the program was not started.".into());
+        // A queued program refused for a human takeover reports that
+        // takeover, as a program stopped before its start would.
+        let pending = state
+            .interruptions
+            .iter()
+            .copied()
+            .find(|reason| *reason == InterruptReason::HumanControl)
+            .or_else(|| state.interruptions.first().copied());
+        if let Some(reason) = pending {
+            return Err(reason.before_start());
+        }
+        if state.active.is_some() {
+            return Err("browser_operation_rejected: Another Playwright program holds the browser; the program was not started.".into());
         }
         let (sender, canceled) = watch::channel(None);
         state.active = Some(sender);
@@ -233,12 +252,12 @@ impl<R: AsyncRead + Unpin> RunnerChannel<R> {
         loop {
             if let Some(end) = self.received.iter().position(|byte| *byte == b'\n') {
                 if end >= MAX_RESULT {
-                    return Err(unknown("The program result exceeded 2 MiB."));
+                    return Err("The program result exceeded 2 MiB.".into());
                 }
                 return Ok(self.received.drain(..=end).collect());
             }
             if self.received.len() >= MAX_RESULT {
-                return Err(unknown("The program result exceeded 2 MiB."));
+                return Err("The program result exceeded 2 MiB.".into());
             }
             // Cancel-safe: a canceled read consumed nothing. Reading into the
             // retained buffer keeps this future, part of every command's,
@@ -248,7 +267,7 @@ impl<R: AsyncRead + Unpin> RunnerChannel<R> {
                 .reader
                 .read_buf(&mut self.received)
                 .await
-                .map_err(|_| unknown("The program result could not be read."))?;
+                .map_err(|_| "The program result could not be read.".to_string())?;
             if count == 0 {
                 return Ok(std::mem::take(&mut self.received));
             }
@@ -361,6 +380,7 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
         };
         let endpoint = browser.get_cdp_url().to_owned();
         let artifacts = browser.downloads_path().map(std::path::Path::to_path_buf);
+        let owner = browser.client.clone();
         let control = state.browser_control.clone();
         let client = tokio::select! {
             biased;
@@ -382,7 +402,7 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
             return Err(error);
         }
         let mut tunnel = transport::Tunnel::start(client, control.clone()).await?;
-        let request = json!({ "endpoint": tunnel.endpoint(), "targetId": target, "code": code, "timeoutMs": timeout, "artifactsDir": artifacts, "environment": environment, "isolatedContexts": isolated_contexts });
+        let request = json!({ "endpoint": tunnel.endpoint(), "targetId": target, "code": code, "artifactsDir": artifacts, "environment": environment, "isolatedContexts": isolated_contexts });
         let mut node = Command::new(
             std::env::var("AGENT_BROWSER_NODE_PATH").unwrap_or_else(|_| "node".into()),
         );
@@ -444,7 +464,7 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
             stdin
                 .write_all(&serde_json::to_vec(&request).unwrap())
                 .await
-                .map_err(|_| unknown("The runner did not accept its invocation."))?;
+                .map_err(|_| "The runner did not accept its invocation.".to_string())?;
             drop(stdin);
             let mut record = channel.record().await?;
             if record == START_RECORD {
@@ -498,60 +518,117 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
                     (String::new(), true)
                 }
             };
-        process_cleanup.map_err(unknown)?;
-        tunnel_cleanup.map_err(unknown)?;
-        input_cleanup.map_err(unknown)?;
+        // Native refs and frame scope predate the program, whatever settled.
         state.ref_map.clear();
         state.active_frame_id = None;
-        let bytes = match ended {
-            Ended::Record(bytes) => bytes,
-            ended => {
-                // A program that never ran sent no input and left the last
-                // observation current; one that ran must be observed afresh.
-                if started {
-                    control
-                        .lock()
-                        .await
-                        .cancel_native_input()
-                        .await
-                        .map_err(unknown)?;
-                }
-                return Err(match ended {
-                    Ended::Interrupted(reason) if started => reason.stopped(),
-                    Ended::Interrupted(reason) => reason.before_start(),
-                    Ended::Deadline if started => unknown("The program reached its deadline."),
-                    Ended::Deadline => {
-                        "browser_operation_rejected: The program did not start before its deadline."
-                            .into()
-                    }
-                    Ended::Failed(error) => error,
-                    Ended::Record(_) => unreachable!(),
-                });
-            }
+        let cleanup = process_cleanup.and(tunnel_cleanup).and(input_cleanup);
+        // A program that ran and did not end cleanly may have left input
+        // held; release it, and the next observation is taken afresh. One
+        // that never ran sent no input and left the last observation current.
+        let release = if started && (cleanup.is_err() || !matches!(ended, Ended::Record(_))) {
+            control.lock().await.cancel_native_input().await
+        } else {
+            Ok(())
         };
-        let result: Value = serde_json::from_slice(&bytes).map_err(|_| {
-            if started {
-                unknown("The runner did not produce a complete JSON result.")
-            } else {
-                "browser_operation_rejected: The Playwright runner stopped before starting the program.".into()
+        let outcome = match ended {
+            // Stock Playwright attaches to every tab in the browser and waits
+            // for each to commit its first navigation. One that never will
+            // (a popup whose navigation was refused) keeps any program from
+            // starting, whichever tab it selects; name it.
+            Ended::Deadline if !started => {
+                Err(not_started_by_deadline(&stalled_tabs(&owner).await))
             }
-        })?;
-        if result["success"] != true {
-            let message = result["error"]
-                .as_str()
-                .unwrap_or("The Playwright program failed.");
-            // The daemon's own start record decides; a program cannot report
-            // its failure as never started.
-            return Err(if started {
-                unknown(message)
-            } else {
-                format!("browser_operation_rejected: {message}")
-            });
+            ended => program_outcome(ended, started),
         }
-        Ok(
-            json!({ "result": result["result"], "diagnostics": diagnostics, "diagnosticsTruncated": diagnostics_truncated, "targetId": target }),
-        )
+        .map(|value| {
+            json!({ "result": value, "diagnostics": diagnostics, "diagnosticsTruncated": diagnostics_truncated, "targetId": target })
+        });
+        after_cleanup(outcome, started, cleanup.and(release))
     }
+}
+
+/// A cleanup failure after the program ran leaves its effects unknown, and
+/// keeps the program's own outcome in the report. Cleanup after a program
+/// that never ran cannot change what happened: nothing did.
+fn after_cleanup(
+    outcome: Result<Value, String>,
+    started: bool,
+    cleanup: Result<(), String>,
+) -> Result<Value, String> {
+    match cleanup {
+        Err(error) if started => Err(unknown(match outcome {
+            Ok(_) => format!("{error} The program itself returned before cleanup failed."),
+            Err(program) => format!("{error} The program itself reported: {program}"),
+        })),
+        _ => outcome,
+    }
+}
+
+/// Page targets that have not committed a first navigation: Playwright's
+/// initial empty page. Best effort; the roster is only a diagnosis.
+async fn stalled_tabs(client: &CdpClient) -> Vec<String> {
+    let roster = tokio::time::timeout(
+        Duration::from_secs(1),
+        client.send_command_no_params("Target.getTargets", None),
+    )
+    .await;
+    let Ok(Ok(roster)) = roster else {
+        return Vec::new();
+    };
+    roster["targetInfos"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|target| target["type"] == "page" && target["url"] == "")
+        .filter_map(|target| target["targetId"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn not_started_by_deadline(stalled: &[String]) -> String {
+    if stalled.is_empty() {
+        return "browser_operation_rejected: The program did not start before its deadline.".into();
+    }
+    format!(
+        "browser_operation_rejected: The program did not start before its deadline. Playwright attaches to every tab and waits for each to finish its first navigation; these tabs have not: {}. Close or navigate them, then run the program again.",
+        stalled.join(", ")
+    )
+}
+
+/// What the program's own end proves, before any cleanup failure. `started`
+/// is the daemon's start record; a program cannot report itself not started.
+fn program_outcome(ended: Ended, started: bool) -> Result<Value, String> {
+    let bytes = match ended {
+        Ended::Record(bytes) => bytes,
+        Ended::Interrupted(reason) if started => return Err(reason.stopped()),
+        Ended::Interrupted(reason) => return Err(reason.before_start()),
+        Ended::Deadline if started => return Err(unknown("The program reached its deadline.")),
+        Ended::Deadline => return Err(not_started_by_deadline(&[])),
+        Ended::Failed(error) if started => return Err(unknown(error)),
+        Ended::Failed(error) => {
+            return Err(format!(
+                "browser_operation_rejected: {error} The program was not started."
+            ))
+        }
+    };
+    let result: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        if started {
+            unknown("The runner did not produce a complete JSON result.")
+        } else {
+            "browser_operation_rejected: The Playwright runner stopped before starting the program."
+                .to_string()
+        }
+    })?;
+    if result["success"] != true {
+        let message = result["error"]
+            .as_str()
+            .unwrap_or("The Playwright program failed.");
+        return Err(if started {
+            unknown(message)
+        } else {
+            format!("browser_operation_rejected: {message}")
+        });
+    }
+    Ok(result["result"].clone())
 }
 
 #[cfg(test)]
@@ -608,9 +685,107 @@ mod tests {
         );
         drop(current);
         operations.settled().await;
-        assert!(operations.begin().is_err());
+        let queued = operations.begin().err().unwrap();
+        assert!(
+            queued.starts_with("browser_controlled_by_user:"),
+            "{queued}"
+        );
+        let shutdown = operations.interrupt(InterruptReason::Shutdown);
+        let queued = operations.begin().err().unwrap();
+        assert!(
+            queued.starts_with("browser_controlled_by_user:"),
+            "{queued}"
+        );
         drop(takeover);
+        let queued = operations.begin().err().unwrap();
+        assert!(
+            queued.starts_with("browser_operation_rejected:"),
+            "{queued}"
+        );
+        drop(shutdown);
         assert!(operations.begin().is_ok());
+    }
+
+    #[test]
+    fn a_program_that_never_started_names_the_tabs_playwright_waits_for() {
+        let plain = not_started_by_deadline(&[]);
+        assert_eq!(
+            plain,
+            "browser_operation_rejected: The program did not start before its deadline."
+        );
+        let named = not_started_by_deadline(&["A1".into(), "B2".into()]);
+        assert!(named.starts_with(&plain), "{named}");
+        assert!(named.contains("these tabs have not: A1, B2."), "{named}");
+        assert_eq!(program_outcome(Ended::Deadline, false), Err(plain));
+    }
+
+    #[test]
+    fn only_the_start_record_decides_whether_a_failure_ran_program_code() {
+        let before = program_outcome(
+            Ended::Failed("The runner did not accept its invocation.".into()),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            before.starts_with("browser_operation_rejected:"),
+            "{before}"
+        );
+        let after = program_outcome(
+            Ended::Failed("The program result could not be read.".into()),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            after.starts_with("browser_operation_outcome_unknown:"),
+            "{after}"
+        );
+        let own = program_outcome(
+            Ended::Record(br#"{"success":false,"started":false,"error":"boom"}"#.to_vec()),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            own.starts_with("browser_operation_outcome_unknown: boom"),
+            "{own}"
+        );
+        assert_eq!(
+            program_outcome(
+                Ended::Record(br#"{"success":true,"result":7}"#.to_vec()),
+                true
+            ),
+            Ok(json!(7))
+        );
+    }
+
+    #[test]
+    fn a_cleanup_failure_keeps_the_program_outcome_only_when_it_ran() {
+        let failed = Err("The browser connection closed.".to_string());
+        let reported = after_cleanup(
+            Err("browser_operation_outcome_unknown: boom".into()),
+            true,
+            failed.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            reported
+                .starts_with("browser_operation_outcome_unknown: The browser connection closed."),
+            "{reported}"
+        );
+        assert!(
+            reported.contains("reported: browser_operation_outcome_unknown: boom"),
+            "{reported}"
+        );
+        let returned = after_cleanup(Ok(json!(1)), true, failed.clone()).unwrap_err();
+        assert!(
+            returned.contains("returned before cleanup failed"),
+            "{returned}"
+        );
+        let never_ran = "browser_controlled_by_user: User control prevented this Playwright program from starting.".to_string();
+        assert_eq!(
+            after_cleanup(Err(never_ran.clone()), false, failed),
+            Err(never_ran)
+        );
+        assert_eq!(after_cleanup(Ok(json!(1)), true, Ok(())), Ok(json!(1)));
     }
 
     #[tokio::test]
@@ -665,7 +840,7 @@ mod tests {
         assert!(!channel.started_before_stop());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
     async fn e2e_playwright_uses_existing_target_and_retains_browser_after_timeout() {
         use crate::native::actions::execute_command;
@@ -718,7 +893,7 @@ mod tests {
     /// is lost while it waits for an event, settle promptly as unknown
     /// outcomes rather than at their deadlines. The retained browser keeps
     /// its tab after the first.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
     async fn e2e_playwright_lost_transports_settle_before_the_deadline() {
         use crate::native::actions::execute_command;
@@ -783,7 +958,7 @@ mod tests {
         let _ = Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
     async fn e2e_playwright_frames_popups_files_and_real_pointer_share_native_owners() {
         use crate::native::actions::execute_command;
@@ -914,7 +1089,7 @@ try {
         Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
     async fn e2e_playwright_windows_share_profile_and_isolated_contexts_are_never_misrepresented() {
         use crate::native::actions::execute_command;
@@ -934,9 +1109,14 @@ try {
             .to_owned();
         let client = state.browser.as_ref().unwrap().client.clone();
         client.send_command("Storage.setCookies", Some(json!({"cookies":[{"name":"account","value":"persistent","url":"https://account.example/"}]})), None).await.unwrap();
-        let created = Box::pin(execute_command(&json!({"action":"window_new"}), &mut state)).await;
+        // A shared window is a second tab of the profile's own context.
+        let created = Box::pin(execute_command(
+            &json!({"action":"window_new","shared":true}),
+            &mut state,
+        ))
+        .await;
         assert_eq!(created["success"], true, "{created}");
-        assert_eq!(created["data"]["isolated"], false);
+        assert_eq!(created["data"]["shared"], true);
         let target = state
             .browser
             .as_ref()
@@ -957,13 +1137,10 @@ try {
             .as_array()
             .unwrap()
             .contains(&json!("account=persistent")));
-        let isolated = Box::pin(execute_command(
-            &json!({"action":"window_new","isolated":true}),
-            &mut state,
-        ))
-        .await;
+        // The default window has its own context, without the profile's cookies.
+        let isolated = Box::pin(execute_command(&json!({"action":"window_new"}), &mut state)).await;
         assert_eq!(isolated["success"], true, "{isolated}");
-        assert_eq!(isolated["data"]["isolated"], true);
+        assert_eq!(isolated["data"]["shared"], false);
         let isolated_target = state
             .browser
             .as_ref()
@@ -1025,14 +1202,22 @@ try {
                 assert!(!error.contains("PROGRAM MUST NOT START"), "{read}");
             }
         }
-        client
-            .send_command(
-                "Target.disposeBrowserContext",
-                Some(json!({"browserContextId":isolated_context})),
-                None,
-            )
+        // Closing the isolated window through the native tools discards its
+        // context with it, so no client is left with anything to misrepresent.
+        let closed = Box::pin(execute_command(
+            &json!({"action":"tab_close","tabId":isolated_target}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(closed["success"], true, "{closed}");
+        assert!(!state
+            .browser
+            .as_ref()
+            .unwrap()
+            .isolated_context_ids()
             .await
-            .unwrap();
+            .unwrap()
+            .contains(&isolated_context.as_str().unwrap().to_owned()));
         let selected = Box::pin(execute_command(
             &json!({"action":"tab_switch","tabId":target}),
             &mut state,
@@ -1048,6 +1233,118 @@ try {
             .as_array()
             .unwrap()
             .contains(&json!("persistent")));
+        if let Ok(stock) = std::env::var("AGENT_BROWSER_TEST_STOCK_PLAYWRIGHT_MODULE") {
+            let env = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_PLAYWRIGHT_MODULE"]);
+            env.set("AGENT_BROWSER_PLAYWRIGHT_MODULE", &stock);
+            let read = Box::pin(execute_command(&json!({"action":"run_playwright","targetId":target,"code":cookie_values,"timeoutMs":15000}), &mut state)).await;
+            assert_eq!(read["success"], true, "{read}");
+        }
+        Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
+    }
+
+    /// Playwright pipelines each page's setup (Runtime.enable before
+    /// Runtime.runIfWaitingForDebugger) and relies on Chrome running it in
+    /// order. Sent out of order on the daemon's multi-threaded runtime, an
+    /// attachment occasionally lost the main context and hung to its deadline.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
+    async fn e2e_playwright_repeated_attachments_keep_every_page_context() {
+        use crate::native::actions::execute_command;
+        let (port, server) = serve_pages(
+            "<title>Main</title><p>main text</p>",
+            "<title>Popup</title><p>popup text</p>",
+        )
+        .await;
+        let mut state = DaemonState::new();
+        let opened = Box::pin(execute_command(
+            &json!({"action":"navigate","url":format!("http://127.0.0.1:{port}/")}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(opened["success"], true, "{opened}");
+        let code = format!("const title = await page.evaluate(() => document.title); const text = await page.locator('p').innerText(); const [popup] = await Promise.all([page.waitForEvent('popup'), page.evaluate(() => {{ window.open('http://127.0.0.1:{port}/frame'); }})]); await popup.waitForLoadState('load'); const popupText = await popup.locator('p').innerText(); await popup.close(); return {{ title, text, popupText }};");
+        let mut failures = Vec::new();
+        for run in 0..64 {
+            let result = Box::pin(execute_command(
+                &json!({"action":"run_playwright","timeoutMs":8000,"code":code}),
+                &mut state,
+            ))
+            .await;
+            if result["data"]["result"]
+                != json!({"title":"Main","text":"main text","popupText":"popup text"})
+            {
+                failures.push((run, result));
+                // An unknown outcome requires a fresh observation first.
+                Box::pin(execute_command(&json!({"action":"snapshot"}), &mut state)).await;
+            }
+        }
+        Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
+        server.abort();
+        assert!(failures.is_empty(), "{failures:?}");
+    }
+
+    /// Stock Playwright waits for every tab's first navigation before any
+    /// program starts. A popup that never navigates is named, closing it
+    /// through the native tools recovers, and nothing ran meanwhile.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
+    async fn e2e_playwright_names_a_tab_that_never_navigated_and_recovers_after_closing_it() {
+        use crate::native::actions::execute_command;
+        let mut state = DaemonState::new();
+        let opened = Box::pin(execute_command(
+            &json!({"action":"navigate","url":"data:text/html,<title>Main</title><p>main</p>"}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(opened["success"], true, "{opened}");
+        let main = state
+            .browser
+            .as_ref()
+            .unwrap()
+            .active_target_id()
+            .unwrap()
+            .to_owned();
+        // Chrome refuses a renderer-initiated top-level data: navigation, so
+        // this popup stays on its initial empty document.
+        let opener = Box::pin(execute_command(&json!({"action":"run_playwright","targetId":main,"timeoutMs":15000,"code":"await page.evaluate(() => { window.open('data:text/html,<p>never</p>'); }); return true;"}), &mut state)).await;
+        assert_eq!(opener["success"], true, "{opener}");
+        let client = state.browser.as_ref().unwrap().client.clone();
+        let stalled = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let found = stalled_tabs(&client).await;
+                if !found.is_empty() {
+                    break found;
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(stalled.len(), 1, "{stalled:?}");
+        let blocked = Box::pin(execute_command(&json!({"action":"run_playwright","targetId":main,"timeoutMs":3000,"code":"await page.evaluate(() => { document.title = 'RAN'; }); return true;"}), &mut state)).await;
+        assert_eq!(blocked["code"], "browser_operation_rejected", "{blocked}");
+        assert!(
+            blocked["error"].as_str().unwrap().contains(&stalled[0]),
+            "{blocked}"
+        );
+        let closed = Box::pin(execute_command(
+            &json!({"action":"tab_close","tabId":stalled[0]}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(closed["success"], true, "{closed}");
+        let selected = Box::pin(execute_command(
+            &json!({"action":"tab_switch","tabId":main}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(selected["success"], true, "{selected}");
+        let read = Box::pin(execute_command(&json!({"action":"run_playwright","targetId":main,"timeoutMs":15000,"code":"return await page.title();"}), &mut state)).await;
+        assert_eq!(read["success"], true, "{read}");
+        assert_eq!(
+            read["data"]["result"], "Main",
+            "the blocked program ran: {read}"
+        );
         Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
     }
 
@@ -1086,7 +1383,7 @@ try {
     /// out-of-process frame and after the native window is resized, lands at
     /// the requested client points and is published as the owner's activity.
     /// DOM `element.click()` publishes nothing.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires local Chromium, the browser display helper and installed playwright-core 1.62.1"]
     async fn e2e_playwright_pointer_reaches_scrolled_frames_after_resize_and_is_published() {
         use crate::native::actions::execute_command;
@@ -1224,7 +1521,7 @@ return {main: await page.evaluate(() => pointerLog), frame: await frame.evaluate
     /// One Chrome process, profile and tab across native commands, Playwright
     /// programs, a human click and new tabs, in the native window mode that
     /// production uses.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires local Chromium, the browser display helper and installed playwright-core 1.62.1"]
     async fn e2e_playwright_and_native_share_one_chrome_across_human_control_and_new_tabs() {
         use crate::native::actions::execute_command;

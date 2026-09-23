@@ -1665,15 +1665,15 @@ fn parse_command_inner(
             const VALID: &[&str] = &["new"];
             match rest.first().copied() {
                 Some("new") => {
-                    if rest[1..].iter().any(|arg| *arg != "--isolated") {
+                    if rest[1..].iter().any(|arg| *arg != "--shared") {
                         return Err(ParseError::InvalidValue {
-                            message: "window new accepts only --isolated".into(),
-                            usage: "window new [--isolated]",
+                            message: "window new accepts only --shared".into(),
+                            usage: "window new [--shared]",
                         });
                     }
                     let mut command = json!({ "id": id, "action": "window_new" });
-                    if rest[1..].contains(&"--isolated") {
-                        command["isolated"] = json!(true);
+                    if rest[1..].contains(&"--shared") {
+                        command["shared"] = json!(true);
                     }
                     Ok(command)
                 }
@@ -4549,6 +4549,19 @@ mod tests {
         let cmd = parse_command(&args("tab close docs"), &default_flags()).unwrap();
         assert_eq!(cmd["action"], "tab_close");
         assert_eq!(cmd["tabId"], "docs");
+    }
+
+    /// A window has its own cookie context unless the caller opts into the
+    /// profile; there is no flag for the default.
+    #[test]
+    fn test_window_new_shared_is_the_only_flag() {
+        let cmd = parse_command(&args("window new"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "window_new");
+        assert!(cmd.get("shared").is_none());
+        let cmd = parse_command(&args("window new --shared"), &default_flags()).unwrap();
+        assert_eq!(cmd["action"], "window_new");
+        assert_eq!(cmd["shared"], true);
+        assert!(parse_command(&args("window new --isolated"), &default_flags()).is_err());
     }
 
     #[test]

@@ -371,8 +371,8 @@ agent-browser tab new [url]                    # New tab (optionally with URL)
 agent-browser tab new --label docs [url]       # New tab with a user-assigned label
 agent-browser tab <t<N>|label>                 # Switch to a tab by id or label
 agent-browser tab close [t<N>|label]           # Close a tab (defaults to active)
-agent-browser window new                       # New window in the persistent profile
-agent-browser window new --isolated            # Separate native cookie context
+agent-browser window new                       # New window in its own cookie context
+agent-browser window new --shared              # New window in the signed-in profile
 ```
 
 Tab ids are stable strings of the form `t1`, `t2`, `t3`. They're never reused within a session, so scripts and agents can keep referring to the same tab even after other tabs are opened or closed. Positional integers like `tab 2` are **not** accepted; the `t` prefix disambiguates handles from indices and mirrors the `@e1` convention used for element refs.
@@ -2038,7 +2038,7 @@ Apache-2.0
 
 ### Playwright in the existing browser
 
-Ordinary `window new` now shares the browser's persistent profile and authentication state. Use `window new --isolated` (MCP `isolated: true`) for separate native cookies. Existing isolated windows are retained without migration or cookie copying. Playwright cannot faithfully adopt those pre-existing contexts, so attachment is refused while they are open; native browser tools remain available. Close those isolated windows before returning to Playwright. New contexts created within a Playwright program retain normal Playwright semantics.
+`window new` opens a window in its own cookie context, as it always has, and closing that window's last tab discards the context, as closing a private window does. `window new --shared` (MCP `shared: true`) opens one in the browser's persistent profile and authentication state instead. Existing windows and credentials are never moved or copied. A Playwright client with context adoption represents each tab's real context; the stock 1.62.1 client would report an isolated window's tabs under the profile, so it refuses to attach, before any program code runs, while an isolated window is open. Native browser tools work in every window. New contexts created within a Playwright program retain normal Playwright semantics.
 
 Linux private window streaming uses ANGLE software GLES for WebGL by default, with software compositing so the stream still sends only damaged regions. Explicit browser arguments override that preset, and the existing `--webgpu` preset keeps its backend. A fresh driver-owned profile opens `about:blank`; retained profiles and caller-selected startup arguments keep their existing startup behavior.
 

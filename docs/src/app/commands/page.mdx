@@ -47,7 +47,7 @@ Successful `open <url>` and `navigate` commands advertise when WebMCP tools are 
 
 ## Playwright in the current browser
 
-Ordinary new windows share the persistent profile. `window new --isolated`, or MCP `agent_browser_window_new` with `isolated: true`, retains separate native cookies. Playwright cannot represent pre-existing isolated contexts correctly and refuses attachment while their windows remain open. Native tools still work in those windows; closing them permits Playwright attachment again. Existing windows and credentials are never moved or copied.
+`window new` opens a window in its own cookie context; closing that window's last tab discards the context, as closing a private window does. `window new --shared`, or MCP `agent_browser_window_new` with `shared: true`, opens one in the persistent profile instead. A Playwright client with context adoption represents each tab's real context; the stock 1.62.1 client cannot, so it refuses to attach while an isolated window is open. Native tools work in every window; closing an isolated window admits the stock client again. Existing windows and credentials are never moved or copied.
 
 On Linux, private window streaming defaults to ANGLE software GLES for WebGL with software compositing, so the stream still sends only damaged regions. Explicit browser arguments override this preset, and `--webgpu` keeps its existing backend. Fresh driver-owned profiles open `about:blank`; retained profiles and caller-selected startup behavior are preserved.
 
@@ -255,8 +255,8 @@ agent-browser tab new [url]                    # New tab
 agent-browser tab new --label docs [url]       # New tab with a user-assigned label
 agent-browser tab <t<N>|label>                 # Switch to a tab by id or label
 agent-browser tab close [t<N>|label]           # Close a tab (defaults to active)
-agent-browser window new                       # New window in the persistent profile
-agent-browser window new --isolated            # Separate native cookie context
+agent-browser window new                       # New window in its own cookie context
+agent-browser window new --shared              # New window in the signed-in profile
 agent-browser frame <sel>                      # Switch to iframe by CSS selector
 agent-browser frame @e3                        # Switch to iframe by element ref
 agent-browser frame main                       # Back to main frame

@@ -440,6 +440,10 @@ pub struct BrowserManager {
     /// launch rules such as extension-forced headed mode. Meaningless for
     /// attached browsers (browser_process is None).
     headless: bool,
+    /// Cookie contexts created for isolated windows. Each lives exactly as
+    /// long as its window's pages, as a private window's session does: the
+    /// destruction of its last page disposes it.
+    window_contexts: HashSet<String>,
 }
 
 #[path = "browser_window.rs"]
@@ -585,6 +589,7 @@ impl BrowserManager {
                 bound_target_id: None,
                 bound_target_gone: None,
                 headless,
+                window_contexts: HashSet::new(),
             };
             manager.discover_and_attach_targets().await?;
             manager
@@ -697,6 +702,7 @@ impl BrowserManager {
             bound_target_id: None,
             bound_target_gone: None,
             headless: true,
+            window_contexts: HashSet::new(),
         };
 
         if direct_page {
@@ -1822,7 +1828,11 @@ impl BrowserManager {
         let closed_label = page.label.clone();
         let closed_target_id = page.target_id.clone();
         self.handle_bound_target_removed(&page.target_id, &page.url);
-        let _ = self
+        // Chrome acknowledges the close before it destroys the target. The
+        // close is reported once the target is gone, so the next command's
+        // view of the browser (its tab roster, its contexts) already holds.
+        let mut events = self.client.subscribe();
+        let closed = self
             .client
             .send_command_typed::<_, Value>(
                 "Target.closeTarget",
@@ -1832,6 +1842,23 @@ impl BrowserManager {
                 None,
             )
             .await;
+        if closed.is_ok() {
+            let destroyed = async {
+                loop {
+                    match events.recv().await {
+                        Ok(event)
+                            if event.method == "Target.targetDestroyed"
+                                && event.params["targetId"] == closed_target_id.as_str() =>
+                        {
+                            break
+                        }
+                        Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    }
+                }
+            };
+            let _ = tokio::time::timeout(Duration::from_secs(5), destroyed).await;
+        }
 
         let mut result = json!({
             "tabId": format_tab_id(closed_tab_id),
@@ -2393,6 +2420,67 @@ impl BrowserManager {
             .collect()
     }
 
+    /// The cookie context of one isolated window, disposed with its last page.
+    pub(crate) async fn create_window_context(&mut self) -> Result<String, String> {
+        let created = self
+            .client
+            .send_command_no_params("Target.createBrowserContext", None)
+            .await?;
+        let context = created["browserContextId"]
+            .as_str()
+            .ok_or("Failed to create browser context")?
+            .to_owned();
+        // Recorded before anything that can still fail, so a window that
+        // never opens leaves no context behind.
+        self.window_contexts.insert(context.clone());
+        self.inherit_downloads(&context).await?;
+        Ok(context)
+    }
+
+    /// Dispose window contexts whose pages are all gone. Chrome keeps an
+    /// explicit context, with any workers still in it, until it is disposed;
+    /// a window's context has no life beyond its window.
+    pub(crate) async fn dispose_empty_window_contexts(&mut self) -> Result<(), String> {
+        if self.window_contexts.is_empty() {
+            return Ok(());
+        }
+        let roster = self
+            .client
+            .send_command_no_params("Target.getTargets", None)
+            .await?;
+        let targets = roster["targetInfos"]
+            .as_array()
+            .ok_or("Browser target roster is unavailable")?;
+        let occupied: HashSet<&str> = targets
+            .iter()
+            .filter(|target| target["type"] == "page")
+            .filter_map(|target| target["browserContextId"].as_str())
+            .collect();
+        let empty: Vec<String> = self
+            .window_contexts
+            .iter()
+            .filter(|context| !occupied.contains(context.as_str()))
+            .cloned()
+            .collect();
+        for context in empty {
+            // A context Chrome no longer knows is already gone; either way
+            // nothing of the window remains to keep.
+            let _ = self
+                .client
+                .send_command(
+                    "Target.disposeBrowserContext",
+                    Some(json!({ "browserContextId": context })),
+                    None,
+                )
+                .await;
+            self.window_contexts.remove(&context);
+            if let Some(directory) = self.downloads_directory.as_mut() {
+                directory.contexts.remove(&Some(context));
+            }
+        }
+        Ok(())
+    }
+
     pub(crate) async fn download_context_for_target(
         &self,
         target: &str,
@@ -2625,6 +2713,7 @@ async fn initialize_lightpanda_manager(
             bound_target_id: None,
             bound_target_gone: None,
             headless: true,
+            window_contexts: HashSet::new(),
         };
 
         match discover_and_attach_lightpanda_targets(&mut manager, deadline).await {
@@ -3331,7 +3420,84 @@ mod tests {
             bound_target_id: None,
             bound_target_gone: None,
             headless: true,
+            window_contexts: HashSet::new(),
         }
+    }
+
+    /// A window's context is disposed once no page target remains in it,
+    /// even while Chrome still keeps a worker there. A context Chrome no
+    /// longer knows is simply forgotten; one that still holds a page stays.
+    #[tokio::test]
+    async fn window_contexts_are_disposed_with_their_last_page() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (disposed_tx, mut disposed_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let (mut tx, mut rx) = ws.split();
+            while let Some(Ok(msg)) = rx.next().await {
+                let text = match msg {
+                    Message::Text(t) => t,
+                    Message::Ping(p) => {
+                        let _ = tx.send(Message::Pong(p)).await;
+                        continue;
+                    }
+                    _ => continue,
+                };
+                let cmd: Value = match serde_json::from_str(&text) {
+                    Ok(v) => v,
+                    Err(_) => continue,
+                };
+                let Some(id) = cmd["id"].as_u64() else {
+                    continue;
+                };
+                let reply = match cmd["method"].as_str().unwrap_or("") {
+                    "Target.getTargets" => json!({ "id": id, "result": { "targetInfos": [
+                        { "targetId": "P1", "type": "page", "title": "", "url": "https://a.test/", "attached": false, "browserContextId": "C-PAGES" },
+                        { "targetId": "W1", "type": "service_worker", "title": "", "url": "chrome-extension://x/sw.js", "attached": false, "browserContextId": "C-WORKER" },
+                    ] } }),
+                    "Target.disposeBrowserContext" => {
+                        let context = cmd["params"]["browserContextId"]
+                            .as_str()
+                            .unwrap()
+                            .to_owned();
+                        let known = context != "C-GONE";
+                        disposed_tx.send(context).unwrap();
+                        if known {
+                            json!({ "id": id, "result": {} })
+                        } else {
+                            json!({ "id": id, "error": { "code": -32602, "message": "Failed to find context with id C-GONE" } })
+                        }
+                    }
+                    _ => json!({ "id": id, "result": {} }),
+                };
+                let _ = tx.send(Message::Text(reply.to_string())).await;
+            }
+        });
+        let client = CdpClient::connect(&format!("ws://{}", addr)).await.unwrap();
+        let mut manager = test_manager(Vec::new()).await;
+        manager.client = Arc::new(client);
+        manager.window_contexts = ["C-PAGES", "C-WORKER", "C-GONE"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        manager.dispose_empty_window_contexts().await.unwrap();
+        let mut disposed = Vec::new();
+        while let Ok(context) = disposed_rx.try_recv() {
+            disposed.push(context);
+        }
+        disposed.sort();
+        assert_eq!(disposed, ["C-GONE", "C-WORKER"]);
+        assert_eq!(
+            manager.window_contexts,
+            HashSet::from(["C-PAGES".to_owned()])
+        );
+        // Nothing left to reconcile: the roster is not even consulted.
+        manager.window_contexts.clear();
+        manager.dispose_empty_window_contexts().await.unwrap();
     }
 
     const TARGET_A: &str = "AAAA0000BBBB1111CCCC2222DDDD3333";
@@ -3913,6 +4079,18 @@ mod tests {
                     "Runtime.evaluate" => Some(respond(
                         json!({ "result": { "type": "string", "value": "https://discarded.test/" } }),
                     )),
+                    // A browser destroys the target after acknowledging the
+                    // close; the manager reports the close once it is gone.
+                    "Target.closeTarget" => {
+                        let target = cmd["params"]["targetId"].as_str().unwrap_or("").to_owned();
+                        let _ = tx
+                            .send(Message::Text(respond(json!({ "success": true }))))
+                            .await;
+                        Some(
+                            json!({ "method": "Target.targetDestroyed", "params": { "targetId": target } })
+                                .to_string(),
+                        )
+                    }
                     _ => Some(respond(json!({}))),
                 };
                 if let Some(r) = reply {

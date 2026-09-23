@@ -856,7 +856,7 @@ mod tests {
     /// attaching proves that no program code ran: human control reports the
     /// ordinary refusal and a deadline reports rejection, never an
     /// interrupted or unknown outcome. The page shows no program effect.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
     async fn e2e_playwright_stop_before_program_code_reports_that_nothing_ran() {
         use crate::test_utils::EnvGuard;
@@ -943,7 +943,7 @@ mod tests {
             .unwrap();
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
     async fn e2e_playwright_takeover_and_caller_disconnect_settle_before_releasing_custody() {
         use serde_json::json;

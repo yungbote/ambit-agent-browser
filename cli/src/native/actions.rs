@@ -1316,6 +1316,13 @@ impl DaemonState {
                 mgr.remove_page_by_target_id(target_id);
             }
         }
+        // An isolated window's context ends with its last page, whoever
+        // closed it: the agent, the user, the page itself or a program.
+        if !drained.destroyed_targets.is_empty() {
+            if let Some(ref mut mgr) = self.browser {
+                mgr.dispose_empty_window_contexts().await?;
+            }
+        }
 
         // Track cross-origin iframe sessions
         for (frame_id, iframe_sid) in &drained.attached_iframe_sessions {
@@ -7596,6 +7603,9 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         mgr.tab_close_by_id(tab_id, dialog_session.as_deref())
             .await?
     };
+    // The destroyed target is settled before the close is reported: a window
+    // context it was the last page of is disposed here, not at a later command.
+    state.drain_cdp_events_background().await?;
     // Clear only after the close commits; a rejected close (last tab, bad
     // index) must not wipe the caller's refs and frame scope.
     state.ref_map.clear();
@@ -11045,62 +11055,62 @@ async fn handle_waitfordownload(cmd: &Value, state: &DaemonState) -> Result<Valu
     mgr.finish_download(&download, cmd.get("path").and_then(Value::as_str))
 }
 
+/// Open a window's first page and make it the active tab. A window has its
+/// own cookie context unless the caller asks for the profile; neither
+/// direction copies credentials.
+async fn open_window(
+    mgr: &mut super::browser::BrowserManager,
+    shared: bool,
+) -> Result<(u32, String), String> {
+    let mut target = json!({ "url": "about:blank", "newWindow": true });
+    if !shared {
+        target["browserContextId"] = json!(mgr.create_window_context().await?);
+    }
+    let create_result: super::cdp::types::CreateTargetResult = mgr
+        .client
+        .send_command_typed("Target.createTarget", &target, None)
+        .await?;
+    let attach: super::cdp::types::AttachToTargetResult = mgr
+        .client
+        .send_command_typed(
+            "Target.attachToTarget",
+            &super::cdp::types::AttachToTargetParams {
+                target_id: create_result.target_id.clone(),
+                flatten: true,
+            },
+            None,
+        )
+        .await?;
+    mgr.prepare_domains_pub(&attach.session_id).await?;
+    let tab_id = mgr.assign_tab_id();
+    mgr.add_page(super::browser::PageInfo {
+        tab_id,
+        label: None,
+        target_id: create_result.target_id,
+        session_id: attach.session_id.clone(),
+        url: "about:blank".to_string(),
+        title: String::new(),
+        target_type: "page".to_string(),
+    });
+    Ok((tab_id, attach.session_id))
+}
+
 async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let isolated = match cmd.get("isolated") {
+    let shared = match cmd.get("shared") {
         None => false,
         Some(Value::Bool(value)) => *value,
-        _ => return Err("isolated must be a boolean".into()),
+        _ => return Err("shared must be a boolean".into()),
     };
     let (tab_id, session_id) = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-
-        let mut target = json!({ "url": "about:blank", "newWindow": true });
-        // An ordinary window shares the current profile. Isolation is an
-        // explicit native capability and never requires copying credentials.
-        if isolated {
-            let context_result = mgr
-                .client
-                .send_command_no_params("Target.createBrowserContext", None)
-                .await?;
-            let context_id = context_result
-                .get("browserContextId")
-                .and_then(|v| v.as_str())
-                .ok_or("Failed to create browser context")?
-                .to_string();
-            mgr.inherit_downloads(&context_id).await?;
-            target["browserContextId"] = json!(context_id);
+        match open_window(mgr, shared).await {
+            Ok(opened) => opened,
+            Err(error) => {
+                // A context whose window never opened has nothing to keep.
+                let _ = mgr.dispose_empty_window_contexts().await;
+                return Err(error);
+            }
         }
-
-        let create_result: super::cdp::types::CreateTargetResult = mgr
-            .client
-            .send_command_typed("Target.createTarget", &target, None)
-            .await?;
-
-        let attach: super::cdp::types::AttachToTargetResult = mgr
-            .client
-            .send_command_typed(
-                "Target.attachToTarget",
-                &super::cdp::types::AttachToTargetParams {
-                    target_id: create_result.target_id.clone(),
-                    flatten: true,
-                },
-                None,
-            )
-            .await?;
-
-        mgr.prepare_domains_pub(&attach.session_id).await?;
-
-        let tab_id = mgr.assign_tab_id();
-        mgr.add_page(super::browser::PageInfo {
-            tab_id,
-            label: None,
-            target_id: create_result.target_id,
-            session_id: attach.session_id.clone(),
-            url: "about:blank".to_string(),
-            title: String::new(),
-            target_type: "page".to_string(),
-        });
-        (tab_id, attach.session_id)
     };
 
     let has_proxy_creds = state.proxy_credentials.read().await.is_some();
@@ -11136,7 +11146,7 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
     Ok(json!({
         "tabId": super::browser::format_tab_id(tab_id),
         "total": total,
-        "isolated": isolated,
+        "shared": shared,
     }))
 }
 

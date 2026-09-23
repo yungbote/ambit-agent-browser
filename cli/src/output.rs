@@ -2640,7 +2640,7 @@ Usage: agent-browser window <operation>
 Manage browser windows.
 
 Operations:
-  new [--isolated]     Open a window in the existing profile, or a separate cookie context
+  new [--shared]       Open a window in its own cookie context, or in the signed-in profile with --shared
 
 Global Options:
   --json               Output as JSON
@@ -2648,7 +2648,7 @@ Global Options:
 
 Examples:
   agent-browser window new
-  agent-browser window new --isolated
+  agent-browser window new --shared
 "##
         }
 
