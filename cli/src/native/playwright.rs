@@ -380,6 +380,7 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
         };
         let endpoint = browser.get_cdp_url().to_owned();
         let artifacts = browser.downloads_path().map(std::path::Path::to_path_buf);
+        let owner = browser.client.clone();
         let control = state.browser_control.clone();
         let client = tokio::select! {
             biased;
@@ -401,7 +402,7 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
             return Err(error);
         }
         let mut tunnel = transport::Tunnel::start(client, control.clone()).await?;
-        let request = json!({ "endpoint": tunnel.endpoint(), "targetId": target, "code": code, "timeoutMs": timeout, "artifactsDir": artifacts, "environment": environment, "isolatedContexts": isolated_contexts });
+        let request = json!({ "endpoint": tunnel.endpoint(), "targetId": target, "code": code, "artifactsDir": artifacts, "environment": environment, "isolatedContexts": isolated_contexts });
         let mut node = Command::new(
             std::env::var("AGENT_BROWSER_NODE_PATH").unwrap_or_else(|_| "node".into()),
         );
@@ -534,9 +535,9 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
             // for each to commit its first navigation. One that never will
             // (a popup whose navigation was refused) keeps any program from
             // starting, whichever tab it selects; name it.
-            Ended::Deadline if !started => Err(not_started_by_deadline(
-                &stalled_tabs(&state.browser.as_ref().unwrap().client).await,
-            )),
+            Ended::Deadline if !started => {
+                Err(not_started_by_deadline(&stalled_tabs(&owner).await))
+            }
             ended => program_outcome(ended, started),
         }
         .map(|value| {
@@ -703,6 +704,19 @@ mod tests {
         );
         drop(shutdown);
         assert!(operations.begin().is_ok());
+    }
+
+    #[test]
+    fn a_program_that_never_started_names_the_tabs_playwright_waits_for() {
+        let plain = not_started_by_deadline(&[]);
+        assert_eq!(
+            plain,
+            "browser_operation_rejected: The program did not start before its deadline."
+        );
+        let named = not_started_by_deadline(&["A1".into(), "B2".into()]);
+        assert!(named.starts_with(&plain), "{named}");
+        assert!(named.contains("these tabs have not: A1, B2."), "{named}");
+        assert_eq!(program_outcome(Ended::Deadline, false), Err(plain));
     }
 
     #[test]

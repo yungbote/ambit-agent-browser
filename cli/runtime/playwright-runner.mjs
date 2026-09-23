@@ -39,11 +39,14 @@ try {
   if (ambitCdpContextAdoptionVersion !== 1 && request.isolatedContexts > 0) {
     throw new Error(`The installed Playwright client cannot represent ${request.isolatedContexts} open isolated window context(s) faithfully. Close those isolated windows or use native browser tools for them.`);
   }
+  // The daemon's deadline is the only clock: it stops this process group and
+  // then names what kept the attachment from completing. A second timer here
+  // would race it with a less specific error.
   browser = await chromium.connectOverCDP(request.endpoint, {
     noDefaults: true,
     isLocal: true,
     artifactsDir: request.artifactsDir ?? undefined,
-    timeout: request.timeoutMs,
+    timeout: 0,
   });
   let selected;
   for (const context of browser.contexts()) {
