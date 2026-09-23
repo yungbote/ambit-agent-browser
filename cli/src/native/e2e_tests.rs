@@ -12329,3 +12329,64 @@ async fn e2e_native_mouse_reaches_iframes_and_refuses_points_outside_the_page() 
     assert_eq!(downs["data"]["result"], 1);
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
+
+// A Cloudflare challenge is a cross-site iframe in its own renderer process.
+#[tokio::test]
+#[ignore]
+async fn e2e_native_mouse_reaches_a_cross_site_iframe() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            // Chrome may hold an idle preconnected socket; serve each apart.
+            std::thread::spawn(move || {
+                let mut request = [0u8; 2048];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..read]).to_string();
+                let body = if request.starts_with("GET /child ") {
+                    "<!doctype html><body style='margin:0'><button style='width:300px;height:200px'>Challenge</button><script>for(const type of ['pointerdown','click'])addEventListener(type,e=>parent.postMessage({type,trusted:e.isTrusted},'*'),true)</script>".to_string()
+                } else {
+                    format!("<!doctype html><style>body{{margin:0}}#frame{{position:absolute;left:200px;top:200px;width:300px;height:200px;border:0}}</style><iframe id=frame src='http://localhost:{port}/child'></iframe><script>window.got=[];addEventListener('message',e=>got.push(e.data))</script>")
+                };
+                let _ = write!(
+                stream,
+                "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            });
+        }
+    });
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"navigate","url":format!("http://127.0.0.1:{port}/")}),
+            &mut state,
+        )
+        .await,
+    );
+    assert!(state.browser_control.lock().await.has_native_display());
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !state.iframe_sessions.is_empty(),
+        "the cross-site iframe must be out of process"
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"mousemove","x":300,"y":300}), &mut state).await,
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#frame"}), &mut state).await,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let got = control_test_command(&json!({"action":"evaluate","script":"got"}), &mut state).await;
+    assert_success(&got);
+    assert_eq!(
+        got["data"]["result"],
+        json!([{"type":"pointerdown","trusted":true},{"type":"click","trusted":true}])
+    );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
