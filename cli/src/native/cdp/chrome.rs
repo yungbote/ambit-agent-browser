@@ -571,9 +571,16 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
     // WebGL without opting into Chromium's unsafe automatic WebGL fallback.
     // User/config arguments are appended later and retain normal precedence;
     // the WebGPU preset owns its own graphics backend.
+    //
+    // The display compositor stays in software. A GL compositor swaps the
+    // whole window on every frame, so the display reports the entire window
+    // as damaged and every keystroke or hover ships as a whole frame instead
+    // of a patch; software presents only what changed. WebGL contexts still
+    // render through the selected GLES backend.
     if cfg!(target_os = "linux") && options.window_stream && !options.webgpu {
         args.push("--use-gl=angle".to_string());
         args.push("--use-angle=swiftshader".to_string());
+        args.push("--disable-gpu-compositing".to_string());
     }
 
     // A fresh managed window needs one initial page, not Chrome's expensive
@@ -2223,6 +2230,10 @@ mod tests {
         if cfg!(target_os = "linux") {
             assert!(arguments.iter().any(|arg| arg == "--use-gl=angle"));
             assert!(arguments.iter().any(|arg| arg == "--use-angle=swiftshader"));
+            // Damage-limited presents keep window capture incremental.
+            assert!(arguments
+                .iter()
+                .any(|arg| arg == "--disable-gpu-compositing"));
         }
         assert!(!arguments
             .iter()
@@ -2249,6 +2260,9 @@ mod tests {
         };
         let arguments = build_chrome_args(&webgpu).unwrap().args;
         assert!(!arguments.iter().any(|arg| arg == "--use-angle=swiftshader"));
+        assert!(!arguments
+            .iter()
+            .any(|arg| arg == "--disable-gpu-compositing"));
         if cfg!(target_os = "linux") {
             assert!(arguments.iter().any(|arg| arg == "--use-angle=vulkan"));
         }
