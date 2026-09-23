@@ -12202,7 +12202,7 @@ async fn e2e_native_mouse_reaches_iframes_and_refuses_points_outside_the_page() 
     env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
     env.set("DISPLAY", "");
     let mut state = DaemonState::new();
-    let html = r#"<!doctype html><style>body{margin:0}#frame{position:absolute;left:200px;top:200px;width:300px;height:200px;border:0}</style><a id=fixed href='#f' style='position:fixed;top:-100px;left:10px'>Fixed</a><iframe id=frame srcdoc="<body style='margin:0'><button id=inner style='width:300px;height:200px'>Inner</button><script>window.events=[];for(const type of ['pointermove','pointerdown','click'])addEventListener(type,e=>events.push({type,trusted:e.isTrusted,x:e.clientX,y:e.clientY}),true)</script></body>"></iframe><script>window.downs=0;addEventListener('pointerdown',()=>downs++,true)</script>"#;
+    let html = r#"<!doctype html><style>body{margin:0}#frame{position:absolute;left:200px;top:200px;width:300px;height:200px;border:0}</style><a id=fixed href='#f' style='position:fixed;top:-100px;left:10px'>Fixed</a><button id=edge style='position:absolute;left:20px;top:calc(100vh - 6px);height:40px' onclick='edgeClicks++'>Edge</button><div style='height:300vh'></div><iframe id=frame srcdoc="<body style='margin:0'><button id=inner style='width:300px;height:200px'>Inner</button><script>window.events=[];for(const type of ['pointermove','pointerdown','click'])addEventListener(type,e=>events.push({type,trusted:e.isTrusted,x:e.clientX,y:e.clientY}),true)</script></body>"></iframe><script>window.downs=0;window.edgeClicks=0;addEventListener('pointerdown',()=>downs++,true)</script>"#;
     assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
     assert!(state.browser_control.lock().await.has_native_display());
     let inner = "frame.contentWindow.events.filter(e=>e.trusted&&e.type!=='pointermove'||e.trusted&&e.x===100&&e.y===100).map(e=>e.type)";
@@ -12235,6 +12235,25 @@ async fn e2e_native_mouse_reaches_iframes_and_refuses_points_outside_the_page() 
         assert!(error.contains("is outside the visible page"), "{error}");
         assert!(error.contains("No native input was sent"), "{error}");
     }
+    // A partly visible element is scrolled until its click point is visible.
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#edge"}), &mut state).await,
+    );
+    let edge = control_test_command(
+        &json!({"action":"evaluate","script":"edgeClicks"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&edge);
+    assert_eq!(edge["data"]["result"], 1);
+    assert_success(
+        &control_test_command(
+            &json!({"action":"evaluate","script":"scrollTo(0,0);downs=0"}),
+            &mut state,
+        )
+        .await,
+    );
+
     // Refusals press nothing anywhere: only the iframe click pressed.
     let downs = control_test_command(
         &json!({"action":"evaluate","script":"downs+frame.contentWindow.events.filter(e=>e.type==='pointerdown').length"}),

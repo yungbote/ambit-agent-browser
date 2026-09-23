@@ -812,10 +812,14 @@ fn build_selector_js(selector: &str) -> String {
         r#"(() => {{
             const el = {find_expr};
             if (!el) return null;
-            const inView = (r) => r.width > 0 && r.height > 0 &&
-                r.bottom > 0 && r.right > 0 &&
-                r.top < (window.innerHeight || document.documentElement.clientHeight) &&
-                r.left < (window.innerWidth || document.documentElement.clientWidth);
+            // The click point is the center, so the center must be visible;
+            // a partly visible element can have its center off-screen.
+            const inView = (r) => {{
+                const x = r.x + r.width / 2, y = r.y + r.height / 2;
+                return r.width > 0 && r.height > 0 && x >= 0 && y >= 0 &&
+                    y < (window.innerHeight || document.documentElement.clientHeight) &&
+                    x < (window.innerWidth || document.documentElement.clientWidth);
+            }};
             let rect = el.getBoundingClientRect();
             if (!inView(rect)) {{
                 el.scrollIntoView({{ block: 'center', inline: 'center', behavior: 'instant' }});
