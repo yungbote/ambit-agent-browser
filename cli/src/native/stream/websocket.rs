@@ -87,15 +87,17 @@ struct SentFrame {
 /// acknowledgements say about the path. A viewer's newest pixels wait behind
 /// every older frame still in flight, so beyond the negotiated count and byte
 /// bounds a whole frame leaves only while the bytes ahead of it are within
-/// what the path delivers in its shortest round trip. At most about one
-/// frame then queues behind another, which keeps the path full (a frame
-/// travels while the previous one is painted) without a standing backlog.
+/// what the path delivers in its shortest round trip, or within one frame of
+/// its own size when that is more. About one frame then queues behind
+/// another, which keeps the path full (a frame travels while the previous
+/// one is painted) without a standing backlog, and an estimate taken from
+/// smaller frames (a sparse page before a dense one) cannot hold whole
+/// frames to one per round trip.
 /// Patches are exempt: they are small, and holding one back would strand the
 /// next patch without its base and force a whole-frame rebase. For the same
 /// reason they do not measure the path: a patch travels alone, so its paint
 /// measures what one patch needed, not what the path can deliver, and while
 /// the reader types, patch samples alone would shrink the bound to one patch.
-/// A frame alone on the path is always admitted.
 #[derive(Default)]
 struct InFlightFrames {
     frames: VecDeque<SentFrame>,
@@ -117,14 +119,16 @@ impl InFlightFrames {
             .is_some_and(|total| total <= MAX_WINDOW_BYTES)
     }
     /// Whether a frame of `bytes` may leave now: within the hard byte bound,
-    /// and, for a whole frame, either alone on the path or behind no more
-    /// than the delivery bound. Before any acknowledgement only the
+    /// and, for a whole frame, behind no more than the delivery bound or one
+    /// frame of its own size, whichever is larger (so a frame alone on the
+    /// path always leaves). Before any whole frame is acknowledged only the
     /// negotiated bounds apply.
     fn admits(&self, bytes: usize, whole: bool) -> bool {
         self.has_bytes(bytes)
-            && (self.frames.is_empty()
-                || !whole
-                || self.bound().is_none_or(|bound| self.bytes <= bound))
+            && (!whole
+                || self
+                    .bound()
+                    .is_none_or(|bound| self.bytes <= bound.max(bytes)))
     }
     /// The best recent delivery rate over the shortest recent round trip.
     fn bound(&self) -> Option<usize> {
@@ -1091,6 +1095,8 @@ mod tests {
         None,
         /// Six seconds of typing: a 2 KB patch every 50 ms, each alone on the path.
         Typing,
+        /// Six seconds of 25 KB whole frames, a sparse page before a dense one.
+        SparsePage,
     }
 
     /// One viewer behind a bottleneck: whole frames are produced at 60 fps
@@ -1109,13 +1115,14 @@ mod tests {
         let at = |ms: f64| origin + Duration::from_micros((ms * 1000.0) as u64);
         let start = match prelude {
             Prelude::None => 0.0,
-            Prelude::Typing => 6_000.0,
+            Prelude::Typing | Prelude::SparsePage => 6_000.0,
         };
         let mut flight = InFlightFrames::default();
         // (seq, captured at, painted/acknowledged at, whole)
         let mut travelling: VecDeque<(u64, f64, f64, bool)> = VecDeque::new();
         let (mut link_free, mut seq) = (0.0_f64, 0_u64);
-        let (mut next_capture, mut next_patch) = (start, 0.0_f64);
+        let typing = matches!(prelude, Prelude::Typing);
+        let (mut next_capture, mut next_patch) = (if typing { start } else { 0.0 }, 0.0_f64);
         let mut pending: Option<(u64, f64)> = None;
         let mut ages = Vec::new();
         let mut t = 0.0;
@@ -1123,20 +1130,21 @@ mod tests {
             while travelling.front().is_some_and(|(_, _, done, _)| *done <= t) {
                 let (acked, captured, done, whole) = travelling.pop_front().unwrap();
                 flight.acknowledge(acked, at(done), true);
-                if whole && t > start + 4_000.0 {
+                if whole && captured >= start && t > start + 4_000.0 {
                     ages.push(done - captured);
                 }
             }
-            // (seq, captured at, bytes): a patch leaves at once while typing;
-            // then the newest whole frame leaves once admitted.
+            // (seq, captured at, bytes, whole): a patch leaves at once while
+            // typing; otherwise the newest whole frame leaves once admitted.
             let mut outgoing = None;
-            if t < start {
+            if t < start && typing {
                 if t >= next_patch {
                     seq += 1;
-                    outgoing = Some((seq, t, 2_000));
+                    outgoing = Some((seq, t, 2_000, false));
                     next_patch += 50.0;
                 }
             } else {
+                let size = if t < start { 25_000 } else { bytes };
                 if t >= next_capture {
                     seq += 1;
                     pending = Some((seq, t));
@@ -1145,18 +1153,17 @@ mod tests {
                 if let Some((frame, captured)) = pending {
                     let admitted = flight.has_slot(MAX_FRAME_WINDOW)
                         && if bounded {
-                            flight.admits(bytes, true)
+                            flight.admits(size, true)
                         } else {
-                            flight.has_bytes(bytes)
+                            flight.has_bytes(size)
                         };
                     if admitted {
-                        outgoing = Some((frame, captured, bytes));
+                        outgoing = Some((frame, captured, size, true));
                         pending = None;
                     }
                 }
             }
-            if let Some((frame, captured, size)) = outgoing {
-                let whole = size == bytes;
+            if let Some((frame, captured, size, whole)) = outgoing {
                 link_free = link_free.max(t) + size as f64 / rate;
                 flight.sent(frame, size, at(t), whole);
                 travelling.push_back((frame, captured, link_free + transit, whole));
@@ -1193,6 +1200,16 @@ mod tests {
                 );
             }
         }
+        // A dense page after a sparse one: the estimate from 25 KB frames is
+        // below one 150 KB frame, and alone it would hold the dense frames to
+        // one per round trip (14 of 16.7 fps at 20 Mbit/s) until it aged out.
+        let (fps, _) = simulate_whole_frames(2_500.0, 40.0, 150_000, false, Prelude::SparsePage);
+        let (bounded_fps, _) =
+            simulate_whole_frames(2_500.0, 40.0, 150_000, true, Prelude::SparsePage);
+        assert!(
+            bounded_fps >= fps * 0.97,
+            "bounded {bounded_fps} fps vs window-only {fps} fps after a sparse page"
+        );
         // A path faster than the producer never waits on the bound.
         let (fps, age) = simulate_whole_frames(25_000.0, 40.0, 150_000, false, Prelude::None);
         let (bounded_fps, bounded_age) =
@@ -1201,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn delivery_bound_spares_patches_and_a_lone_frame() {
+    fn delivery_bound_spares_patches_and_holds_at_least_one_frame() {
         let origin = Instant::now();
         let mut flight = InFlightFrames::default();
         // No acknowledgement yet: only the negotiated bounds apply.
@@ -1212,12 +1229,17 @@ mod tests {
         assert_eq!(flight.bound(), Some(100_000));
         let later = origin + Duration::from_millis(200);
         flight.sent(2, 120_000, later, true);
-        // 120 KB ahead exceeds the 100 KB bound for a whole frame...
+        // 120 KB ahead exceeds the 100 KB bound and a 110 KB frame...
+        assert!(!flight.admits(110_000, true));
+        // ...but one frame of the newest frame's own size may queue ahead,
+        // whatever the estimate says...
+        assert!(flight.admits(150_000, true));
+        flight.sent(3, 150_000, later, true);
         assert!(!flight.admits(150_000, true));
-        // ...but a patch still leaves, so its successor keeps its base.
+        // ...and a patch still leaves, so its successor keeps its base.
         assert!(flight.admits(8_000, false));
         // Alone on the path, any frame within the hard bound leaves.
-        flight.acknowledge(2, later + Duration::from_millis(150), true);
+        flight.acknowledge(3, later + Duration::from_millis(150), true);
         assert!(flight.frames.is_empty());
         assert!(flight.admits(MAX_WINDOW_BYTES, true));
         assert!(!flight.admits(MAX_WINDOW_BYTES + 1, true));
