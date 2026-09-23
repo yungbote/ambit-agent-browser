@@ -251,6 +251,10 @@ pub(super) async fn cdp_event_loop(
                         changed = presentation_rx.changed(), if display.is_some() => {
                             if changed.is_err() { break; }
                             repace!();
+                            // A viewer's layout just changed or was applied: the
+                            // first frame of the new geometry must not wait out
+                            // the remainder of the current capture interval.
+                            display_tick.reset_immediately();
                         }
                         changed = custody.changed(), if display.is_some() => {
                             if changed.is_err() { break; }
@@ -980,6 +984,107 @@ mod tests {
         })
         .await
         .expect("timed out waiting for CDP method");
+    }
+
+    /// A presentation change (a viewer's new layout, or its applied surface)
+    /// wakes the capture loop at once instead of waiting for the next tick of
+    /// the current interval, so the first frame of a new geometry is captured
+    /// as soon as the layout is ready.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_presentation_change_wakes_capture_before_the_next_tick() {
+        use crate::native::display::DisplayClient;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (display, _control, frames) = DisplayClient::test_channel();
+        // The event sender is the mock browser's connection: dropping it
+        // closes CDP and ends the loop's attachment before any capture.
+        let (client, _events, methods) = mock_cdp("F-MAIN").await;
+        let (frame_tx, _messages) = broadcast::channel(64);
+        let (frame_watch, _) = watch::channel(None);
+        let client_notify = Arc::new(tokio::sync::Notify::new());
+        let presentation = Arc::new(super::super::presentation::Presentation::new());
+        let connection = uuid::Uuid::new_v4();
+        let config = super::super::presentation::PresentationConfig {
+            viewer: uuid::Uuid::new_v4(),
+            width: 800,
+            height: 600,
+        };
+        presentation.configure(connection, config);
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        // A closed custody channel ends a display attachment at once, so the
+        // test holds its sender like the daemon's browser control does.
+        let (_custody, custody) = watch::channel(None);
+        let task = tokio::spawn(cdp_event_loop(
+            frame_tx,
+            frame_watch,
+            Arc::new(super::super::ScreencastConfig::default()),
+            Arc::new(RwLock::new(Some(client))),
+            Arc::new(RwLock::new(Some(display))),
+            presentation.clone(),
+            custody,
+            client_notify.clone(),
+            Arc::new(Mutex::new(false)),
+            Arc::new(Mutex::new(1)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            Arc::new(RwLock::new(Some("S-ACTIVE".to_string()))),
+            Arc::new(Mutex::new(1280)),
+            Arc::new(Mutex::new(720)),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new("chrome".to_string())),
+            Arc::new(Mutex::new(false)),
+            shutdown_rx,
+        ));
+        client_notify.notify_one();
+        let mut frames = BufReader::new(frames);
+        let mut line = String::new();
+        // The first tick captures at once; answer it unchanged after a short
+        // hold so the next natural tick is still most of a period away.
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            frames.read_line(&mut line),
+        )
+        .await
+        .expect("a first capture request")
+        .unwrap();
+        let first: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(first["op"], "capture");
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let reply = json!({"id": first["id"], "success": true, "data": {"changed": false}})
+            .to_string()
+            + "\n";
+        frames.get_mut().write_all(reply.as_bytes()).await.unwrap();
+        // Same viewer, same pacing tier, new requested size: only the wake
+        // can explain a capture request arriving before the interval elapses.
+        let triggered = std::time::Instant::now();
+        presentation.configure(
+            connection,
+            super::super::presentation::PresentationConfig {
+                width: 640,
+                ..config
+            },
+        );
+        line.clear();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            frames.read_line(&mut line),
+        )
+        .await
+        .expect("a second capture request")
+        .unwrap();
+        let waited = triggered.elapsed();
+        let period = super::super::presentation::FramePacing::PRESENTED.period();
+        assert!(
+            waited < period / 2,
+            "capture waited {waited:?} after the presentation changed (period {period:?})"
+        );
+        let second: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(second["op"], "capture");
+        let reply = json!({"id": second["id"], "success": true, "data": {"changed": false}})
+            .to_string()
+            + "\n";
+        frames.get_mut().write_all(reply.as_bytes()).await.unwrap();
+        let _ = shutdown.send(true);
+        task.await.unwrap();
+        drop(methods);
     }
 
     /// Reading the float as an integer stamps every frame 0, so no client can
