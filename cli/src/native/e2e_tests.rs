@@ -42,6 +42,41 @@ fn assert_error_code(resp: &Value, code: &str) {
     assert_eq!(resp.get("code").and_then(Value::as_str), Some(code));
 }
 
+/// Full-window pixels of a page point and the surface generation that
+/// human input must name. Fixture-only calibration: a trusted CDP hover
+/// reports the point's screen position; the tested input stays native.
+pub(crate) async fn window_point(state: &DaemonState, x: f64, y: f64) -> (f64, f64, String) {
+    let browser = state.browser.as_ref().unwrap();
+    let session = browser.active_session_id().unwrap();
+    let display = browser.display_client().expect("an owned browser window");
+    let evaluate = |expression: &str| {
+        browser.client.send_command(
+            "Runtime.evaluate",
+            Some(json!({"expression":expression,"awaitPromise":true,"returnByValue":true})),
+            Some(session),
+        )
+    };
+    evaluate("window.__screenPoint=new Promise(resolve=>addEventListener('pointermove',e=>resolve([e.screenX,e.screenY]),{once:true,capture:true})),true").await.unwrap();
+    browser
+        .client
+        .send_command(
+            "Input.dispatchMouseEvent",
+            Some(json!({"type":"mouseMoved","x":x,"y":y})),
+            Some(session),
+        )
+        .await
+        .unwrap();
+    let screen = evaluate("window.__screenPoint").await.unwrap();
+    let point = &screen["result"]["value"];
+    let surface = display.surface();
+    let scale = f64::from(surface.device_scale_factor);
+    (
+        point[0].as_f64().unwrap() * scale,
+        point[1].as_f64().unwrap() * scale,
+        surface.generation,
+    )
+}
+
 // Keep the large daemon command future off the test thread's small stack.
 // This journey has many sequential commands; the real daemon already spawns
 // its connection task onto the runtime and retains one command at a time.
@@ -11937,6 +11972,81 @@ async fn e2e_native_window_latency_measurements() {
         })
     );
     let _ = close_current_browser(&mut state).await;
+}
+
+/// The owned window renders WebGL1 and WebGL2 through the explicitly
+/// selected software GLES backend, and those pixels reach the native window
+/// capture. Compositing stays in software so ordinary damage is still
+/// delivered as patches; the controlled stream journey proves that part.
+#[tokio::test]
+#[ignore]
+async fn e2e_native_window_webgl_pixels_reach_the_window_capture() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = "<!doctype html><style>body{margin:0;background:#fff}canvas{position:absolute;width:200px;height:120px;top:40px}#a{left:40px}#b{left:300px}</style><canvas id=a width=200 height=120></canvas><canvas id=b width=200 height=120></canvas><script>function paint(id,kind,rgb){const gl=document.getElementById(id).getContext(kind,{preserveDrawingBuffer:true});if(!gl)return null;gl.clearColor(rgb[0],rgb[1],rgb[2],1);gl.clear(gl.COLOR_BUFFER_BIT);const pixel=new Uint8Array(4);gl.readPixels(100,60,1,1,gl.RGBA,gl.UNSIGNED_BYTE,pixel);const info=gl.getExtension('WEBGL_debug_renderer_info');return{pixel:[...pixel],renderer:info?gl.getParameter(info.UNMASKED_RENDERER_WEBGL):gl.getParameter(gl.RENDERER)}}window.painted={webgl:paint('a','webgl',[1,0,0]),webgl2:paint('b','webgl2',[0,1,0])}</script>";
+    assert_success(
+        &control_test_command(
+            &json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}),
+            &mut state,
+        )
+        .await,
+    );
+    let painted =
+        control_test_command(&json!({"action":"evaluate","script":"painted"}), &mut state).await;
+    assert_success(&painted);
+    let painted = &painted["data"]["result"];
+    assert_eq!(
+        painted["webgl"]["pixel"],
+        json!([255, 0, 0, 255]),
+        "{painted}"
+    );
+    assert_eq!(
+        painted["webgl2"]["pixel"],
+        json!([0, 255, 0, 255]),
+        "{painted}"
+    );
+    for kind in ["webgl", "webgl2"] {
+        assert!(
+            painted[kind]["renderer"]
+                .as_str()
+                .is_some_and(|renderer| renderer.contains("SwiftShader")),
+            "{painted}"
+        );
+    }
+    let red = window_point(&state, 140.0, 100.0).await;
+    let green = window_point(&state, 400.0, 100.0).await;
+    let display = state.browser.as_ref().unwrap().display_client().unwrap();
+    let (capture, _) = display
+        .capture(crate::native::display::CaptureRequest {
+            cursor: false,
+            budget_bytes: 0,
+            force: true,
+            patches: false,
+        })
+        .await
+        .unwrap()
+        .expect("a forced capture returns a whole frame");
+    let image = image::load_from_memory(&STANDARD.decode(capture.data.unwrap()).unwrap())
+        .unwrap()
+        .to_rgb8();
+    if let Ok(directory) = std::env::var("AMBIT_GRAPHICS_ARTIFACT_DIR") {
+        image
+            .save(std::path::Path::new(&directory).join("window-webgl.png"))
+            .unwrap();
+    }
+    for ((x, y, _), expected) in [(red, [255u8, 0, 0]), (green, [0, 255, 0])] {
+        let actual = image.get_pixel(x as u32, y as u32).0;
+        assert!(
+            actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, expected)| actual.abs_diff(expected) <= 40),
+            "window pixel at {x},{y} is {actual:?}, expected about {expected:?}"
+        );
+    }
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
 
 /// Actual Chrome stream: negotiated deltas maintain their exact base while

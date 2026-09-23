@@ -2182,9 +2182,10 @@ Environment:
 
 Programs use the same profile, tabs and native window. Human takeover, caller
 disconnect and deadline stop the operation's process group without closing Chrome.
-Linux private windows default to ANGLE software GLES; explicit browser arguments
-override it and --webgpu keeps its backend. Fresh owned profiles open about:blank;
-retained profiles and custom startup arguments preserve their startup behavior.
+Linux private windows default to ANGLE software GLES with software compositing;
+explicit browser arguments override it and --webgpu keeps its backend. Fresh
+owned profiles open about:blank; retained profiles and custom startup arguments
+preserve their startup behavior.
 A failed or interrupted program may have performed effects; never replay it.
 Console output is bounded diagnostics. Returned JSON is limited to 2 MiB.
 

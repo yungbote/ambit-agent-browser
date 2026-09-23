@@ -1221,41 +1221,6 @@ return {main: await page.evaluate(() => pointerLog), frame: await frame.evaluate
         Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
     }
 
-    /// Full-window pixels of a page point and the surface generation that
-    /// human input must name. Fixture-only calibration: a trusted CDP hover
-    /// reports the point's screen position; the tested input stays native.
-    async fn window_point(state: &DaemonState, x: f64, y: f64) -> (f64, f64, String) {
-        let browser = state.browser.as_ref().unwrap();
-        let session = browser.active_session_id().unwrap();
-        let display = browser.display_client().expect("an owned browser window");
-        let evaluate = |expression: &str| {
-            browser.client.send_command(
-                "Runtime.evaluate",
-                Some(json!({"expression":expression,"awaitPromise":true,"returnByValue":true})),
-                Some(session),
-            )
-        };
-        evaluate("window.__screenPoint=new Promise(resolve=>addEventListener('pointermove',e=>resolve([e.screenX,e.screenY]),{once:true,capture:true})),true").await.unwrap();
-        browser
-            .client
-            .send_command(
-                "Input.dispatchMouseEvent",
-                Some(json!({"type":"mouseMoved","x":x,"y":y})),
-                Some(session),
-            )
-            .await
-            .unwrap();
-        let screen = evaluate("window.__screenPoint").await.unwrap();
-        let point = &screen["result"]["value"];
-        let surface = display.surface();
-        let scale = f64::from(surface.device_scale_factor);
-        (
-            point[0].as_f64().unwrap() * scale,
-            point[1].as_f64().unwrap() * scale,
-            surface.generation,
-        )
-    }
-
     /// One Chrome process, profile and tab across native commands, Playwright
     /// programs, a human click and new tabs, in the native window mode that
     /// production uses.
@@ -1339,7 +1304,7 @@ return {main: await page.evaluate(() => pointerLog), frame: await frame.evaluate
         ))
         .await;
         assert_eq!(refused["code"], "browser_controlled_by_user", "{refused}");
-        let (x, y, surface) = window_point(&state, 120.0, 144.0).await;
+        let (x, y, surface) = crate::native::e2e_tests::window_point(&state, 120.0, 144.0).await;
         let click = |event: &str| json!({"type":"input_mouse","eventType":event,"x":x,"y":y,"button":"left","clickCount":1});
         let input = Box::pin(execute_command(&json!({"action":crate::native::browser_control::ACTION,"op":"input","controllerId":controller,"sequence":1,"expectedSurfaceGeneration":surface,"events":[click("mousePressed"), click("mouseReleased")]}), &mut state)).await;
         assert_eq!(input["success"], true, "{input}");

@@ -2040,7 +2040,7 @@ Apache-2.0
 
 Ordinary `window new` now shares the browser's persistent profile and authentication state. Use `window new --isolated` (MCP `isolated: true`) for separate native cookies. Existing isolated windows are retained without migration or cookie copying. Playwright cannot faithfully adopt those pre-existing contexts, so attachment is refused while they are open; native browser tools remain available. Close those isolated windows before returning to Playwright. New contexts created within a Playwright program retain normal Playwright semantics.
 
-Linux private window streaming uses ANGLE software GLES for WebGL by default. Explicit browser arguments override that preset, and the existing `--webgpu` preset keeps its backend. A fresh driver-owned profile opens `about:blank`; retained profiles and caller-selected startup arguments keep their existing startup behavior.
+Linux private window streaming uses ANGLE software GLES for WebGL by default, with software compositing so the stream still sends only damaged regions. Explicit browser arguments override that preset, and the existing `--webgpu` preset keeps its backend. A fresh driver-owned profile opens `about:blank`; retained profiles and caller-selected startup arguments keep their existing startup behavior.
 
 `agent-browser run-playwright --stdin` runs an async JavaScript body with the actual `page`, `context`, and `browser` from the current native Chromium session. Return a JSON-serializable value. `--target <id>` selects another existing CDP target; `--timeout-ms <ms>` bounds execution to 1 through 120000 milliseconds (default 30000). The MCP equivalent is `agent_browser_run_playwright` with `code`, optional `targetId`, and optional `timeoutMs`.
 

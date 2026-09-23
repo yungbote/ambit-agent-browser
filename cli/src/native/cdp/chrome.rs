@@ -569,11 +569,15 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
     // The native window stream owns a private virtual display. Its ordinary
     // Linux workspace has no GPU render device, so select software GLES for
     // WebGL without opting into Chromium's unsafe automatic WebGL fallback.
+    // Compositing stays in software: GPU-composited presentation replaces
+    // the whole window on every frame, and the stream would lose its damage
+    // patches. WebGL output is read back into the software compositor.
     // User/config arguments are appended later and retain normal precedence;
     // the WebGPU preset owns its own graphics backend.
     if cfg!(target_os = "linux") && options.window_stream && !options.webgpu {
         args.push("--use-gl=angle".to_string());
         args.push("--use-angle=swiftshader".to_string());
+        args.push("--disable-gpu-compositing".to_string());
     }
 
     // A fresh managed window needs one initial page, not Chrome's expensive
@@ -2223,6 +2227,9 @@ mod tests {
         if cfg!(target_os = "linux") {
             assert!(arguments.iter().any(|arg| arg == "--use-gl=angle"));
             assert!(arguments.iter().any(|arg| arg == "--use-angle=swiftshader"));
+            assert!(arguments
+                .iter()
+                .any(|arg| arg == "--disable-gpu-compositing"));
         }
         assert!(!arguments
             .iter()
@@ -2249,6 +2256,9 @@ mod tests {
         };
         let arguments = build_chrome_args(&webgpu).unwrap().args;
         assert!(!arguments.iter().any(|arg| arg == "--use-angle=swiftshader"));
+        assert!(!arguments
+            .iter()
+            .any(|arg| arg == "--disable-gpu-compositing"));
         if cfg!(target_os = "linux") {
             assert!(arguments.iter().any(|arg| arg == "--use-angle=vulkan"));
         }
