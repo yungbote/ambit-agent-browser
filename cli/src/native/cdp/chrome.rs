@@ -578,18 +578,13 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
 
     // A fresh managed window needs one initial page, not Chrome's expensive
     // new-tab application before the first requested navigation. Do not append
-    // a tab to an explicit profile, retained session, app or startup URL. This
+    // a tab to an explicit profile, retained session or custom launch. This
     // trusted inert target is not a user argument and does not weaken the
     // separate domain-containment check on arbitrary startup URLs.
     if options.window_stream
         && options.profile.is_none()
         && options.retained_profile.is_none()
-        && options.args.iter().all(|arg| {
-            arg.starts_with('-')
-                && !arg.starts_with("--app=")
-                && !arg.starts_with("--app-id=")
-                && arg != "--restore-last-session"
-        })
+        && options.args.is_empty()
     {
         args.push("about:blank".to_string());
     }
@@ -2260,6 +2255,9 @@ mod tests {
             vec!["--app=https://example.com".into()],
             vec!["--app-id=installed-app".into()],
             vec!["--restore-last-session".into()],
+            vec!["--user-data-dir=/tmp/explicit-profile".into()],
+            vec!["-app=https://example.com".into()],
+            vec!["--lang=fr".into()],
         ] {
             let options = LaunchOptions {
                 window_stream: true,
