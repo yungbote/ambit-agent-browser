@@ -100,7 +100,8 @@ impl InterruptReason {
 #[derive(Default)]
 struct OperationState {
     active: Option<watch::Sender<Option<InterruptReason>>>,
-    interruptions: usize,
+    /// Pending custody transfers, one entry per outstanding interruption.
+    interruptions: Vec<InterruptReason>,
 }
 
 #[derive(Clone, Default)]
@@ -109,11 +110,18 @@ pub(crate) struct Operations {
     finished: Arc<Notify>,
 }
 
-pub(crate) struct Interruption(Operations);
+pub(crate) struct Interruption(Operations, InterruptReason);
 
 impl Drop for Interruption {
     fn drop(&mut self) {
-        self.0.state.lock().unwrap().interruptions -= 1;
+        let mut state = self.0.state.lock().unwrap();
+        if let Some(index) = state
+            .interruptions
+            .iter()
+            .position(|reason| *reason == self.1)
+        {
+            state.interruptions.swap_remove(index);
+        }
     }
 }
 
@@ -134,17 +142,28 @@ impl Operations {
     /// start between the cancellation request and control acquisition.
     pub(crate) fn interrupt(&self, reason: InterruptReason) -> Interruption {
         let mut state = self.state.lock().unwrap();
-        state.interruptions += 1;
+        state.interruptions.push(reason);
         if let Some(active) = &state.active {
             active.send_replace(Some(reason));
         }
-        Interruption(self.clone())
+        Interruption(self.clone(), reason)
     }
 
     fn begin(&self) -> Result<Operation, String> {
         let mut state = self.state.lock().unwrap();
-        if state.interruptions > 0 || state.active.is_some() {
-            return Err("browser_operation_rejected: Browser command custody is being transferred; the program was not started.".into());
+        // A queued program refused for a human takeover reports that
+        // takeover, as a program stopped before its start would.
+        let pending = state
+            .interruptions
+            .iter()
+            .copied()
+            .find(|reason| *reason == InterruptReason::HumanControl)
+            .or_else(|| state.interruptions.first().copied());
+        if let Some(reason) = pending {
+            return Err(reason.before_start());
+        }
+        if state.active.is_some() {
+            return Err("browser_operation_rejected: Another Playwright program holds the browser; the program was not started.".into());
         }
         let (sender, canceled) = watch::channel(None);
         state.active = Some(sender);
@@ -233,12 +252,12 @@ impl<R: AsyncRead + Unpin> RunnerChannel<R> {
         loop {
             if let Some(end) = self.received.iter().position(|byte| *byte == b'\n') {
                 if end >= MAX_RESULT {
-                    return Err(unknown("The program result exceeded 2 MiB."));
+                    return Err("The program result exceeded 2 MiB.".into());
                 }
                 return Ok(self.received.drain(..=end).collect());
             }
             if self.received.len() >= MAX_RESULT {
-                return Err(unknown("The program result exceeded 2 MiB."));
+                return Err("The program result exceeded 2 MiB.".into());
             }
             // Cancel-safe: a canceled read consumed nothing. Reading into the
             // retained buffer keeps this future, part of every command's,
@@ -248,7 +267,7 @@ impl<R: AsyncRead + Unpin> RunnerChannel<R> {
                 .reader
                 .read_buf(&mut self.received)
                 .await
-                .map_err(|_| unknown("The program result could not be read."))?;
+                .map_err(|_| "The program result could not be read.".to_string())?;
             if count == 0 {
                 return Ok(std::mem::take(&mut self.received));
             }
@@ -444,7 +463,7 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
             stdin
                 .write_all(&serde_json::to_vec(&request).unwrap())
                 .await
-                .map_err(|_| unknown("The runner did not accept its invocation."))?;
+                .map_err(|_| "The runner did not accept its invocation.".to_string())?;
             drop(stdin);
             let mut record = channel.record().await?;
             if record == START_RECORD {
@@ -498,60 +517,81 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
                     (String::new(), true)
                 }
             };
-        process_cleanup.map_err(unknown)?;
-        tunnel_cleanup.map_err(unknown)?;
-        input_cleanup.map_err(unknown)?;
+        // Native refs and frame scope predate the program, whatever settled.
         state.ref_map.clear();
         state.active_frame_id = None;
-        let bytes = match ended {
-            Ended::Record(bytes) => bytes,
-            ended => {
-                // A program that never ran sent no input and left the last
-                // observation current; one that ran must be observed afresh.
-                if started {
-                    control
-                        .lock()
-                        .await
-                        .cancel_native_input()
-                        .await
-                        .map_err(unknown)?;
-                }
-                return Err(match ended {
-                    Ended::Interrupted(reason) if started => reason.stopped(),
-                    Ended::Interrupted(reason) => reason.before_start(),
-                    Ended::Deadline if started => unknown("The program reached its deadline."),
-                    Ended::Deadline => {
-                        "browser_operation_rejected: The program did not start before its deadline."
-                            .into()
-                    }
-                    Ended::Failed(error) => error,
-                    Ended::Record(_) => unreachable!(),
-                });
-            }
+        let cleanup = process_cleanup.and(tunnel_cleanup).and(input_cleanup);
+        // A program that ran and did not end cleanly may have left input
+        // held; release it, and the next observation is taken afresh. One
+        // that never ran sent no input and left the last observation current.
+        let release = if started && (cleanup.is_err() || !matches!(ended, Ended::Record(_))) {
+            control.lock().await.cancel_native_input().await
+        } else {
+            Ok(())
         };
-        let result: Value = serde_json::from_slice(&bytes).map_err(|_| {
-            if started {
-                unknown("The runner did not produce a complete JSON result.")
-            } else {
-                "browser_operation_rejected: The Playwright runner stopped before starting the program.".into()
-            }
-        })?;
-        if result["success"] != true {
-            let message = result["error"]
-                .as_str()
-                .unwrap_or("The Playwright program failed.");
-            // The daemon's own start record decides; a program cannot report
-            // its failure as never started.
-            return Err(if started {
-                unknown(message)
-            } else {
-                format!("browser_operation_rejected: {message}")
-            });
-        }
-        Ok(
-            json!({ "result": result["result"], "diagnostics": diagnostics, "diagnosticsTruncated": diagnostics_truncated, "targetId": target }),
-        )
+        let outcome = program_outcome(ended, started).map(|value| {
+            json!({ "result": value, "diagnostics": diagnostics, "diagnosticsTruncated": diagnostics_truncated, "targetId": target })
+        });
+        after_cleanup(outcome, started, cleanup.and(release))
     }
+}
+
+/// A cleanup failure after the program ran leaves its effects unknown, and
+/// keeps the program's own outcome in the report. Cleanup after a program
+/// that never ran cannot change what happened: nothing did.
+fn after_cleanup(
+    outcome: Result<Value, String>,
+    started: bool,
+    cleanup: Result<(), String>,
+) -> Result<Value, String> {
+    match cleanup {
+        Err(error) if started => Err(unknown(match outcome {
+            Ok(_) => format!("{error} The program itself returned before cleanup failed."),
+            Err(program) => format!("{error} The program itself reported: {program}"),
+        })),
+        _ => outcome,
+    }
+}
+
+/// What the program's own end proves, before any cleanup failure. `started`
+/// is the daemon's start record; a program cannot report itself not started.
+fn program_outcome(ended: Ended, started: bool) -> Result<Value, String> {
+    let bytes = match ended {
+        Ended::Record(bytes) => bytes,
+        Ended::Interrupted(reason) if started => return Err(reason.stopped()),
+        Ended::Interrupted(reason) => return Err(reason.before_start()),
+        Ended::Deadline if started => return Err(unknown("The program reached its deadline.")),
+        Ended::Deadline => {
+            return Err(
+                "browser_operation_rejected: The program did not start before its deadline.".into(),
+            )
+        }
+        Ended::Failed(error) if started => return Err(unknown(error)),
+        Ended::Failed(error) => {
+            return Err(format!(
+                "browser_operation_rejected: {error} The program was not started."
+            ))
+        }
+    };
+    let result: Value = serde_json::from_slice(&bytes).map_err(|_| {
+        if started {
+            unknown("The runner did not produce a complete JSON result.")
+        } else {
+            "browser_operation_rejected: The Playwright runner stopped before starting the program."
+                .to_string()
+        }
+    })?;
+    if result["success"] != true {
+        let message = result["error"]
+            .as_str()
+            .unwrap_or("The Playwright program failed.");
+        return Err(if started {
+            unknown(message)
+        } else {
+            format!("browser_operation_rejected: {message}")
+        });
+    }
+    Ok(result["result"].clone())
 }
 
 #[cfg(test)]
@@ -608,9 +648,94 @@ mod tests {
         );
         drop(current);
         operations.settled().await;
-        assert!(operations.begin().is_err());
+        let queued = operations.begin().err().unwrap();
+        assert!(
+            queued.starts_with("browser_controlled_by_user:"),
+            "{queued}"
+        );
+        let shutdown = operations.interrupt(InterruptReason::Shutdown);
+        let queued = operations.begin().err().unwrap();
+        assert!(
+            queued.starts_with("browser_controlled_by_user:"),
+            "{queued}"
+        );
         drop(takeover);
+        let queued = operations.begin().err().unwrap();
+        assert!(
+            queued.starts_with("browser_operation_rejected:"),
+            "{queued}"
+        );
+        drop(shutdown);
         assert!(operations.begin().is_ok());
+    }
+
+    #[test]
+    fn only_the_start_record_decides_whether_a_failure_ran_program_code() {
+        let before = program_outcome(
+            Ended::Failed("The runner did not accept its invocation.".into()),
+            false,
+        )
+        .unwrap_err();
+        assert!(
+            before.starts_with("browser_operation_rejected:"),
+            "{before}"
+        );
+        let after = program_outcome(
+            Ended::Failed("The program result could not be read.".into()),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            after.starts_with("browser_operation_outcome_unknown:"),
+            "{after}"
+        );
+        let own = program_outcome(
+            Ended::Record(br#"{"success":false,"started":false,"error":"boom"}"#.to_vec()),
+            true,
+        )
+        .unwrap_err();
+        assert!(
+            own.starts_with("browser_operation_outcome_unknown: boom"),
+            "{own}"
+        );
+        assert_eq!(
+            program_outcome(
+                Ended::Record(br#"{"success":true,"result":7}"#.to_vec()),
+                true
+            ),
+            Ok(json!(7))
+        );
+    }
+
+    #[test]
+    fn a_cleanup_failure_keeps_the_program_outcome_only_when_it_ran() {
+        let failed = Err("The browser connection closed.".to_string());
+        let reported = after_cleanup(
+            Err("browser_operation_outcome_unknown: boom".into()),
+            true,
+            failed.clone(),
+        )
+        .unwrap_err();
+        assert!(
+            reported
+                .starts_with("browser_operation_outcome_unknown: The browser connection closed."),
+            "{reported}"
+        );
+        assert!(
+            reported.contains("reported: browser_operation_outcome_unknown: boom"),
+            "{reported}"
+        );
+        let returned = after_cleanup(Ok(json!(1)), true, failed.clone()).unwrap_err();
+        assert!(
+            returned.contains("returned before cleanup failed"),
+            "{returned}"
+        );
+        let never_ran = "browser_controlled_by_user: User control prevented this Playwright program from starting.".to_string();
+        assert_eq!(
+            after_cleanup(Err(never_ran.clone()), false, failed),
+            Err(never_ran)
+        );
+        assert_eq!(after_cleanup(Ok(json!(1)), true, Ok(())), Ok(json!(1)));
     }
 
     #[tokio::test]
