@@ -119,6 +119,7 @@ pub struct CdpClient {
     pub(crate) files: Arc<super::super::browser_files::FileDestinations>,
     raw_tx: broadcast::Sender<RawCdpMessage>,
     private_sessions: PrivateSessions,
+    target_sessions: Arc<std::sync::Mutex<HashMap<String, String>>>,
     native_pointer_enabled: Arc<AtomicBool>,
     native_pointer_lock: Arc<Mutex<()>>,
     _reader_handle: tokio::task::JoinHandle<()>,
@@ -253,6 +254,8 @@ impl CdpClient {
         let (raw_tx, _) = broadcast::channel(4096);
 
         let private_sessions: PrivateSessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
+        let target_sessions = Arc::new(std::sync::Mutex::new(HashMap::<String, String>::new()));
+        let targets_clone = target_sessions.clone();
 
         let page_generations: PageGenerations = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let pages_clone = page_generations.clone();
@@ -352,6 +355,27 @@ impl CdpClient {
                         }
                     }
                 } else if let Some(ref method) = parsed.method {
+                    if method == "Target.attachedToTarget" {
+                        if let Some(params) = parsed.params.as_ref() {
+                            if let (Some(session), Some(target)) = (
+                                params["sessionId"].as_str(),
+                                params["targetInfo"]["targetId"].as_str(),
+                            ) {
+                                targets_clone
+                                    .lock()
+                                    .unwrap()
+                                    .insert(session.into(), target.into());
+                            }
+                        }
+                    } else if method == "Target.detachedFromTarget" {
+                        if let Some(session) = parsed
+                            .params
+                            .as_ref()
+                            .and_then(|params| params["sessionId"].as_str())
+                        {
+                            targets_clone.lock().unwrap().remove(session);
+                        }
+                    }
                     if method == "Runtime.bindingCalled" {
                         if let (Some(params), Some(session)) =
                             (parsed.params.as_ref(), parsed.session_id.as_deref())
@@ -491,6 +515,7 @@ impl CdpClient {
             files,
             raw_tx,
             private_sessions,
+            target_sessions,
             native_pointer_enabled: Arc::new(AtomicBool::new(false)),
             native_pointer_lock: Arc::new(Mutex::new(())),
             _reader_handle: reader_handle,
@@ -565,11 +590,15 @@ impl CdpClient {
                     // slow renderer) costs this one command its measurement.
                     // It is retried by the next pointer command; attribution
                     // is never switched off for the browser's lifetime.
-                    if let Some(context) = Box::pin(self.prepare_native_pointer(session, id)).await
+                    if let Some((context, frame)) =
+                        Box::pin(self.prepare_native_pointer(session, id, params.as_ref())).await
                     {
                         if let Some(observation) = observation.as_mut() {
                             observation.track_native();
                             observation.set_native_context(context);
+                            if let Some((source, geometry)) = frame {
+                                observation.set_native_frame(source, geometry);
+                            }
                         }
                     }
                 }
@@ -633,11 +662,24 @@ impl CdpClient {
         page_generation(&self.page_generations, session)
     }
 
+    pub(super) fn session_for_target(&self, target: &str) -> Option<String> {
+        self.target_sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .find_map(|(session, observed)| (observed == target).then(|| session.clone()))
+    }
+
     pub(crate) fn enable_window_pointer(&self) {
         self.native_pointer_enabled.store(true, Ordering::Release);
     }
 
-    async fn prepare_native_pointer(&self, session: &str, token: u64) -> Option<i64> {
+    async fn prepare_native_pointer(
+        &self,
+        session: &str,
+        token: u64,
+        params: Option<&Value>,
+    ) -> Option<(i64, Option<(activity::NativePointerFrame, Value)>)> {
         let prepare = async {
             let tree = self
                 .send_command_no_params("Page.getFrameTree", Some(session))
@@ -657,9 +699,39 @@ impl CdpClient {
             let context = world["executionContextId"]
                 .as_i64()
                 .ok_or("Pointer observation realm is unavailable")?;
+            let params = params.ok_or("Pointer coordinates are unavailable")?;
+            let source = super::pointer::locate(
+                self,
+                session,
+                frame,
+                context,
+                params["x"].as_f64().ok_or("Pointer x is unavailable")?,
+                params["y"].as_f64().ok_or("Pointer y is unavailable")?,
+            )
+            .await?;
+            let source_session = source.session;
+            let source_context = source.context;
+            let frame_observation = if source_session != session || source_context != context {
+                let geometry = self.send_command("Runtime.evaluate", Some(serde_json::json!({
+                    "expression": "({scale:devicePixelRatio*(visualViewport?.scale??1),width:innerWidth,height:innerHeight,offsetX:visualViewport?.offsetLeft??0,offsetY:visualViewport?.offsetTop??0})",
+                    "contextId": context, "returnByValue": true,
+                })), Some(session)).await?["result"]["value"].clone();
+                Some((
+                    activity::NativePointerFrame {
+                        session: source_session.clone(),
+                        context: source_context,
+                        generation: self.page_generation(&source_session),
+                        x: source.x,
+                        y: source.y,
+                    },
+                    geometry,
+                ))
+            } else {
+                None
+            };
             self.send_command("Runtime.addBinding", Some(serde_json::json!({
                 "name": activity::POINTER_BINDING, "executionContextName": activity::POINTER_WORLD,
-            })), Some(session)).await?;
+            })), Some(&source_session)).await?;
             let token =
                 serde_json::to_string(&token.to_string()).map_err(|error| error.to_string())?;
             let expression = format!(
@@ -690,12 +762,14 @@ impl CdpClient {
                 .send_command(
                     "Runtime.evaluate",
                     Some(serde_json::json!({
-                        "expression": expression, "contextId": context, "returnByValue": true,
+                        "expression": expression, "contextId": source_context, "returnByValue": true,
                     })),
-                    Some(session),
+                    Some(&source_session),
                 )
                 .await?;
-            Ok::<Option<i64>, String>((value["result"]["value"] == true).then_some(context))
+            Ok::<_, String>(
+                (value["result"]["value"] == true).then_some((context, frame_observation)),
+            )
         };
         tokio::time::timeout(std::time::Duration::from_millis(500), prepare)
             .await

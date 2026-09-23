@@ -15,6 +15,15 @@ pub(crate) const POINTER_WORLD: &str = "ambit-window-pointer";
 /// Geometry measured by one trusted renderer event in an isolated realm.
 /// It is input to the owned display, never a replacement input acknowledgement.
 #[derive(Clone, Debug)]
+pub(crate) struct NativePointerFrame {
+    pub session: String,
+    pub context: i64,
+    pub generation: String,
+    pub x: f64,
+    pub y: f64,
+}
+
+#[derive(Clone, Debug)]
 pub(crate) struct NativePointer {
     pub context: i64,
     pub page_generation: String,
@@ -23,6 +32,7 @@ pub(crate) struct NativePointer {
     pub screen_x: f64,
     pub screen_y: f64,
     pub geometry: Value,
+    pub source_page: Option<NativePointerFrame>,
 }
 
 #[derive(Clone, Copy)]
@@ -54,6 +64,7 @@ pub(crate) struct ActivityObservation {
     native_tracked: bool,
     native_context: Option<i64>,
     native_geometry: Option<Value>,
+    native_source_page: Option<NativePointerFrame>,
 }
 
 impl ActivityObservation {
@@ -76,6 +87,7 @@ impl ActivityObservation {
             native_tracked: false,
             native_context: None,
             native_geometry: None,
+            native_source_page: None,
         }
     }
 
@@ -92,6 +104,11 @@ impl ActivityObservation {
         self.native_context = Some(context);
     }
 
+    pub(crate) fn set_native_frame(&mut self, source: NativePointerFrame, geometry: Value) {
+        self.native_source_page = Some(source);
+        self.native_geometry = Some(geometry);
+    }
+
     pub(crate) fn native_pointer(&self) -> Option<NativePointer> {
         Some(NativePointer {
             context: self.native_context?,
@@ -101,6 +118,7 @@ impl ActivityObservation {
             screen_x: self.event.params["screenX"].as_f64()?,
             screen_y: self.event.params["screenY"].as_f64()?,
             geometry: self.native_geometry.clone()?,
+            source_page: self.native_source_page.clone(),
         })
     }
 
@@ -113,14 +131,22 @@ impl ActivityObservation {
 
     pub(crate) fn native_event(&mut self, session: &str, payload: &Value) {
         if !self.native_tracked
-            || self.event.session_id.as_deref() != Some(session)
+            || self
+                .native_source_page
+                .as_ref()
+                .map(|source| source.session.as_str())
+                .or(self.event.session_id.as_deref())
+                != Some(session)
             || self.event.params["eventType"] != payload["eventType"]
         {
             return;
         }
         for (command, actual) in [("x", "clientX"), ("y", "clientY")] {
             let (Some(command), Some(actual)) = (
-                self.event.params[command].as_f64(),
+                self.native_source_page
+                    .as_ref()
+                    .map(|source| if command == "x" { source.x } else { source.y })
+                    .or_else(|| self.event.params[command].as_f64()),
                 payload[actual].as_f64(),
             ) else {
                 return;
@@ -139,9 +165,10 @@ impl ActivityObservation {
         }
         self.event.params["screenX"] = payload["screenX"].clone();
         self.event.params["screenY"] = payload["screenY"].clone();
-        if payload["geometry"]["scale"]
-            .as_f64()
-            .is_some_and(|scale| scale.is_finite() && scale > 0.0)
+        if self.native_source_page.is_none()
+            && payload["geometry"]["scale"]
+                .as_f64()
+                .is_some_and(|scale| scale.is_finite() && scale > 0.0)
         {
             self.native_geometry = Some(payload["geometry"].clone());
         }

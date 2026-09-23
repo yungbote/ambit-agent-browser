@@ -124,6 +124,11 @@ impl NativeMouse {
         if !display.ready()
             || mapping.surface != display.surface().generation
             || mapping.pointer.page_generation != client.page_generation(session)
+            || mapping
+                .pointer
+                .source_page
+                .as_ref()
+                .is_some_and(|source| client.page_generation(&source.session) != source.generation)
         {
             return Err(
                 "The browser changed during this mouse gesture. Inspect it before continuing."
@@ -144,6 +149,12 @@ impl NativeMouse {
             || read["result"]["value"] != mapping.pointer.geometry
         {
             return Err("The page layout changed during this mouse gesture.".into());
+        }
+        if let Some(source) = mapping.pointer.source_page.as_ref() {
+            let alive = client.send_command("Runtime.evaluate", Some(json!({"expression":"true","contextId":source.context,"returnByValue":true})), Some(&source.session)).await?;
+            if alive["result"]["value"] != true {
+                return Err("The pointer frame changed during this mouse gesture.".into());
+            }
         }
         Ok(())
     }
@@ -433,6 +444,7 @@ mod tests {
         Mapping {
             session: "page".into(),
             pointer: NativePointer {
+                source_page: None,
                 context: 7,
                 page_generation: "page".into(),
                 client_x: 210.0,
