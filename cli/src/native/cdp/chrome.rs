@@ -566,6 +566,34 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         "--metrics-recording-only".to_string(),
     ];
 
+    // The native window stream owns a private virtual display. Its ordinary
+    // Linux workspace has no GPU render device, so select software GLES for
+    // WebGL without opting into Chromium's unsafe automatic WebGL fallback.
+    // User/config arguments are appended later and retain normal precedence;
+    // the WebGPU preset owns its own graphics backend.
+    if cfg!(target_os = "linux") && options.window_stream && !options.webgpu {
+        args.push("--use-gl=angle".to_string());
+        args.push("--use-angle=swiftshader".to_string());
+    }
+
+    // A fresh managed window needs one initial page, not Chrome's expensive
+    // new-tab application before the first requested navigation. Do not append
+    // a tab to an explicit profile, retained session, app or startup URL. This
+    // trusted inert target is not a user argument and does not weaken the
+    // separate domain-containment check on arbitrary startup URLs.
+    if options.window_stream
+        && options.profile.is_none()
+        && options.retained_profile.is_none()
+        && options.args.iter().all(|arg| {
+            arg.starts_with('-')
+                && !arg.starts_with("--app=")
+                && !arg.starts_with("--app-id=")
+                && arg != "--restore-last-session"
+        })
+    {
+        args.push("about:blank".to_string());
+    }
+
     if options.webgpu {
         // WebGPU is not exposed in headless or GPU-blocklisted environments
         // unless explicitly enabled.
@@ -2181,6 +2209,84 @@ mod tests {
         let dir = result.temp_user_data_dir.unwrap();
         assert!(dir.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn managed_window_software_graphics_preserves_explicit_backend_and_webgpu() {
+        let options = LaunchOptions {
+            window_stream: true,
+            require_sandbox: true,
+            ..Default::default()
+        };
+        let arguments = build_chrome_args(&options).unwrap().args;
+        if cfg!(target_os = "linux") {
+            assert!(arguments.iter().any(|arg| arg == "--use-gl=angle"));
+            assert!(arguments.iter().any(|arg| arg == "--use-angle=swiftshader"));
+        }
+        assert!(!arguments
+            .iter()
+            .any(|arg| arg == "--enable-unsafe-swiftshader"));
+        assert!(!arguments.iter().any(|arg| arg == "--no-sandbox"));
+        assert!(arguments.iter().any(|arg| arg == "about:blank"));
+        assert!(options.args.is_empty());
+
+        let explicit = LaunchOptions {
+            args: vec!["--use-angle=gl".into()],
+            ..options.clone()
+        };
+        let arguments = build_chrome_args(&explicit).unwrap().args;
+        assert_eq!(
+            arguments
+                .iter()
+                .rfind(|arg| arg.starts_with("--use-angle=")),
+            Some(&"--use-angle=gl".to_string())
+        );
+
+        let webgpu = LaunchOptions {
+            webgpu: true,
+            ..options
+        };
+        let arguments = build_chrome_args(&webgpu).unwrap().args;
+        assert!(!arguments.iter().any(|arg| arg == "--use-angle=swiftshader"));
+        if cfg!(target_os = "linux") {
+            assert!(arguments.iter().any(|arg| arg == "--use-angle=vulkan"));
+        }
+    }
+
+    #[test]
+    fn managed_window_blank_start_preserves_profile_and_explicit_startup() {
+        for args in [
+            vec!["https://example.com".into()],
+            vec!["--app=https://example.com".into()],
+            vec!["--app-id=installed-app".into()],
+            vec!["--restore-last-session".into()],
+        ] {
+            let options = LaunchOptions {
+                window_stream: true,
+                args,
+                ..Default::default()
+            };
+            assert!(!build_chrome_args(&options)
+                .unwrap()
+                .args
+                .iter()
+                .any(|arg| arg == "about:blank"));
+        }
+        let profile = LaunchOptions {
+            window_stream: true,
+            profile: Some("/tmp/managed-profile".into()),
+            ..Default::default()
+        };
+        assert!(!build_chrome_args(&profile)
+            .unwrap()
+            .args
+            .iter()
+            .any(|arg| arg == "about:blank"));
+        assert!(!build_chrome_args(&LaunchOptions::default())
+            .unwrap()
+            .args
+            .iter()
+            .any(|arg| arg == "about:blank"));
     }
 
     #[test]
