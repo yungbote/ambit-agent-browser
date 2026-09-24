@@ -727,6 +727,14 @@ impl DaemonState {
         }
     }
 
+    /// The page session a pending JavaScript dialog pauses: its renderer
+    /// answers nothing until the dialog is resolved.
+    pub(crate) fn dialog_session(&self) -> Option<String> {
+        self.pending_dialog
+            .as_ref()
+            .and_then(|dialog| dialog.session_id.clone())
+    }
+
     /// The expiry path every command and maintenance tick runs. A sign-in
     /// ends here too, so no agent command can reach a browser a person holds.
     pub(crate) async fn expire_browser_control(
@@ -7469,10 +7477,11 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
 // Phase 5 handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_tab_list(state: &DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let tabs = mgr.tab_list();
-    Ok(json!({ "tabs": tabs }))
+async fn handle_tab_list(state: &mut DaemonState) -> Result<Value, String> {
+    let dialog_session = state.dialog_session();
+    let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
+    mgr.observe_titles(dialog_session.as_deref()).await;
+    Ok(json!({ "tabs": mgr.tab_list() }))
 }
 
 async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -7536,10 +7545,7 @@ async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value
         let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
         mgr.resolve_tab_ref(&tab_ref)?
     };
-    let dialog_session = state
-        .pending_dialog
-        .as_ref()
-        .and_then(|d| d.session_id.clone());
+    let dialog_session = state.dialog_session();
     let result = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
         mgr.tab_switch_by_id(tab_id, dialog_session.as_deref())
@@ -7594,10 +7600,7 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
             None => None,
         }
     };
-    let dialog_session = state
-        .pending_dialog
-        .as_ref()
-        .and_then(|d| d.session_id.clone());
+    let dialog_session = state.dialog_session();
     let result = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
         mgr.tab_close_by_id(tab_id, dialog_session.as_deref())

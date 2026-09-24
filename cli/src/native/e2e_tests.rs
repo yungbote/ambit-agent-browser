@@ -3274,6 +3274,142 @@ async fn e2e_tab_switch_rejects_bare_integer() {
     assert_success(&resp);
 }
 
+/// Runs page script in the tab `target` without passing through the daemon,
+/// as the page's own timers and events would.
+async fn page_script(state: &DaemonState, target: &str, expression: &str) {
+    let browser = state.browser.as_ref().unwrap();
+    let session = browser.session_id_for_target(target).unwrap();
+    browser
+        .client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({ "expression": expression })),
+            Some(session),
+        )
+        .await
+        .unwrap();
+}
+
+/// Waits until the browser reports an event `wanted` accepts.
+async fn browser_event(
+    events: &mut tokio::sync::broadcast::Receiver<super::cdp::types::CdpEvent>,
+    wanted: impl Fn(&super::cdp::types::CdpEvent) -> bool,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            match events.recv().await {
+                Ok(event) if wanted(&event) => return,
+                Ok(_) | Err(RecvError::Lagged(_)) => {}
+                Err(RecvError::Closed) => panic!("the browser connection closed"),
+            }
+        }
+    })
+    .await
+    .expect("the browser reports the event");
+}
+
+/// `tab_list` lists every tab under its page's current title. Chrome reports
+/// a title when a tab opens or navigates, not when its page retitles itself,
+/// so each page is read. The page a dialog pauses answers nothing until the
+/// dialog is resolved: it keeps its last known title and does not hold the
+/// list for the observation bound.
+#[tokio::test]
+#[ignore]
+async fn e2e_tab_list_reads_the_current_title_of_every_tab() {
+    let port = serve_each_connection(|path, stream| {
+        let title = if path.starts_with("/mail") {
+            "Inbox"
+        } else {
+            "Checkout"
+        };
+        write_html(
+            stream,
+            &format!("<!doctype html><title>{title}</title><h1>{title}</h1>"),
+        );
+    });
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({ "action": "launch", "headless": true }), &mut state).await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "action": "navigate", "url": format!("http://127.0.0.1:{port}/checkout") }),
+            &mut state,
+        )
+        .await,
+    );
+    let opened = execute_command(
+        &json!({ "action": "tab_new", "url": format!("http://localhost:{port}/mail") }),
+        &mut state,
+    )
+    .await;
+    assert_success(&opened);
+    let mail = opened["data"]["targetId"].as_str().unwrap().to_string();
+    assert_success(
+        &execute_command(&json!({ "action": "wait", "text": "Inbox" }), &mut state).await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "action": "tab_switch", "tabId": "t1" }),
+            &mut state,
+        )
+        .await,
+    );
+
+    // The mailbox counts new mail in the background.
+    page_script(&state, &mail, "document.title = 'Inbox (4) - Acme Mail'").await;
+    let listed = execute_command(&json!({ "action": "tab_list" }), &mut state).await;
+    assert_success(&listed);
+    let titles: Vec<_> = get_data(&listed)["tabs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tab| tab["title"].clone())
+        .collect();
+    assert_eq!(titles, ["Checkout", "Inbox (4) - Acme Mail"]);
+
+    // An action on the mailbox opens a dialog, which pauses its page.
+    assert_success(
+        &execute_command(
+            &json!({ "action": "tab_switch", "tabId": "t2" }),
+            &mut state,
+        )
+        .await,
+    );
+    let mut events = state.browser.as_ref().unwrap().client.subscribe();
+    page_script(
+        &state,
+        &mail,
+        "setTimeout(() => confirm('Leave this page?'), 0)",
+    )
+    .await;
+    browser_event(&mut events, |event| {
+        event.method == "Page.javascriptDialogOpening"
+    })
+    .await;
+    let started = std::time::Instant::now();
+    let listed = execute_command(&json!({ "action": "tab_list" }), &mut state).await;
+    let elapsed = started.elapsed();
+    assert_success(&listed);
+    assert_eq!(
+        get_data(&listed)["tabs"][1]["title"],
+        "Inbox (4) - Acme Mail"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(1),
+        "the paused page held the list for {elapsed:?}"
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "action": "dialog", "response": "dismiss" }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(&execute_command(&json!({ "action": "close" }), &mut state).await);
+}
+
 // ---------------------------------------------------------------------------
 // Element queries: isvisible, isenabled, gettext, getattribute
 // ---------------------------------------------------------------------------

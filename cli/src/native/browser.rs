@@ -523,6 +523,8 @@ pub struct BrowserManager {
     window_contexts: HashSet<String>,
 }
 
+#[path = "browser_tabs.rs"]
+mod tabs;
 #[path = "browser_window.rs"]
 mod window;
 pub(crate) use window::ACTIVE_PAGE_AMBIGUOUS;
@@ -3610,7 +3612,7 @@ mod tests {
     /// Build a `BrowserManager` backed by a dummy WebSocket server that
     /// accepts the connection and then stays silent. Enough for the binding
     /// logic, which never awaits a CDP response in these tests.
-    async fn test_manager(pages: Vec<PageInfo>) -> BrowserManager {
+    pub(super) async fn test_manager(pages: Vec<PageInfo>) -> BrowserManager {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {
