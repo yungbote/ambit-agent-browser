@@ -525,6 +525,7 @@ pub struct BrowserManager {
 
 #[path = "browser_window.rs"]
 mod window;
+pub(crate) use window::ACTIVE_PAGE_AMBIGUOUS;
 
 /// Stable machine-readable prefix for "the bound tab no longer exists"
 /// errors, so scripts using `--json` can match on it.

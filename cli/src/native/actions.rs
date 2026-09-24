@@ -2665,8 +2665,7 @@ pub(crate) async fn execute_command_received(
     received_at: std::time::Instant,
 ) -> Value {
     if let Err((code, message)) = state.prepare_window_command(cmd, received_at).await {
-        let mut response =
-            json!({ "id": cmd["id"], "success": false, "code": code, "error": message });
+        let mut response = state.window_refusal(&cmd["id"], code, message);
         if let Some(value) = cmd.get(super::feedback::REQUEST_FIELD) {
             if let Ok(request) = super::feedback::FeedbackRequest::parse(value, state) {
                 super::feedback::attach(&request, &mut response, state).await;

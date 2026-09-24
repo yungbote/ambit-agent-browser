@@ -3623,6 +3623,10 @@ of the file bytes. --describe-host-bound prints the full catalog without
 starting a browser. Host-bound calls are limited to 120000 milliseconds.
 After human control, browser_observation_required returns fresh feedback
 before another host-bound action. Earlier image pageGeneration values are stale.
+A page action without a single visible tab is refused as
+browser_active_page_ambiguous. data.tabs lists the open tabs (at most 20: tabId,
+label, title, URL origin, active), data.tabCount counts them, and no tab is
+selected.
 
 
 Starts a Model Context Protocol server over stdio. MCP clients launch this

@@ -346,6 +346,102 @@ async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
 
+/// A page command the window cannot place on one tab is refused with the
+/// open tabs listed, so the caller can select one explicitly without a
+/// `tab_list` round. Here a person brings another tab of a pinned session to
+/// the front of the native window; the refusal selects nothing for the agent.
+#[tokio::test]
+#[ignore]
+async fn e2e_native_ambiguous_page_refusal_lists_the_open_tabs() {
+    let env = EnvGuard::new(&[
+        "AGENT_BROWSER_WINDOW_STREAM",
+        "DISPLAY",
+        "AGENT_BROWSER_SOCKET_DIR",
+        "AGENT_BROWSER_SESSION",
+        "AGENT_BROWSER_PIN_TAB",
+    ]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    // The pinned binding persists beside a private socket directory.
+    let sockets = tempfile::tempdir().unwrap();
+    env.set("AGENT_BROWSER_SOCKET_DIR", sockets.path().to_str().unwrap());
+    env.set("AGENT_BROWSER_SESSION", "ambiguous-page-refusal");
+    env.remove("AGENT_BROWSER_PIN_TAB");
+    let report = "Quarterly report ".repeat(12);
+    let served = report.clone();
+    let port = serve_each_connection(move |path, stream| {
+        let title = if path.starts_with("/checkout") {
+            "Checkout"
+        } else {
+            served.as_str()
+        };
+        write_html(
+            stream,
+            &format!("<!doctype html><title>{title}</title><h1>{title}</h1>"),
+        );
+    });
+    let mut state = DaemonState::new();
+    let checkout = format!("http://127.0.0.1:{port}/checkout?token=secret#receipt");
+    assert_success(
+        &control_test_command(&json!({"action":"navigate","url":checkout}), &mut state).await,
+    );
+    // Pinning binds the launched browser's session to the tab it selects.
+    let opened = control_test_command(
+        &json!({"action":"tab_new","url":format!("http://localhost:{port}/report"),"pinTab":true}),
+        &mut state,
+    )
+    .await;
+    assert_success(&opened);
+    let report_target = opened["data"]["targetId"].as_str().unwrap().to_string();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"wait","text":"Quarterly report"}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"tab_switch","tabId":"t1"}), &mut state).await,
+    );
+    assert_success(&control_test_command(&json!({"action":"snapshot"}), &mut state).await);
+
+    // The person selects the report tab in the native window.
+    state
+        .browser
+        .as_ref()
+        .unwrap()
+        .client
+        .send_command(
+            "Target.activateTarget",
+            Some(json!({ "targetId": report_target })),
+            None,
+        )
+        .await
+        .unwrap();
+    let refused = control_test_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_error_code(&refused, "browser_active_page_ambiguous");
+    let cut: String = report.trim_end().chars().take(100).collect();
+    assert_eq!(
+        refused["data"],
+        json!({
+            "tabCount": 2,
+            "tabs": [
+                {"tabId": "t1", "title": "Checkout", "origin": format!("http://127.0.0.1:{port}"), "active": true},
+                {"tabId": "t2", "title": format!("{cut}…"), "origin": format!("http://localhost:{port}"), "active": false},
+            ],
+        }),
+        "{}",
+        serde_json::to_string_pretty(&refused).unwrap_or_default()
+    );
+
+    // A listed tab id is the explicit selection that ends the refusal.
+    assert_success(
+        &control_test_command(&json!({"action":"tab_switch","tabId":"t2"}), &mut state).await,
+    );
+    assert_success(&control_test_command(&json!({"action":"snapshot"}), &mut state).await);
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
 /// Own-window mouse input uses the same command and takeover owners as CLI/MCP.
 /// Run with an existing Chrome executable and the host-built display helper.
 #[tokio::test]

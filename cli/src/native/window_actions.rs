@@ -1,8 +1,9 @@
 //! Window presentation joins the existing daemon command boundary.
 
 use super::DaemonState;
+use crate::native::browser::ACTIVE_PAGE_AMBIGUOUS;
 use crate::native::display::{window_pixels, Surface, DEVICE_SCALE_FACTOR};
-use serde_json::Value;
+use serde_json::{json, Value};
 use std::time::Instant;
 
 fn explicit_browser_action(command: &Value) -> bool {
@@ -163,6 +164,20 @@ impl DaemonState {
         server.presentation.complete(&request, target, surface);
     }
 
+    /// The response to a command `prepare_window_command` refused. When no
+    /// single tab is the active page, the refusal also lists the open tabs
+    /// (`data`, see `BrowserManager::tab_roster`): the caller can select one
+    /// explicitly without a `tab_list` round. Nothing is selected for it.
+    pub(super) fn window_refusal(&self, id: &Value, code: &str, message: &str) -> Value {
+        let mut refusal = json!({ "id": id, "success": false, "code": code, "error": message });
+        if code == ACTIVE_PAGE_AMBIGUOUS {
+            if let Some(browser) = self.browser.as_ref() {
+                refusal["data"] = browser.tab_roster();
+            }
+        }
+        refusal
+    }
+
     pub(crate) async fn prepare_window_command(
         &mut self,
         command: &Value,
@@ -192,7 +207,7 @@ impl DaemonState {
         if !observes_page(command) && display.changed_since(received_at) {
             return Err(("browser_observation_stale", "The browser window changed while this command was queued. Observe its current page before choosing another action."));
         }
-        self.drain_cdp_events_background().await.map_err(|_| ("browser_active_page_ambiguous", "The active browser page is not observable. Inspect the browser or select an existing tab explicitly."))?;
+        self.drain_cdp_events_background().await.map_err(|_| (ACTIVE_PAGE_AMBIGUOUS, "The active browser page is not observable. Inspect the browser or select an existing tab explicitly."))?;
         if self.window_page_error == Some("browser_dialog_open")
             && self.pending_dialog.is_none()
             && self.viewport.is_some()
