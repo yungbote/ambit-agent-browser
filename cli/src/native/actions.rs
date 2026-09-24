@@ -16964,6 +16964,11 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
 
     #[tokio::test]
     async fn test_build_fetch_patterns_empty_state() {
+        // DaemonState::new reads AGENT_BROWSER_ALLOWED_DOMAINS; a domain
+        // filter adds the catch-all pattern, so this test holds the
+        // environment lock like the other tests of that variable.
+        let guard = EnvGuard::new(&["AGENT_BROWSER_ALLOWED_DOMAINS"]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
         let state = DaemonState::new();
         let patterns = build_fetch_patterns(&state).await;
         assert!(
@@ -16974,6 +16979,11 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
 
     #[tokio::test]
     async fn test_build_fetch_patterns_with_routes() {
+        // DaemonState::new reads AGENT_BROWSER_ALLOWED_DOMAINS; a domain
+        // filter adds the catch-all pattern, so this test holds the
+        // environment lock like the other tests of that variable.
+        let guard = EnvGuard::new(&["AGENT_BROWSER_ALLOWED_DOMAINS"]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
         let state = DaemonState::new();
         {
             let mut routes = state.routes.write().await;
@@ -17036,6 +17046,11 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
 
     #[tokio::test]
     async fn test_build_fetch_patterns_collapses_repeated_wildcards() {
+        // DaemonState::new reads AGENT_BROWSER_ALLOWED_DOMAINS; a domain
+        // filter adds the catch-all pattern, so this test holds the
+        // environment lock like the other tests of that variable.
+        let guard = EnvGuard::new(&["AGENT_BROWSER_ALLOWED_DOMAINS"]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
         let state = DaemonState::new();
         {
             let mut routes = state.routes.write().await;
@@ -17089,6 +17104,11 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
 
     #[tokio::test]
     async fn test_build_fetch_patterns_adds_wildcard_for_domain_filter() {
+        // DaemonState::new reads AGENT_BROWSER_ALLOWED_DOMAINS; a domain
+        // filter adds the catch-all pattern, so this test holds the
+        // environment lock like the other tests of that variable.
+        let guard = EnvGuard::new(&["AGENT_BROWSER_ALLOWED_DOMAINS"]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
         let state = DaemonState::new();
         {
             let mut df = state.domain_filter.write().await;
@@ -17101,6 +17121,11 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
 
     #[tokio::test]
     async fn test_build_fetch_patterns_adds_wildcard_for_origin_headers() {
+        // DaemonState::new reads AGENT_BROWSER_ALLOWED_DOMAINS; a domain
+        // filter adds the catch-all pattern, so this test holds the
+        // environment lock like the other tests of that variable.
+        let guard = EnvGuard::new(&["AGENT_BROWSER_ALLOWED_DOMAINS"]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
         let state = DaemonState::new();
         {
             let mut oh = state.origin_headers.write().await;
@@ -17115,6 +17140,11 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
 
     #[tokio::test]
     async fn test_build_fetch_patterns_no_duplicate_wildcard() {
+        // DaemonState::new reads AGENT_BROWSER_ALLOWED_DOMAINS; a domain
+        // filter adds the catch-all pattern, so this test holds the
+        // environment lock like the other tests of that variable.
+        let guard = EnvGuard::new(&["AGENT_BROWSER_ALLOWED_DOMAINS"]);
+        guard.remove("AGENT_BROWSER_ALLOWED_DOMAINS");
         let state = DaemonState::new();
         {
             let mut routes = state.routes.write().await;
