@@ -389,7 +389,7 @@ agent-browser tab close docs         # close by label
 
 Tabs opened through `tab new` or `click --new-tab` inherit the session's user agent, headers, HTTP credentials, init scripts, routes, and emulation overrides before their first document loads.
 
-`tab list --json` also reports each tab's CDP `targetId`, and target ids are accepted anywhere a tab ref is accepted (`tab <targetId>`, `tab close <targetId>`). Unlike `t<N>` ids, which are per-daemon counters, target ids stay stable across daemon restarts, so they're the right handle for scripts coordinating multiple sessions on one browser.
+`tab list --json` also reports each tab's CDP `targetId`, and target ids are accepted anywhere a tab ref is accepted (`tab <targetId>`, `tab close <targetId>`). Unlike `t<N>` ids, which are per-daemon counters, target ids stay stable across daemon restarts, so they're the right handle for scripts coordinating multiple sessions on one browser. A tab ref that names no open tab fails with `"code": "tab_not_found"`, and `data.tabs` and `data.tabCount` list the open tabs as `browser_active_page_ambiguous` does.
 
 Switching to a tab discarded by Chrome's Memory Saver reactivates it, since a discarded tab has no renderer to drive. Reactivation reloads the discarded page and resets its unsaved state, and the switch result reports `"revived": true`. A tab whose page is paused by a JavaScript dialog is alive rather than discarded, so the switch leaves it untouched and reports `"dialogBlocked": true`; resolve the dialog with `dialog accept` or `dialog dismiss` before interacting. Closing the active tab onto a discarded successor revives it the same way and reports `"activeTabRevived": true`.
 
@@ -800,7 +800,8 @@ agent-browser --session agent2 --cdp 9222 --pin-tab open site-b.com
 With `--pin-tab`:
 
 - Attaching with no binding opens a fresh tab instead of adopting an existing one
-- If the bound tab is closed, commands fail with a `tab_gone` error (exit code 1) instead of silently acting on another tab. JSON responses carry `"code": "tab_gone"` and recovery metadata in `data.targetId` plus optional `data.lastUrl`
+- If the bound tab is closed, commands addressed to it are refused with a `tab_gone` error (exit code 1) before they act, instead of silently acting on another tab. JSON responses carry `"code": "tab_gone"`, recovery metadata in `data.targetId` plus optional `data.lastUrl`, and the open tabs in `data.tabs` and `data.tabCount`
+- A command whose bound tab closes while it runs fails with `"code": "tab_closed_during_command"` and the same data instead, since it may already have acted
 - `tab list`, `tab new`, and `tab <ref>` still work in that state, so an agent can recover by binding a new tab
 - Tabs opened by other sessions or the user never steal the pinned session's active tab
 

@@ -2608,6 +2608,19 @@ fn skip_launch_action(action: &str) -> bool {
     )
 }
 
+/// Whether a command acts on the session's active tab, the tab it addresses
+/// without naming one. Daemon-level commands act on no tab; explicit browser
+/// commands act on the browser or on a tab they name.
+fn addresses_active_tab(cmd: &Value, action: &str) -> bool {
+    match action {
+        "read" => cmd.get("url").and_then(Value::as_str).is_none(),
+        "run_playwright" => cmd.get("targetId").is_none(),
+        "tab_close" => cmd.get("tabId").and_then(Value::as_str).is_none(),
+        "dialog" => cmd.get("response").and_then(Value::as_str) != Some("status"),
+        _ => !skip_launch_action(action) && !window_actions::explicit_browser_action(cmd),
+    }
+}
+
 fn should_validate_restore_after_action(action: &str) -> bool {
     action != "launch"
 }
@@ -3146,6 +3159,20 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         );
     }
 
+    // A pinned session whose bound tab is gone refuses a command addressed to
+    // its active tab here, before the command acts. A tab that closes while a
+    // command runs fails it with `tab_closed_during_command` instead.
+    if let Some(Err(refusal)) = state
+        .browser
+        .as_ref()
+        .filter(|_| addresses_active_tab(cmd, action))
+        .map(BrowserManager::admit_active_tab)
+    {
+        let mut resp = error_response(&id, &refusal);
+        attach_tab_recovery(&mut resp, state).await;
+        return resp;
+    }
+
     // A pending confirm/prompt dialog blocks the renderer's main thread, so
     // any command that touches the page would hang until the client read
     // timeout. Fail fast with instructions instead. Actions in skip_launch
@@ -3402,7 +3429,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         Ok(data) => success_response(&id, data),
         Err(e) => error_response(&id, &super::browser::to_ai_friendly_error(&e)),
     };
-    attach_tab_gone_data(&mut resp, state);
+    attach_tab_recovery(&mut resp, state).await;
 
     // A failed binding write is retried on the next command, but a pinned
     // session must know its isolation may not survive a daemon restart.
@@ -3434,7 +3461,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
     // below; events are otherwise only drained at the start of a command.
     if let Err(e) = state.drain_cdp_events_background().await {
         resp = error_response(&id, &super::browser::to_ai_friendly_error(&e));
-        attach_tab_gone_data(&mut resp, state);
+        attach_tab_recovery(&mut resp, state).await;
         inject_lifecycle(
             &mut resp,
             state,
@@ -13226,20 +13253,12 @@ fn error_response(id: &str, error: &str) -> Value {
         "success": false,
         "error": error,
     });
-    // Machine-readable code for "the bound tab no longer exists" so scripts
-    // using --json can match on it instead of parsing the message.
-    if error.starts_with(super::browser::TAB_GONE_PREFIX) {
-        resp["code"] = json!("tab_gone");
-    } else if let Some((code, _)) = error.split_once(": ") {
-        if code.starts_with("webmcp_")
-            || code == "browser_control_outcome_unknown"
-            || code == "browser_controlled_by_user"
-            || code.starts_with("browser_operation_")
-        {
-            resp["code"] = json!(code);
-            if code == "browser_operation_interrupted" {
-                resp["data"] = json!({"interruptedBy":"human","executionStopped":true,"effectsMayHaveOccurred":true});
-            }
+    // Machine-readable code, so scripts using --json can match on it instead
+    // of parsing the message.
+    if let Some(code) = super::browser::error_code(error) {
+        resp["code"] = json!(code);
+        if code == "browser_operation_interrupted" {
+            resp["data"] = json!({"interruptedBy":"human","executionStopped":true,"effectsMayHaveOccurred":true});
         }
     }
     resp
@@ -13253,21 +13272,29 @@ pub(crate) fn native_error_response_for_test(error: &str) -> Value {
     )
 }
 
-fn attach_tab_gone_data(resp: &mut Value, state: &DaemonState) {
-    if resp.get("code").and_then(Value::as_str) != Some("tab_gone") {
-        return;
-    }
-    let Some((target_id, last_url)) = state
-        .browser
-        .as_ref()
-        .and_then(BrowserManager::bound_target_gone_details)
-    else {
+/// A refusal or failure whose recovery is addressing an open tab explicitly
+/// lists the open tabs under their current titles, as
+/// `browser_active_page_ambiguous` does (see `BrowserManager::tab_roster`), so
+/// the caller can select one without a `tab_list` round; nothing is selected
+/// for it. A gone tab's own recovery identifiers stay beside the list.
+async fn attach_tab_recovery(resp: &mut Value, state: &mut DaemonState) {
+    use super::browser::{TAB_CLOSED_DURING_COMMAND, TAB_GONE, TAB_NOT_FOUND};
+    let gone = match resp.get("code").and_then(Value::as_str) {
+        Some(TAB_GONE | TAB_CLOSED_DURING_COMMAND) => true,
+        Some(TAB_NOT_FOUND) => false,
+        _ => return,
+    };
+    let dialog_session = state.dialog_session();
+    let Some(browser) = state.browser.as_mut() else {
         return;
     };
-
-    let mut data = json!({ "targetId": target_id });
-    if !last_url.is_empty() {
-        data["lastUrl"] = json!(last_url);
+    browser.observe_titles(dialog_session.as_deref()).await;
+    let mut data = browser.tab_roster();
+    if let Some((target_id, last_url)) = browser.bound_target_gone_details().filter(|_| gone) {
+        data["targetId"] = json!(target_id);
+        if !last_url.is_empty() {
+            data["lastUrl"] = json!(last_url);
+        }
     }
     resp["data"] = data;
 }
@@ -15199,12 +15226,73 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         // top-level machine-readable `code` so `--json` consumers can match
         // on it instead of parsing the message.
         let err = format!(
-            "{} bound tab is gone (target ABC). Run `agent-browser tab new <url>`",
-            super::super::browser::TAB_GONE_PREFIX
+            "{}: bound tab is gone (target ABC). Run `agent-browser tab new <url>`",
+            super::super::browser::TAB_GONE
         );
         let resp = error_response("cmd-3", &err);
         assert_eq!(resp["success"], false);
         assert_eq!(resp["code"], "tab_gone");
+    }
+
+    /// A tab-addressing refusal reaches its response whole and with its code,
+    /// although its message quotes words the error rewriter reacts to: a gone
+    /// tab's URL path, a label.
+    #[test]
+    fn test_error_response_keeps_tab_refusal_codes() {
+        for (error, code) in [
+            ("tab_gone: bound tab is gone (target ABC, last url https://example.com/timeout). Run `agent-browser tab new <url>` to bind a new tab, or `agent-browser tab list` to pick an existing one", "tab_gone"),
+            ("tab_not_found: No tab with label `intercept-panel`; run `agent-browser tab` to list open tabs", "tab_not_found"),
+            ("tab_not_found: Tab t5 not found; run `agent-browser tab` to list open tabs", "tab_not_found"),
+            ("tab_closed_during_command: bound tab closed while this command ran (target ABC, last url https://example.com/intercept); the command may already have acted. Inspect the browser before retrying, then run `agent-browser tab new <url>` to bind a new tab, or `agent-browser tab list` to pick an existing one", "tab_closed_during_command"),
+        ] {
+            let resp = native_error_response_for_test(error);
+            assert_eq!(resp["code"], code, "{resp}");
+            assert_eq!(resp["error"], error);
+        }
+    }
+
+    /// Only a command addressed to the active tab is refused at admission
+    /// while a pinned tab is gone: daemon-level commands, explicit browser
+    /// commands and commands naming their tab go on.
+    #[test]
+    fn test_commands_addressed_to_the_active_tab() {
+        for cmd in [
+            json!({"action": "navigate", "url": "https://example.com"}),
+            json!({"action": "click", "selector": "#buy"}),
+            json!({"action": "title"}),
+            json!({"action": "a11y", "url": "https://example.com"}),
+            json!({"action": "cookies_set", "cookies": []}),
+            json!({"action": "read"}),
+            json!({"action": "read", "llms": "full"}),
+            json!({"action": "run_playwright", "code": "return 1;"}),
+            json!({"action": "tab_close"}),
+            json!({"action": "dialog", "response": "accept"}),
+        ] {
+            assert!(
+                addresses_active_tab(&cmd, cmd["action"].as_str().unwrap()),
+                "{cmd}"
+            );
+        }
+        for cmd in [
+            json!({"action": "tab_list"}),
+            json!({"action": "tab_new", "url": "https://example.com"}),
+            json!({"action": "tab_switch", "tabId": "t2"}),
+            json!({"action": "tab_close", "tabId": "t2"}),
+            json!({"action": "window_new"}),
+            json!({"action": "close"}),
+            json!({"action": "launch"}),
+            json!({"action": "cdp_url"}),
+            json!({"action": "read", "url": "https://example.com"}),
+            json!({"action": "run_playwright", "code": "return 1;", "targetId": "T1"}),
+            json!({"action": "dialog", "response": "status"}),
+            json!({"action": "session_info"}),
+            json!({"action": "state_list"}),
+        ] {
+            assert!(
+                !addresses_active_tab(&cmd, cmd["action"].as_str().unwrap()),
+                "{cmd}"
+            );
+        }
     }
 
     #[test]

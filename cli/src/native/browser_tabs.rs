@@ -165,8 +165,9 @@ impl BrowserManager {
         }
     }
 
-    /// The open tabs a refusal lists when its recovery is selecting one
-    /// explicitly (`browser_active_page_ambiguous`), bounded unlike
+    /// The open tabs listed by a refusal or failure whose recovery is selecting
+    /// a tab explicitly (`browser_active_page_ambiguous`, `tab_gone`,
+    /// `tab_closed_during_command`, `tab_not_found`), bounded unlike
     /// `tab_list` (see `roster`). The active tab is the one commands act on;
     /// none is while a pinned tab is gone.
     pub(crate) fn tab_roster(&self) -> Value {

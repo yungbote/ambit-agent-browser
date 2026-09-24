@@ -74,7 +74,8 @@ agent-browser --session agent2 --cdp 9222 --pin-tab open https://site-b.com
 With `--pin-tab`:
 
 - Attaching with no binding opens a fresh tab instead of adopting an existing one
-- If the bound tab is closed, commands fail with a `tab_gone` error instead of silently acting on another tab. JSON responses carry <code>"code": "tab_gone"</code>, <code>data.targetId</code>, and optional <code>data.lastUrl</code>
+- If the bound tab is closed, commands addressed to it are refused with a `tab_gone` error before they act, instead of silently acting on another tab. JSON responses carry <code>"code": "tab_gone"</code>, <code>data.targetId</code>, optional <code>data.lastUrl</code>, and the open tabs in <code>data.tabs</code> and <code>data.tabCount</code>
+- A command whose bound tab closes while it runs fails with <code>"code": "tab_closed_during_command"</code> and the same data instead, since it may already have acted
 - `tab list`, `tab new`, and `tab <ref>` still work in that state, so an agent can recover by binding a new tab
 - Tabs opened by other sessions or the user never steal the pinned session's active tab
 

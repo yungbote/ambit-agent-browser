@@ -6,7 +6,9 @@ use crate::native::display::{window_pixels, Surface, DEVICE_SCALE_FACTOR};
 use serde_json::{json, Value};
 use std::time::Instant;
 
-fn explicit_browser_action(command: &Value) -> bool {
+/// Explicit browser and tab management, which addresses no implicit active
+/// page: the window observation does not run for it.
+pub(super) fn explicit_browser_action(command: &Value) -> bool {
     matches!(
         command["action"].as_str(),
         Some(

@@ -3410,6 +3410,173 @@ async fn e2e_tab_list_reads_the_current_title_of_every_tab() {
     assert_success(&execute_command(&json!({ "action": "close" }), &mut state).await);
 }
 
+/// A tab reference that names no open tab, and a page command of a pinned
+/// session whose tab is gone, are refused with a machine code and the open
+/// tabs under their current titles, as the ambiguous-page refusal lists
+/// them: the caller selects one without a `tab_list` round. Their codes
+/// survive whatever their messages quote. The gone tab is refused at
+/// admission, before the command acts. Nothing is selected for the caller.
+#[tokio::test]
+#[ignore]
+async fn e2e_tab_address_refusals_list_the_open_tabs() {
+    let env = EnvGuard::new(&[
+        "AGENT_BROWSER_SOCKET_DIR",
+        "AGENT_BROWSER_SESSION",
+        "AGENT_BROWSER_PIN_TAB",
+    ]);
+    // The pinned binding persists beside a private socket directory.
+    let sockets = tempfile::tempdir().unwrap();
+    env.set("AGENT_BROWSER_SOCKET_DIR", sockets.path().to_str().unwrap());
+    env.set("AGENT_BROWSER_SESSION", "tab-address-refusals");
+    env.remove("AGENT_BROWSER_PIN_TAB");
+    let requested = Arc::new(Mutex::new(Vec::new()));
+    let served = Arc::clone(&requested);
+    let port = serve_each_connection(move |path, stream| {
+        served.lock().unwrap().push(path.to_string());
+        let title = if path.starts_with("/mail") {
+            "Inbox"
+        } else if path.starts_with("/timeout-settings") {
+            "Settings"
+        } else {
+            "Checkout"
+        };
+        write_html(
+            stream,
+            &format!("<!doctype html><title>{title}</title><h1>{title}</h1>"),
+        );
+    });
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(&json!({ "action": "launch", "headless": true }), &mut state).await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "action": "navigate", "url": format!("http://127.0.0.1:{port}/checkout?token=secret#receipt") }),
+            &mut state,
+        )
+        .await,
+    );
+    let opened = execute_command(
+        &json!({ "action": "tab_new", "label": "mail", "url": format!("http://localhost:{port}/mail") }),
+        &mut state,
+    )
+    .await;
+    assert_success(&opened);
+    let mail = opened["data"]["targetId"].as_str().unwrap().to_string();
+    assert_success(
+        &execute_command(&json!({ "action": "wait", "text": "Inbox" }), &mut state).await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "action": "tab_switch", "tabId": "t1" }),
+            &mut state,
+        )
+        .await,
+    );
+    page_script(&state, &mail, "document.title = 'Inbox (4) - Acme Mail'").await;
+
+    let checkout = json!({"tabId": "t1", "title": "Checkout", "origin": format!("http://127.0.0.1:{port}"), "active": true});
+    let inbox = json!({"tabId": "t2", "label": "mail", "title": "Inbox (4) - Acme Mail", "origin": format!("http://localhost:{port}"), "active": false});
+    for (command, detail) in [
+        (
+            json!({ "action": "tab_switch", "tabId": "t9" }),
+            "Tab t9 not found",
+        ),
+        (
+            json!({ "action": "tab_close", "tabId": "timeout-panel" }),
+            "No tab with label `timeout-panel`",
+        ),
+        (
+            json!({ "action": "tab_switch", "tabId": "0123456789ABCDEF0123456789ABCDEF" }),
+            "No tab with target id `0123456789ABCDEF0123456789ABCDEF`",
+        ),
+    ] {
+        let refused = execute_command(&command, &mut state).await;
+        assert_error_code(&refused, "tab_not_found");
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains(detail), "{error}");
+        assert_eq!(
+            refused["data"],
+            json!({ "tabCount": 2, "tabs": [checkout, inbox] }),
+            "{}",
+            serde_json::to_string_pretty(&refused).unwrap_or_default()
+        );
+    }
+    // Nothing was selected: commands still act on the first tab.
+    let title = execute_command(&json!({ "action": "title" }), &mut state).await;
+    assert_eq!(get_data(&title)["title"], "Checkout");
+
+    // A pinned session whose tab someone else closes.
+    let opened = execute_command(
+        &json!({ "action": "tab_new", "url": format!("http://127.0.0.1:{port}/timeout-settings?token=secret"), "pinTab": true }),
+        &mut state,
+    )
+    .await;
+    assert_success(&opened);
+    let settings = opened["data"]["targetId"].as_str().unwrap().to_string();
+    assert_success(
+        &execute_command(&json!({ "action": "wait", "text": "Settings" }), &mut state).await,
+    );
+    let client = state.browser.as_ref().unwrap().client.clone();
+    let mut events = client.subscribe();
+    client
+        .send_command(
+            "Target.closeTarget",
+            Some(json!({ "targetId": settings })),
+            None,
+        )
+        .await
+        .unwrap();
+    browser_event(&mut events, |event| {
+        event.method == "Target.targetDestroyed" && event.params["targetId"] == settings
+    })
+    .await;
+    // A command addressed to the gone tab is refused before it acts: this
+    // navigation never reaches the server.
+    let refused = execute_command(
+        &json!({ "action": "navigate", "url": format!("http://127.0.0.1:{port}/never") }),
+        &mut state,
+    )
+    .await;
+    assert_error_code(&refused, "tab_gone");
+    assert!(!requested
+        .lock()
+        .unwrap()
+        .iter()
+        .any(|path| path.starts_with("/never")));
+    let refused = execute_command(&json!({ "action": "title" }), &mut state).await;
+    assert_error_code(&refused, "tab_gone");
+    let error = refused["error"].as_str().unwrap();
+    assert!(error.starts_with("tab_gone: bound tab is gone"), "{error}");
+    let settings_url = format!("http://127.0.0.1:{port}/timeout-settings");
+    assert_eq!(
+        refused["data"],
+        json!({
+            "targetId": settings,
+            "lastUrl": settings_url,
+            "tabCount": 2,
+            "tabs": [
+                {"tabId": "t1", "title": "Checkout", "origin": format!("http://127.0.0.1:{port}"), "active": false},
+                {"tabId": "t2", "label": "mail", "title": "Inbox (4) - Acme Mail", "origin": format!("http://localhost:{port}"), "active": false},
+            ],
+        }),
+        "{}",
+        serde_json::to_string_pretty(&refused).unwrap_or_default()
+    );
+
+    // A listed tab id is the explicit selection that ends the refusal.
+    assert_success(
+        &execute_command(
+            &json!({ "action": "tab_switch", "tabId": "t2" }),
+            &mut state,
+        )
+        .await,
+    );
+    let title = execute_command(&json!({ "action": "title" }), &mut state).await;
+    assert_eq!(get_data(&title)["title"], "Inbox (4) - Acme Mail");
+    assert_success(&execute_command(&json!({ "action": "close" }), &mut state).await);
+}
+
 // ---------------------------------------------------------------------------
 // Element queries: isvisible, isenabled, gettext, getattribute
 // ---------------------------------------------------------------------------
@@ -12000,9 +12167,10 @@ async fn e2e_pin_tab_gone_error_and_recovery() {
         serde_json::to_string_pretty(&resp).unwrap_or_default()
     );
     let err = resp["error"].as_str().unwrap_or("");
-    assert!(
-        err.starts_with(super::browser::TAB_GONE_PREFIX),
-        "error should start with the tab_gone prefix, got: {}",
+    assert_eq!(
+        super::browser::error_code(err),
+        Some(super::browser::TAB_GONE),
+        "error should carry the tab_gone code as its prefix, got: {}",
         err
     );
     assert_eq!(resp["data"]["targetId"], binding_a.target_id);

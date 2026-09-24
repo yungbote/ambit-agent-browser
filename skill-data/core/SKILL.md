@@ -307,7 +307,7 @@ agent-browser tab t2                   # switch to tab t2
 agent-browser tab close t2             # close tab t2
 ```
 
-Stable `tabId`s mean `t2` points at the same tab across commands even when other tabs open or close. After switching, refs from a prior snapshot on a different tab no longer apply — re-snapshot. `tab list --json` also reports each tab's CDP `targetId`, accepted anywhere a tab ref is accepted; target ids stay stable across daemon restarts, unlike `t<N>` ids.
+Stable `tabId`s mean `t2` points at the same tab across commands even when other tabs open or close. After switching, refs from a prior snapshot on a different tab no longer apply — re-snapshot. `tab list --json` also reports each tab's CDP `targetId`, accepted anywhere a tab ref is accepted; target ids stay stable across daemon restarts, unlike `t<N>` ids. A tab ref that names no open tab fails with `tab_not_found`, and its `data.tabs` lists the open tabs, so pick one from there instead of running `tab list`.
 
 Tabs opened through `tab new` or `click --new-tab` inherit the session's user agent, headers, HTTP credentials, init scripts, routes, and emulation overrides before their first document loads.
 
@@ -331,7 +331,7 @@ agent-browser --session b fill @e1 "bob@test.com"
 
 `AGENT_BROWSER_SESSION=myapp` sets the default session for the current shell.
 
-When several sessions share one Chrome over `--cdp <port>`, add `--pin-tab` so each session sticks to its own tab. Every session remembers its bound tab across daemon restarts; with `--pin-tab` a command whose bound tab was closed fails with a `tab_gone` error instead of acting on another session's tab. JSON output includes `"code": "tab_gone"`, `data.targetId`, and an optional sanitized `data.lastUrl` for recovery. Recover with `tab new <url>` or pick a tab from `tab list`. The flag is sticky per session, so pass it once (`--no-pin-tab` turns it off again). See `references/session-management.md` for details.
+When several sessions share one Chrome over `--cdp <port>`, add `--pin-tab` so each session sticks to its own tab. Every session remembers its bound tab across daemon restarts; with `--pin-tab` a command addressed to a bound tab that was closed is refused with a `tab_gone` error before it acts, instead of acting on another session's tab. JSON output includes `"code": "tab_gone"`, `data.targetId`, an optional sanitized `data.lastUrl`, and the open tabs in `data.tabs` for recovery. A command whose bound tab closes while it runs fails with `tab_closed_during_command` and the same data: it may already have acted, so inspect before retrying. Recover with `tab new <url>` or pick a tab from `data.tabs` or `tab list`. The flag is sticky per session, so pass it once (`--no-pin-tab` turns it off again). See `references/session-management.md` for details.
 
 ### Mock network requests
 

@@ -197,15 +197,29 @@ fn active_page_index_after_add(
     }
 }
 
+/// The machine-readable code an error carries as its `code: ` prefix: a
+/// refusal that callers match on rather than on its message.
+pub(crate) fn error_code(error: &str) -> Option<&str> {
+    let (code, _) = error.split_once(": ")?;
+    let coded = matches!(
+        code,
+        TAB_GONE
+            | TAB_CLOSED_DURING_COMMAND
+            | TAB_NOT_FOUND
+            | "browser_control_outcome_unknown"
+            | "browser_controlled_by_user"
+    ) || code.starts_with("webmcp_")
+        || code.starts_with("browser_operation_");
+    coded.then_some(code)
+}
+
 /// Converts common error messages into AI-friendly, actionable descriptions.
 pub fn to_ai_friendly_error(error: &str) -> String {
-    // This is the existing input outcome classification. Rewriting a word
-    // such as "timeout" inside it must not turn a partial action into a
-    // definite failure that the host could retry automatically.
-    if error.starts_with("browser_control_outcome_unknown: ")
-        || error.starts_with("browser_controlled_by_user: ")
-        || error.starts_with("browser_operation_")
-    {
+    // A coded refusal is kept as it is. Its message may quote a label, a URL
+    // or page text: rewriting a word such as "timeout" in it would drop its
+    // code, or turn a partial action into a definite failure that the host
+    // could retry automatically.
+    if error_code(error).is_some() {
         return error.to_string();
     }
     let lower = error.to_lowercase();
@@ -529,20 +543,49 @@ mod tabs;
 mod window;
 pub(crate) use window::ACTIVE_PAGE_AMBIGUOUS;
 
-/// Stable machine-readable prefix for "the bound tab no longer exists"
-/// errors, so scripts using `--json` can match on it.
-pub const TAB_GONE_PREFIX: &str = "tab_gone:";
+/// Code of the refusal, before it acts, of a command addressed to the active
+/// tab of a pinned session whose bound tab is gone. As with `TAB_NOT_FOUND`,
+/// its recovery is addressing an open tab explicitly, and it lists the open
+/// tabs (see `tab_roster`).
+pub const TAB_GONE: &str = "tab_gone";
+/// Code of the failure of a command whose bound tab closed while it ran. The
+/// command may already have acted, so this is not the `TAB_GONE` refusal; it
+/// carries the same recovery data.
+pub const TAB_CLOSED_DURING_COMMAND: &str = "tab_closed_during_command";
+/// Code of the refusal of a tab reference that names no open tab.
+pub const TAB_NOT_FOUND: &str = "tab_not_found";
+
+/// `target <id>, last url <url>`, or `target <id>` when no URL is known.
+fn gone_tab(target_id: &str, last_url: &str) -> String {
+    if last_url.is_empty() {
+        format!("target {target_id}")
+    } else {
+        format!("target {target_id}, last url {last_url}")
+    }
+}
 
 fn tab_gone_error(target_id: &str, last_url: &str) -> String {
-    let url_part = if last_url.is_empty() {
-        String::new()
-    } else {
-        format!(", last url {}", last_url)
-    };
     format!(
-        "{} bound tab is gone (target {}{}). Run `agent-browser tab new <url>` to bind a new \
-         tab, or `agent-browser tab list` to pick an existing one",
-        TAB_GONE_PREFIX, target_id, url_part
+        "{TAB_GONE}: bound tab is gone ({}). Run `agent-browser tab new <url>` to bind a new tab, \
+         or `agent-browser tab list` to pick an existing one",
+        gone_tab(target_id, last_url)
+    )
+}
+
+fn tab_closed_error(target_id: &str, last_url: &str) -> String {
+    format!(
+        "{TAB_CLOSED_DURING_COMMAND}: bound tab closed while this command ran ({}); the \
+         command may already have acted. Inspect the browser before retrying, then run \
+         `agent-browser tab new <url>` to bind a new tab, or `agent-browser tab list` to pick an \
+         existing one",
+        gone_tab(target_id, last_url)
+    )
+}
+
+fn tab_id_not_found(tab_id: u32) -> String {
+    format!(
+        "{TAB_NOT_FOUND}: Tab {} not found; run `agent-browser tab` to list open tabs",
+        format_tab_id(tab_id)
     )
 }
 
@@ -1175,14 +1218,26 @@ impl BrowserManager {
         self.bound_target_id.as_deref()
     }
 
-    /// Returns the `tab_gone` error when the bound tab no longer exists.
-    /// Commands that operate on the active page call this (via
-    /// `active_session_id` / `active_target_id`) so they fail loudly instead
-    /// of acting on a neighboring tab. Recovery commands (`tab list`,
-    /// `tab new`, `tab <ref>`) do not.
-    fn check_bound(&self) -> Result<(), String> {
+    /// Admits a command addressed to the active tab: while the tab a pinned
+    /// session is bound to is gone, the command is refused with `tab_gone`
+    /// before it acts. That is the only place the refusal is made, so it
+    /// always means that nothing was done.
+    pub fn admit_active_tab(&self) -> Result<(), String> {
         match self.bound_target_gone {
             Some((ref target_id, ref last_url)) => Err(tab_gone_error(target_id, last_url)),
+            None => Ok(()),
+        }
+    }
+
+    /// Guards each use of the active tab inside a command (via
+    /// `active_session_id` / `active_target_id`), so a command whose bound tab
+    /// closed while it ran fails loudly instead of acting on a neighboring
+    /// tab. It was admitted with its tab (`admit_active_tab`) and may already
+    /// have acted: it fails with `tab_closed_during_command`. Recovery
+    /// commands (`tab list`, `tab new`, `tab <ref>`) do not check.
+    fn check_bound(&self) -> Result<(), String> {
+        match self.bound_target_gone {
+            Some((ref target_id, ref last_url)) => Err(tab_closed_error(target_id, last_url)),
             None => Ok(()),
         }
     }
@@ -1760,17 +1815,15 @@ impl BrowserManager {
     }
 
     /// Resolve a user-supplied `TabRef` (either `t<N>` or a label) to the
-    /// stable numeric `tab_id`. Returns a teaching error for unknown tabs.
+    /// stable numeric `tab_id`. Returns a teaching `tab_not_found` error for
+    /// unknown tabs.
     pub fn resolve_tab_ref(&self, tab_ref: &TabRef) -> Result<u32, String> {
         match tab_ref {
             TabRef::Id(id) => {
                 if self.has_tab_id(*id) {
                     Ok(*id)
                 } else {
-                    Err(format!(
-                        "Tab {} not found; run `agent-browser tab` to list open tabs",
-                        format_tab_id(*id)
-                    ))
+                    Err(tab_id_not_found(*id))
                 }
             }
             TabRef::Label(name) => self
@@ -1790,14 +1843,15 @@ impl BrowserManager {
                 })
                 .ok_or_else(|| {
                     format!(
-                        "No tab with label `{}`; run `agent-browser tab` to list open tabs",
+                        "{TAB_NOT_FOUND}: No tab with label `{}`; run `agent-browser tab` to \
+                         list open tabs",
                         name
                     )
                 }),
             TabRef::Target(target_id) => self.find_tab_id_by_target(target_id).ok_or_else(|| {
                 format!(
-                    "No tab with target id `{}`; run `agent-browser tab list --json` to \
-                         list open tabs with their target ids",
+                    "{TAB_NOT_FOUND}: No tab with target id `{}`; run `agent-browser tab list \
+                     --json` to list open tabs with their target ids",
                     target_id
                 )
             }),
@@ -2320,7 +2374,7 @@ impl BrowserManager {
             .pages
             .iter()
             .position(|p| p.tab_id == tab_id)
-            .ok_or_else(|| format!("Tab ID {} not found", tab_id))?;
+            .ok_or_else(|| tab_id_not_found(tab_id))?;
         self.tab_switch(index, dialog_session).await
     }
 
@@ -2334,7 +2388,7 @@ impl BrowserManager {
                 self.pages
                     .iter()
                     .position(|p| p.tab_id == id)
-                    .ok_or_else(|| format!("Tab ID {} not found", id))?,
+                    .ok_or_else(|| tab_id_not_found(id))?,
             ),
             None => None,
         };
@@ -3745,21 +3799,15 @@ mod tests {
         assert!(!mgr.restore_target_binding(TARGET_A, "https://mine.example/checkout"));
         assert!(mgr.bound_target_is_gone());
 
-        let err = mgr.active_session_id().unwrap_err();
-        assert!(
-            err.starts_with(TAB_GONE_PREFIX),
-            "unexpected error: {}",
-            err
-        );
+        // The next command addressed to the active tab is refused before it
+        // acts, and nothing in a command reaches a neighboring tab.
+        let err = mgr.admit_active_tab().unwrap_err();
+        assert_eq!(error_code(&err), Some(TAB_GONE), "unexpected error: {err}");
         assert!(err.contains(TARGET_A));
         assert!(err.contains("https://mine.example/checkout"));
         assert!(err.contains("tab new"));
-
-        // active_target_id is guarded the same way
-        assert!(mgr
-            .active_target_id()
-            .unwrap_err()
-            .starts_with(TAB_GONE_PREFIX));
+        assert!(mgr.active_session_id().is_err());
+        assert!(mgr.active_target_id().is_err());
         // No tab is reported active while the binding is unresolved.
         assert!(mgr.tab_list().iter().all(|t| t["active"] == false));
     }
@@ -3771,10 +3819,14 @@ mod tests {
 
         assert!(!mgr.restore_target_binding(TARGET_A, "data:text/html,restore-secret"));
 
-        let err = mgr.active_session_id().unwrap_err();
-        assert!(err.contains(TARGET_A));
-        assert!(!err.contains("restore-secret"));
-        assert!(!err.contains("last url"));
+        for err in [
+            mgr.admit_active_tab().unwrap_err(),
+            mgr.active_session_id().unwrap_err(),
+        ] {
+            assert!(err.contains(TARGET_A));
+            assert!(!err.contains("restore-secret"));
+            assert!(!err.contains("last url"));
+        }
     }
 
     #[tokio::test]
@@ -3800,10 +3852,44 @@ mod tests {
         mgr.remove_page_by_target_id(TARGET_A);
 
         assert!(mgr.bound_target_is_gone());
-        let err = mgr.active_session_id().unwrap_err();
-        assert!(err.starts_with(TAB_GONE_PREFIX));
+        let err = mgr.admit_active_tab().unwrap_err();
+        assert_eq!(error_code(&err), Some(TAB_GONE));
         // Recovery data is intact: the other tab is still listed.
         assert_eq!(mgr.tab_list().len(), 1);
+    }
+
+    /// `tab_gone` is the refusal at admission, before a command acts. When the
+    /// tab of an admitted command closes while it runs, the command fails with
+    /// `tab_closed_during_command` instead, since it may already have acted;
+    /// neither acts on a neighboring tab.
+    #[tokio::test]
+    async fn test_a_gone_tab_is_refused_before_a_command_but_fails_one_it_closes_during() {
+        let mut mgr = test_manager(vec![
+            page(1, TARGET_A, "https://mine.example/report?token=secret"),
+            page(2, TARGET_B, "https://other.example"),
+        ])
+        .await;
+        mgr.set_pin_tab(true);
+        mgr.admit_active_tab().unwrap();
+        // A drain inside the admitted command sees its tab close.
+        mgr.remove_page_by_target_id(TARGET_A);
+        for err in [
+            mgr.active_session_id().unwrap_err(),
+            mgr.active_target_id().unwrap_err(),
+        ] {
+            assert_eq!(error_code(&err), Some(TAB_CLOSED_DURING_COMMAND), "{err}");
+            assert!(
+                err.contains(&format!(
+                    "(target {TARGET_A}, last url https://mine.example/report)"
+                )),
+                "{err}"
+            );
+            assert_eq!(to_ai_friendly_error(&err), err);
+        }
+        // The next command addressed to the active tab is refused before it acts.
+        let refusal = mgr.admit_active_tab().unwrap_err();
+        assert_eq!(error_code(&refusal), Some(TAB_GONE), "{refusal}");
+        assert!(!refusal.contains("secret"));
     }
 
     #[tokio::test]
@@ -3818,10 +3904,14 @@ mod tests {
 
         mgr.remove_page_by_target_id(TARGET_A);
 
-        let err = mgr.active_session_id().unwrap_err();
-        assert!(err.contains(TARGET_A));
-        assert!(!err.contains("live-secret"));
-        assert!(!err.contains("last url"));
+        for err in [
+            mgr.admit_active_tab().unwrap_err(),
+            mgr.active_session_id().unwrap_err(),
+        ] {
+            assert!(err.contains(TARGET_A));
+            assert!(!err.contains("live-secret"));
+            assert!(!err.contains("last url"));
+        }
     }
 
     #[tokio::test]
@@ -3868,9 +3958,11 @@ mod tests {
         assert!(mgr.restore_target_binding(TARGET_A, "https://mine.example"));
         mgr.remove_page_by_target_id(TARGET_A);
 
-        // "Close the current tab" must not close the fallback neighbor.
+        // "Close the current tab" must not close the fallback neighbor. The
+        // daemon refuses it at admission; inside a command it fails the same
+        // as any use of the active tab.
         let err = mgr.tab_close(None, None).await.unwrap_err();
-        assert!(err.starts_with(TAB_GONE_PREFIX));
+        assert_eq!(error_code(&err), Some(TAB_CLOSED_DURING_COMMAND));
         assert_eq!(mgr.tab_list().len(), 1);
     }
 
@@ -4154,13 +4246,35 @@ mod tests {
         );
     }
 
+    /// Every tab reference that names no open tab is refused with the
+    /// `tab_not_found` code, which the error rewriter keeps whatever the
+    /// reference quotes.
     #[tokio::test]
-    async fn test_resolve_tab_ref_unknown_target_id_errors() {
-        let mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
-        let err = mgr
-            .resolve_tab_ref(&TabRef::Target("0123456789ABCDEF".to_string()))
-            .unwrap_err();
-        assert!(err.contains("target id"));
+    async fn test_tab_refs_naming_no_open_tab_are_tab_not_found() {
+        let mut mgr = test_manager(vec![page(1, TARGET_A, "https://mine.example")]).await;
+        for (tab_ref, detail) in [
+            (TabRef::Id(5), "Tab t5 not found"),
+            (
+                TabRef::Label("timeout-panel".to_string()),
+                "No tab with label `timeout-panel`",
+            ),
+            (
+                TabRef::Target("0123456789ABCDEF".to_string()),
+                "No tab with target id `0123456789ABCDEF`",
+            ),
+        ] {
+            let err = mgr.resolve_tab_ref(&tab_ref).unwrap_err();
+            assert_eq!(error_code(&err), Some(TAB_NOT_FOUND), "{err}");
+            assert!(err.contains(detail), "{err}");
+            assert_eq!(to_ai_friendly_error(&err), err);
+        }
+        // A tab that closed after it was resolved is the same refusal.
+        for err in [
+            mgr.tab_switch_by_id(5, None).await.unwrap_err(),
+            mgr.tab_close_by_id(Some(5), None).await.unwrap_err(),
+        ] {
+            assert_eq!(err, tab_id_not_found(5));
+        }
     }
 
     #[tokio::test]
@@ -4180,10 +4294,53 @@ mod tests {
         assert!(TabRef::parse("1234").is_err());
     }
 
+    /// A coded refusal keeps its message, and so its code, through the error
+    /// rewriter, although it quotes words the rewriter reacts to: a gone
+    /// tab's URL path, a tab label, a tool's own text. Page text quoted after
+    /// another prefix is not a code, and uncoded errors are still rewritten.
+    #[test]
+    fn test_coded_refusals_are_never_rewritten() {
+        for (error, code) in [
+            (
+                tab_gone_error("ABCD", "https://example.com/timeout/intercept"),
+                TAB_GONE,
+            ),
+            (
+                tab_closed_error("ABCD", "https://example.com/timeout"),
+                TAB_CLOSED_DURING_COMMAND,
+            ),
+            (
+                format!("{TAB_NOT_FOUND}: No tab with label `intercept-panel`"),
+                TAB_NOT_FOUND,
+            ),
+            (
+                "webmcp_invoke_failed: the tool reported a timeout".to_string(),
+                "webmcp_invoke_failed",
+            ),
+            (
+                "browser_operation_rejected: Browser setup timeout".to_string(),
+                "browser_operation_rejected",
+            ),
+        ] {
+            assert_eq!(error_code(&error), Some(code), "{error}");
+            assert_eq!(to_ai_friendly_error(&error), error);
+        }
+        for error in [
+            "Evaluation error: tab_gone: forged by the page",
+            "tab_gone",
+            "Element not found: #timeout",
+            "Waiting for the selector timeout",
+        ] {
+            assert_eq!(error_code(error), None, "{error}");
+        }
+        assert!(to_ai_friendly_error("Waiting for the selector timeout")
+            .starts_with("Operation timed out."));
+    }
+
     #[test]
     fn test_tab_gone_error_without_url_omits_url_part() {
         let err = tab_gone_error("ABCD", "");
-        assert!(err.starts_with(TAB_GONE_PREFIX));
+        assert_eq!(error_code(&err), Some(TAB_GONE));
         assert!(err.contains("(target ABCD)"));
         assert!(!err.contains("last url"));
     }

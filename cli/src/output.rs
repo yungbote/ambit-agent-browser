@@ -2589,18 +2589,23 @@ Manage browser tabs in the current window. Stable tab ids look like `t1`,
 referring to the same tab across commands. Optional user-assigned labels
 (e.g. `docs`, `app`) are interchangeable with ids everywhere a tab ref is
 accepted. CDP target ids (from `tab list --json`) are also accepted as tab
-refs; unlike `t<N>` ids they stay stable across daemon restarts.
+refs; unlike `t<N>` ids they stay stable across daemon restarts. A ref that
+names no open tab fails with code=tab_not_found; data.tabs and data.tabCount
+list the open tabs.
 
 Tabs opened with `tab new` or `click --new-tab` inherit the session's user
 agent, headers, HTTP credentials, init scripts, routes, and emulation
 overrides before their first document loads.
 
 Each session remembers its active tab (bound by CDP target id) and returns
-to it after a daemon restart. With --pin-tab, commands fail with a
-`tab_gone` error instead of falling back to another tab when the bound tab
-is closed. JSON output includes code=tab_gone, data.targetId, and an
-optional sanitized data.lastUrl; batch output uses result for the recovery
-object. Recover with `tab new` or `tab list`. The pin is sticky per session;
+to it after a daemon restart. With --pin-tab, a command addressed to the
+bound tab once it is closed is refused with a `tab_gone` error before it
+acts, instead of falling back to another tab. JSON output includes
+code=tab_gone, data.targetId, an optional sanitized data.lastUrl and the
+open tabs; batch output uses result for the recovery object. A command
+whose bound tab closes while it runs fails with
+code=tab_closed_during_command and the same data: it may already have
+acted. Recover with `tab new` or `tab list`. The pin is sticky per session;
 pass --no-pin-tab to turn it off again.
 
 Operations:
@@ -3626,7 +3631,9 @@ before another host-bound action. Earlier image pageGeneration values are stale.
 A page action without a single visible tab is refused as
 browser_active_page_ambiguous. data.tabs lists the open tabs (at most 20: tabId,
 label, title, URL origin, active), data.tabCount counts them, and no tab is
-selected.
+selected. tab_gone (refused before acting), tab_closed_during_command (the tab
+closed while the command ran; it may have acted) and tab_not_found list them
+the same way.
 
 
 Starts a Model Context Protocol server over stdio. MCP clients launch this
@@ -4059,9 +4066,10 @@ Options:
                              (or AGENT_BROWSER_NO_WEBMCP env)
   --cdp <port|url>           Connect via CDP; root WebSocket query slash is optional
   --pin-tab                  Pin the session to its bound tab (or AGENT_BROWSER_PIN_TAB env)
-                             Commands fail with a tab_gone error instead of falling back
-                             to another tab when the bound tab is closed. JSON includes
-                             data.targetId and optional sanitized data.lastUrl. Sticky per session.
+                             Commands addressed to a closed bound tab are refused with
+                             tab_gone before they act, instead of falling back to another
+                             tab. JSON includes data.targetId, optional sanitized
+                             data.lastUrl and the open tabs. Sticky per session.
   --no-pin-tab               Disable a sticky pin previously enabled with --pin-tab
   --color-scheme <scheme>    Color scheme: dark, light, no-preference (or AGENT_BROWSER_COLOR_SCHEME)
   --download-path <path>     Default download directory (or AGENT_BROWSER_DOWNLOAD_PATH)

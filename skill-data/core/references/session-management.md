@@ -60,7 +60,8 @@ agent-browser --session agent2 --cdp 9222 --pin-tab open https://site-b.com
 Every session remembers which tab it is bound to (by CDP target id, persisted in the session's state directory), so a restarted daemon reattaches to the session's own tab instead of adopting the most recently active one. `--pin-tab` (env `AGENT_BROWSER_PIN_TAB=1`) additionally makes the binding strict:
 
 - Attaching with no binding opens a fresh tab instead of adopting an existing one
-- If the bound tab is closed, commands fail with a `tab_gone` error instead of silently acting on another tab. JSON output includes `"code": "tab_gone"`, `data.targetId`, and optional `data.lastUrl`
+- If the bound tab is closed, commands addressed to it are refused with a `tab_gone` error before they act, instead of silently acting on another tab. JSON output includes `"code": "tab_gone"`, `data.targetId`, optional `data.lastUrl`, and the open tabs in `data.tabs` and `data.tabCount`
+- A command whose bound tab closes while it runs fails with `tab_closed_during_command` and the same data instead, since it may already have acted
 - Recovery commands still work in that state: run `tab new <url>` to bind a fresh tab, or `tab list` and switch to an existing one
 - Tabs opened by other sessions or the user never steal the pinned session's active tab
 
