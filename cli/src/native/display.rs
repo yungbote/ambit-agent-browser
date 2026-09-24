@@ -210,11 +210,19 @@ impl DisplayError {
         }
     }
 
+    fn retired() -> Self {
+        Self {
+            code: "display_retired".into(),
+            message: "The browser window is being replaced.".into(),
+            operation_performed: Some(json!(false)),
+        }
+    }
+
     /// The frame loop skips these; they are not helper failures.
     pub(crate) fn is_transient(&self) -> bool {
         matches!(
             self.code.as_str(),
-            "display_layout_pending" | "display_frame_stale"
+            "display_layout_pending" | "display_frame_stale" | "display_retired"
         )
     }
 }
@@ -229,6 +237,17 @@ impl std::error::Error for DisplayError {}
 
 pub(crate) fn enabled() -> bool {
     std::env::var("AGENT_BROWSER_WINDOW_STREAM").is_ok_and(|value| value == "1")
+}
+
+/// The display pixels of an owned window of `width` × `height` CSS pixels.
+pub(crate) fn window_pixels(width: u32, height: u32) -> Result<(u32, u32), String> {
+    let maximum = MAX_DISPLAY_SIZE / DEVICE_SCALE_FACTOR;
+    if !(1..=maximum).contains(&width) || !(1..=maximum).contains(&height) {
+        return Err(format!(
+            "Window dimensions must be between 1 and {maximum} CSS pixels"
+        ));
+    }
+    Ok((width * DEVICE_SCALE_FACTOR, height * DEVICE_SCALE_FACTOR))
 }
 
 #[cfg(target_os = "linux")]
@@ -250,6 +269,9 @@ mod platform {
         frames: tokio::sync::Mutex<Wire>,
         abort_sockets: [UnixStream; 2],
         failed: AtomicBool,
+        /// Its owner ended this display on purpose: it stops producing frames
+        /// without failing the view that showed it.
+        retired: AtomicBool,
         next_id: AtomicU64,
         surface: RwLock<SurfaceState>,
     }
@@ -306,6 +328,7 @@ mod platform {
                 frames: tokio::sync::Mutex::new(wire(frames)?),
                 abort_sockets,
                 failed: AtomicBool::new(false),
+                retired: AtomicBool::new(false),
                 next_id: AtomicU64::new(1),
                 surface: RwLock::new(SurfaceState {
                     value: surface,
@@ -352,6 +375,12 @@ mod platform {
 
         pub(crate) fn ready(&self) -> bool {
             self.available() && self.surface.read().unwrap().ready
+        }
+
+        /// Called before the browser behind this display closes or is
+        /// replaced. Its captures end as transient, never as a failure.
+        pub(crate) fn retire(&self) {
+            self.retired.store(true, Ordering::Release);
         }
 
         fn abort(&self) {
@@ -471,11 +500,26 @@ mod platform {
 
         /// One frame, or `None` when the display has not changed since the
         /// previous capture. A generation rotated while the frame was in
-        /// flight makes the frame stale (transient), never a helper failure.
+        /// flight makes the frame stale (transient), never a helper failure,
+        /// and so does retirement: a closing window is never published.
         pub(crate) async fn capture(
             &self,
             request: CaptureRequest,
         ) -> Result<Option<(Capture, Surface)>, DisplayError> {
+            let captured = self.capture_current(request).await;
+            if self.retired.load(Ordering::Acquire) {
+                return Err(DisplayError::retired());
+            }
+            captured
+        }
+
+        async fn capture_current(
+            &self,
+            request: CaptureRequest,
+        ) -> Result<Option<(Capture, Surface)>, DisplayError> {
+            if self.retired.load(Ordering::Acquire) {
+                return Err(DisplayError::retired());
+            }
             let mut wire = self.frames.lock().await;
             let before = {
                 let state = self.surface.read().unwrap();
@@ -602,6 +646,7 @@ mod platform {
 
     impl Drop for DisplayProcess {
         fn drop(&mut self) {
+            self.client.retire();
             self.client.abort();
             let deadline = std::time::Instant::now() + Duration::from_secs(2);
             loop {
@@ -906,6 +951,37 @@ mod platform {
             helper.await.unwrap();
         }
 
+        /// A display its owner is replacing stops publishing without failing
+        /// the view: before, during and after the helper goes away.
+        #[tokio::test]
+        async fn a_retired_display_ends_its_captures_as_transient() {
+            let (display, _peer, frames) = DisplayClient::test_channel();
+            let (seen, received) = oneshot::channel();
+            let helper = tokio::spawn(async move {
+                let mut frames = BufReader::new(frames);
+                let request = read_request(&mut frames).await;
+                seen.send(()).unwrap();
+                reply(
+                    &mut frames,
+                    json!({"id":request["id"],"success":true,"data":frame(2560, 1440, true)}),
+                )
+                .await;
+                frames
+            });
+            let owner = display.clone();
+            let in_flight = tokio::spawn(async move { owner.capture(CAPTURE).await });
+            received.await.unwrap();
+            display.retire();
+            let error = in_flight.await.unwrap().unwrap_err();
+            assert_eq!(error.code, "display_retired");
+            assert!(error.is_transient());
+            drop(helper.await.unwrap());
+            display.abort();
+            let error = display.capture(CAPTURE).await.unwrap_err();
+            assert_eq!(error.code, "display_retired");
+            assert!(error.is_transient());
+        }
+
         #[tokio::test]
         async fn a_frame_that_contradicts_the_request_is_fatal() {
             let (display, _peer, frames) = DisplayClient::test_channel();
@@ -951,6 +1027,9 @@ impl DisplayClient {
         match *self {}
     }
     pub(crate) fn changed_since(&self, _: std::time::Instant) -> bool {
+        match *self {}
+    }
+    pub(crate) fn retire(&self) {
         match *self {}
     }
     pub(crate) async fn request(&self, _: Value) -> Result<Value, DisplayError> {

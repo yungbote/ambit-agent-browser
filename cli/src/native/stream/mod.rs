@@ -339,7 +339,7 @@ impl StreamServer {
     /// Update and broadcast the recording state.
     pub async fn set_recording(&self, active: bool, engine: &str) {
         *self.recording.lock().await = active;
-        let connected = self.client_slot.read().await.is_some();
+        let connected = source_connected(&self.client_slot, &self.display_slot).await;
         let sc = *self.screencasting.lock().await;
         let (vw, vh) = self.viewport().await;
         self.broadcast_status(connected, sc, vw, vh, engine).await;
@@ -398,6 +398,7 @@ impl StreamServer {
         let recording = Arc::new(Mutex::new(false));
         let display_slot = Arc::new(RwLock::new(None));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let display_slot_accept = display_slot.clone();
 
         let frame_tx_clone = frame_tx.clone();
         let client_count_clone = client_count.clone();
@@ -426,6 +427,7 @@ impl StreamServer {
                 client_count_clone,
                 patch_clients_accept,
                 client_slot_clone,
+                display_slot_accept,
                 notify_clone,
                 idle_activity_clone,
                 browser_control_clone,
@@ -520,12 +522,7 @@ impl StreamServer {
 
     pub(crate) async fn set_display(&self, display: Option<Arc<super::display::DisplayClient>>) {
         let mut slot = self.display_slot.write().await;
-        let changed = match (&*slot, &display) {
-            (Some(current), Some(next)) => !Arc::ptr_eq(current, next),
-            (None, None) => false,
-            _ => true,
-        };
-        if changed {
+        if cdp_loop::replaced(&slot, &display) {
             *slot = display;
             self.frame_watch.send_replace(None);
             self.client_notify.notify_one();
@@ -722,6 +719,15 @@ impl StreamServer {
     }
 }
 
+/// A stream is connected while it has a source: a CDP client, an owned
+/// window's display, or both. A browser without DevTools streams its window.
+pub(super) async fn source_connected(
+    client_slot: &RwLock<Option<Arc<CdpClient>>>,
+    display_slot: &RwLock<Option<Arc<super::display::DisplayClient>>>,
+) -> bool {
+    client_slot.read().await.is_some() || display_slot.read().await.is_some()
+}
+
 /// History availability is observed only on navigation and attachment, never
 /// on pointer input or on each frame. Only booleans leave the native driver.
 pub(super) async fn history_availability(
@@ -902,6 +908,109 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A browser without DevTools streams its window alone: the viewer is told
+    /// the stream is connected, frames flow from the display, and a display
+    /// its owner retires and replaces never reads as a failed or stopped view.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn display_only_source_streams_and_survives_replacement() {
+        use super::super::display::DisplayClient;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+        async fn answer_capture(helper: &mut BufReader<tokio::net::UnixStream>) -> Value {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(5), helper.read_line(&mut line))
+                .await
+                .expect("a capture request")
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["op"], "capture");
+            let reply = json!({"id": request["id"], "success": true, "data": {
+                "changed": true, "width": 2560, "height": 1440, "encoding": "jpeg",
+                "data": "AA==", "cursorIncluded": request["cursor"], "quality": 85}});
+            helper
+                .get_mut()
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+            request
+        }
+
+        async fn next_message(ws: &mut WsClient) -> Value {
+            loop {
+                let message = tokio::time::timeout(Duration::from_secs(5), ws.next())
+                    .await
+                    .expect("a stream message")
+                    .expect("stream ended")
+                    .expect("ws error");
+                if let Message::Text(text) = message {
+                    return serde_json::from_str(&text).unwrap();
+                }
+            }
+        }
+
+        /// Messages until the next frame; the view must never fail or stop.
+        async fn until_frame(ws: &mut WsClient) -> Value {
+            loop {
+                let message = next_message(ws).await;
+                assert_ne!(message["type"], "error", "{message}");
+                if message["type"] == "status" {
+                    assert_eq!(message["connected"], true, "{message}");
+                    assert_eq!(message["screencasting"], true, "{message}");
+                }
+                if message["type"] == "frame" {
+                    return message;
+                }
+            }
+        }
+
+        let (server, _slot) = StreamServer::start_without_client(
+            0,
+            "display-only".into(),
+            true,
+            Arc::new(IdleActivity::new()),
+        )
+        .await
+        .unwrap();
+        let (first, _first_control, first_frames) = DisplayClient::test_channel();
+        server.set_display(Some(first.clone())).await;
+        let mut viewer = connect_client(server.port()).await;
+        let handshake = next_message(&mut viewer).await;
+        assert_eq!(handshake["type"], "status");
+        assert_eq!(handshake["connected"], true);
+
+        let mut helper = BufReader::new(first_frames);
+        answer_capture(&mut helper).await;
+        let frame = until_frame(&mut viewer).await;
+        assert_eq!(frame["surface"]["generation"], first.surface().generation);
+
+        // The owner retires the display while a capture is in flight, then the
+        // helper goes away: neither is a failed view.
+        let mut line = String::new();
+        helper.read_line(&mut line).await.unwrap();
+        first.retire();
+        drop(helper);
+
+        let (second, _second_control, second_frames) = DisplayClient::test_channel();
+        server.set_display(Some(second.clone())).await;
+        let mut helper = BufReader::new(second_frames);
+        let request = answer_capture(&mut helper).await;
+        assert_eq!(
+            request["force"], true,
+            "a new surface starts with a whole frame"
+        );
+        let frame = until_frame(&mut viewer).await;
+        assert_eq!(frame["surface"]["generation"], second.surface().generation);
+        assert!(server.is_screencasting().await);
+
+        // With no source at all the stream truthfully reports disconnection.
+        server.set_display(None).await;
+        let mut late = connect_client(server.port()).await;
+        let handshake = next_message(&mut late).await;
+        assert_eq!(handshake["connected"], false);
+        server.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

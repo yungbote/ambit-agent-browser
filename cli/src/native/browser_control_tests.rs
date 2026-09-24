@@ -39,6 +39,7 @@ async fn expired_native_input_retains_custody_until_reset_is_proven() {
             held: HeldInputs::default(),
             native_input_pending: true,
             download_cursor: 0,
+            sign_in: None,
         }),
         ..BrowserControl::default()
     };
@@ -980,4 +981,349 @@ async fn resumed_controller_rejects_late_input_and_starts_a_fresh_sequence() {
     assert_eq!(applied["status"], "applied");
     assert_eq!(applied["lastSequence"], 1);
     assert!(browser.commands.try_recv().is_err());
+}
+
+fn sign_in_request(sequence: u64, events: Value) -> ControlRequest {
+    parse(
+        json!({ "action": ACTION, "op": "input", "controllerId": OWNER,
+        "sequence": sequence, "events": events }),
+    )
+}
+
+fn sign_in_event() -> Value {
+    json!([{ "type": "sign_in", "idleTimeoutMs": 600000 }])
+}
+
+fn lease_for(controller_id: &str, deadline: Instant, last_sequence: u64) -> Lease {
+    Lease {
+        controller_id: controller_id.into(),
+        expires_at: expires(),
+        deadline,
+        last_sequence,
+        outcome_unknown: false,
+        held: HeldInputs::default(),
+        native_input_pending: false,
+        download_cursor: 0,
+        sign_in: None,
+    }
+}
+
+/// A display helper that acknowledges every control operation and reports
+/// each operation it received.
+fn acknowledging_display() -> (
+    std::sync::Arc<crate::native::display::DisplayClient>,
+    mpsc::UnboundedReceiver<Value>,
+    tokio::net::UnixStream,
+) {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let (display, peer, frames) = crate::native::display::DisplayClient::test_channel();
+    let (seen, received) = mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        let mut peer = tokio::io::BufReader::new(peer);
+        let mut line = String::new();
+        while peer.read_line(&mut line).await.is_ok_and(|read| read > 0) {
+            let request: Value = serde_json::from_str(&line).unwrap();
+            line.clear();
+            let reply = json!({ "id": request["id"], "success": true, "data": {} });
+            let _ = seen.send(request);
+            if peer
+                .get_mut()
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    (display, received, frames)
+}
+
+#[test]
+fn sign_in_event_shape_is_exact_and_judged_after_the_sequence() {
+    for (idle, expected) in [(10_000, 10), (600_000, 600), (3_600_000, 3600)] {
+        let request = sign_in_request(1, json!([{ "type": "sign_in", "idleTimeoutMs": idle }]));
+        assert_eq!(
+            request.sign_in().unwrap().unwrap(),
+            Duration::from_secs(expected)
+        );
+    }
+    let generation = uuid::Uuid::new_v4().to_string();
+    let mut surfaced = json!({ "action": ACTION, "op": "input", "controllerId": OWNER,
+        "sequence": 1, "events": sign_in_event() });
+    surfaced["expectedSurfaceGeneration"] = json!(generation);
+    assert!(parse(surfaced).sign_in().unwrap().is_ok());
+    assert!(input(1).sign_in().is_none());
+    // Variants still parse, so a replayed sequence reads as a duplicate; the
+    // event itself is refused only after the sequence is ordered.
+    for events in [
+        json!([{ "type": "sign_in" }]),
+        json!([{ "type": "sign_in", "idleTimeoutMs": 9_999 }]),
+        json!([{ "type": "sign_in", "idleTimeoutMs": 3_600_001 }]),
+        json!([{ "type": "sign_in", "idleTimeoutMs": 600000.5 }]),
+        json!([{ "type": "sign_in", "idleTimeoutMs": "600000" }]),
+        json!([{ "type": "sign_in", "idleTimeoutMs": -1 }]),
+        json!([{ "type": "sign_in", "idleTimeoutMs": 600000, "url": "https://example.com" }]),
+        json!([{ "type": "sign_in", "idleTimeoutMs": 600000 }, { "type": "sign_in", "idleTimeoutMs": 600000 }]),
+        json!([{ "type": "sign_in", "idleTimeoutMs": 600000 }, { "type": "input_keyboard", "eventType": "char", "text": "x" }]),
+        json!(["sign_in", { "type": "sign_in", "idleTimeoutMs": 600000 }]),
+    ] {
+        let error = sign_in_request(1, events.clone())
+            .sign_in()
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(error.code, "browser_control_invalid", "{events}");
+    }
+    // Envelope fields keep their ordinary parse-time rules.
+    for invalid in [
+        json!({ "action": ACTION, "op": "input", "controllerId": OWNER, "events": sign_in_event() }),
+        json!({ "action": ACTION, "op": "input", "controllerId": OWNER, "sequence": 1,
+            "events": sign_in_event(), "expiresAt": expires() }),
+        json!({ "action": ACTION, "op": "input", "controllerId": OWNER, "sequence": 1,
+            "events": sign_in_event(), "expectedSurfaceGeneration": "not-a-uuid" }),
+    ] {
+        assert!(ControlRequest::parse(&invalid).is_err(), "{invalid}");
+    }
+}
+
+#[tokio::test]
+async fn sign_in_admission_follows_the_contract_order_without_effect() {
+    let (display, _ops, _frames) = acknowledging_display();
+    let later = Instant::now() + Duration::from_secs(20);
+    let mut control = BrowserControl {
+        lease: Some(lease_for(OWNER, later, 1)),
+        display: Some(display.clone()),
+        ..BrowserControl::default()
+    };
+    let admit = |control: &BrowserControl, request: ControlRequest| {
+        let event = request.sign_in().unwrap();
+        control.admit_sign_in(&request, event)
+    };
+    let refused = |result: Result<SignInAdmission, ControlError>| match result {
+        Err(error) => error.code,
+        Ok(_) => "admitted",
+    };
+    let malformed = json!([{ "type": "sign_in", "idleTimeoutMs": 5 }]);
+    let mut other = sign_in_request(2, malformed.clone());
+    other.controller_id = OTHER.into();
+    assert_eq!(refused(admit(&control, other)), "browser_control_stale");
+    control.lease.as_mut().unwrap().deadline = Instant::now();
+    assert_eq!(
+        refused(admit(&control, sign_in_request(2, malformed.clone()))),
+        "browser_control_expired"
+    );
+    control.lease.as_mut().unwrap().deadline = later;
+    control.lease.as_mut().unwrap().outcome_unknown = true;
+    assert_eq!(
+        refused(admit(&control, sign_in_request(2, malformed.clone()))),
+        "browser_control_outcome_unknown"
+    );
+    control.lease.as_mut().unwrap().outcome_unknown = false;
+    // An applied sequence repeats its acknowledgment before anything else.
+    match admit(&control, sign_in_request(1, malformed.clone())).unwrap() {
+        SignInAdmission::Duplicate(acknowledgment) => {
+            assert_eq!(acknowledgment["status"], "duplicate");
+            assert_eq!(acknowledgment["lastSequence"], 1);
+            assert_eq!(
+                acknowledgment["surface"]["generation"],
+                display.surface().generation
+            );
+        }
+        SignInAdmission::Admitted { .. } => panic!("a duplicate was admitted"),
+    }
+    assert_eq!(
+        refused(admit(&control, sign_in_request(3, sign_in_event()))),
+        "browser_control_sequence_gap"
+    );
+    let mut stale = json!({ "action": ACTION, "op": "input", "controllerId": OWNER,
+        "sequence": 2, "events": malformed });
+    stale["expectedSurfaceGeneration"] = json!(uuid::Uuid::new_v4().to_string());
+    assert_eq!(
+        refused(admit(&control, parse(stale))),
+        "browser_control_surface_stale"
+    );
+    let error = admit(&control, sign_in_request(2, json!([{ "type": "sign_in" }])))
+        .err()
+        .unwrap();
+    assert_eq!(error.code, "browser_control_invalid");
+    assert!(error.message.contains("idleTimeoutMs"), "{}", error.message);
+    // No refusal consumed the sequence or changed the lease.
+    assert_eq!(control.lease.as_ref().unwrap().last_sequence, 1);
+    assert!(!control.signing_in());
+    let SignInAdmission::Admitted {
+        sequence,
+        idle_timeout,
+    } = admit(&control, sign_in_request(2, sign_in_event())).unwrap()
+    else {
+        panic!("a valid sign-in was not admitted");
+    };
+    assert_eq!((sequence, idle_timeout), (2, Duration::from_secs(600)));
+    let applied = control
+        .begin_sign_in(OWNER, sequence, idle_timeout)
+        .unwrap();
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["lastSequence"], 2);
+    assert_eq!(
+        applied["surface"]["generation"],
+        display.surface().generation
+    );
+    let error = admit(&control, sign_in_request(3, sign_in_event()))
+        .err()
+        .unwrap();
+    assert_eq!(error.code, "browser_control_invalid");
+    assert!(error.message.contains("already"), "{}", error.message);
+    assert!(matches!(
+        admit(&control, sign_in_request(2, sign_in_event())).unwrap(),
+        SignInAdmission::Duplicate(_)
+    ));
+}
+
+#[tokio::test]
+async fn sign_in_custody_outlasts_the_lease_deadline_until_the_browser_is_handed_back() {
+    let (display, _ops, _frames) = acknowledging_display();
+    let mut control = BrowserControl {
+        lease: Some(lease_for(
+            OWNER,
+            Instant::now() + Duration::from_secs(20),
+            0,
+        )),
+        display: Some(display),
+        ..BrowserControl::default()
+    };
+    control
+        .begin_sign_in(OWNER, 1, Duration::from_secs(600))
+        .unwrap();
+    assert!(control.signs_in_for(OWNER));
+    assert!(!control.signs_in_for(OTHER));
+    let refusal = control.agent_error().unwrap();
+    assert_eq!(refusal.code, "browser_controlled_by_user");
+    assert!(
+        refusal.message.contains("signing in"),
+        "{}",
+        refusal.message
+    );
+    let inspected = control
+        .execute(parse(json!({"action":ACTION,"op":"inspect"})), None)
+        .await
+        .unwrap();
+    assert_eq!(inspected["supported"], true);
+    assert_eq!(inspected["controlled"], true);
+    assert!(inspected.get("filesSupported").is_none(), "{inspected}");
+
+    // The lease lapses: the watchdog is due, and until it hands the browser
+    // back no agent command and no other controller may take the browser.
+    control.lease.as_mut().unwrap().deadline = Instant::now() - Duration::from_millis(1);
+    assert!(control.sign_in_due(Instant::now()));
+    assert_eq!(
+        control.agent_error().unwrap().code,
+        "browser_controlled_by_user"
+    );
+    let mut other = command("acquire", OTHER);
+    other["expiresAt"] = json!(expires());
+    assert_eq!(
+        control.execute(parse(other), None).await.unwrap_err().code,
+        "browser_control_conflict"
+    );
+
+    let released = control.end_lease().unwrap();
+    assert_eq!(released["status"], "released");
+    assert!(control.agent_error().is_none());
+    assert!(control.needs_observation());
+    assert!(!control.sign_in_due(Instant::now()));
+    assert_eq!(
+        control
+            .execute(parse(command("release", OWNER)), None)
+            .await
+            .unwrap()["status"],
+        "released"
+    );
+    assert_eq!(
+        control
+            .execute(parse(command("renew", OWNER)), None)
+            .await
+            .unwrap_err()
+            .code,
+        "browser_control_stale"
+    );
+}
+
+/// The idle clock follows the person, not the dock: renewing keeps it,
+/// applied input restarts it, and a window without DevTools takes native
+/// input with no page session at all.
+#[tokio::test]
+async fn sign_in_idle_clock_restarts_on_applied_input_only() {
+    let (display, mut ops, _frames) = acknowledging_display();
+    let mut control = BrowserControl {
+        lease: Some(lease_for(
+            OWNER,
+            Instant::now() + Duration::from_secs(20),
+            0,
+        )),
+        display: Some(display.clone()),
+        ..BrowserControl::default()
+    };
+    control
+        .begin_sign_in(OWNER, 1, Duration::from_secs(10))
+        .unwrap();
+    let idle = |control: &BrowserControl| {
+        control
+            .lease
+            .as_ref()
+            .unwrap()
+            .sign_in
+            .as_ref()
+            .unwrap()
+            .idle_deadline
+    };
+    let started = idle(&control);
+    assert!(!control.sign_in_due(Instant::now()));
+    assert!(control.sign_in_due(started));
+    control
+        .execute(parse(command("renew", OWNER)), None)
+        .await
+        .unwrap();
+    assert_eq!(idle(&control), started, "renewal is not presence");
+
+    let generation = display.surface().generation;
+    let typed = parse(
+        json!({ "action": ACTION, "op": "input", "controllerId": OWNER,
+        "sequence": 2, "expectedSurfaceGeneration": generation,
+        "events": [{ "type": "input_keyboard", "eventType": "insertText", "text": "person@example.com" }] }),
+    );
+    let applied = control.execute(typed, None).await.unwrap();
+    assert_eq!(applied["status"], "applied");
+    assert_eq!(applied["lastSequence"], 2);
+    assert_eq!(ops.recv().await.unwrap()["op"], "input");
+    assert!(
+        idle(&control) > started,
+        "applied input restarts the idle clock"
+    );
+
+    let navigate = parse(
+        json!({ "action": ACTION, "op": "input", "controllerId": OWNER,
+        "sequence": 3, "expectedSurfaceGeneration": generation,
+        "events": [{ "type": "navigation", "action": "navigate", "url": "https://example.com" }] }),
+    );
+    let refused = control.execute(navigate, None).await.unwrap_err();
+    assert_eq!(refused.code, "browser_control_invalid");
+    assert!(
+        refused.message.contains("address bar"),
+        "{}",
+        refused.message
+    );
+    assert_eq!(control.lease.as_ref().unwrap().last_sequence, 2);
+    assert!(
+        ops.try_recv().is_err(),
+        "a refused batch never reaches the window"
+    );
+
+    control
+        .lease
+        .as_mut()
+        .unwrap()
+        .sign_in
+        .as_mut()
+        .unwrap()
+        .idle_deadline = Instant::now();
+    assert!(control.sign_in_due(Instant::now()));
 }

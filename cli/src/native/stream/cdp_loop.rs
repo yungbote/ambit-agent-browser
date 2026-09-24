@@ -8,6 +8,7 @@ use tokio::sync::{broadcast, watch, Mutex, RwLock};
 
 use crate::native::browser_control::custody_active;
 use crate::native::cdp::client::CdpClient;
+use crate::native::cdp::types::CdpEvent;
 use crate::native::display::CaptureRequest;
 use crate::native::network;
 
@@ -43,24 +44,51 @@ fn main_frame_id(frame_tree: &Value) -> Option<String> {
         .map(String::from)
 }
 
+/// The active main frame, observed through `client`; never without one.
 async fn seed_main_frame_id(
-    client: Arc<CdpClient>,
+    client: Option<Arc<CdpClient>>,
     session_id: Option<String>,
     delay: std::time::Duration,
-    enabled: bool,
-) -> Option<String> {
-    if !enabled {
-        std::future::pending::<()>().await;
-    }
+) -> (Arc<CdpClient>, Option<String>) {
+    let Some(client) = client else {
+        return std::future::pending().await;
+    };
     tokio::time::sleep(delay).await;
-    tokio::time::timeout(
+    let frame_id = tokio::time::timeout(
         std::time::Duration::from_secs(1),
         client.send_command_no_params("Page.getFrameTree", session_id.as_deref()),
     )
     .await
     .ok()
     .and_then(Result::ok)
-    .and_then(|tree| main_frame_id(&tree))
+    .and_then(|tree| main_frame_id(&tree));
+    (client, frame_id)
+}
+
+/// The CDP half of a stream session: its client and that client's events.
+type CdpEvents = (Arc<CdpClient>, broadcast::Receiver<CdpEvent>);
+
+/// The next event of this session's CDP client, with that client; never for
+/// a window shown without DevTools.
+async fn next_cdp_event(
+    cdp: &mut Option<CdpEvents>,
+) -> (
+    Arc<CdpClient>,
+    Result<CdpEvent, broadcast::error::RecvError>,
+) {
+    match cdp {
+        Some((client, events)) => (Arc::clone(client), events.recv().await),
+        None => std::future::pending().await,
+    }
+}
+
+/// Whether a stream source slot now holds another value than `current`.
+pub(super) fn replaced<T>(current: &Option<Arc<T>>, next: &Option<Arc<T>>) -> bool {
+    match (current, next) {
+        (Some(current), Some(next)) => !Arc::ptr_eq(current, next),
+        (None, None) => false,
+        _ => true,
+    }
 }
 
 async fn publish_url(
@@ -104,7 +132,9 @@ async fn publish_url(
     let _ = frame_tx.send(message.to_string());
 }
 
-/// Subscribes to the active page's CDP events and broadcasts stream updates.
+/// Streams the current source to its viewers: the owned window's display,
+/// the active page's CDP events, or both. A browser running without DevTools
+/// streams its window alone.
 ///
 /// Frames use `frame_watch` so the latest value wins. Other messages stay on
 /// the ordered `frame_tx` channel. URL updates follow only the active main
@@ -151,473 +181,458 @@ pub(super) async fn cdp_event_loop(
         }
 
         let count = *client_count.lock().await;
-        let guard = client_slot.read().await;
+        let client = client_slot.read().await.clone();
+        let display = display_slot.read().await.clone();
 
-        if count > 0 {
-            if let Some(ref client) = *guard {
-                let mut event_rx = client.subscribe();
-                let client_arc = Arc::clone(client);
-                drop(guard);
+        if count > 0 && (client.is_some() || display.is_some()) {
+            let mut cdp = client
+                .as_ref()
+                .map(|client| (Arc::clone(client), client.subscribe()));
 
-                let session_id = cdp_session_id.read().await.clone();
+            let session_id = cdp_session_id.read().await.clone();
 
-                let vw = *viewport_width.lock().await;
-                let vh = *viewport_height.lock().await;
+            let vw = *viewport_width.lock().await;
+            let vh = *viewport_height.lock().await;
 
-                let eng = last_engine.read().await.clone();
-                let display = display_slot.read().await.clone();
-                let is_chrome = eng == "chrome";
-                let supports_screencast = is_chrome && display.is_none();
-                let supports_same_document_navigation = is_chrome;
+            let eng = last_engine.read().await.clone();
+            let is_chrome = eng == "chrome";
+            // A page screencast runs only when no owned window is shown.
+            let screencast = client.clone().filter(|_| is_chrome && display.is_none());
+            let supports_screencast = screencast.is_some();
+            let supports_same_document_navigation = is_chrome && client.is_some();
 
-                if supports_screencast {
-                    let _ = client_arc
-                        .send_command(
-                            "Page.startScreencast",
-                            Some(json!({
-                                "format": "jpeg",
-                                "quality": screencast_config.quality,
-                                "maxWidth": screencast_config.max_width.unwrap_or(vw),
-                                "maxHeight": screencast_config.max_height.unwrap_or(vh),
-                                "everyNthFrame": 1,
-                            })),
-                            session_id.as_deref(),
-                        )
-                        .await;
-                }
+            if let Some(client) = &screencast {
+                let _ = client
+                    .send_command(
+                        "Page.startScreencast",
+                        Some(json!({
+                            "format": "jpeg",
+                            "quality": screencast_config.quality,
+                            "maxWidth": screencast_config.max_width.unwrap_or(vw),
+                            "maxHeight": screencast_config.max_height.unwrap_or(vh),
+                            "everyNthFrame": 1,
+                        })),
+                        session_id.as_deref(),
+                    )
+                    .await;
+            }
 
-                {
-                    let mut sc = screencasting.lock().await;
-                    *sc = supports_screencast || display.is_some();
-                }
+            {
+                let mut sc = screencasting.lock().await;
+                *sc = supports_screencast || display.is_some();
+            }
 
-                let rec = *recording.lock().await;
-                let status = json!({
-                    "type": "status",
-                    "connected": true,
-                    "screencasting": supports_screencast || display.is_some(),
-                    "viewportWidth": vw,
-                    "viewportHeight": vh,
-                    "engine": eng,
-                    "recording": rec,
-                });
-                let _ = frame_tx.send(status.to_string());
+            let rec = *recording.lock().await;
+            let status = json!({
+                "type": "status",
+                "connected": true,
+                "screencasting": supports_screencast || display.is_some(),
+                "viewportWidth": vw,
+                "viewportHeight": vh,
+                "engine": eng,
+                "recording": rec,
+            });
+            let _ = frame_tx.send(status.to_string());
 
-                let frame_tree_seed = seed_main_frame_id(
-                    Arc::clone(&client_arc),
-                    session_id.clone(),
-                    std::time::Duration::ZERO,
-                    supports_same_document_navigation,
-                )
-                .fuse();
-                tokio::pin!(frame_tree_seed);
-                let mut seed_in_flight = supports_same_document_navigation;
-                let mut active_main_frame_id = None;
-                let mut pending_same_document = VecDeque::<(Option<String>, String, String)>::new();
-                let mut presentation_rx = presentation.subscribe();
-                // Pacing follows the viewing situation: the presenter roster
-                // and the human lease. Both are re-read at every tick, so a
-                // lease that lapses without a message still slows capture.
-                let mut controlled = custody_active(*custody.borrow_and_update());
-                let mut pacing = presentation.capture_pacing(controlled);
-                let mut display_tick = tokio::time::interval(pacing.period());
-                display_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                let mut display_failed = false;
-                // The generation the newest published frame carries. A rotated
-                // generation is republished on unchanged pixels so viewers can
-                // name the current surface in their next input.
-                let mut published_generation: Option<String> = None;
-                // The newest published frame was a patch; a new or changed
-                // viewer roster then needs a whole frame first.
-                let mut published_patches = false;
-                let mut published_seq = None;
-                macro_rules! repace {
-                    () => {{
-                        let next = presentation.capture_pacing(controlled);
-                        if next != pacing {
-                            pacing = next;
-                            display_tick = tokio::time::interval_at(
-                                tokio::time::Instant::now() + pacing.period(),
-                                pacing.period(),
-                            );
-                            display_tick
-                                .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                        }
-                    }};
-                }
+            let frame_tree_seed = seed_main_frame_id(
+                client.clone().filter(|_| supports_same_document_navigation),
+                session_id.clone(),
+                std::time::Duration::ZERO,
+            )
+            .fuse();
+            tokio::pin!(frame_tree_seed);
+            let mut seed_in_flight = supports_same_document_navigation;
+            let mut active_main_frame_id = None;
+            let mut pending_same_document = VecDeque::<(Option<String>, String, String)>::new();
+            let mut presentation_rx = presentation.subscribe();
+            // Pacing follows the viewing situation: the presenter roster
+            // and the human lease. Both are re-read at every tick, so a
+            // lease that lapses without a message still slows capture.
+            let mut controlled = custody_active(*custody.borrow_and_update());
+            let mut pacing = presentation.capture_pacing(controlled);
+            let mut display_tick = tokio::time::interval(pacing.period());
+            display_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut display_failed = false;
+            // The generation the newest published frame carries. A rotated
+            // generation is republished on unchanged pixels so viewers can
+            // name the current surface in their next input.
+            let mut published_generation: Option<String> = None;
+            // The newest published frame was a patch; a new or changed
+            // viewer roster then needs a whole frame first.
+            let mut published_patches = false;
+            let mut published_seq = None;
+            macro_rules! repace {
+                () => {{
+                    let next = presentation.capture_pacing(controlled);
+                    if next != pacing {
+                        pacing = next;
+                        display_tick = tokio::time::interval_at(
+                            tokio::time::Instant::now() + pacing.period(),
+                            pacing.period(),
+                        );
+                        display_tick
+                            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    }
+                }};
+            }
 
-                loop {
-                    tokio::select! {
-                        changed = presentation_rx.changed(), if display.is_some() => {
-                            if changed.is_err() { break; }
+            loop {
+                tokio::select! {
+                    changed = presentation_rx.changed(), if display.is_some() => {
+                        if changed.is_err() { break; }
+                        repace!();
+                    }
+                    changed = custody.changed(), if display.is_some() => {
+                        if changed.is_err() { break; }
+                        controlled = custody_active(*custody.borrow_and_update());
+                        repace!();
+                    }
+                    _ = display_tick.tick(), if display.is_some() && !display_failed => {
+                        let now_controlled = custody_active(*custody.borrow());
+                        if now_controlled != controlled {
+                            controlled = now_controlled;
                             repace!();
                             // A viewer's layout just changed or was applied: the
                             // first frame of the new geometry must not wait out
                             // the remainder of the current capture interval.
                             display_tick.reset_immediately();
                         }
-                        changed = custody.changed(), if display.is_some() => {
-                            if changed.is_err() { break; }
-                            controlled = custody_active(*custody.borrow_and_update());
-                            repace!();
-                        }
-                        _ = display_tick.tick(), if display.is_some() && !display_failed => {
-                            let now_controlled = custody_active(*custody.borrow());
-                            if now_controlled != controlled {
-                                controlled = now_controlled;
-                                repace!();
-                            }
-                            let display = display.as_ref().unwrap();
-                            // Patches amend a whole frame every viewer holds;
-                            // one viewer that does not composite them makes
-                            // the next frame whole for everyone.
-                            let patches_allowed = patch_clients.load(std::sync::atomic::Ordering::Acquire) == *client_count.lock().await;
-                            if !patches_allowed && published_patches {
-                                published_generation = None;
-                            }
-                            let request = CaptureRequest {
-                                // A controlling client renders its own pointer.
-                                cursor: !controlled,
-                                budget_bytes: pacing.budget_bytes,
-                                force: published_generation.as_deref() != Some(display.surface().generation.as_str()),
-                                patches: patches_allowed,
-                            };
-                            match display.capture(request).await {
-                                Ok(Some((capture, mut surface))) => {
-                                    let seq = super::next_frame_seq();
-                                    let patch = capture.data.is_none();
-                                    surface.cursor_included = capture.cursor_included;
-                                    let mut message = json!({
-                                        "type": "frame", "seq": seq, "encoding": capture.encoding,
-                                        "surface": surface,
-                                    });
-                                    if let Some(data) = capture.data {
-                                        message["data"] = json!(data);
-                                    } else {
-                                        message["patches"] = json!(capture.patches);
-                                        message["baseSeq"] = json!(published_seq);
-                                    }
-                                    published_generation = Some(surface.generation);
-                                    published_patches = patch;
-                                    frame_watch.send_replace(Some(Arc::new(super::StreamFrame {
-                                        seq: Some(seq), json: message.to_string(), patch,
-                                        base_seq: if patch { published_seq } else { None },
-                                        binary: std::sync::OnceLock::new(),
-                                    })));
-                                    published_seq = Some(seq);
-                                }
-                                Ok(None) => {}
-                                Err(error) if error.is_transient() => {}
-                                Err(_) => {
-                                    display_failed = true;
-                                    frame_watch.send_replace(None);
-                                    let _ = frame_tx.send(json!({"type":"error", "code":"display_unavailable"}).to_string());
-                                }
-                            }
-                        }
-                        seeded_frame_id = &mut frame_tree_seed => {
-                            seed_in_flight = false;
-                            if active_main_frame_id.is_none() {
-                                active_main_frame_id = seeded_frame_id;
-                            }
-                            if let Some(main_frame_id) = active_main_frame_id.as_deref() {
-                                for (event_session_id, frame_id, url) in
-                                    pending_same_document.drain(..)
-                                {
-                                    if frame_id == main_frame_id {
-                                        publish_url(
-                                            &client_arc,
-                                            &frame_tx,
-                                            &last_tabs,
-                                            &cdp_session_id,
-                                            event_session_id.as_deref(),
-                                            &url,
-                                        )
-                                        .await;
-                                    }
-                                }
-                            } else if !pending_same_document.is_empty() {
-                                frame_tree_seed.set(
-                                    seed_main_frame_id(
-                                        Arc::clone(&client_arc),
-                                        session_id.clone(),
-                                        std::time::Duration::from_millis(250),
-                                        true,
-                                    )
-                                    .fuse(),
-                                );
-                                seed_in_flight = true;
-                            }
-                        }
-                        changed = shutdown_rx.changed() => {
-                            if changed.is_err() || *shutdown_rx.borrow() {
-                                if supports_screencast {
-                                    let session_id = cdp_session_id.read().await.clone();
-                                    let _ = client_arc
-                                        .send_command_no_params("Page.stopScreencast", session_id.as_deref())
-                                        .await;
-                                }
-                                let mut sc = screencasting.lock().await;
-                                *sc = false;
-                                return;
-                            }
-                        }
-                        event = event_rx.recv() => {
-                            match event {
-                                Ok(evt) => {
-                                    if evt.method == crate::native::activity::EVENT {
-                                        if session_matches(session_id.as_deref(), evt.session_id.as_deref()) {
-                                            let mut activity = evt.params;
-                                            if display.is_some() {
-                                                activity["coordinateSpace"] = json!("viewport-css");
-                                            }
-                                            if let (Some(display), Some(screen_x), Some(screen_y), Some(page)) = (
-                                                display.as_ref(), activity["screenX"].as_f64(), activity["screenY"].as_f64(), evt.session_id.as_deref()
-                                            ) {
-                                                let surface = display.surface();
-                                                let x = screen_x * f64::from(surface.device_scale_factor);
-                                                let y = screen_y * f64::from(surface.device_scale_factor);
-                                                if activity["source"] == "agent"
-                                                    && activity["pageGeneration"] == client_arc.page_generation(page)
-                                                    && x >= 0.0 && y >= 0.0 && x < f64::from(surface.width) && y < f64::from(surface.height) {
-                                                    activity["coordinateSpace"] = json!("display-pixels");
-                                                    activity["surfaceGeneration"] = json!(surface.generation);
-                                                    activity["x"] = json!(x);
-                                                    activity["y"] = json!(y);
-                                                }
-                                            }
-                                            if let Some(object) = activity.as_object_mut() {
-                                                object.remove("screenX");
-                                                object.remove("screenY");
-                                            }
-                                            let _ = frame_tx.send(activity.to_string());
-                                        }
-                                    } else if evt.method == "Page.frameNavigated" {
-                                        if let Some(frame) = evt.params.get("frame") {
-                                            let is_main = frame
-                                                .get("parentId")
-                                                .and_then(|v| v.as_str())
-                                                .is_none_or(|s| s.is_empty());
-                                            let is_active_session = session_matches(
-                                                session_id.as_deref(),
-                                                evt.session_id.as_deref(),
-                                            );
-                                            if is_main && is_active_session {
-                                                if supports_screencast {
-                                                    pending_same_document.clear();
-                                                    active_main_frame_id = frame
-                                                        .get("id")
-                                                        .and_then(Value::as_str)
-                                                        .map(String::from);
-                                                }
-                                                if let Some(url) = frame.get("url").and_then(|v| v.as_str()) {
-                                                    publish_url(
-                                                        &client_arc,
-                                                        &frame_tx,
-                                                        &last_tabs,
-                                                        &cdp_session_id,
-                                                        evt.session_id.as_deref(),
-                                                        url,
-                                                    )
-                                                    .await;
-                                                }
-                                            }
-                                        }
-                                    } else if evt.method == "Page.navigatedWithinDocument" {
-                                        let is_active_session = supports_same_document_navigation
-                                            && session_matches(
-                                                session_id.as_deref(),
-                                                evt.session_id.as_deref(),
-                                            );
-                                        if is_active_session {
-                                            if let (Some(frame_id), Some(url)) = (
-                                                evt.params.get("frameId").and_then(Value::as_str),
-                                                evt.params.get("url").and_then(Value::as_str),
-                                            ) {
-                                                if active_main_frame_id.is_none() {
-                                                    if pending_same_document.len() == 64 {
-                                                        pending_same_document.pop_front();
-                                                    }
-                                                    pending_same_document
-                                                        .push_back((
-                                                            evt.session_id.clone(),
-                                                            frame_id.to_string(),
-                                                            url.to_string(),
-                                                        ));
-                                                    if !seed_in_flight {
-                                                        frame_tree_seed.set(
-                                                            seed_main_frame_id(
-                                                                Arc::clone(&client_arc),
-                                                                session_id.clone(),
-                                                                std::time::Duration::ZERO,
-                                                                true,
-                                                            )
-                                                            .fuse(),
-                                                        );
-                                                        seed_in_flight = true;
-                                                    }
-                                                } else if Some(frame_id)
-                                                    == active_main_frame_id.as_deref()
-                                                {
-                                                    publish_url(
-                                                        &client_arc,
-                                                        &frame_tx,
-                                                        &last_tabs,
-                                                        &cdp_session_id,
-                                                        evt.session_id.as_deref(),
-                                                        url,
-                                                    )
-                                                    .await;
-                                                }
-                                            }
-                                        }
-                                    } else if evt.method == "Page.screencastFrame" {
-                                        if let Some(sid) = evt.params.get("sessionId").and_then(|v| v.as_i64()) {
-                                            let _ = client_arc.send_command(
-                                                "Page.screencastFrameAck",
-                                                Some(json!({ "sessionId": sid })),
-                                                evt.session_id.as_deref(),
-                                            ).await;
-                                        }
-
-                                        if display.is_some() {
-                                            continue;
-                                        }
-
-                                        if let Some(data) = evt.params.get("data").and_then(|v| v.as_str()) {
-                                            let meta = evt.params.get("metadata");
-                                            let seq = super::next_frame_seq();
-                                            let msg = json!({
-                                                "type": "frame",
-                                                "seq": seq,
-                                                "data": data,
-                                                "pageGeneration": evt.params[crate::native::activity::FRAME_GENERATION],
-                                                "metadata": {
-                                                    "offsetTop": meta.and_then(|m| m.get("offsetTop")).and_then(|v| v.as_f64()).unwrap_or(0.0),
-                                                    "pageScaleFactor": meta.and_then(|m| m.get("pageScaleFactor")).and_then(|v| v.as_f64()).unwrap_or(1.0),
-                                                    "deviceWidth": vw,
-                                                    "deviceHeight": vh,
-                                                    "scrollOffsetX": meta.and_then(|m| m.get("scrollOffsetX")).and_then(|v| v.as_f64()).unwrap_or(0.0),
-                                                    "scrollOffsetY": meta.and_then(|m| m.get("scrollOffsetY")).and_then(|v| v.as_f64()).unwrap_or(0.0),
-                                                    "timestamp": frame_timestamp_ms(meta),
-                                                }
-                                            });
-                                            frame_watch.send_replace(Some(Arc::new(
-                                                super::StreamFrame {
-                                                    seq: Some(seq),
-                                                    json: msg.to_string(),
-                                                    patch: false,
-                                                    base_seq: None,
-                                                    binary: std::sync::OnceLock::new(),
-                                                },
-                                            )));
-                                        }
-                                    } else if evt.method == "Runtime.consoleAPICalled" {
-                                        let level = evt.params.get("type")
-                                            .and_then(|v| v.as_str())
-                                            .unwrap_or("log");
-                                        let raw_args = evt.params.get("args")
-                                            .and_then(|v| v.as_array())
-                                            .cloned()
-                                            .unwrap_or_default();
-                                        let text = network::format_console_args(&raw_args);
-                                        if !text.is_empty() {
-                                            let mut msg = json!({
-                                                "type": "console",
-                                                "level": level,
-                                                "text": text,
-                                                "timestamp": timestamp_ms(),
-                                            });
-                                            if !raw_args.is_empty() {
-                                                msg.as_object_mut().unwrap().insert(
-                                                    "args".to_string(),
-                                                    Value::Array(raw_args),
-                                                );
-                                            }
-                                            let _ = frame_tx.send(msg.to_string());
-                                        }
-                                    } else if evt.method == "Runtime.exceptionThrown" {
-                                        let text = evt.params.get("exceptionDetails")
-                                            .and_then(|d| {
-                                                d.get("exception")
-                                                    .and_then(|e| e.get("description").and_then(|v| v.as_str()))
-                                                    .or_else(|| d.get("text").and_then(|v| v.as_str()))
-                                            })
-                                            .unwrap_or("Unknown error");
-                                        let line = evt.params.get("exceptionDetails")
-                                            .and_then(|d| d.get("lineNumber").and_then(|v| v.as_i64()));
-                                        let column = evt.params.get("exceptionDetails")
-                                            .and_then(|d| d.get("columnNumber").and_then(|v| v.as_i64()));
-                                        let msg = json!({
-                                            "type": "page_error",
-                                            "text": text,
-                                            "line": line,
-                                            "column": column,
-                                            "timestamp": timestamp_ms(),
-                                        });
-                                        let _ = frame_tx.send(msg.to_string());
-                                    }
-                                }
-                                Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                                Err(broadcast::error::RecvError::Closed) => break,
-                            }
-                        }
-                        _ = client_notify.notified() => {
-                            let count = *client_count.lock().await;
-                            // A new viewer or a writer that skipped a delta
-                            // needs a whole frame. This uses the existing
-                            // wakeup without rotating input coordinates.
+                        let display = display.as_ref().unwrap();
+                        // Patches amend a whole frame every viewer holds;
+                        // one viewer that does not composite them makes
+                        // the next frame whole for everyone.
+                        let patches_allowed = patch_clients.load(std::sync::atomic::Ordering::Acquire) == *client_count.lock().await;
+                        if !patches_allowed && published_patches {
                             published_generation = None;
-                            display_tick.reset_immediately();
-                            let new_session_id = cdp_session_id.read().await.clone();
-                            if count == 0 {
-                                if supports_screencast {
-                                    let _ = client_arc
-                                        .send_command_no_params("Page.stopScreencast", session_id.as_deref())
-                                        .await;
+                        }
+                        let request = CaptureRequest {
+                            // A controlling client renders its own pointer.
+                            cursor: !controlled,
+                            budget_bytes: pacing.budget_bytes,
+                            force: published_generation.as_deref() != Some(display.surface().generation.as_str()),
+                            patches: patches_allowed,
+                        };
+                        match display.capture(request).await {
+                            Ok(Some((capture, mut surface))) => {
+                                let seq = super::next_frame_seq();
+                                let patch = capture.data.is_none();
+                                surface.cursor_included = capture.cursor_included;
+                                let mut message = json!({
+                                    "type": "frame", "seq": seq, "encoding": capture.encoding,
+                                    "surface": surface,
+                                });
+                                if let Some(data) = capture.data {
+                                    message["data"] = json!(data);
+                                } else {
+                                    message["patches"] = json!(capture.patches);
+                                    message["baseSeq"] = json!(published_seq);
                                 }
-                                let mut sc = screencasting.lock().await;
-                                *sc = false;
-                                break;
+                                published_generation = Some(surface.generation);
+                                published_patches = patch;
+                                frame_watch.send_replace(Some(Arc::new(super::StreamFrame {
+                                    seq: Some(seq), json: message.to_string(), patch,
+                                    base_seq: if patch { published_seq } else { None },
+                                    binary: std::sync::OnceLock::new(),
+                                })));
+                                published_seq = Some(seq);
                             }
-                            let client_changed = {
-                                let guard = client_slot.read().await;
-                                let same = guard
-                                    .as_ref()
-                                    .is_some_and(|c| Arc::ptr_eq(c, &client_arc));
-                                !same
-                            };
-                            let session_changed = new_session_id != session_id;
-                            let new_vw = *viewport_width.lock().await;
-                            let new_vh = *viewport_height.lock().await;
-                            let viewport_changed = new_vw != vw || new_vh != vh;
-                            let current_display = display_slot.read().await.clone();
-                            let display_changed = match (&display, &current_display) {
-                                (Some(previous), Some(current)) => !Arc::ptr_eq(previous, current),
-                                (None, None) => false,
-                                _ => true,
-                            };
-                            if client_changed || session_changed || viewport_changed || display_changed {
-                                if supports_screencast {
-                                    let _ = client_arc
-                                        .send_command_no_params("Page.stopScreencast", session_id.as_deref())
-                                        .await;
-                                }
-                                let mut sc = screencasting.lock().await;
-                                *sc = false;
-                                client_notify.notify_one();
-                                break;
+                            Ok(None) => {}
+                            Err(error) if error.is_transient() => {}
+                            Err(_) => {
+                                display_failed = true;
+                                frame_watch.send_replace(None);
+                                let _ = frame_tx.send(json!({"type":"error", "code":"display_unavailable"}).to_string());
                             }
                         }
                     }
+                    (client_arc, seeded_frame_id) = &mut frame_tree_seed => {
+                        seed_in_flight = false;
+                        if active_main_frame_id.is_none() {
+                            active_main_frame_id = seeded_frame_id;
+                        }
+                        if let Some(main_frame_id) = active_main_frame_id.as_deref() {
+                            for (event_session_id, frame_id, url) in
+                                pending_same_document.drain(..)
+                            {
+                                if frame_id == main_frame_id {
+                                    publish_url(
+                                        &client_arc,
+                                        &frame_tx,
+                                        &last_tabs,
+                                        &cdp_session_id,
+                                        event_session_id.as_deref(),
+                                        &url,
+                                    )
+                                    .await;
+                                }
+                            }
+                        } else if !pending_same_document.is_empty() {
+                            frame_tree_seed.set(
+                                seed_main_frame_id(
+                                    Some(Arc::clone(&client_arc)),
+                                    session_id.clone(),
+                                    std::time::Duration::from_millis(250),
+                                )
+                                .fuse(),
+                            );
+                            seed_in_flight = true;
+                        }
+                    }
+                    changed = shutdown_rx.changed() => {
+                        if changed.is_err() || *shutdown_rx.borrow() {
+                            if let Some(client) = &screencast {
+                                let session_id = cdp_session_id.read().await.clone();
+                                let _ = client
+                                    .send_command_no_params("Page.stopScreencast", session_id.as_deref())
+                                    .await;
+                            }
+                            let mut sc = screencasting.lock().await;
+                            *sc = false;
+                            return;
+                        }
+                    }
+                    (client_arc, event) = next_cdp_event(&mut cdp) => {
+                        match event {
+                            Ok(evt) => {
+                                if evt.method == crate::native::activity::EVENT {
+                                    if session_matches(session_id.as_deref(), evt.session_id.as_deref()) {
+                                        let mut activity = evt.params;
+                                        if display.is_some() {
+                                            activity["coordinateSpace"] = json!("viewport-css");
+                                        }
+                                        if let (Some(display), Some(screen_x), Some(screen_y), Some(page)) = (
+                                            display.as_ref(), activity["screenX"].as_f64(), activity["screenY"].as_f64(), evt.session_id.as_deref()
+                                        ) {
+                                            let surface = display.surface();
+                                            let x = screen_x * f64::from(surface.device_scale_factor);
+                                            let y = screen_y * f64::from(surface.device_scale_factor);
+                                            if activity["source"] == "agent"
+                                                && activity["pageGeneration"] == client_arc.page_generation(page)
+                                                && x >= 0.0 && y >= 0.0 && x < f64::from(surface.width) && y < f64::from(surface.height) {
+                                                activity["coordinateSpace"] = json!("display-pixels");
+                                                activity["surfaceGeneration"] = json!(surface.generation);
+                                                activity["x"] = json!(x);
+                                                activity["y"] = json!(y);
+                                            }
+                                        }
+                                        if let Some(object) = activity.as_object_mut() {
+                                            object.remove("screenX");
+                                            object.remove("screenY");
+                                        }
+                                        let _ = frame_tx.send(activity.to_string());
+                                    }
+                                } else if evt.method == "Page.frameNavigated" {
+                                    if let Some(frame) = evt.params.get("frame") {
+                                        let is_main = frame
+                                            .get("parentId")
+                                            .and_then(|v| v.as_str())
+                                            .is_none_or(|s| s.is_empty());
+                                        let is_active_session = session_matches(
+                                            session_id.as_deref(),
+                                            evt.session_id.as_deref(),
+                                        );
+                                        if is_main && is_active_session {
+                                            if supports_screencast {
+                                                pending_same_document.clear();
+                                                active_main_frame_id = frame
+                                                    .get("id")
+                                                    .and_then(Value::as_str)
+                                                    .map(String::from);
+                                            }
+                                            if let Some(url) = frame.get("url").and_then(|v| v.as_str()) {
+                                                publish_url(
+                                                    &client_arc,
+                                                    &frame_tx,
+                                                    &last_tabs,
+                                                    &cdp_session_id,
+                                                    evt.session_id.as_deref(),
+                                                    url,
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                    }
+                                } else if evt.method == "Page.navigatedWithinDocument" {
+                                    let is_active_session = supports_same_document_navigation
+                                        && session_matches(
+                                            session_id.as_deref(),
+                                            evt.session_id.as_deref(),
+                                        );
+                                    if is_active_session {
+                                        if let (Some(frame_id), Some(url)) = (
+                                            evt.params.get("frameId").and_then(Value::as_str),
+                                            evt.params.get("url").and_then(Value::as_str),
+                                        ) {
+                                            if active_main_frame_id.is_none() {
+                                                if pending_same_document.len() == 64 {
+                                                    pending_same_document.pop_front();
+                                                }
+                                                pending_same_document
+                                                    .push_back((
+                                                        evt.session_id.clone(),
+                                                        frame_id.to_string(),
+                                                        url.to_string(),
+                                                    ));
+                                                if !seed_in_flight {
+                                                    frame_tree_seed.set(
+                                                        seed_main_frame_id(
+                                                            Some(Arc::clone(&client_arc)),
+                                                            session_id.clone(),
+                                                            std::time::Duration::ZERO,
+                                                        )
+                                                        .fuse(),
+                                                    );
+                                                    seed_in_flight = true;
+                                                }
+                                            } else if Some(frame_id)
+                                                == active_main_frame_id.as_deref()
+                                            {
+                                                publish_url(
+                                                    &client_arc,
+                                                    &frame_tx,
+                                                    &last_tabs,
+                                                    &cdp_session_id,
+                                                    evt.session_id.as_deref(),
+                                                    url,
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                    }
+                                } else if evt.method == "Page.screencastFrame" {
+                                    if let Some(sid) = evt.params.get("sessionId").and_then(|v| v.as_i64()) {
+                                        let _ = client_arc.send_command(
+                                            "Page.screencastFrameAck",
+                                            Some(json!({ "sessionId": sid })),
+                                            evt.session_id.as_deref(),
+                                        ).await;
+                                    }
+
+                                    if display.is_some() {
+                                        continue;
+                                    }
+
+                                    if let Some(data) = evt.params.get("data").and_then(|v| v.as_str()) {
+                                        let meta = evt.params.get("metadata");
+                                        let seq = super::next_frame_seq();
+                                        let msg = json!({
+                                            "type": "frame",
+                                            "seq": seq,
+                                            "data": data,
+                                            "pageGeneration": evt.params[crate::native::activity::FRAME_GENERATION],
+                                            "metadata": {
+                                                "offsetTop": meta.and_then(|m| m.get("offsetTop")).and_then(|v| v.as_f64()).unwrap_or(0.0),
+                                                "pageScaleFactor": meta.and_then(|m| m.get("pageScaleFactor")).and_then(|v| v.as_f64()).unwrap_or(1.0),
+                                                "deviceWidth": vw,
+                                                "deviceHeight": vh,
+                                                "scrollOffsetX": meta.and_then(|m| m.get("scrollOffsetX")).and_then(|v| v.as_f64()).unwrap_or(0.0),
+                                                "scrollOffsetY": meta.and_then(|m| m.get("scrollOffsetY")).and_then(|v| v.as_f64()).unwrap_or(0.0),
+                                                "timestamp": frame_timestamp_ms(meta),
+                                            }
+                                        });
+                                        frame_watch.send_replace(Some(Arc::new(
+                                            super::StreamFrame {
+                                                seq: Some(seq),
+                                                json: msg.to_string(),
+                                                patch: false,
+                                                base_seq: None,
+                                                binary: std::sync::OnceLock::new(),
+                                            },
+                                        )));
+                                    }
+                                } else if evt.method == "Runtime.consoleAPICalled" {
+                                    let level = evt.params.get("type")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("log");
+                                    let raw_args = evt.params.get("args")
+                                        .and_then(|v| v.as_array())
+                                        .cloned()
+                                        .unwrap_or_default();
+                                    let text = network::format_console_args(&raw_args);
+                                    if !text.is_empty() {
+                                        let mut msg = json!({
+                                            "type": "console",
+                                            "level": level,
+                                            "text": text,
+                                            "timestamp": timestamp_ms(),
+                                        });
+                                        if !raw_args.is_empty() {
+                                            msg.as_object_mut().unwrap().insert(
+                                                "args".to_string(),
+                                                Value::Array(raw_args),
+                                            );
+                                        }
+                                        let _ = frame_tx.send(msg.to_string());
+                                    }
+                                } else if evt.method == "Runtime.exceptionThrown" {
+                                    let text = evt.params.get("exceptionDetails")
+                                        .and_then(|d| {
+                                            d.get("exception")
+                                                .and_then(|e| e.get("description").and_then(|v| v.as_str()))
+                                                .or_else(|| d.get("text").and_then(|v| v.as_str()))
+                                        })
+                                        .unwrap_or("Unknown error");
+                                    let line = evt.params.get("exceptionDetails")
+                                        .and_then(|d| d.get("lineNumber").and_then(|v| v.as_i64()));
+                                    let column = evt.params.get("exceptionDetails")
+                                        .and_then(|d| d.get("columnNumber").and_then(|v| v.as_i64()));
+                                    let msg = json!({
+                                        "type": "page_error",
+                                        "text": text,
+                                        "line": line,
+                                        "column": column,
+                                        "timestamp": timestamp_ms(),
+                                    });
+                                    let _ = frame_tx.send(msg.to_string());
+                                }
+                            }
+                            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(broadcast::error::RecvError::Closed) => break,
+                        }
+                    }
+                    _ = client_notify.notified() => {
+                        let count = *client_count.lock().await;
+                        // A new viewer or a writer that skipped a delta
+                        // needs a whole frame. This uses the existing
+                        // wakeup without rotating input coordinates.
+                        published_generation = None;
+                        display_tick.reset_immediately();
+                        let new_session_id = cdp_session_id.read().await.clone();
+                        if count == 0 {
+                            if let Some(client) = &screencast {
+                                let _ = client
+                                    .send_command_no_params("Page.stopScreencast", session_id.as_deref())
+                                    .await;
+                            }
+                            let mut sc = screencasting.lock().await;
+                            *sc = false;
+                            break;
+                        }
+                        let client_changed = replaced(&client, &*client_slot.read().await);
+                        let session_changed = new_session_id != session_id;
+                        let new_vw = *viewport_width.lock().await;
+                        let new_vh = *viewport_height.lock().await;
+                        let viewport_changed = new_vw != vw || new_vh != vh;
+                        let display_changed = replaced(&display, &*display_slot.read().await);
+                        if client_changed || session_changed || viewport_changed || display_changed {
+                            if let Some(client) = &screencast {
+                                let _ = client
+                                    .send_command_no_params("Page.stopScreencast", session_id.as_deref())
+                                    .await;
+                            }
+                            // The next session publishes its own status. A
+                            // replaced source never reads as a stopped stream;
+                            // only no source or no viewer stops it.
+                            client_notify.notify_one();
+                            break;
+                        }
+                    }
                 }
-            } else {
-                drop(guard);
             }
         } else {
             let was_screencasting = *screencasting.lock().await;
             if was_screencasting {
-                if let Some(ref client) = *guard {
+                if let Some(ref client) = client {
                     let session_id = cdp_session_id.read().await.clone();
                     let _ = client
                         .send_command_no_params("Page.stopScreencast", session_id.as_deref())
@@ -626,7 +641,6 @@ pub(super) async fn cdp_event_loop(
                 let mut sc = screencasting.lock().await;
                 *sc = false;
             }
-            drop(guard);
         }
     }
 }

@@ -13,16 +13,23 @@ use crate::ca_bundle::CaBundle;
 
 pub struct ChromeProcess {
     child: Child,
-    pub ws_url: String,
+    /// Absent when Chrome runs without any remote-debugging switch: such a
+    /// browser has no automation channel at all.
+    devtools_url: Option<String>,
+    /// The effective options that launched this browser and its resolved
+    /// executable; a relaunch starts from exactly these.
+    launch: Box<LaunchOptions>,
+    executable: PathBuf,
     temp_user_data_dir: Option<Arc<TemporaryBrowserDirectory>>,
     temp_nss_home: Option<PreparedNssHome>,
     /// On Unix, the process group ID used to kill the entire Chrome process tree.
     #[cfg(unix)]
     pgid: Option<i32>,
     /// Private Xvfb server auto-started for headed mode on displayless Linux
-    /// hosts. Dropped (and killed) after the Chrome tree is torn down.
+    /// hosts. Its last owner drops (and kills) it after the Chrome tree is
+    /// torn down; a relaunch into the same display shares it.
     #[cfg(target_os = "linux")]
-    xvfb: Option<XvfbServer>,
+    xvfb: Option<RetainedDisplay>,
     #[cfg(target_os = "linux")]
     display_process: Option<crate::native::display::DisplayProcess>,
 }
@@ -69,6 +76,14 @@ pub(crate) struct RetainedChromeProfile {
     nss_home: Option<PreparedNssHome>,
 }
 
+/// Shared ownership of one private display, so a browser relaunched into it
+/// keeps the same display. The server stops with its last owner.
+#[derive(Clone)]
+pub(crate) struct RetainedDisplay {
+    #[cfg(target_os = "linux")]
+    server: Arc<XvfbServer>,
+}
+
 impl ChromeProcess {
     pub(crate) fn retained_profile(&self) -> Option<RetainedChromeProfile> {
         Some(RetainedChromeProfile {
@@ -76,15 +91,43 @@ impl ChromeProcess {
             nss_home: self.temp_nss_home.clone(),
         })
     }
+
+    /// The DevTools endpoint, or `None` for a browser without one.
+    pub fn devtools_url(&self) -> Option<&str> {
+        self.devtools_url.as_deref()
+    }
+
+    /// Options that relaunch this browser exactly: its executable and flags,
+    /// its own profile, CA trust and private display, reopening its last
+    /// session. Callers choose only whether DevTools is open.
+    pub(crate) fn relaunch_options(&self) -> Result<LaunchOptions, String> {
+        let executable = self
+            .executable
+            .to_str()
+            .ok_or("The browser executable path is not valid UTF-8")?;
+        Ok(LaunchOptions {
+            executable_path: Some(executable.to_string()),
+            prepared_nss_home: self.temp_nss_home.clone(),
+            retained_profile: self.retained_profile(),
+            #[cfg(target_os = "linux")]
+            retained_display: self.xvfb.clone(),
+            restore_last_session: true,
+            // Storage state is loaded by the daemon into a fresh launch; a
+            // relaunch restores this browser's own session instead.
+            storage_state: None,
+            ..(*self.launch).clone()
+        })
+    }
+
     #[cfg(target_os = "linux")]
-    pub(crate) fn start_window_display(&mut self) -> Result<(), String> {
+    fn start_window_display(&mut self) -> Result<(), String> {
         let display = self
             .xvfb
             .as_ref()
             .ok_or("Window streaming requires this browser's private Xvfb display")?;
         self.display_process = Some(crate::native::display::DisplayProcess::spawn(
-            &display.display,
-            &display.auth_file,
+            &display.server.display,
+            &display.server.auth_file,
             self.child.id(),
         )?);
         Ok(())
@@ -139,6 +182,26 @@ impl ChromeProcess {
         }
 
         self.kill();
+    }
+
+    /// Close Chrome without DevTools, as a person closing it would: SIGTERM
+    /// lets the browser save its session and profile, and whatever remains
+    /// after `timeout` is killed with its process group. Blocking.
+    pub(crate) fn terminate(&mut self, timeout: Duration) {
+        #[cfg(target_os = "linux")]
+        if let Some(display) = self.display_client() {
+            display.retire();
+        }
+        // An unreaped child keeps its pid, so the signal cannot reach
+        // another process.
+        #[cfg(unix)]
+        if matches!(self.child.try_wait(), Ok(None)) {
+            // SAFETY: kill(2) on this owned, unreaped child.
+            unsafe {
+                libc::kill(self.child.id() as i32, libc::SIGTERM);
+            }
+        }
+        self.wait_or_kill(timeout);
     }
 }
 
@@ -226,7 +289,10 @@ fn xvfb_applicable(options: &LaunchOptions) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn maybe_start_xvfb(options: &LaunchOptions) -> Option<XvfbServer> {
+fn maybe_start_xvfb(options: &LaunchOptions) -> Option<RetainedDisplay> {
+    if let Some(display) = options.retained_display.clone() {
+        return Some(display);
+    }
     if !xvfb_applicable(options) {
         return None;
     }
@@ -325,10 +391,12 @@ fn maybe_start_xvfb(options: &LaunchOptions) -> Option<XvfbServer> {
                 if let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                     match String::from_utf8_lossy(&buf[..pos]).trim().parse::<u32>() {
                         Ok(num) => {
-                            return Some(XvfbServer {
-                                child,
-                                display: format!(":{}", num),
-                                auth_file,
+                            return Some(RetainedDisplay {
+                                server: Arc::new(XvfbServer {
+                                    child,
+                                    display: format!(":{}", num),
+                                    auth_file,
+                                }),
                             });
                         }
                         Err(_) => break,
@@ -402,6 +470,14 @@ pub struct LaunchOptions {
     /// Restrict WebRTC to proxied transports so direct UDP cannot bypass the
     /// HTTP domain filter. Enabled automatically with `--allowed-domains`.
     pub restrict_webrtc: bool,
+    /// Open the DevTools endpoint (`--remote-debugging-port=0`). Only sign-in
+    /// mode turns it off: that browser has no automation channel at all.
+    pub remote_debugging: bool,
+    /// Reopen the tabs of this profile's previous session. Explicit, never a
+    /// profile preference, because both sign-in relaunches rely on it.
+    pub restore_last_session: bool,
+    /// Launch into this private display instead of starting a new one.
+    pub(crate) retained_display: Option<RetainedDisplay>,
 }
 
 impl LaunchOptions {
@@ -413,6 +489,17 @@ impl LaunchOptions {
         !self.window_stream
             && self.headless
             && self.extensions.as_ref().is_none_or(|exts| exts.is_empty())
+    }
+
+    /// The same launch with no automation channel at all, or why sign-in
+    /// mode cannot remove it. Nothing is masked: the switch is absent.
+    pub(crate) fn without_automation(self) -> Result<Self, String> {
+        let options = Self {
+            remote_debugging: false,
+            ..self
+        };
+        build_chrome_args(&options)?;
+        Ok(options)
     }
 }
 
@@ -448,6 +535,9 @@ impl Default for LaunchOptions {
             webmcp: true,
             no_xvfb: false,
             restrict_webrtc: false,
+            remote_debugging: true,
+            restore_last_session: false,
+            retained_display: None,
         }
     }
 }
@@ -472,20 +562,10 @@ pub(crate) fn validate_sandbox_options(
         return Err("--require-sandbox requires locally launched Chrome; sandboxing cannot be verified for attached browsers, providers, or other engines".to_string());
     }
     for arg in &options.args {
-        let switch = arg.split('=').next().unwrap_or(arg);
-        let switch = switch
-            .strip_prefix("--")
-            .or_else(|| switch.strip_prefix('-'))
-            .or_else(|| {
-                if cfg!(windows) {
-                    switch.strip_prefix('/')
-                } else {
-                    None
-                }
-            });
-        if switch.is_some_and(|switch| {
+        let switch = switch_name(arg);
+        if switch.as_deref().is_some_and(|switch| {
             matches!(
-                switch.to_ascii_lowercase().as_str(),
+                switch,
                 "no-sandbox"
                     | "disable-gpu-sandbox"
                     | "disable-setuid-sandbox"
@@ -500,7 +580,7 @@ pub(crate) fn validate_sandbox_options(
         }) {
             return Err(format!("--require-sandbox cannot be combined with '{}'. Remove the sandbox-disabling browser argument.", arg));
         }
-        if switch.is_some_and(|switch| switch.eq_ignore_ascii_case("enable-features"))
+        if switch.as_deref() == Some("enable-features")
             && arg.split_once('=').is_some_and(|(_, features)| {
                 features.split(',').any(|feature| {
                     feature.trim().split(['<', ':']).next().is_some_and(|name| {
@@ -515,8 +595,47 @@ pub(crate) fn validate_sandbox_options(
     Ok(())
 }
 
+/// The lowercase name of a Chrome switch as Chrome parses it (`--name`,
+/// `-name`, and `/name` on Windows, with any `=value`), or `None` for a
+/// positional argument such as a startup URL.
+fn switch_name(arg: &str) -> Option<String> {
+    let switch = arg.split('=').next().unwrap_or(arg);
+    switch
+        .strip_prefix("--")
+        .or_else(|| switch.strip_prefix('-'))
+        .or_else(|| {
+            if cfg!(windows) {
+                switch.strip_prefix('/')
+            } else {
+                None
+            }
+        })
+        .map(str::to_ascii_lowercase)
+}
+
+/// Switches that turn on Chrome's automation-controlled state, which pages
+/// observe as `navigator.webdriver`.
+fn automation_switch(arg: &str) -> bool {
+    switch_name(arg).is_some_and(|switch| {
+        switch.starts_with("remote-debugging")
+            || switch == "enable-automation"
+            || switch.starts_with("headless")
+    })
+}
+
 fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
     validate_sandbox_options(options, Some("chrome"), false)?;
+    // Without DevTools nothing can observe or drive the browser but its own
+    // window, so only an owned window reopening its own profile qualifies.
+    if !options.remote_debugging
+        && !(options.window_stream
+            && (options.profile.is_some() || options.retained_profile.is_some()))
+    {
+        return Err(
+            "A browser without DevTools must be an owned window relaunched into its own profile"
+                .to_string(),
+        );
+    }
     // Chrome only honors the last --enable-features switch on the command
     // line, so every feature must be collected into a single flag.
     let mut enable_features: Vec<String> = vec!["NetworkService".to_string()];
@@ -549,8 +668,11 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         }
     }
 
-    let mut args = vec![
-        "--remote-debugging-port=0".to_string(),
+    let mut args = Vec::new();
+    if options.remote_debugging {
+        args.push("--remote-debugging-port=0".to_string());
+    }
+    args.extend([
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--disable-background-networking".to_string(),
@@ -564,7 +686,10 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         "--disable-features=Translate".to_string(),
         format!("--enable-features={}", enable_features.join(",")),
         "--metrics-recording-only".to_string(),
-    ];
+    ]);
+    if options.restore_last_session {
+        args.push("--restore-last-session".to_string());
+    }
 
     // The native window stream owns a private virtual display. Its ordinary
     // Linux workspace has no GPU render device, so select software GLES for
@@ -728,6 +853,16 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         args.push("--disable-dev-shm-usage".to_string());
     }
 
+    // Removing the managed switch must leave no other automation channel;
+    // a remaining one is refused, never silently stripped.
+    if !options.remote_debugging {
+        if let Some(arg) = args.iter().find(|arg| automation_switch(arg)) {
+            return Err(format!(
+                "The browser launch carries the automation argument '{arg}', which sign-in mode cannot remove"
+            ));
+        }
+    }
+
     Ok(ChromeArgs {
         args,
         user_data_dir,
@@ -861,6 +996,30 @@ pub async fn launch_chrome(options: LaunchOptions) -> Result<ChromeProcess, Stri
         .map_err(|e| format!("Chrome launch task failed: {}", e))?
 }
 
+/// Launch Chrome, canceling a launch that is still running at `deadline`.
+/// Unlike dropping the future, the cancellation is awaited: when this
+/// returns, a canceled launch has already stopped the browser it started, so
+/// its profile is free for whoever launches into it next.
+pub(crate) async fn launch_chrome_by(
+    options: LaunchOptions,
+    deadline: tokio::time::Instant,
+) -> Result<ChromeProcess, String> {
+    let canceled = Arc::new(AtomicBool::new(false));
+    let _cancel_on_drop = CancelLaunchOnDrop(canceled.clone());
+    let mut launch = tokio::task::spawn_blocking({
+        let canceled = canceled.clone();
+        move || launch_chrome_blocking(&options, &canceled)
+    });
+    let finished = tokio::select! {
+        finished = &mut launch => finished,
+        _ = tokio::time::sleep_until(deadline) => {
+            canceled.store(true, Ordering::Relaxed);
+            launch.await
+        }
+    };
+    finished.map_err(|e| format!("Chrome launch task failed: {}", e))?
+}
+
 fn launch_chrome_blocking(
     options: &LaunchOptions,
     canceled: &AtomicBool,
@@ -913,7 +1072,13 @@ fn launch_chrome_blocking(
 
     let effective_options = resolved_options.as_ref().unwrap_or(options);
 
-    let max_attempts = 3;
+    // A browser without DevTools serves a person waiting for its window: its
+    // caller falls back promptly instead of retrying.
+    let max_attempts = if effective_options.remote_debugging {
+        3
+    } else {
+        1
+    };
     let mut last_err = String::new();
 
     for attempt in 1..=max_attempts {
@@ -1005,8 +1170,8 @@ fn try_launch_chrome(
     // the daemon's own environment is left untouched.
     #[cfg(target_os = "linux")]
     if let Some(ref x) = xvfb {
-        cmd.env("DISPLAY", &x.display);
-        cmd.env("XAUTHORITY", &x.auth_file);
+        cmd.env("DISPLAY", &x.server.display);
+        cmd.env("XAUTHORITY", &x.server.auth_file);
         // The private display is X11. Inheriting a workstation's Wayland
         // selection can open Chrome on another surface than the one we own.
         // Scope this choice to Chrome; never alter the host desktop session.
@@ -1058,7 +1223,9 @@ fn try_launch_chrome(
     let pgid = Some(child.id() as i32);
     let mut process = ChromeProcess {
         child,
-        ws_url: String::new(),
+        devtools_url: None,
+        launch: Box::new(options.clone()),
+        executable: chrome_path.to_path_buf(),
         temp_user_data_dir,
         temp_nss_home,
         #[cfg(unix)]
@@ -1089,27 +1256,90 @@ fn try_launch_chrome(
             }
         })
         .map_err(|e| format!("Failed to read Chrome stderr: {}", e))?;
-    process.ws_url = wait_for_devtools_endpoint(
-        &mut process.child,
-        &user_data_dir,
-        &stderr_rx,
-        std::time::Instant::now() + Duration::from_secs(30),
-        canceled,
-        options.require_sandbox,
-    )?;
+    // The display helper is bound to this Chrome's pid from the start.
+    if options.window_stream {
+        #[cfg(target_os = "linux")]
+        process.start_window_display()?;
+        #[cfg(not(target_os = "linux"))]
+        return Err("Private window streaming is supported on Linux".into());
+    }
+    let started = std::time::Instant::now();
+    process.devtools_url = if options.remote_debugging {
+        Some(wait_for_startup(
+            &mut process.child,
+            &stderr_rx,
+            started + DEVTOOLS_STARTUP,
+            canceled,
+            options.require_sandbox,
+            (
+                "Chrome exited before providing DevTools URL",
+                "Timeout waiting for Chrome DevTools URL",
+            ),
+            |observed| match observed {
+                Startup::Poll => read_devtools_active_port(&user_data_dir)
+                    .map(|(port, ws_path)| format!("ws://127.0.0.1:{}{}", port, ws_path)),
+                Startup::Stderr(line) => line
+                    .strip_prefix("DevTools listening on ")
+                    .map(|url| url.trim().to_string()),
+            },
+        )?)
+    } else {
+        #[cfg(target_os = "linux")]
+        {
+            // Without DevTools, readiness is this Chrome's own normal window
+            // mapped on its private display, as the pid-bound helper sees it.
+            let display = process.display_client();
+            let runtime = tokio::runtime::Handle::current();
+            wait_for_startup(
+                &mut process.child,
+                &stderr_rx,
+                started + WINDOW_STARTUP,
+                canceled,
+                options.require_sandbox,
+                (
+                    "Chrome exited before showing its window",
+                    "Timeout waiting for the Chrome window",
+                ),
+                |observed| {
+                    let display = display.as_ref().filter(|_| observed == Startup::Poll)?;
+                    // Blocking-pool threads may drive the display helper's
+                    // runtime I/O; this thread is not an async context.
+                    let info = runtime.block_on(display.info()).ok()?;
+                    info.active_window().map(|_| ())
+                },
+            )?;
+        }
+        None
+    };
     Ok(process)
 }
 
-/// Both endpoint sources share a deadline and a cancellation boundary. Bounded
-/// stderr batches keep a noisy browser from starving the cancellation check.
-fn wait_for_devtools_endpoint(
+/// How long Chrome may take to open its DevTools endpoint.
+const DEVTOOLS_STARTUP: Duration = Duration::from_secs(30);
+/// How long a browser without DevTools may take to show its window. A person
+/// is waiting; the sign-in transition falls back to automation after it.
+#[cfg(target_os = "linux")]
+const WINDOW_STARTUP: Duration = Duration::from_secs(4);
+
+/// What one readiness probe observes: a periodic poll, or one new stderr line.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Startup<'a> {
+    Poll,
+    Stderr(&'a str),
+}
+
+/// Both readiness kinds share a deadline, a cancellation boundary and the
+/// stderr tail reported on failure. Bounded stderr batches keep a noisy
+/// browser from starving the cancellation check.
+fn wait_for_startup<T>(
     child: &mut Child,
-    user_data_dir: &Path,
     stderr: &mpsc::Receiver<String>,
     deadline: std::time::Instant,
     canceled: &AtomicBool,
     require_sandbox: bool,
-) -> Result<String, String> {
+    (exited_message, timeout_message): (&str, &str),
+    mut ready: impl FnMut(Startup<'_>) -> Option<T>,
+) -> Result<T, String> {
     let poll_interval = Duration::from_millis(50);
     let mut stderr_lines = std::collections::VecDeque::with_capacity(64);
     let mut stderr_finished = false;
@@ -1117,14 +1347,14 @@ fn wait_for_devtools_endpoint(
         if canceled.load(Ordering::Relaxed) {
             return Err("Chrome launch canceled".to_string());
         }
-        if let Some((port, ws_path)) = read_devtools_active_port(user_data_dir) {
-            return Ok(format!("ws://127.0.0.1:{}{}", port, ws_path));
+        if let Some(value) = ready(Startup::Poll) {
+            return Ok(value);
         }
         for _ in 0..64 {
             match stderr.try_recv() {
                 Ok(line) => {
-                    if let Some(url) = line.strip_prefix("DevTools listening on ") {
-                        return Ok(url.trim().to_string());
+                    if let Some(value) = ready(Startup::Stderr(&line)) {
+                        return Ok(value);
                     }
                     if stderr_lines.len() == 64 {
                         stderr_lines.pop_front();
@@ -1142,9 +1372,9 @@ fn wait_for_devtools_endpoint(
         let timed_out = std::time::Instant::now() >= deadline;
         if timed_out || (exited && stderr_finished) {
             let message = if exited {
-                "Chrome exited before providing DevTools URL"
+                exited_message
             } else {
-                "Timeout waiting for Chrome DevTools URL"
+                timeout_message
             };
             return Err(chrome_launch_error(
                 message,
@@ -1987,6 +2217,332 @@ mod tests {
         Child::spawn(&cmd, &["/C".into(), "exit 0".into()], false).unwrap()
     }
 
+    fn retained_profile() -> RetainedChromeProfile {
+        let path = std::env::temp_dir().join(format!(
+            "agent-browser-retained-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&path).unwrap();
+        RetainedChromeProfile {
+            directory: Arc::new(TemporaryBrowserDirectory { path }),
+            nss_home: None,
+        }
+    }
+
+    fn test_process(child: Child, launch: LaunchOptions) -> ChromeProcess {
+        ChromeProcess {
+            child,
+            devtools_url: None,
+            launch: Box::new(launch),
+            executable: PathBuf::from("/opt/ambit/browser/chrome/chrome"),
+            temp_user_data_dir: None,
+            temp_nss_home: None,
+            #[cfg(unix)]
+            pgid: None,
+            #[cfg(target_os = "linux")]
+            xvfb: None,
+            #[cfg(target_os = "linux")]
+            display_process: None,
+        }
+    }
+
+    /// Sign-in mode removes the one automation switch and nothing else:
+    /// every other managed flag stays byte-identical and in order.
+    #[test]
+    fn sign_in_launch_drops_only_the_automation_switch() {
+        // Both launches are built under one environment: the dev-shm
+        // fallback reads `CI`, which other tests set under the same guard.
+        let guard = crate::test_utils::EnvGuard::new(&["CI"]);
+        guard.remove("CI");
+        let automation = LaunchOptions {
+            window_stream: true,
+            require_sandbox: true,
+            proxy: Some("http://proxy.internal:3128".into()),
+            proxy_bypass: Some("localhost".into()),
+            restrict_webrtc: true,
+            args: vec!["--lang=fr".into()],
+            viewport_size: Some((1000, 700)),
+            retained_profile: Some(retained_profile()),
+            restore_last_session: true,
+            ..Default::default()
+        };
+        let managed = build_chrome_args(&automation).unwrap().args;
+        assert_eq!(managed[0], "--remote-debugging-port=0");
+        let sign_in = automation.clone().without_automation().unwrap();
+        assert!(!sign_in.remote_debugging);
+        let args = build_chrome_args(&sign_in).unwrap().args;
+        assert_eq!(args, managed[1..]);
+        assert!(!args.iter().any(|arg| automation_switch(arg)), "{args:?}");
+        for expected in [
+            "--restore-last-session",
+            "--proxy-server=http://proxy.internal:3128",
+            "--proxy-bypass-list=localhost",
+            "--force-webrtc-ip-handling-policy=disable_non_proxied_udp",
+            "--disable-infobars",
+            "--password-store=basic",
+            "--use-mock-keychain",
+            "--window-position=0,0",
+            "--force-device-scale-factor=2",
+            "--window-size=1000,700",
+            "--lang=fr",
+        ] {
+            assert!(
+                args.iter().any(|arg| arg == expected),
+                "{expected} missing from {args:?}"
+            );
+        }
+        let profile = &sign_in.retained_profile.as_ref().unwrap().directory.path;
+        assert!(args.contains(&format!("--user-data-dir={}", profile.display())));
+        assert!(args
+            .iter()
+            .any(|arg| arg.starts_with("--enable-features=") && arg.contains("WebMCPTesting")));
+        if cfg!(target_os = "linux") {
+            assert!(args.iter().any(|arg| arg == "--disable-gpu-compositing"));
+        }
+        assert!(!args.iter().any(|arg| arg == "about:blank"));
+    }
+
+    #[test]
+    fn sign_in_launch_refuses_automation_arguments_it_cannot_remove() {
+        for arg in [
+            "--enable-automation",
+            "--Enable-Automation",
+            "--remote-debugging-pipe",
+            "--remote-debugging-port=9222",
+            "--remote-debugging-address=127.0.0.1",
+            "-remote-debugging-port=0",
+            "--headless",
+            "--headless=new",
+            "--HEADLESS=old",
+        ] {
+            let options = LaunchOptions {
+                window_stream: true,
+                retained_profile: Some(retained_profile()),
+                args: vec![arg.into()],
+                ..Default::default()
+            };
+            let error = options.clone().without_automation().err().unwrap();
+            assert!(error.contains(arg), "{arg}: {error}");
+            // With DevTools the same launch is unchanged.
+            assert!(build_chrome_args(&options).is_ok(), "{arg}");
+        }
+        for arg in [
+            "https://example.com/--enable-automation",
+            "--enable-automation-banner",
+        ] {
+            let options = LaunchOptions {
+                window_stream: true,
+                retained_profile: Some(retained_profile()),
+                args: vec![arg.into()],
+                ..Default::default()
+            };
+            assert!(options.without_automation().is_ok(), "{arg}");
+        }
+    }
+
+    #[test]
+    fn sign_in_launch_requires_an_owned_window_in_its_own_profile() {
+        let headed = LaunchOptions {
+            headless: false,
+            retained_profile: Some(retained_profile()),
+            ..Default::default()
+        };
+        assert!(headed.without_automation().is_err());
+        // Refused before any temporary profile would be created for it.
+        let fresh = LaunchOptions {
+            window_stream: true,
+            ..Default::default()
+        };
+        assert!(fresh.without_automation().is_err());
+        let explicit = LaunchOptions {
+            window_stream: true,
+            profile: Some("/tmp/agent-browser-explicit-profile".into()),
+            ..Default::default()
+        };
+        assert!(explicit.without_automation().is_ok());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn relaunch_options_keep_the_executable_profile_trust_and_display() {
+        let dir = std::env::temp_dir().join(format!(
+            "agent-browser-relaunch-test-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&dir).unwrap();
+        let nss = prepared_nss_home();
+        let auth_file = std::env::temp_dir().join(format!(
+            "agent-browser-relaunch-xauth-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::write(&auth_file, b"cookie").unwrap();
+        let display = RetainedDisplay {
+            server: Arc::new(XvfbServer {
+                child: spawn_noop_child(),
+                display: ":97".into(),
+                auth_file: auth_file.clone(),
+            }),
+        };
+        let mut process = test_process(
+            spawn_noop_child(),
+            LaunchOptions {
+                window_stream: true,
+                args: vec!["--lang=fr".into()],
+                storage_state: Some("/tmp/state.json".into()),
+                prepared_nss_home: Some(nss.clone()),
+                ..Default::default()
+            },
+        );
+        process.devtools_url = Some("ws://127.0.0.1:1/devtools/browser/test".into());
+        process.temp_user_data_dir =
+            Some(Arc::new(TemporaryBrowserDirectory { path: dir.clone() }));
+        process.temp_nss_home = Some(nss.clone());
+        process.xvfb = Some(display.clone());
+
+        let relaunch = process.relaunch_options().unwrap();
+        assert_eq!(
+            relaunch.executable_path.as_deref(),
+            Some("/opt/ambit/browser/chrome/chrome")
+        );
+        let profile = relaunch.retained_profile.as_ref().unwrap();
+        assert_eq!(profile.directory.path, dir);
+        assert_eq!(profile.nss_home.as_ref().unwrap().path(), nss.path());
+        assert_eq!(
+            resolve_prepared_nss_home(&relaunch)
+                .unwrap()
+                .unwrap()
+                .path(),
+            nss.path()
+        );
+        assert!(Arc::ptr_eq(
+            &relaunch.retained_display.as_ref().unwrap().server,
+            &display.server
+        ));
+        assert!(relaunch.restore_last_session);
+        assert!(relaunch.remote_debugging);
+        assert_eq!(relaunch.storage_state, None);
+        assert_eq!(relaunch.args, vec!["--lang=fr".to_string()]);
+        drop(display);
+
+        drop(process);
+        assert!(dir.exists(), "the relaunch retains the profile");
+        assert!(auth_file.exists(), "the relaunch retains the display");
+        drop(relaunch);
+        assert!(!dir.exists());
+        assert!(!auth_file.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn terminate_lets_the_browser_exit_before_killing_it() {
+        use std::os::unix::process::ExitStatusExt;
+        let shell = |script: &str| {
+            Command::new("/bin/sh")
+                .args(["-c", script])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap()
+        };
+        // Wait until the shell has installed its handler before signalling.
+        let started_shell = |script: &str| {
+            let child = shell(script);
+            std::thread::sleep(Duration::from_millis(200));
+            child
+        };
+
+        let mut graceful = test_process(
+            started_shell("trap 'exit 0' TERM; while :; do sleep 0.05; done"),
+            LaunchOptions::default(),
+        );
+        let started = std::time::Instant::now();
+        graceful.terminate(Duration::from_secs(5));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let status = graceful.child.try_wait().unwrap().unwrap();
+        assert!(
+            status.success(),
+            "SIGTERM let it exit on its own: {status:?}"
+        );
+
+        let mut stubborn = test_process(
+            started_shell("trap '' TERM; while :; do sleep 0.05; done"),
+            LaunchOptions::default(),
+        );
+        let started = std::time::Instant::now();
+        stubborn.terminate(Duration::from_millis(300));
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        let status = stubborn.child.try_wait().unwrap().unwrap();
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+    }
+
+    /// The readiness loop both launch kinds share returns what its probe
+    /// proves, fails fast with Chrome's stderr when Chrome exits first, and
+    /// otherwise ends at its deadline.
+    #[cfg(unix)]
+    #[test]
+    fn startup_waits_for_its_probe_and_fails_fast_with_the_stderr_tail() {
+        let canceled = AtomicBool::new(false);
+        let messages = (
+            "Chrome exited before showing its window",
+            "Timeout waiting for the Chrome window",
+        );
+        let (lines, stderr) = mpsc::sync_channel(64);
+        let mut alive = Command::new("/bin/sh")
+            .args(["-c", "sleep 5"])
+            .spawn()
+            .unwrap();
+        let mut polls = 0;
+        let ready = wait_for_startup(
+            &mut alive,
+            &stderr,
+            std::time::Instant::now() + Duration::from_secs(5),
+            &canceled,
+            false,
+            messages,
+            |observed| {
+                polls += usize::from(observed == Startup::Poll);
+                (polls == 3).then_some("window")
+            },
+        );
+        assert_eq!(ready.unwrap(), "window");
+
+        let mut exited = spawn_noop_child();
+        lines
+            .send("[1:1:FATAL:zygote_host] Failed to start the sandbox".into())
+            .unwrap();
+        drop(lines);
+        let error = wait_for_startup(
+            &mut exited,
+            &stderr,
+            std::time::Instant::now() + Duration::from_secs(5),
+            &canceled,
+            true,
+            messages,
+            |_| None::<()>,
+        )
+        .unwrap_err();
+        assert!(error.starts_with(messages.0), "{error}");
+        assert!(error.contains("Failed to start the sandbox"), "{error}");
+
+        let (_lines, stderr) = mpsc::sync_channel(64);
+        let started = std::time::Instant::now();
+        let error = wait_for_startup(
+            &mut alive,
+            &stderr,
+            started + Duration::from_millis(200),
+            &canceled,
+            false,
+            messages,
+            |_| None::<()>,
+        )
+        .unwrap_err();
+        assert!(error.starts_with(messages.1), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(2));
+        let _ = alive.kill();
+        let _ = alive.wait();
+    }
+
     #[test]
     fn test_find_chrome_returns_some_on_host() {
         // This test only makes sense on systems with Chrome installed
@@ -2721,7 +3277,9 @@ mod tests {
             let child = spawn_noop_child();
             let _process = ChromeProcess {
                 child,
-                ws_url: String::new(),
+                devtools_url: None,
+                launch: Box::default(),
+                executable: PathBuf::new(),
                 temp_user_data_dir: Some(Arc::new(TemporaryBrowserDirectory { path: dir.clone() })),
                 temp_nss_home: None,
                 #[cfg(unix)]
@@ -2746,7 +3304,9 @@ mod tests {
         std::fs::create_dir(&dir).unwrap();
         let process = ChromeProcess {
             child: spawn_noop_child(),
-            ws_url: String::new(),
+            devtools_url: None,
+            launch: Box::default(),
+            executable: PathBuf::new(),
             temp_user_data_dir: Some(Arc::new(TemporaryBrowserDirectory { path: dir.clone() })),
             temp_nss_home: None,
             #[cfg(unix)]

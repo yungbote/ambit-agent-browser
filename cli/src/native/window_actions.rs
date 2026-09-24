@@ -1,7 +1,7 @@
 //! Window presentation joins the existing daemon command boundary.
 
 use super::DaemonState;
-use crate::native::display::{Surface, DEVICE_SCALE_FACTOR};
+use crate::native::display::{window_pixels, Surface, DEVICE_SCALE_FACTOR};
 use serde_json::Value;
 use std::time::Instant;
 
@@ -40,6 +40,9 @@ impl DaemonState {
         height: u32,
         events: Option<tokio::sync::broadcast::Receiver<crate::native::cdp::types::CdpEvent>>,
     ) -> Result<Surface, String> {
+        if self.browser.is_none() {
+            return self.apply_display_layout(width, height).await;
+        }
         let events = if let Some(events) = events {
             events
         } else {
@@ -92,6 +95,29 @@ impl DaemonState {
         Ok(surface)
     }
 
+    /// A window without DevTools, as while a person signs in, follows its
+    /// display alone: the helper resizes it, with no page paint to confirm.
+    async fn apply_display_layout(&mut self, width: u32, height: u32) -> Result<Surface, String> {
+        let display = self.window_display().ok_or("Browser not launched")?;
+        let (display_width, display_height) = window_pixels(width, height)?;
+        let info = display.info().await.map_err(|error| error.to_string())?;
+        let window = info
+            .active_window()
+            .ok_or("The active browser window is ambiguous")?
+            .id;
+        display
+            .resize(display_width, display_height, Some(window))
+            .await
+            .map_err(|error| error.to_string())?;
+        display.finish_layout().await;
+        let surface = display.surface();
+        if let Some(server) = self.stream_server.as_ref() {
+            server.set_viewport(width, height).await;
+            server.presentation.update_surface(&surface);
+        }
+        Ok(surface)
+    }
+
     pub(crate) async fn apply_pending_window_layout(&mut self) {
         let Some(server) = self.stream_server.clone() else {
             return;
@@ -100,11 +126,7 @@ impl DaemonState {
         if !server.presentation.configured() {
             return;
         }
-        let Some(display) = self
-            .browser
-            .as_ref()
-            .and_then(|browser| browser.display_client())
-        else {
+        let Some(display) = self.window_display() else {
             if let Some(request) = server.presentation.pending("unavailable") {
                 server
                     .presentation
@@ -155,22 +177,20 @@ impl DaemonState {
             return Ok(());
         }
         self.apply_pending_window_layout().await;
-        let Some(display) = self
-            .browser
-            .as_ref()
-            .and_then(|browser| browser.display_client())
-        else {
+        let Some(display) = self.window_display() else {
             self.window_page_error = None;
             return Ok(());
         };
+        // While a person holds the browser, every command is refused for
+        // that reason alone: the shared custody gate preserves its typed error.
+        if self.browser_control.lock().await.agent_error().is_some() {
+            return Ok(());
+        }
         // Admission time is taken before waiting for command custody. A
         // queued legacy operation cannot become safe merely because another
         // queued screenshot cleared the one-shot observation requirement.
         if !observes_page(command) && display.changed_since(received_at) {
             return Err(("browser_observation_stale", "The browser window changed while this command was queued. Observe its current page before choosing another action."));
-        }
-        if self.browser_control.lock().await.agent_error().is_some() {
-            return Ok(()); // The shared custody gate preserves its typed error.
         }
         self.drain_cdp_events_background().await.map_err(|_| ("browser_active_page_ambiguous", "The active browser page is not observable. Inspect the browser or select an existing tab explicitly."))?;
         if self.window_page_error == Some("browser_dialog_open")
