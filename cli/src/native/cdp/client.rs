@@ -77,6 +77,56 @@ const PRIVATE_SESSION_BUFFER: usize = 16;
 /// through intermediate proxies (reverse proxies, load balancers, service meshes).
 const WS_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 
+/// Chrome serializes a lone UTF-16 surrogate in page-controlled text (a
+/// title, an accessible name, a console argument) as a `\uD800`-style JSON
+/// escape. That is not a Unicode scalar value, so serde_json refuses the
+/// whole message: the command awaiting a reply would time out, and an event
+/// would go unseen. Every lone surrogate escape becomes U+FFFD before the
+/// message is parsed; a surrogate pair is kept. JSON has no backslash
+/// outside a string, so every backslash starts an escape, and a two-character
+/// escape (`\\`, `\"`) is stepped over whole so its second character is never
+/// read as the start of another. A message without a lone surrogate is
+/// returned as it came, without a copy.
+fn replace_lone_surrogate_escapes(text: String) -> String {
+    let mut replaced = String::new();
+    let mut copied = 0;
+    let mut cursor = 0;
+    while let Some(offset) = text[cursor..].find('\\') {
+        let escape = cursor + offset;
+        cursor = match hex_escape(&text, escape) {
+            Some(0xD800..=0xDBFF)
+                if hex_escape(&text, escape + 6)
+                    .is_some_and(|low| (0xDC00..=0xDFFF).contains(&low)) =>
+            {
+                escape + 12
+            }
+            Some(0xD800..=0xDFFF) => {
+                replaced.push_str(&text[copied..escape]);
+                replaced.push_str("\\uFFFD");
+                copied = escape + 6;
+                copied
+            }
+            Some(_) => escape + 6,
+            None => escape + 1 + text[escape + 1..].chars().next().map_or(0, char::len_utf8),
+        };
+    }
+    if copied == 0 {
+        return text;
+    }
+    replaced.push_str(&text[copied..]);
+    replaced
+}
+
+/// The code unit of a `\uXXXX` escape at byte `at` of `text`.
+fn hex_escape(text: &str, at: usize) -> Option<u16> {
+    let digits = text.get(at..at + 6)?.strip_prefix("\\u")?;
+    digits
+        .bytes()
+        .all(|byte| byte.is_ascii_hexdigit())
+        .then(|| u16::from_str_radix(digits, 16).ok())
+        .flatten()
+}
+
 fn normalize_websocket_root_path(url: &str) -> String {
     let Some(scheme_end) = url.find("://").map(|index| index + 3) else {
         return url.to_string();
@@ -311,10 +361,7 @@ impl CdpClient {
                 // (e.g. Browserless) may send responses as Binary frames.
                 let msg = match msg {
                     Ok(Message::Text(text)) => text,
-                    Ok(Message::Binary(data)) => match String::from_utf8(data) {
-                        Ok(text) => text,
-                        Err(_) => continue,
-                    },
+                    Ok(Message::Binary(data)) => String::from_utf8_lossy(&data).into_owned(),
                     Ok(Message::Close(frame)) => {
                         if std::env::var("AGENT_BROWSER_DEBUG").is_ok() {
                             let reason = frame
@@ -335,6 +382,9 @@ impl CdpClient {
                         break;
                     }
                 };
+                // Decoded leniently once, so neither consumer below drops a
+                // message over a lone surrogate in page-controlled text.
+                let msg = replace_lone_surrogate_escapes(msg);
 
                 // Broadcast raw message for inspect proxy subscribers before typed parse,
                 // so messages with negative IDs (used by the inspect proxy) are still delivered.
@@ -1272,6 +1322,97 @@ mod tests {
 
         client.unsubscribe_session("S-REC");
         drop(client);
+        server.abort();
+    }
+
+    /// The wire form of a lone surrogate is its `\u` escape, which serde_json
+    /// refuses. A pair, an escaped backslash and every other escape are kept,
+    /// and a clean message is returned without a copy.
+    #[test]
+    fn lone_surrogate_escapes_become_the_replacement_character() {
+        let unchanged = [
+            r#"{"title":"caf\u00e9 \ud83d\ude00 \uD83D\uDE00"}"#,
+            r#""\\ud800 \"\n\t\/ \u0041 \\""#,
+            r#""\ud80"#,
+            "\"\\é\"",
+            "\\",
+            "",
+        ];
+        for text in unchanged {
+            let owned = text.to_string();
+            let pointer = owned.as_ptr();
+            let kept = replace_lone_surrogate_escapes(owned);
+            assert_eq!(kept, text);
+            assert_eq!(kept.as_ptr(), pointer, "a clean message is not copied");
+        }
+        let replaced = [
+            (r#""\ud800""#, r#""\uFFFD""#),
+            (r#""a\uDC00b""#, r#""a\uFFFDb""#),
+            (r#""\ud800\u0041""#, r#""\uFFFD\u0041""#),
+            (r#""\ud800\ud800\ude00""#, r#""\uFFFD\ud800\ude00""#),
+            (r#""\ude00\ud800""#, r#""\uFFFD\uFFFD""#),
+            (r#""\"\ud800\\""#, r#""\"\uFFFD\\""#),
+            (r#""é\ud800é""#, r#""é\uFFFDé""#),
+        ];
+        for (text, expected) in replaced {
+            assert_eq!(replace_lone_surrogate_escapes(text.to_string()), expected);
+        }
+        let parsed: Value = serde_json::from_str(&replace_lone_surrogate_escapes(
+            r#"{"id":7,"result":{"value":"Checkout \ud800 x"}}"#.to_string(),
+        ))
+        .unwrap();
+        assert_eq!(parsed["result"]["value"], "Checkout \u{FFFD} x");
+    }
+
+    /// A reply and an event whose page text holds a lone surrogate reach the
+    /// awaiting command and the event subscribers instead of being dropped.
+    #[tokio::test]
+    async fn messages_with_lone_surrogates_are_decoded_not_dropped() {
+        use serde_json::json;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let command: Value = serde_json::from_str(&text).unwrap();
+                // Chrome's wire form of a retitled page and of a title read.
+                ws.send(Message::Text(
+                    r#"{"method":"Target.targetInfoChanged","params":{"targetInfo":{"targetId":"T1","type":"page","title":"Checkout \ud800","url":"https://shop.example/","attached":true}}}"#.to_string(),
+                ))
+                .await
+                .unwrap();
+                ws.send(Message::Text(format!(
+                    r#"{{"id":{},"result":{{"result":{{"type":"string","value":"Total \udc00 42"}}}}}}"#,
+                    command["id"]
+                )))
+                .await
+                .unwrap();
+            }
+        });
+        let client = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let mut events = client.subscribe();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.send_command(
+                "Runtime.evaluate",
+                Some(json!({"expression":"document.title"})),
+                Some("page"),
+            ),
+        )
+        .await
+        .expect("the reply is decoded, not dropped")
+        .unwrap();
+        assert_eq!(result["result"]["value"], "Total \u{FFFD} 42");
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(event.method, "Target.targetInfoChanged");
+        assert_eq!(event.params["targetInfo"]["title"], "Checkout \u{FFFD}");
+        assert!(client.pending.lock().await.is_empty());
         server.abort();
     }
 }

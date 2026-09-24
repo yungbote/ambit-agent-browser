@@ -2946,6 +2946,51 @@ async fn e2e_tabs() {
     assert_success(&resp);
 }
 
+/// A page sets its title and text to any string, a lone surrogate included.
+/// Chrome's replies carrying such text are decoded rather than dropped, so
+/// the commands reading it complete at once, with U+FFFD in its place.
+#[tokio::test]
+#[ignore]
+async fn e2e_lone_surrogate_page_text_is_observed() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(
+            &json!({ "id": "1", "action": "launch", "headless": true }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "id": "2", "action": "navigate", "url": "data:text/html,<title>Checkout</title><h1>Total</h1>" }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "id": "3", "action": "evaluate", "script": "document.title = 'Checkout \\uD800'; document.querySelector('h1').textContent = 'Total \\uDC00 42'; 'retitled'" }),
+            &mut state,
+        )
+        .await,
+    );
+
+    let started = std::time::Instant::now();
+    let title = execute_command(&json!({ "id": "4", "action": "title" }), &mut state).await;
+    assert_success(&title);
+    assert_eq!(get_data(&title)["title"], "Checkout \u{FFFD}");
+    let snapshot = execute_command(&json!({ "id": "5", "action": "snapshot" }), &mut state).await;
+    assert_success(&snapshot);
+    let text = get_data(&snapshot)["snapshot"].as_str().unwrap_or_default();
+    assert!(text.contains("Total \u{FFFD} 42"), "{text}");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(10),
+        "a dropped reply waits for the CDP command timeout"
+    );
+
+    assert_success(&execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await);
+}
+
 #[tokio::test]
 #[ignore]
 async fn e2e_tab_ids_not_reused() {

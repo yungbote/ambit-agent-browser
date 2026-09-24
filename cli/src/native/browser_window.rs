@@ -112,10 +112,8 @@ async fn page_geometry(
         .as_i64()
         .ok_or("Page observation realm is unavailable")?;
     let result = client.send_command("Runtime.evaluate", Some(json!({
-        // A page sets `document.title` to any string: read a bounded,
-        // well-formed one, since a lone surrogate would make this reply
-        // unparsable and the page unobservable.
-        "expression": "({visible:document.visibilityState==='visible',focused:document.hasFocus(),title:document.title.slice(0,4096).toWellFormed(),innerWidth,innerHeight,dpr:devicePixelRatio,screenWidth:screen.width,screenHeight:screen.height})",
+        // A page sets `document.title` to any string: read a bounded one.
+        "expression": "({visible:document.visibilityState==='visible',focused:document.hasFocus(),title:document.title.slice(0,4096),innerWidth,innerHeight,dpr:devicePixelRatio,screenWidth:screen.width,screenHeight:screen.height})",
         "contextId": context, "returnByValue": true,
     })), Some(session)).await?;
     let value = result["result"]["value"].clone();
