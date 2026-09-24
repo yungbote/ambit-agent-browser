@@ -404,6 +404,14 @@ async fn e2e_native_ambiguous_page_refusal_lists_the_open_tabs() {
         &control_test_command(&json!({"action":"tab_switch","tabId":"t1"}), &mut state).await,
     );
     assert_success(&control_test_command(&json!({"action":"snapshot"}), &mut state).await);
+    // A page may retitle itself with any string, even a lone surrogate.
+    assert_success(
+        &control_test_command(
+            &json!({"action":"evaluate","script":"document.title = 'Checkout \\uD800' + ' x'.repeat(3000); 'retitled'"}),
+            &mut state,
+        )
+        .await,
+    );
 
     // The person selects the report tab in the native window.
     state
@@ -421,12 +429,16 @@ async fn e2e_native_ambiguous_page_refusal_lists_the_open_tabs() {
     let refused = control_test_command(&json!({"action":"snapshot"}), &mut state).await;
     assert_error_code(&refused, "browser_active_page_ambiguous");
     let cut: String = report.trim_end().chars().take(100).collect();
+    let retitled: String = format!("Checkout \u{FFFD}{}", " x".repeat(50))
+        .chars()
+        .take(100)
+        .collect();
     assert_eq!(
         refused["data"],
         json!({
             "tabCount": 2,
             "tabs": [
-                {"tabId": "t1", "title": "Checkout", "origin": format!("http://127.0.0.1:{port}"), "active": true},
+                {"tabId": "t1", "title": format!("{retitled}…"), "origin": format!("http://127.0.0.1:{port}"), "active": true},
                 {"tabId": "t2", "title": format!("{cut}…"), "origin": format!("http://localhost:{port}"), "active": false},
             ],
         }),
