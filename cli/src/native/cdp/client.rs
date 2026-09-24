@@ -361,7 +361,11 @@ impl CdpClient {
                 // (e.g. Browserless) may send responses as Binary frames.
                 let msg = match msg {
                     Ok(Message::Text(text)) => text,
-                    Ok(Message::Binary(data)) => String::from_utf8_lossy(&data).into_owned(),
+                    // Decoded leniently, like any page text: a frame that is
+                    // not UTF-8 is not dropped. A valid one is not copied.
+                    Ok(Message::Binary(data)) => String::from_utf8(data).unwrap_or_else(|error| {
+                        String::from_utf8_lossy(error.as_bytes()).into_owned()
+                    }),
                     Ok(Message::Close(frame)) => {
                         if std::env::var("AGENT_BROWSER_DEBUG").is_ok() {
                             let reason = frame
@@ -1413,6 +1417,46 @@ mod tests {
         assert_eq!(event.method, "Target.targetInfoChanged");
         assert_eq!(event.params["targetInfo"]["title"], "Checkout \u{FFFD}");
         assert!(client.pending.lock().await.is_empty());
+        server.abort();
+    }
+
+    /// A reply in a binary frame (as remote CDP proxies send them) whose bytes
+    /// are not UTF-8 reaches the awaiting command, decoded leniently.
+    #[tokio::test]
+    async fn binary_frames_that_are_not_utf8_are_decoded_not_dropped() {
+        use serde_json::json;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = ws.next().await {
+                let command: Value = serde_json::from_str(&text).unwrap();
+                let mut reply = format!(
+                    r#"{{"id":{},"result":{{"result":{{"type":"string","value":"Total "#,
+                    command["id"]
+                )
+                .into_bytes();
+                reply.push(0xFF);
+                reply.extend_from_slice(br#" 42"}}}"#);
+                ws.send(Message::Binary(reply)).await.unwrap();
+            }
+        });
+        let client = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client.send_command(
+                "Runtime.evaluate",
+                Some(json!({"expression":"document.title"})),
+                Some("page"),
+            ),
+        )
+        .await
+        .expect("the reply is decoded, not dropped")
+        .unwrap();
+        assert_eq!(result["result"]["value"], "Total \u{FFFD} 42");
         server.abort();
     }
 }
