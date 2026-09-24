@@ -281,6 +281,10 @@ pub(super) async fn cdp_event_loop(
                     changed = presentation_rx.changed(), if display.is_some() => {
                         if changed.is_err() { break; }
                         repace!();
+                        // A viewer's layout just changed or was applied: the
+                        // first frame of the new geometry must not wait out
+                        // the remainder of the current capture interval.
+                        display_tick.reset_immediately();
                     }
                     changed = custody.changed(), if display.is_some() => {
                         if changed.is_err() { break; }
@@ -292,10 +296,6 @@ pub(super) async fn cdp_event_loop(
                         if now_controlled != controlled {
                             controlled = now_controlled;
                             repace!();
-                            // A viewer's layout just changed or was applied: the
-                            // first frame of the new geometry must not wait out
-                            // the remainder of the current capture interval.
-                            display_tick.reset_immediately();
                         }
                         let display = display.as_ref().unwrap();
                         // Patches amend a whole frame every viewer holds;
