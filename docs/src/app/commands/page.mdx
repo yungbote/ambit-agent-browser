@@ -201,6 +201,7 @@ agent-browser set offline [on|off]    # Toggle offline mode
 agent-browser set headers <json>      # Extra HTTP headers
 agent-browser set credentials <u> <p> # HTTP basic auth for current and future tabs
 agent-browser set media [dark|light]  # Emulate color scheme (persists for session)
+agent-browser set theme <dark|light>  # Browser theme: window UI and pages
 ```
 
 Use `--color-scheme` for persistent dark/light mode across all commands:
@@ -208,6 +209,10 @@ Use `--color-scheme` for persistent dark/light mode across all commands:
 ```bash
 agent-browser --color-scheme dark open https://example.com
 ```
+
+The browser theme, `dark` or `light`, reaches Chrome's own window UI (tab strip, address bar, infobars) in a headed or window-mode browser and every page's `prefers-color-scheme`, so sites render their own dark or light design. Page content is never repainted, so a page without a dark design stays as it is. `--theme` (or `AGENT_BROWSER_THEME`, config `theme`) sets it when a browser launches and never relaunches a running browser; an invalid value is refused before anything starts. An explicit `dark` or `light` from `--color-scheme` or `set media` decides the pages until the next `set theme`, while the theme still decides the window UI. A `no-preference` scheme, or `set media` without a color, leaves pages on the theme, and a theme change keeps other media features such as reduced motion.
+
+`set theme` changes the theme of a running session. Every page of its automated browser switches now, including background tabs, tabs a person opened and popups, and tabs opened later get it too. The window UI follows at the next launch, since agent-browser can set it only when Chrome launches; every launch the daemon performs, including its relaunches for sign-in and hand-back, uses the session theme unless that launch names its own. The result data carries `theme`, `pages` (`live`, or `next_launch` when no automated browser runs, as during sign-in) and `ui` (`next_launch`, or `none` for a headless or attached browser). It never starts a daemon or launches a browser; with no running session it fails with `browser_runtime_unavailable` and changes nothing. It is not an agent action, so it is accepted while a person controls the browser or signs in, with a JavaScript dialog open or an ambiguous active tab, and it never counts as the fresh observation a handoff requires. The MCP tool is `agent_browser_set_theme` in the `mobile` profile, and `agent_browser_open` accepts an optional `theme`.
 
 ## Cookies & storage
 
@@ -278,7 +283,7 @@ agent-browser tab close docs    # close by label
 
 Labels are never auto-generated and never rewritten on navigation — an agent that names a tab `docs` keeps that name until the tab is closed. Labels are unique within a session; creating a second tab with an existing label errors.
 
-Tabs opened through `tab new` or `click --new-tab` inherit the session's setup before their first document loads: user agent, `set headers`, `set credentials`, origin-scoped `--headers`, init scripts, `route` rules, and emulation overrides (color scheme, timezone, locale, geolocation, offline). Turning offline mode off or setting headers to `{}` restores the default setup for future tabs.
+Tabs opened through `tab new` or `click --new-tab` inherit the session's setup before their first document loads: user agent, `set headers`, `set credentials`, origin-scoped `--headers`, init scripts, `route` rules, emulation overrides (color scheme, timezone, locale, geolocation, offline), and the browser theme. Tabs a person opens and popups get the same setup when the session discovers them. Turning offline mode off or setting headers to `{}` restores the default setup for future tabs.
 
 `tab list --json` also reports each tab's CDP `targetId`, and target ids are accepted anywhere a tab ref is accepted (`tab <targetId>`, `tab close <targetId>`). Unlike `t<N>` ids, which are per-daemon counters, target ids stay stable across daemon restarts. Each session is bound to its active tab by target id and returns to it after a daemon restart; with `--pin-tab` the binding is strict and a closed bound tab produces a `tab_gone` error, before the command acts, instead of a silent fallback. JSON errors include <code>code: "tab_gone"</code>, <code>data.targetId</code>, optional sanitized <code>data.lastUrl</code>, and the open tabs in <code>data.tabs</code> and <code>data.tabCount</code>. A command whose bound tab closes while it runs fails with <code>code: "tab_closed_during_command"</code> and the same data, since it may already have acted. A tab ref that names no open tab fails with <code>code: "tab_not_found"</code> and the open tabs. Batch output carries the recovery object under <code>result</code>. See [CDP Mode](/cdp-mode) for the multi-session workflow.
 
@@ -618,6 +623,7 @@ See [Init Scripts & Extensions](/init-scripts) for launch-time scripts, runtime 
 --cdp <port|url>         # Connect via CDP; root WebSocket query slash is optional
 --auto-connect           # Auto-discover and connect to running Chrome
 --color-scheme <scheme>  # Color scheme: dark, light, no-preference
+--theme <dark|light>     # Browser theme at launch: window UI and pages
 --download-path <path>   # Default download directory
 --content-boundaries     # Wrap page output in boundary markers for LLM safety
 --max-output <chars>     # Truncate page output to N characters
@@ -687,6 +693,8 @@ Every host-bound operation returns its primary result in `structuredContent.resp
 
 After a host-authorized takeover ends, the next host-bound MCP call reports `browser_observation_required` with fresh page/capture feedback before executing another agent action. A successful capture or native-proven absence of an active page clears that handoff requirement. Existing element refs are invalidated, and acquisition rotates the native `pageGeneration`, so image coordinates from before takeover remain stale even if the URL and geometry are unchanged. Ordinary CLI use keeps its existing behavior.
 
+The configuration's optional `theme` (`dark` or `light`) is the browser theme for every launch it makes. `AGENT_BROWSER_THEME` does not apply here, and the model-facing `open` tool has no `theme`. The descriptor lists `agent_browser_set_theme` with `"_meta": {"io.ambit/browser": {"caller": "host"}}`, a host operation the host calls itself and never offers to the model. It reaches the running daemon directly, so it starts no daemon, sends no launch settings, captures no feedback, and is admitted while a person holds control. Exactly the driver generations whose descriptor lists `agent_browser_set_theme` accept a configuration with `theme`; earlier ones reject it as an unknown field.
+
 
 Starts a Model Context Protocol server over stdio. MCP clients launch this command as a subprocess and exchange newline-delimited JSON-RPC on stdin and stdout. The server defaults to MCP protocol 2025-11-25 and accepts older supported client protocol versions during initialization.
 
@@ -700,7 +708,7 @@ Profiles:
 - `debug` - Console/errors, tracing, profiling, recording, accessibility audits, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
 - `tabs` - Back/forward/reload, tabs, windows, frames, dialogs
 - `react` - React tree/inspect/renders/suspense, vitals, pushstate
-- `mobile` - Viewport/device/geolocation/media, touch, swipe, mouse, keyboard
+- `mobile` - Viewport/device/geolocation/media, browser theme, touch, swipe, mouse, keyboard
 - `all` - Every MCP tool, including the full typed CLI parity surface
 
 Example MCP client config:

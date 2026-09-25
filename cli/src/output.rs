@@ -4103,8 +4103,8 @@ Options:
   --no-pin-tab               Disable a sticky pin previously enabled with --pin-tab
   --color-scheme <scheme>    Color scheme: dark, light, no-preference (or AGENT_BROWSER_COLOR_SCHEME)
   --theme <dark|light>       Browser theme at launch: Chrome's window UI and pages'
-                             prefers-color-scheme; --color-scheme still decides pages
-                             (or AGENT_BROWSER_THEME)
+                             prefers-color-scheme; --color-scheme dark or light still
+                             decides pages (or AGENT_BROWSER_THEME)
   --download-path <path>     Default download directory (or AGENT_BROWSER_DOWNLOAD_PATH)
   --content-boundaries       Wrap page output in boundary markers (or AGENT_BROWSER_CONTENT_BOUNDARIES)
   --max-output <chars>       Truncate page output to N chars (or AGENT_BROWSER_MAX_OUTPUT)
