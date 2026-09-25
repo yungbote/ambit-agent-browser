@@ -401,11 +401,13 @@ async fn dump_window(state: &DaemonState, name: &str) -> std::path::PathBuf {
         budget_bytes: 4 * 1024 * 1024,
         force: true,
         patches: false,
+        ..Default::default()
     };
     let (capture, _) = display
         .capture(request)
         .await
         .expect("the window can be captured")
+        .frame
         .expect("a forced capture returns a frame");
     let path = std::env::temp_dir().join(format!(
         "sign-in-e2e-{name}-{}.{}",

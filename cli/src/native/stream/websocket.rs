@@ -647,6 +647,10 @@ async fn handle_ws_client(
             });
             let _ = ws_tx.send(Message::Text(tabs_msg.to_string())).await;
         }
+        // The pointer's current state: identities are sent only on change.
+        if let Some(cursor) = media.cursor() {
+            let _ = ws_tx.send(Message::Text(cursor)).await;
+        }
     }
 
     // Invariant: only a successful send writes `last_sent`. `None` means

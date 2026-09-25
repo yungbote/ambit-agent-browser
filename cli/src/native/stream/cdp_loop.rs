@@ -6,10 +6,8 @@ use std::time::Instant;
 use futures_util::FutureExt;
 use tokio::sync::{broadcast, watch, Mutex, RwLock};
 
-use crate::native::browser_control::custody_active;
 use crate::native::cdp::client::CdpClient;
 use crate::native::cdp::types::CdpEvent;
-use crate::native::display::CaptureRequest;
 use crate::native::network;
 
 use super::timestamp_ms;
@@ -167,7 +165,7 @@ pub(super) async fn cdp_event_loop(
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<crate::native::display::DisplayClient>>>>,
     presentation: Arc<super::presentation::Presentation>,
-    mut custody: watch::Receiver<Option<Instant>>,
+    custody: watch::Receiver<Option<Instant>>,
     media: Arc<super::StreamMedia>,
     client_notify: Arc<tokio::sync::Notify>,
     screencasting: Arc<Mutex<bool>>,
@@ -181,6 +179,22 @@ pub(super) async fn cdp_event_loop(
     recording: Arc<Mutex<bool>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    let sinks = super::window_capture::Sinks {
+        frame_tx: frame_tx.clone(),
+        frame_watch: frame_watch.clone(),
+        presentation: presentation.clone(),
+        custody,
+        media: media.clone(),
+        client_count: client_count.clone(),
+        patch_clients: patch_clients.clone(),
+    };
+    // The owned window's frames run beside this loop and outlive its
+    // restarts: a restart must never cancel a capture in flight.
+    let mut window_capture: Option<super::window_capture::WindowCapture> = None;
+    // The display whose cursor identity the stream holds. Its helper reports
+    // an identity only when it changes, so the identity outlives a capture
+    // loop restarted for the same display and ends with the display.
+    let mut identity_source: Option<String> = None;
     loop {
         tokio::select! {
             changed = shutdown_rx.changed() => {
@@ -204,6 +218,26 @@ pub(super) async fn cdp_event_loop(
         let count = *client_count.lock().await;
         let client = client_slot.read().await.clone();
         let display = display_slot.read().await.clone();
+        if identity_source.as_deref() != display.as_ref().map(|display| display.identity()) {
+            media.set_cursor(None);
+            identity_source = display
+                .as_ref()
+                .map(|display| display.identity().to_string());
+        }
+        match display.as_ref().filter(|_| count > 0) {
+            Some(display) => {
+                if !window_capture
+                    .as_ref()
+                    .is_some_and(|capture| capture.captures(display))
+                {
+                    window_capture = Some(super::window_capture::WindowCapture::start(
+                        display.clone(),
+                        sinks.clone(),
+                    ));
+                }
+            }
+            None => window_capture = None,
+        }
 
         if count > 0 && (client.is_some() || display.is_some()) {
             let mut cdp = client
@@ -269,124 +303,13 @@ pub(super) async fn cdp_event_loop(
             let mut seed_in_flight = supports_same_document_navigation;
             let mut active_main_frame_id = None;
             let mut pending_same_document = VecDeque::<(Option<String>, String, String)>::new();
-            let mut presentation_rx = presentation.subscribe();
-            // Pacing follows the viewing situation: the presenter roster
-            // and the human lease. Both are re-read at every tick, so a
-            // lease that lapses without a message still slows capture.
-            let mut controlled = custody_active(*custody.borrow_and_update());
-            let mut pacing = presentation.capture_pacing(controlled);
-            let mut display_tick = tokio::time::interval(pacing.period());
-            display_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            let mut display_failed = false;
-            // The generation the newest published frame carries. A rotated
-            // generation is republished on unchanged pixels so viewers can
-            // name the current surface in their next input.
-            let mut published_generation: Option<String> = None;
-            // The newest published frame was a patch; a new or changed
-            // viewer roster then needs a whole frame first.
-            let mut published_patches = false;
-            let mut published_seq = None;
-            macro_rules! repace {
-                () => {{
-                    let next = presentation.capture_pacing(controlled);
-                    if next != pacing {
-                        pacing = next;
-                        display_tick = tokio::time::interval_at(
-                            tokio::time::Instant::now() + pacing.period(),
-                            pacing.period(),
-                        );
-                        display_tick
-                            .set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    }
-                }};
-            }
-
             loop {
                 tokio::select! {
-                    changed = presentation_rx.changed(), if display.is_some() => {
-                        if changed.is_err() { break; }
-                        repace!();
-                        // A viewer's layout just changed or was applied: the
-                        // first frame of the new geometry must not wait out
-                        // the remainder of the current capture interval.
-                        display_tick.reset_immediately();
-                    }
-                    changed = custody.changed(), if display.is_some() => {
-                        if changed.is_err() { break; }
-                        controlled = custody_active(*custody.borrow_and_update());
-                        repace!();
-                    }
                     _ = revision_changed(&mut file_revision) => {
                         let _ = frame_tx.send(files_doorbell());
                     }
                     _ = revision_changed(&mut download_revision) => {
                         let _ = frame_tx.send(files_doorbell());
-                    }
-                    _ = display_tick.tick(), if display.is_some() && !display_failed => {
-                        let now_controlled = custody_active(*custody.borrow());
-                        if now_controlled != controlled {
-                            controlled = now_controlled;
-                            repace!();
-                        }
-                        let display = display.as_ref().unwrap();
-                        // Patches amend a whole frame every viewer holds;
-                        // one viewer that does not composite them makes
-                        // the next frame whole for everyone.
-                        let patches_allowed = patch_clients.load(std::sync::atomic::Ordering::Acquire) == *client_count.lock().await;
-                        if !patches_allowed && published_patches {
-                            published_generation = None;
-                        }
-                        let request = CaptureRequest {
-                            // Only a viewer that does not draw the pointer
-                            // itself needs it in frames, and never while a
-                            // person controls (their own cursor is it).
-                            cursor: media.composites_cursor(controlled),
-                            budget_bytes: pacing.budget_bytes,
-                            force: published_generation.as_deref() != Some(display.surface().generation.as_str()),
-                            patches: patches_allowed,
-                        };
-                        // Read before the request leaves: input acknowledged
-                        // by then is in every pixel the helper fetches.
-                        let ts = super::monotonic_us();
-                        let input_seq = media.applied_input();
-                        match display.capture(request).await {
-                            Ok(Some((capture, mut surface))) => {
-                                let seq = super::next_frame_seq();
-                                let patch = capture.data.is_none();
-                                surface.cursor_included = capture.cursor_included;
-                                let visible = capture.visible.unwrap_or(crate::native::display::Rect {
-                                    x: 0, y: 0, width: surface.width, height: surface.height,
-                                });
-                                let mut message = json!({
-                                    "type": "frame", "seq": seq, "encoding": capture.encoding,
-                                    "surface": surface, "ts": ts, "visible": visible,
-                                });
-                                if let Some(input_seq) = input_seq {
-                                    message["inputSeq"] = json!(input_seq);
-                                }
-                                if let Some(data) = capture.data {
-                                    message["data"] = json!(data);
-                                } else {
-                                    message["patches"] = json!(capture.patches);
-                                    message["baseSeq"] = json!(published_seq);
-                                }
-                                published_generation = Some(surface.generation);
-                                published_patches = patch;
-                                frame_watch.send_replace(Some(Arc::new(super::StreamFrame {
-                                    seq: Some(seq), json: message.to_string(), patch,
-                                    base_seq: if patch { published_seq } else { None },
-                                    binary: std::sync::OnceLock::new(),
-                                })));
-                                published_seq = Some(seq);
-                            }
-                            Ok(None) => {}
-                            Err(error) if error.is_transient() => {}
-                            Err(_) => {
-                                display_failed = true;
-                                frame_watch.send_replace(None);
-                                let _ = frame_tx.send(json!({"type":"error", "code":"display_unavailable"}).to_string());
-                            }
-                        }
                     }
                     (client_arc, seeded_frame_id) = &mut frame_tree_seed => {
                         seed_in_flight = false;
@@ -639,8 +562,9 @@ pub(super) async fn cdp_event_loop(
                         // A new viewer or a writer that skipped a delta
                         // needs a whole frame. This uses the existing
                         // wakeup without rotating input coordinates.
-                        published_generation = None;
-                        display_tick.reset_immediately();
+                        if let Some(capture) = window_capture.as_ref() {
+                            capture.refresh();
+                        }
                         let new_session_id = cdp_session_id.read().await.clone();
                         if count == 0 {
                             if let Some(client) = &screencast {
@@ -1202,9 +1126,9 @@ mod tests {
         stop_loop(harness).await;
     }
 
-    /// Every window frame carries the media clock at its capture request, the
-    /// window rectangle within it, and, while a lease has applied input, the
-    /// last input sequence the display acknowledged before that request.
+    /// Every window frame carries the media clock at its capture, the window
+    /// rectangle within it, and, while a lease has applied input, the last
+    /// input sequence the display acknowledged before that capture.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_window_frames_carry_ts_visible_and_applied_input() {
         use crate::native::display::DisplayClient;
@@ -1215,7 +1139,7 @@ mod tests {
         let client_notify = Arc::new(tokio::sync::Notify::new());
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (_custody, custody) = watch::channel(None);
-        let applied = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let applied = Arc::new(super::super::AppliedInput::default());
         // One viewer that does not draw the pointer: frames composite it.
         let media = Arc::new(super::super::StreamMedia::new(applied.clone()));
         media.viewer_joined(false, false);
@@ -1276,12 +1200,119 @@ mod tests {
             json!({"x":0,"y":0,"width":2560,"height":1440})
         );
         assert!(first.get("inputSeq").is_none(), "{first}");
-        applied.store(7, std::sync::atomic::Ordering::Release);
-        let window = json!({"x":0,"y":0,"width":1418,"height":1888});
+        applied.record(7);
+        let window = json!({"x":0,"y":0,"width":1418,"height":1200});
         let second = next_frame(Some(window.clone())).await;
         assert_eq!(second["inputSeq"], 7);
         assert_eq!(second["visible"], window);
         assert!(second["ts"].as_u64() > first["ts"].as_u64());
+        let _ = shutdown.send(true);
+        task.await.unwrap();
+    }
+
+    /// The helper reports the cursor's identity only when it changes, so the
+    /// stream keeps it for later viewers across a capture loop restarted for
+    /// the same display (the last viewer left and one returned), and drops
+    /// it with the display.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_cursor_identity_outlives_a_capture_restart_and_ends_with_its_display() {
+        use crate::native::display::DisplayClient;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (display, _control, frames) = DisplayClient::test_channel();
+        display.advertise(&["captureWait", "cursorIdentity"]);
+        let (frame_tx, _messages) = broadcast::channel(64);
+        let (frame_watch, _published) = watch::channel(None);
+        let client_notify = Arc::new(tokio::sync::Notify::new());
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (_custody, custody) = watch::channel(None);
+        let media = Arc::new(super::super::StreamMedia::new(Default::default()));
+        let client_count = Arc::new(Mutex::new(1));
+        let display_slot = Arc::new(RwLock::new(Some(display.clone())));
+        let task = tokio::spawn(cdp_event_loop(
+            frame_tx,
+            frame_watch,
+            Arc::new(super::super::ScreencastConfig::default()),
+            Arc::new(RwLock::new(None)),
+            display_slot.clone(),
+            Arc::new(super::super::presentation::Presentation::new()),
+            custody,
+            media.clone(),
+            client_notify.clone(),
+            Arc::new(Mutex::new(false)),
+            client_count.clone(),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(RwLock::new(None)),
+            Arc::new(Mutex::new(1280)),
+            Arc::new(Mutex::new(720)),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new("chrome".to_string())),
+            Arc::new(Mutex::new(false)),
+            shutdown_rx,
+        ));
+        client_notify.notify_one();
+        let mut frames = BufReader::new(frames);
+        // The helper's side of the frame socket: the next capture request,
+        // then its answer.
+        async fn next(frames: &mut BufReader<tokio::net::UnixStream>) -> Value {
+            let mut line = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                frames.read_line(&mut line),
+            )
+            .await
+            .expect("a capture request")
+            .unwrap();
+            serde_json::from_str(&line).unwrap()
+        }
+        async fn answer(
+            frames: &mut BufReader<tokio::net::UnixStream>,
+            request: &Value,
+            data: Value,
+        ) {
+            let reply = json!({"id": request["id"], "success": true, "data": data});
+            frames
+                .get_mut()
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        let first = next(&mut frames).await;
+        answer(
+            &mut frames,
+            &first,
+            json!({"changed": false, "cursor": {"serial": 3, "css": "pointer"}}),
+        )
+        .await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while media.cursor().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the identity is kept");
+        // The last viewer leaves: the loop stops after its capture answers.
+        *client_count.lock().await = 0;
+        client_notify.notify_one();
+        let second = next(&mut frames).await;
+        answer(&mut frames, &second, json!({"changed": false})).await;
+        // A viewer returns to the same display: its identity is still known.
+        *client_count.lock().await = 1;
+        client_notify.notify_one();
+        let third = next(&mut frames).await;
+        assert!(media.cursor().is_some(), "kept across the restart");
+        answer(&mut frames, &third, json!({"changed": false})).await;
+        // Another display replaces it: the old identity is not its own.
+        let (replacement, _replacement_control, _replacement_frames) =
+            DisplayClient::test_channel();
+        *display_slot.write().await = Some(replacement);
+        client_notify.notify_one();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while media.cursor().is_some() {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the identity ends with its display");
         let _ = shutdown.send(true);
         task.await.unwrap();
     }

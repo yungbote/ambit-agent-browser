@@ -12555,22 +12555,24 @@ async fn e2e_native_window_latency_measurements() {
         budget_bytes: 0,
         force: true,
         patches: false,
+        ..Default::default()
     };
     let incremental = CaptureRequest {
         cursor: false,
         budget_bytes: 120_000,
         force: false,
         patches: true,
+        ..Default::default()
     };
 
-    let (first, surface) = display.capture(whole).await.unwrap().unwrap();
+    let (first, surface) = display.capture(whole).await.unwrap().frame.unwrap();
     assert_eq!((surface.width, surface.height), (1466, 1792));
     let mut full = Vec::new();
     let mut full_bytes = Vec::new();
     let mut timings = Vec::new();
     for _ in 0..20 {
         let started = std::time::Instant::now();
-        let (capture, _) = display.capture(whole).await.unwrap().unwrap();
+        let (capture, _) = display.capture(whole).await.unwrap().frame.unwrap();
         full.push(ms(started));
         full_bytes.push(bytes(&capture));
         timings.push(capture.timings.unwrap_or(Value::Null));
@@ -12586,7 +12588,7 @@ async fn e2e_native_window_latency_measurements() {
         }), &mut state).await);
         tokio::time::sleep(std::time::Duration::from_millis(60)).await;
         let started = std::time::Instant::now();
-        let (capture, _) = display.capture(whole).await.unwrap().unwrap();
+        let (capture, _) = display.capture(whole).await.unwrap().frame.unwrap();
         damage.push(ms(started));
         let timing = capture.timings.unwrap_or(Value::Null);
         assert!(
@@ -12599,7 +12601,7 @@ async fn e2e_native_window_latency_measurements() {
     // unchanged surface. Those transitions themselves require a real frame.
     let mut settled = false;
     for _ in 0..10 {
-        if display.capture(incremental).await.unwrap().is_none() {
+        if display.capture(incremental).await.unwrap().frame.is_none() {
             settled = true;
             break;
         }
@@ -12609,7 +12611,7 @@ async fn e2e_native_window_latency_measurements() {
     let mut unchanged = Vec::new();
     for _ in 0..20 {
         let started = std::time::Instant::now();
-        let frame = display.capture(incremental).await.unwrap();
+        let frame = display.capture(incremental).await.unwrap().frame;
         unchanged.push(ms(started));
         assert!(
             frame.is_none(),
@@ -12635,6 +12637,7 @@ async fn e2e_native_window_latency_measurements() {
             .capture(incremental)
             .await
             .unwrap()
+            .frame
             .expect("typing changes the display");
         typing.push(ms(started));
         typing_bytes.push(bytes(&capture));
@@ -12748,9 +12751,11 @@ async fn e2e_native_window_webgl_pixels_reach_the_window_capture() {
             budget_bytes: 0,
             force: true,
             patches: false,
+            ..Default::default()
         })
         .await
         .unwrap()
+        .frame
         .expect("a forced capture returns a whole frame");
     let image = image::load_from_memory(&STANDARD.decode(capture.data.unwrap()).unwrap())
         .unwrap()
@@ -12986,6 +12991,141 @@ async fn e2e_native_binary_viewer_resizes_the_same_window() {
         "Not changed: a person's open view of this browser sets its window to 733x896 CSS pixels. Keep working at that size; set_viewport applies only while no view is open."
     );
     drop(ws);
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+/// A person's keystroke reaches a frame when the browser paints it: with a
+/// helper that waits for damage, the frame that includes key n (its
+/// `inputSeq`) leaves as soon as the paint lands instead of on the next
+/// capture tick. Prints the acknowledgement → frame distribution (P1's
+/// driver share) for the helper under test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn e2e_native_typed_keys_reach_frames_at_the_browsers_paint() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let enabled =
+        control_test_command(&json!({"action":"stream_enable","port":0}), &mut state).await;
+    assert_success(&enabled);
+    let port = enabled["data"]["port"].as_u64().unwrap();
+    let html = "<body style='margin:0'><input id=field style='font-size:32px;width:600px'></body>";
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#field"}), &mut state).await,
+    );
+    let mut request = format!(
+        "ws://127.0.0.1:{port}/?patches=1&pacing=ack&maxFps=60&width=733&height=896&cursor=viewer"
+    )
+    .into_client_request()
+    .unwrap();
+    request.headers_mut().insert(
+        "X-Ambit-Browser-Viewer",
+        uuid::Uuid::new_v4().to_string().parse().unwrap(),
+    );
+    let (ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let (mut sink, mut source) = futures_util::StreamExt::split(ws);
+    let arrivals = Arc::new(std::sync::Mutex::new(
+        Vec::<(u64, std::time::Instant)>::new(),
+    ));
+    let recorded = arrivals.clone();
+    let reader = tokio::spawn(async move {
+        use futures_util::SinkExt;
+        while let Some(Ok(message)) = source.next().await {
+            let Ok(text) = message.to_text() else {
+                continue;
+            };
+            let Ok(frame) = serde_json::from_str::<Value>(text) else {
+                continue;
+            };
+            if frame["type"] != "frame" {
+                continue;
+            }
+            if let Some(sequence) = frame["inputSeq"].as_u64() {
+                recorded
+                    .lock()
+                    .unwrap()
+                    .push((sequence, std::time::Instant::now()));
+            }
+            let _ = sink
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"type":"ack","seq":frame["seq"]}).to_string(),
+                ))
+                .await;
+        }
+    });
+    let controller = uuid::Uuid::new_v4().to_string();
+    assert_success(&control_test_command(&json!({"action":"ambit_browser_control","op":"acquire","controllerId":controller,"expiresAt":super::stream::timestamp_ms()+29000}), &mut state).await);
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let mut acknowledged = Vec::new();
+    for sequence in 1..=40u64 {
+        let generation = state
+            .browser
+            .as_ref()
+            .unwrap()
+            .display_client()
+            .unwrap()
+            .surface()
+            .generation;
+        let key = if sequence % 2 == 1 { "a" } else { "b" };
+        let code = if sequence % 2 == 1 { "KeyA" } else { "KeyB" };
+        let response = control_test_command(&json!({"action":"ambit_browser_control","op":"input","controllerId":controller,"sequence":sequence,"expectedSurfaceGeneration":generation,"events":[
+            {"type":"input_keyboard","eventType":"keyDown","key":key,"code":code,"text":key,"windowsVirtualKeyCode":if key == "a" {65} else {66}},
+            {"type":"input_keyboard","eventType":"keyUp","key":key,"code":code,"windowsVirtualKeyCode":if key == "a" {65} else {66}}]}), &mut state).await;
+        assert_success(&response);
+        acknowledged.push((sequence, std::time::Instant::now()));
+        tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+    }
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let arrivals = arrivals.lock().unwrap().clone();
+    let mut latencies: Vec<f64> = acknowledged
+        .iter()
+        .filter_map(|(sequence, at)| {
+            arrivals
+                .iter()
+                .find(|(seen, arrived)| seen >= sequence && arrived >= at)
+                .map(|(_, arrived)| arrived.duration_since(*at).as_secs_f64() * 1000.0)
+        })
+        .collect();
+    latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let typed = control_test_command(
+        &json!({"action":"ambit_browser_control","op":"release","controllerId":controller}),
+        &mut state,
+    )
+    .await;
+    assert_success(&typed);
+    // After a person's control the agent observes before it acts.
+    assert_success(&control_test_command(&json!({"action":"snapshot"}), &mut state).await);
+    let value = control_test_command(
+        &json!({"action":"evaluate","script":"field.value.length"}),
+        &mut state,
+    )
+    .await;
+    reader.abort();
+    let features = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .display_client()
+        .unwrap()
+        .info()
+        .await
+        .unwrap()
+        .features;
+    let at = |q: f64| latencies[((latencies.len() - 1) as f64 * q).round() as usize];
+    println!(
+        "KEY_TO_FRAME {}",
+        json!({"features": features, "keys": acknowledged.len(), "framesNamingKeys": latencies.len(),
+            "ackToFrameMs": {"p50": at(0.5), "p90": at(0.9), "max": at(1.0), "min": at(0.0)},
+            "typed": value["data"]["result"]})
+    );
+    assert_eq!(value["data"]["result"], 40, "{value}");
+    assert!(
+        latencies.len() >= 36,
+        "frames name the keys they include: {latencies:?}"
+    );
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
 

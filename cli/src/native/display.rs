@@ -72,6 +72,12 @@ pub(crate) struct DisplayInfo {
     #[serde(default)]
     pub windows: Vec<WindowInfo>,
     pub focus_window: Option<u32>,
+    /// The protocol extensions this helper serves (`info` answers them):
+    /// `captureWait`, `cursorIdentity`, `layoutGate`, `sizeClass`. An older
+    /// helper lists none and rejects their fields, so each is sent only when
+    /// advertised.
+    #[serde(default)]
+    pub features: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -118,7 +124,7 @@ impl DisplayInfo {
 /// through the helper's adaptive quality (0 = no bound); `force` returns a
 /// frame even when nothing changed, so a rotated surface generation can be
 /// published on the same pixels.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct CaptureRequest {
     pub cursor: bool,
     pub budget_bytes: u32,
@@ -126,6 +132,13 @@ pub(crate) struct CaptureRequest {
     /// Every viewer composites damaged rectangles onto its last full frame,
     /// so the helper may answer with patches instead of a whole frame.
     pub patches: bool,
+    /// How long an unchanged capture waits in the helper for damage, a new
+    /// cursor identity or a finished layout before answering unchanged
+    /// (`captureWait`); 0 answers at once.
+    pub wait_ms: u32,
+    /// Report the displayed cursor's identity when it changed since the
+    /// helper last reported it (`cursorIdentity`).
+    pub cursor_identity: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -149,10 +162,31 @@ pub(crate) struct Capture {
     #[serde(default)]
     #[cfg_attr(not(test), allow(dead_code))] // Retained for capture qualification.
     pub quality: u32,
-    /// The helper's per-stage wall times for this capture, for measurement.
+    /// The helper's per-stage wall times for this capture, for measurement;
+    /// `waitUs` is how long the helper held an unchanged answer before this
+    /// frame's damage arrived.
     #[serde(default)]
-    #[cfg_attr(not(test), allow(dead_code))] // Measured in native capture qualification.
     pub timings: Option<Value>,
+}
+
+impl Capture {
+    /// Microseconds the helper waited before taking this frame.
+    pub(crate) fn wait_us(&self) -> u64 {
+        self.timings
+            .as_ref()
+            .and_then(|timings| timings["waitUs"].as_u64())
+            .unwrap_or(0)
+    }
+}
+
+/// One capture's answer: a frame when the display changed, and the displayed
+/// cursor's identity when it changed and was asked for. Either may be absent.
+#[derive(Debug, Default)]
+pub(crate) struct Captured {
+    pub frame: Option<(Capture, Surface)>,
+    /// The helper's identity record: `serial`, `css` (a keyword or null) and,
+    /// for a page's own cursor, `image` with its hotspot, scale and PNG.
+    pub cursor: Option<Value>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -287,6 +321,8 @@ mod platform {
         retired: AtomicBool,
         next_id: AtomicU64,
         surface: RwLock<SurfaceState>,
+        /// What the helper's `info` last advertised.
+        features: RwLock<Vec<String>>,
     }
 
     struct SurfaceState {
@@ -348,7 +384,14 @@ mod platform {
                     changed_at: std::time::Instant::now(),
                     ready,
                 }),
+                features: RwLock::new(Vec::new()),
             }))
+        }
+
+        /// As if the helper's `info` had listed these protocol extensions.
+        #[cfg(test)]
+        pub(crate) fn advertise(&self, features: &[&str]) {
+            *self.features.write().unwrap() = features.iter().map(|f| f.to_string()).collect();
         }
 
         /// A client whose control and frame peers the test drives directly.
@@ -376,6 +419,15 @@ mod platform {
         }
         pub(crate) fn surface(&self) -> Surface {
             self.surface.read().unwrap().value.clone()
+        }
+
+        /// Whether the helper advertised a protocol extension.
+        pub(crate) fn has(&self, feature: &str) -> bool {
+            self.features
+                .read()
+                .unwrap()
+                .iter()
+                .any(|advertised| advertised == feature)
         }
 
         pub(crate) fn changed_since(&self, received_at: std::time::Instant) -> bool {
@@ -461,8 +513,11 @@ mod platform {
         }
 
         pub(crate) async fn info(&self) -> Result<DisplayInfo, DisplayError> {
-            serde_json::from_value(self.request(json!({ "op": "info" })).await?)
-                .map_err(|_| DisplayError::unavailable())
+            let info: DisplayInfo =
+                serde_json::from_value(self.request(json!({ "op": "info" })).await?)
+                    .map_err(|_| DisplayError::unavailable())?;
+            *self.features.write().unwrap() = info.features.clone();
+            Ok(info)
         }
 
         pub(crate) async fn resize(
@@ -511,14 +566,15 @@ mod platform {
             surface.changed_at = std::time::Instant::now();
         }
 
-        /// One frame, or `None` when the display has not changed since the
-        /// previous capture. A generation rotated while the frame was in
-        /// flight makes the frame stale (transient), never a helper failure,
-        /// and so does retirement: a closing window is never published.
+        /// One capture: a frame when the display changed since the previous
+        /// capture, and the cursor's identity when asked and changed. A
+        /// generation rotated while the frame was in flight makes the frame
+        /// stale (transient), never a helper failure, and so does
+        /// retirement: a closing window is never published.
         pub(crate) async fn capture(
             &self,
             request: CaptureRequest,
-        ) -> Result<Option<(Capture, Surface)>, DisplayError> {
+        ) -> Result<Captured, DisplayError> {
             let captured = self.capture_current(request).await;
             if self.retired.load(Ordering::Acquire) {
                 return Err(DisplayError::retired());
@@ -526,10 +582,7 @@ mod platform {
             captured
         }
 
-        async fn capture_current(
-            &self,
-            request: CaptureRequest,
-        ) -> Result<Option<(Capture, Surface)>, DisplayError> {
+        async fn capture_current(&self, request: CaptureRequest) -> Result<Captured, DisplayError> {
             if self.retired.load(Ordering::Acquire) {
                 return Err(DisplayError::retired());
             }
@@ -545,18 +598,27 @@ mod platform {
                 }
                 state.value.clone()
             };
-            let reply = self
-                .command(
-                    &mut wire,
-                    json!({
-                        "op": "capture", "cursor": request.cursor,
-                        "budgetBytes": request.budget_bytes, "force": request.force,
-                        "patches": request.patches,
-                    }),
-                )
-                .await?;
+            let mut command = json!({
+                "op": "capture", "cursor": request.cursor,
+                "budgetBytes": request.budget_bytes, "force": request.force,
+                "patches": request.patches,
+            });
+            if request.wait_ms > 0 {
+                command["waitMs"] = json!(request.wait_ms);
+            }
+            if request.cursor_identity {
+                command["cursorIdentity"] = json!(true);
+            }
+            let mut reply = self.command(&mut wire, command).await?;
+            let cursor = reply
+                .as_object_mut()
+                .and_then(|reply| reply.remove("cursor"))
+                .filter(|cursor| cursor.is_object());
             if reply["changed"] == false {
-                return Ok(None);
+                return Ok(Captured {
+                    frame: None,
+                    cursor,
+                });
             }
             let capture: Capture =
                 serde_json::from_value(reply).map_err(|_| DisplayError::unavailable())?;
@@ -572,7 +634,10 @@ mod platform {
                 self.abort();
                 return Err(DisplayError::unavailable());
             }
-            Ok(Some((capture, after)))
+            Ok(Captured {
+                frame: Some((capture, after)),
+                cursor,
+            })
         }
 
         pub(crate) async fn input(&self, events: &[Value]) -> Result<(), DisplayError> {
@@ -702,6 +767,8 @@ mod platform {
             budget_bytes: 0,
             force: false,
             patches: false,
+            wait_ms: 0,
+            cursor_identity: false,
         };
 
         #[tokio::test]
@@ -816,13 +883,14 @@ mod platform {
                         budget_bytes: 120000,
                         force: false,
                         patches: false,
+                        ..Default::default()
                     })
                     .await
             });
             capture_received.await.unwrap();
             display.input(&[]).await.unwrap();
             input_done.send(()).unwrap();
-            let (captured, surface) = capture.await.unwrap().unwrap().unwrap();
+            let (captured, surface) = capture.await.unwrap().unwrap().frame.unwrap();
             assert!(!captured.cursor_included);
             assert_eq!(captured.quality, 85);
             assert_eq!(surface.width, 2560);
@@ -856,7 +924,7 @@ mod platform {
                 )
                 .await;
             });
-            assert!(display.capture(CAPTURE).await.unwrap().is_none());
+            assert!(display.capture(CAPTURE).await.unwrap().frame.is_none());
             let owner = display.clone();
             let forced = tokio::spawn(async move {
                 owner
@@ -872,7 +940,7 @@ mod platform {
             assert_eq!(error.code, "display_frame_stale");
             assert!(error.is_transient());
             assert!(display.available());
-            assert!(display.capture(CAPTURE).await.unwrap().is_some());
+            assert!(display.capture(CAPTURE).await.unwrap().frame.is_some());
             helper.await.unwrap();
         }
 
@@ -904,7 +972,7 @@ mod platform {
                 patches: true,
                 ..CAPTURE
             };
-            let (captured, _) = display.capture(patched).await.unwrap().unwrap();
+            let (captured, _) = display.capture(patched).await.unwrap().frame.unwrap();
             assert!(captured.data.is_none());
             assert_eq!(captured.patches.len(), 1);
             assert_eq!(
@@ -1042,6 +1110,9 @@ impl DisplayClient {
     pub(crate) fn changed_since(&self, _: std::time::Instant) -> bool {
         match *self {}
     }
+    pub(crate) fn has(&self, _: &str) -> bool {
+        match *self {}
+    }
     pub(crate) fn retire(&self) {
         match *self {}
     }
@@ -1065,10 +1136,7 @@ impl DisplayClient {
     pub(crate) async fn finish_layout(&self) {
         match *self {}
     }
-    pub(crate) async fn capture(
-        &self,
-        _: CaptureRequest,
-    ) -> Result<Option<(Capture, Surface)>, DisplayError> {
+    pub(crate) async fn capture(&self, _: CaptureRequest) -> Result<Captured, DisplayError> {
         match *self {}
     }
     pub(crate) async fn input(&self, _: &[Value]) -> Result<(), DisplayError> {

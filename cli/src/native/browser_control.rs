@@ -388,10 +388,10 @@ pub(crate) struct BrowserControl {
     /// The current lease deadline, published for frame pacing. Readers
     /// compare it with their own clock; no timer expires it.
     custody: watch::Sender<Option<Instant>>,
-    /// The lease's last applied input sequence (0 without a lease or before
-    /// its first input), published after the helper acknowledged that input.
-    /// A capture that reads it first shows at least that much input.
-    applied_input: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// The lease's applied input sequence over the media clock (0 without a
+    /// lease or before its first input), recorded after the helper
+    /// acknowledged that input. A capture that began later shows it.
+    applied_input: std::sync::Arc<crate::native::stream::AppliedInput>,
 }
 
 impl Default for BrowserControl {
@@ -479,16 +479,15 @@ impl BrowserControl {
         self.custody.subscribe()
     }
 
-    /// The lease's last applied input sequence, for frames' `inputSeq`.
-    pub(crate) fn applied_input(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
+    /// The lease's applied input over the media clock, for frames' `inputSeq`.
+    pub(crate) fn applied_input(&self) -> std::sync::Arc<crate::native::stream::AppliedInput> {
         self.applied_input.clone()
     }
 
     fn publish_custody(&self) {
-        self.applied_input.store(
-            self.lease.as_ref().map_or(0, |lease| lease.last_sequence),
-            std::sync::atomic::Ordering::Release,
-        );
+        self.applied_input
+            .record(self.lease.as_ref().map_or(0, |lease| lease.last_sequence));
+
         let deadline = self.lease.as_ref().map(|lease| lease.deadline);
         self.custody.send_if_modified(|current| {
             if *current == deadline {

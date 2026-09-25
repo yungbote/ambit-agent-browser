@@ -1610,9 +1610,11 @@ try {
                     budget_bytes: 0,
                     force: true,
                     patches: false,
+                    ..Default::default()
                 })
                 .await
                 .unwrap()
+                .frame
                 .unwrap();
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(capture.data.unwrap())

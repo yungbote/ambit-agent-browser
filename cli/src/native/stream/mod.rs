@@ -5,6 +5,7 @@ mod discovery;
 mod http;
 pub(crate) mod presentation;
 mod websocket;
+mod window_capture;
 mod wire;
 
 pub use cdp_loop::{ack_screencast_frame, start_screencast, stop_screencast};
@@ -172,18 +173,56 @@ impl ViewerRoster {
     }
 }
 
+/// The controller's applied input over the media clock: each sequence the
+/// display acknowledged, with when. A frame carries the last sequence
+/// acknowledged before its capture began (`inputSeq`), even when the capture
+/// waited in the helper while that input arrived.
+#[derive(Default)]
+pub(crate) struct AppliedInput {
+    /// (media-clock µs, sequence), oldest first; 0 is "no lease".
+    log: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>>,
+}
+
+impl AppliedInput {
+    /// Far more acknowledgements than fit in one capture's wait.
+    const RETAINED: usize = 256;
+
+    /// The lease's applied sequence is now `sequence` (0 without a lease).
+    pub(crate) fn record(&self, sequence: u64) {
+        let mut log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        if log.back().is_some_and(|(_, last)| *last == sequence) {
+            return;
+        }
+        if log.len() == Self::RETAINED {
+            log.pop_front();
+        }
+        log.push_back((monotonic_us(), sequence));
+    }
+
+    /// The sequence applied at media time `ts`: none before the first
+    /// acknowledgement, without a lease, or older than the retained log.
+    pub(crate) fn at(&self, ts: u64) -> Option<u64> {
+        let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        let newer = log.iter().rev().take_while(|(at, _)| *at > ts).count();
+        if newer == log.len() {
+            return None;
+        }
+        Some(log[log.len() - newer - 1].1).filter(|sequence| *sequence > 0)
+    }
+}
+
 /// What a stream's capture loop and its viewers share beyond frames.
 pub(crate) struct StreamMedia {
-    /// The controller's last input sequence the display acknowledged, from
-    /// `BrowserControl`; 0 without a lease. Frames carry it as `inputSeq`.
-    applied_input: Arc<std::sync::atomic::AtomicU64>,
+    /// The controller's acknowledged input, from `BrowserControl`. Frames
+    /// carry it as `inputSeq`.
+    applied_input: Arc<AppliedInput>,
     roster: watch::Sender<ViewerRoster>,
     /// The newest cursor identity message, replayed to each new viewer.
     cursor: std::sync::Mutex<Option<String>>,
 }
 
 impl StreamMedia {
-    pub(crate) fn new(applied_input: Arc<std::sync::atomic::AtomicU64>) -> Self {
+    pub(crate) fn new(applied_input: Arc<AppliedInput>) -> Self {
         Self {
             applied_input,
             roster: watch::channel(ViewerRoster::default()).0,
@@ -224,9 +263,10 @@ impl StreamMedia {
         self.roster().composites_cursor(controlled)
     }
 
-    /// Remember the newest cursor identity for viewers that connect later.
-    pub(super) fn set_cursor(&self, message: String) {
-        *self.cursor.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
+    /// Remember the newest cursor identity for viewers that connect later;
+    /// `None` when the display that had it is gone.
+    pub(super) fn set_cursor(&self, message: Option<String>) {
+        *self.cursor.lock().unwrap_or_else(|e| e.into_inner()) = message;
     }
 
     pub(super) fn cursor(&self) -> Option<String> {
@@ -236,13 +276,9 @@ impl StreamMedia {
             .clone()
     }
 
-    /// The input a capture requested now is known to include, if any.
-    pub(super) fn applied_input(&self) -> Option<u64> {
-        Some(
-            self.applied_input
-                .load(std::sync::atomic::Ordering::Acquire),
-        )
-        .filter(|sequence| *sequence > 0)
+    /// The input a capture that began at media time `ts` includes, if any.
+    pub(super) fn applied_input_at(&self, ts: u64) -> Option<u64> {
+        self.applied_input.at(ts)
     }
 }
 
@@ -935,7 +971,7 @@ mod tests {
         media.viewer_left(true, true);
         assert_eq!(media.roster(), ViewerRoster::default());
         assert!(media.cursor().is_none());
-        media.set_cursor("{\"type\":\"cursor\"}".into());
+        media.set_cursor(Some("{\"type\":\"cursor\"}".into()));
         assert_eq!(media.cursor().as_deref(), Some("{\"type\":\"cursor\"}"));
     }
 

@@ -1449,7 +1449,7 @@ async fn applied_input_watermark_follows_acknowledged_input_only() {
         ..BrowserControl::default()
     };
     let watermark = control.applied_input();
-    let load = || watermark.load(std::sync::atomic::Ordering::Acquire);
+    let load = || watermark.at(u64::MAX).unwrap_or(0);
     let key = |sequence: u64, generation: &str| {
         parse(
             json!({ "action": ACTION, "op": "input", "controllerId": OWNER,
@@ -1464,11 +1464,16 @@ async fn applied_input_watermark_follows_acknowledged_input_only() {
     let stale = uuid::Uuid::new_v4().to_string();
     assert!(control.execute(key(2, &stale), None).await.is_err());
     assert_eq!(load(), 1, "a refused batch applied nothing");
+    let between = crate::native::stream::monotonic_us();
     control.execute(key(2, &generation), None).await.unwrap();
     assert_eq!(load(), 2);
+    // A capture that began before the second acknowledgement shows only
+    // the first input, even when it is answered after it.
+    assert_eq!(watermark.at(between), Some(1));
     control
         .execute(parse(command("release", OWNER)), None)
         .await
         .unwrap();
     assert_eq!(load(), 0);
+    assert_eq!(watermark.at(between), Some(1));
 }
