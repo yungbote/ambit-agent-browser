@@ -1474,6 +1474,66 @@ impl BrowserControl {
     }
 }
 
+/// Whether a control request is only native window input: mouse and keyboard
+/// events a person sends to the owned window. Navigation, viewport, touch and
+/// sign-in batches, and every other operation, use the daemon command path.
+fn window_input_shape(command: &Value) -> bool {
+    command["action"] == ACTION
+        && command["op"] == "input"
+        && command["events"].as_array().is_some_and(|events| {
+            !events.is_empty()
+                && events.iter().all(|event| {
+                    matches!(
+                        event["type"].as_str(),
+                        Some("input_mouse" | "input_keyboard")
+                    )
+                })
+        })
+}
+
+/// Serves a person's window input under this gate alone, never waiting for
+/// daemon command custody: a running agent command, a layout or a file
+/// observation cannot hold a keystroke. The window's display helper orders
+/// the input on its own control socket. `None` means the request needs the
+/// command path instead: it is not native window input, it is invalid (the
+/// command path reports why), there is no owned window, or a sign-in is due
+/// to end first. The acknowledgment reports where the input's time went.
+pub(crate) async fn serve_window_input(
+    control: &tokio::sync::Mutex<BrowserControl>,
+    command: &Value,
+    received_at: Instant,
+) -> Option<Value> {
+    if !window_input_shape(command) {
+        return None;
+    }
+    let request = ControlRequest::parse(command).ok()?;
+    let mut control = control.lock().await;
+    let admitted_at = Instant::now();
+    if control
+        .display
+        .as_ref()
+        .is_none_or(|display| !display.available())
+        || control.sign_in_due(admitted_at)
+    {
+        return None;
+    }
+    let result = control.execute_with_page(request, None, None).await;
+    let timing = json!({
+        "queueUs": admitted_at.saturating_duration_since(received_at).as_micros() as u64,
+        "injectUs": admitted_at.elapsed().as_micros() as u64,
+    });
+    let id = command["id"].as_str().unwrap_or_default();
+    Some(match result {
+        Ok(mut data) => {
+            data["timing"] = timing;
+            json!({ "id": id, "success": true, "data": data })
+        }
+        Err(error) => {
+            json!({ "id": id, "success": false, "code": error.code, "error": error.message })
+        }
+    })
+}
+
 fn canonical_uuid(value: &str) -> bool {
     uuid::Uuid::parse_str(value).is_ok_and(|id| !id.is_nil() && id.to_string() == value)
 }

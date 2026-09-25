@@ -1327,3 +1327,99 @@ async fn sign_in_idle_clock_restarts_on_applied_input_only() {
         .idle_deadline = Instant::now();
     assert!(control.sign_in_due(Instant::now()));
 }
+
+/// Only a person's native mouse and keyboard input to an owned window skips
+/// command custody. Everything else, and a sign-in the watchdog must end
+/// first, is left to the command path unapplied.
+#[tokio::test]
+async fn window_input_fast_path_serves_only_native_window_input() {
+    let (display, mut ops, _frames) = acknowledging_display();
+    let generation = display.surface().generation;
+    let batch = |sequence: u64, events: Value| {
+        json!({ "id": "r", "action": ACTION, "op": "input", "controllerId": OWNER,
+            "sequence": sequence, "expectedSurfaceGeneration": generation, "events": events })
+    };
+    let key = json!([{ "type": "input_keyboard", "eventType": "keyDown", "key": "a" }]);
+    let control = Mutex::new(BrowserControl {
+        lease: Some(lease_for(
+            OWNER,
+            Instant::now() + Duration::from_secs(20),
+            0,
+        )),
+        ..BrowserControl::default()
+    });
+    let received = Instant::now();
+    // No owned window: page input needs its DevTools session.
+    assert!(
+        serve_window_input(&control, &batch(1, key.clone()), received)
+            .await
+            .is_none()
+    );
+    control.lock().await.display = Some(display.clone());
+    for events in [
+        json!([{ "type": "navigation", "action": "reload" }]),
+        json!([{ "type": "viewport", "width": 640, "height": 480 }]),
+        json!([{ "type": "input_touch", "eventType": "touchStart", "touchPoints": [{ "x": 1, "y": 1, "id": 1 }] }]),
+        json!([{ "type": "input_keyboard", "eventType": "keyDown", "key": "a" }, { "type": "navigation", "action": "reload" }]),
+        sign_in_event(),
+        json!([]),
+    ] {
+        assert!(
+            serve_window_input(&control, &batch(1, events.clone()), received)
+                .await
+                .is_none(),
+            "{events}"
+        );
+    }
+    for other in [command("renew", OWNER), command("release", OWNER)] {
+        assert!(serve_window_input(&control, &other, received)
+            .await
+            .is_none());
+    }
+    assert!(ops.try_recv().is_err(), "nothing reached the window");
+    assert_eq!(
+        control.lock().await.lease.as_ref().unwrap().last_sequence,
+        0
+    );
+
+    let applied = serve_window_input(&control, &batch(1, key.clone()), received)
+        .await
+        .unwrap();
+    assert_eq!(applied["success"], true, "{applied}");
+    assert_eq!(applied["data"]["lastSequence"], 1);
+    assert_eq!(ops.recv().await.unwrap()["op"], "input");
+    // A replayed sequence is a duplicate, never a second keystroke.
+    let duplicate = serve_window_input(&control, &batch(1, key.clone()), received)
+        .await
+        .unwrap();
+    assert_eq!(duplicate["data"]["status"], "duplicate");
+    assert!(ops.try_recv().is_err());
+    // A stale surface is refused by the same lease rules.
+    let mut stale = batch(2, key.clone());
+    stale["expectedSurfaceGeneration"] = json!(uuid::Uuid::new_v4().to_string());
+    let refused = serve_window_input(&control, &stale, received)
+        .await
+        .unwrap();
+    assert_eq!(refused["code"], "browser_control_surface_stale");
+
+    // A sign-in whose idle clock ran out is ended by the watchdog first.
+    control
+        .lock()
+        .await
+        .begin_sign_in(OWNER, 2, Duration::from_secs(10))
+        .unwrap();
+    control
+        .lock()
+        .await
+        .lease
+        .as_mut()
+        .unwrap()
+        .sign_in
+        .as_mut()
+        .unwrap()
+        .idle_deadline = Instant::now();
+    assert!(serve_window_input(&control, &batch(3, key), received)
+        .await
+        .is_none());
+    assert!(ops.try_recv().is_err());
+}
