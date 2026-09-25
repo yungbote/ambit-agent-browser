@@ -1171,6 +1171,18 @@ mod tests {
             state.browser.as_ref().unwrap().active_target_id().unwrap(),
             target
         );
+        // A promise the program rejects and never awaits is console output,
+        // not the program's outcome.
+        let unobserved = Box::pin(execute_command(&json!({"action":"run_playwright","code":"Promise.reject(new Error('unobserved')); return 2;","timeoutMs":15000}), &mut state)).await;
+        assert_eq!(unobserved["success"], true, "{unobserved}");
+        assert_eq!(unobserved["data"]["result"], 2);
+        assert!(
+            unobserved["data"]["diagnostics"]
+                .as_str()
+                .unwrap()
+                .starts_with("Unhandled rejection: Error: unobserved"),
+            "{unobserved}"
+        );
         let result = Box::pin(execute_command(&json!({"action":"run_playwright","code":"await page.waitForTimeout(60000);","timeoutMs":1500}), &mut state)).await;
         assert_eq!(
             result["code"], "browser_operation_outcome_unknown",
@@ -1336,6 +1348,19 @@ mod tests {
         assert_eq!(waited["data"]["error"]["name"], "TimeoutError", "{waited}");
         assert_eq!(waited["data"]["error"]["line"], 1, "{waited}");
         assert_eq!(waited["data"]["error"]["column"], 12, "{waited}");
+
+        // A promise the program rejects and never awaits does not end the
+        // runner before it reports.
+        let unobserved = program(
+            &mut state,
+            "Promise.reject(new Error('unobserved'));\nconst rows = document.querySelectorAll('tr');",
+        )
+        .await;
+        assert_eq!(unobserved["code"], PROGRAM_ERROR, "{unobserved}");
+        assert_eq!(
+            unobserved["data"],
+            json!({"error":{"name":"ReferenceError","message":"document is not defined","line":2,"column":14},"pageCallsIssued":0})
+        );
 
         let syntax = program(&mut state, "const a = ;").await;
         assert_eq!(syntax["code"], PROGRAM_ERROR, "{syntax}");

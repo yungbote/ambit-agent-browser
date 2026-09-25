@@ -12,6 +12,10 @@ const request = JSON.parse(Buffer.concat(chunks).toString('utf8'));
 const AsyncFunction = Object.getPrototypeOf(async function () {}).constructor;
 const diagnostics = new Console({ stdout: process.stderr, stderr: process.stderr });
 globalThis.console = diagnostics;
+// A promise the program rejects and never awaits is not its outcome. Node
+// would end the process on it, before the runner reports what the program
+// did; it is console output instead.
+process.on('unhandledRejection', (reason) => diagnostics.error('Unhandled rejection:', reason));
 
 // The program's stack frames carry this name, so a failure is located in the
 // program's own lines. A dynamic function's body starts on the third line of
