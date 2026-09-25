@@ -300,6 +300,11 @@ impl ControlRequest {
         self.op == Operation::Release
     }
 
+    /// A read-only file or download observation, served by `observe_files`.
+    pub(crate) fn observes_files(&self) -> bool {
+        matches!(self.op, Operation::Files | Operation::Downloads)
+    }
+
     /// The idle timeout a sign-in batch asks for, or why its event is invalid.
     pub(crate) fn sign_in(&self) -> Option<Result<Duration, ControlError>> {
         self.sign_in
@@ -1019,28 +1024,10 @@ impl BrowserControl {
                 }
                 Ok(inspected)
             }
-            Operation::Downloads => {
-                let page = page.as_mut().ok_or_else(|| {
-                    ControlError::new(
-                        "browser_control_files_unavailable",
-                        "The browser page is unavailable.",
-                    )
-                })?;
-                // Completed downloads are owned by the browser process, not
-                // by a page. Listing them must stay cheap: the Product polls
-                // it beside human input, under the same command custody.
-                let downloads = tokio::time::timeout(ACK_TIMEOUT, page.completed_downloads(0))
-                    .await
-                    .map_err(|_| {
-                        ControlError::new(
-                            "browser_control_files_unavailable",
-                            "The browser downloads could not be observed.",
-                        )
-                    })??;
-                Ok(
-                    json!({"supported":true,"controlled":self.agent_error().is_some(),"filesSupported":page.files_supported(),"downloads":downloads}),
-                )
-            }
+            // Their page work runs outside this gate; see `observe_files`.
+            Operation::Downloads | Operation::Files => Err(ControlError::invalid(
+                "File observations are served by observe_files.",
+            )),
             Operation::Acquire => {
                 self.expire(browser).await?;
                 request.deadline(now)?;
@@ -1196,10 +1183,9 @@ impl BrowserControl {
                     json!({ "bytes": text.len(), "text": text, "complete": true });
                 Ok(response)
             }
-            Operation::Files | Operation::Drop | Operation::Setfiles | Operation::Dismissfiles => {
+            Operation::Drop | Operation::Setfiles | Operation::Dismissfiles => {
                 let lease = self.require_owner(&request.controller_id)?;
                 let deadline = lease.deadline.min(Instant::now() + ACK_TIMEOUT);
-                let download_cursor = lease.download_cursor;
                 if let Some(sequence) = request.sequence {
                     if sequence <= lease.last_sequence {
                         return Ok(lease.response("duplicate"));
@@ -1236,29 +1222,43 @@ impl BrowserControl {
                 if mutating {
                     self.lease.as_mut().unwrap().outcome_unknown = true;
                 }
-                let result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-                    let file_page = page.file_page().await?;
-                    match request.op {
-                        Operation::Files => {
-                            let chooser = file_page.chooser(&request.controller_id).await?;
-                            let downloads = page.completed_downloads(download_cursor).await?;
-                            Ok(json!({"status":"files","chooser":chooser,"downloads":downloads}))
+                let result =
+                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                        let file_page = page.file_page().await?;
+                        match request.op {
+                            Operation::Drop => {
+                                let destination = file_page
+                                    .drop_destination(
+                                        &request.controller_id,
+                                        request.x.unwrap(),
+                                        request.y.unwrap(),
+                                        deadline,
+                                    )
+                                    .await?;
+                                Ok(json!({"status":"destination","destination":destination}))
+                            }
+                            Operation::Setfiles => {
+                                file_page
+                                    .set_files(
+                                        &request.controller_id,
+                                        request.destination_id.as_deref().unwrap(),
+                                        request.files.as_ref().unwrap(),
+                                        deadline,
+                                    )
+                                    .await?;
+                                Ok(json!({"status":"applied"}))
+                            }
+                            Operation::Dismissfiles => {
+                                file_page.client.files.dismiss(
+                                    &request.controller_id,
+                                    request.destination_id.as_deref().unwrap(),
+                                )?;
+                                Ok(json!({"status":"dismissed"}))
+                            }
+                            _ => unreachable!(),
                         }
-                        Operation::Drop => {
-                            let destination = file_page.drop_destination(&request.controller_id, request.x.unwrap(), request.y.unwrap(), deadline).await?;
-                            Ok(json!({"status":"destination","destination":destination}))
-                        }
-                        Operation::Setfiles => {
-                            file_page.set_files(&request.controller_id, request.destination_id.as_deref().unwrap(), request.files.as_ref().unwrap(), deadline).await?;
-                            Ok(json!({"status":"applied"}))
-                        }
-                        Operation::Dismissfiles => {
-                            file_page.client.files.dismiss(&request.controller_id, request.destination_id.as_deref().unwrap())?;
-                            Ok(json!({"status":"dismissed"}))
-                        }
-                        _ => unreachable!(),
-                    }
-                }).await;
+                    })
+                    .await;
                 let data = match result {
                     Ok(result) => result,
                     Err(_) if matches!(request.op, Operation::Setfiles | Operation::Drop) => {
@@ -1472,6 +1472,73 @@ impl BrowserControl {
         }
         Ok(lease)
     }
+}
+
+fn files_unavailable(message: &str) -> ControlError {
+    ControlError::new("browser_control_files_unavailable", message)
+}
+
+/// Serves the read-only `files` and `downloads` observations. Their DevTools
+/// round trips (visible page, frames, chooser, downloads) run outside the
+/// gate, so a person's input never queues behind them; `files` checks the
+/// controller's lease before and again after observing, under the gate.
+pub(crate) async fn observe_files(
+    gate: &tokio::sync::Mutex<BrowserControl>,
+    request: ControlRequest,
+    mut page: Option<super::actions::ControlPage<'_>>,
+) -> Result<Value, ControlError> {
+    if request.op == Operation::Downloads {
+        let page = page
+            .as_mut()
+            .ok_or_else(|| files_unavailable("The browser page is unavailable."))?;
+        // Completed downloads are owned by the browser process, not by a
+        // page. Listing them must stay cheap: the Product polls it beside
+        // human input.
+        let downloads = tokio::time::timeout(ACK_TIMEOUT, page.completed_downloads(0))
+            .await
+            .map_err(|_| files_unavailable("The browser downloads could not be observed."))??;
+        let control = gate.lock().await;
+        return Ok(control.acknowledge(json!({"supported":true,
+            "controlled":control.agent_error().is_some(),
+            "filesSupported":page.files_supported(),"downloads":downloads})));
+    }
+    if request.op != Operation::Files {
+        return Err(ControlError::invalid(
+            "Only files and downloads are observations.",
+        ));
+    }
+    let (deadline, download_cursor) = {
+        let control = gate.lock().await;
+        let lease = control.require_owner(&request.controller_id)?;
+        (
+            lease.deadline.min(Instant::now() + ACK_TIMEOUT),
+            lease.download_cursor,
+        )
+    };
+    let page = page
+        .as_mut()
+        .ok_or_else(|| files_unavailable("The browser page is unavailable."))?;
+    let observed = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+        let file_page = page.file_page().await?;
+        let chooser = file_page.chooser(&request.controller_id).await?;
+        let downloads = page.completed_downloads(download_cursor).await?;
+        Ok::<_, ControlError>(json!({"chooser":chooser,"downloads":downloads}))
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(files_unavailable(
+            "The browser did not finish observing files. Try again.",
+        ))
+    })?;
+    let control = gate.lock().await;
+    let mut response = control
+        .require_owner(&request.controller_id)?
+        .response("files");
+    response
+        .as_object_mut()
+        .unwrap()
+        .extend(observed.as_object().unwrap().clone());
+    Ok(control.acknowledge(response))
 }
 
 /// Whether a control request is only native window input: mouse and keyboard

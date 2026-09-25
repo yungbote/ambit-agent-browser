@@ -746,6 +746,27 @@ pub(super) async fn history_availability(
     (index < length).then_some((index > 0, index + 1 < length))
 }
 
+/// The media clock: microseconds of the sandbox's monotonic clock. Frames,
+/// pointer samples, cursor identities and file doorbells carry it as `ts`,
+/// so a viewer can place them on one timeline. On Unix it is
+/// `CLOCK_MONOTONIC`, which every process in the container shares; elsewhere
+/// it counts from this process's first reading.
+pub(crate) fn monotonic_us() -> u64 {
+    #[cfg(unix)]
+    {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime writes one timespec through a valid pointer.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } == 0 {
+            return now.tv_sec as u64 * 1_000_000 + now.tv_nsec as u64 / 1_000;
+        }
+    }
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
 pub(crate) fn timestamp_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)

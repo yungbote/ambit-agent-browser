@@ -1289,6 +1289,80 @@ mod tests {
         task.await.unwrap();
     }
 
+    /// A files observation whose DevTools round trips stall never holds a
+    /// person's keystroke: its page work runs outside the control gate.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stalled_files_observation_never_holds_window_input() {
+        use serde_json::json;
+        let owner = "aabbccdd-1111-4222-8333-123456789abc";
+        let mut initial = DaemonState::new();
+        // A browser whose DevTools never answers: every observation stalls.
+        initial.browser = Some(
+            crate::native::browser::tests::test_manager(vec![crate::native::browser::PageInfo {
+                tab_id: 1,
+                label: None,
+                target_id: "target".into(),
+                session_id: "session".into(),
+                url: "https://example.com/".into(),
+                title: String::new(),
+                target_type: "page".into(),
+            }])
+            .await,
+        );
+        let control = initial.browser_control.clone();
+        let operations = initial.playwright_operations.clone();
+        let state = Arc::new(tokio::sync::Mutex::new(initial));
+        let (display, mut ops, _frames) = acknowledging_display();
+        control.lock().await.set_display(Some(display.clone()));
+        let expires = crate::native::stream::timestamp_ms() + 20_000;
+        let acquire = json!({"action":super::super::browser_control::ACTION,"op":"acquire","controllerId":owner,"expiresAt":expires});
+        control
+            .lock()
+            .await
+            .execute(
+                super::super::browser_control::ControlRequest::parse(&acquire).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ops.recv().await.unwrap()["op"], "reset");
+
+        let (mut observing, observation) = connect(
+            state.clone(),
+            control.clone(),
+            operations.clone(),
+            json!({"id":"f1","action":super::super::browser_control::ACTION,"op":"files","controllerId":owner}),
+        )
+        .await;
+        // Let the observation reach its stalled DevTools round trip.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let generation = display.surface().generation;
+        let (mut typed, task) = connect(state.clone(), control.clone(), operations, json!({
+            "id":"k1","action":super::super::browser_control::ACTION,"op":"input","controllerId":owner,
+            "sequence":1,"expectedSurfaceGeneration":generation,
+            "events":[{"type":"input_keyboard","eventType":"keyDown","key":"a"}]})).await;
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), typed.read_line(&mut line))
+            .await
+            .expect("window input waited for a files observation")
+            .unwrap();
+        let applied: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(applied["data"]["status"], "applied", "{applied}");
+        assert_eq!(ops.recv().await.unwrap()["op"], "input");
+        drop(typed);
+        task.await.unwrap();
+        // The observation itself still ends within its bound.
+        let observed = reply(&mut observing).await;
+        assert_eq!(observed["id"], "f1");
+        assert_eq!(
+            observed["code"], "browser_control_files_unavailable",
+            "{observed}"
+        );
+        drop(observing);
+        observation.await.unwrap();
+    }
+
     #[tokio::test]
     async fn test_idle_activity_receives_dashboard_activity() {
         let activity = Arc::new(IdleActivity::new());

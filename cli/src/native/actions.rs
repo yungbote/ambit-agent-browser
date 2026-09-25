@@ -2829,6 +2829,19 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         {
             sign_in::hand_back(state).await;
         }
+        if request.observes_files() {
+            let control = state.browser_control.clone();
+            let result =
+                browser_control::observe_files(&control, request, Some(ControlPage(state, None)))
+                    .await;
+            state.last_command_finished = Some(std::time::Instant::now());
+            return match result {
+                Ok(data) => success_response(&id, data),
+                Err(error) => {
+                    json!({ "id": id, "success": false, "code": error.code, "error": error.message })
+                }
+            };
+        }
         let browser = state.browser.as_ref().and_then(|manager| {
             manager
                 .active_session_id()

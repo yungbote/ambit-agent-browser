@@ -82,6 +82,26 @@ async fn next_cdp_event(
     }
 }
 
+/// The next change of an optional revision; never while there is none. A
+/// closed revision ends: its owner was replaced with the client.
+async fn revision_changed(revision: &mut Option<watch::Receiver<u64>>) {
+    match revision {
+        Some(receiver) => {
+            if receiver.changed().await.is_err() {
+                *revision = None;
+                std::future::pending::<()>().await;
+            }
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// A file picker opened or ended, or a download settled: the controller
+/// asks for the current `files` once instead of polling. It names nothing.
+fn files_doorbell() -> String {
+    json!({ "type": "files", "ts": super::monotonic_us() }).to_string()
+}
+
 /// Whether a stream source slot now holds another value than `current`.
 pub(super) fn replaced<T>(current: &Option<Arc<T>>, next: &Option<Arc<T>>) -> bool {
     match (current, next) {
@@ -188,6 +208,10 @@ pub(super) async fn cdp_event_loop(
             let mut cdp = client
                 .as_ref()
                 .map(|client| (Arc::clone(client), client.subscribe()));
+            let mut file_revision = client.as_ref().map(|client| client.files.subscribe());
+            let mut download_revision = client
+                .as_ref()
+                .map(|client| client.downloads.subscribe_settled());
 
             let session_id = cdp_session_id.read().await.clone();
 
@@ -290,6 +314,12 @@ pub(super) async fn cdp_event_loop(
                         if changed.is_err() { break; }
                         controlled = custody_active(*custody.borrow_and_update());
                         repace!();
+                    }
+                    _ = revision_changed(&mut file_revision) => {
+                        let _ = frame_tx.send(files_doorbell());
+                    }
+                    _ = revision_changed(&mut download_revision) => {
+                        let _ = frame_tx.send(files_doorbell());
                     }
                     _ = display_tick.tick(), if display.is_some() && !display_failed => {
                         let now_controlled = custody_active(*custody.borrow());
@@ -1099,6 +1129,61 @@ mod tests {
         let _ = shutdown.send(true);
         task.await.unwrap();
         drop(methods);
+    }
+
+    /// A picker that opens or ends, and a download that settles, ring the
+    /// files doorbell once each; download progress and unrelated pages do not.
+    #[tokio::test]
+    async fn test_file_pickers_and_settled_downloads_ring_the_files_doorbell() {
+        let (client, events, methods) = mock_cdp("F-MAIN").await;
+        client.files.begin("aabbccdd-1111-4222-8333-123456789abc");
+        client.files.intercepted("S-ACTIVE");
+        let mut harness =
+            start_loop_with_client(Some("S-ACTIVE"), client.clone(), events, methods).await;
+        let send = |event: Value| harness.events.send(event).unwrap();
+        // A picker in a page without interception is not a destination.
+        send(
+            json!({"method":"Page.fileChooserOpened","sessionId":"S-OTHER",
+            "params":{"frameId":"F-MAIN","mode":"selectSingle","backendNodeId":7}}),
+        );
+        send(
+            json!({"method":"Page.fileChooserOpened","sessionId":"S-ACTIVE",
+            "params":{"frameId":"F-MAIN","mode":"selectSingle","backendNodeId":7}}),
+        );
+        let opened = next_message_of_type(&mut harness.messages, "files").await;
+        assert!(opened["ts"].as_u64().is_some_and(|ts| ts > 0), "{opened}");
+        assert_eq!(
+            opened.as_object().unwrap().len(),
+            2,
+            "names nothing: {opened}"
+        );
+        // Navigating the picker's document ends it.
+        send(
+            json!({"method":"Page.frameNavigated","sessionId":"S-ACTIVE",
+            "params":{"frame":{"id":"F-MAIN","url":"https://next.test/"}}}),
+        );
+        let ended = next_message_of_type(&mut harness.messages, "files").await;
+        assert!(ended["ts"].as_u64() >= opened["ts"].as_u64());
+        let guid = uuid::Uuid::new_v4().to_string();
+        send(json!({"method":"Browser.downloadWillBegin",
+            "params":{"guid":guid,"frameId":"F-MAIN","suggestedFilename":"a.txt","url":"https://next.test/a.txt"}}));
+        send(json!({"method":"Browser.downloadProgress",
+            "params":{"guid":guid,"state":"inProgress","receivedBytes":1,"totalBytes":2}}));
+        send(json!({"method":"Browser.downloadProgress",
+            "params":{"guid":guid,"state":"completed","receivedBytes":2,"totalBytes":2}}));
+        next_message_of_type(&mut harness.messages, "files").await;
+        let quiet = tokio::time::timeout(std::time::Duration::from_millis(200), async {
+            loop {
+                let text = harness.messages.recv().await.unwrap();
+                let message: Value = serde_json::from_str(&text).unwrap();
+                if message["type"] == "files" {
+                    return message;
+                }
+            }
+        })
+        .await;
+        assert!(quiet.is_err(), "one doorbell per change: {quiet:?}");
+        stop_loop(harness).await;
     }
 
     /// Reading the float as an integer stamps every frame 0, so no client can
