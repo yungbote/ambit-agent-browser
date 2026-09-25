@@ -314,14 +314,22 @@ async fn native_activity_follows_browser_acknowledgements_and_page_identity() {
         .await
         .unwrap();
     let sent = browser.next().await;
+    let before = crate::native::stream::monotonic_us();
     browser.ack(&sent).await;
     pending.acknowledgment().await.unwrap();
     let observed = events.recv().await.unwrap();
     assert_eq!(observed.method, super::super::activity::EVENT);
     assert_eq!(observed.params["source"], "human");
+    // The executed sample is stamped on the media clock when acknowledged.
+    let ts = observed.params["ts"].as_u64().unwrap();
+    assert!(
+        (before..=crate::native::stream::monotonic_us()).contains(&ts),
+        "{observed:?}"
+    );
     browser.responses.send(json!({ "method": "Page.frameNavigated", "sessionId": "page", "params": { "frame": { "id": "main", "loaderId": "new" } } })).await.unwrap();
     let reset = events.recv().await.unwrap();
     assert_eq!(reset.params["eventType"], "reset");
+    assert!(reset.params["ts"].as_u64() >= Some(ts));
     assert_ne!(
         reset.params["pageGeneration"],
         observed.params["pageGeneration"]
@@ -1422,4 +1430,45 @@ async fn window_input_fast_path_serves_only_native_window_input() {
         .await
         .is_none());
     assert!(ops.try_recv().is_err());
+}
+
+/// Frames name the input they include by its sequence: the watermark moves
+/// only after the display acknowledged a batch, never on a refused one, and
+/// clears when the lease ends.
+#[tokio::test]
+async fn applied_input_watermark_follows_acknowledged_input_only() {
+    let (display, mut ops, _frames) = acknowledging_display();
+    let generation = display.surface().generation;
+    let mut control = BrowserControl {
+        lease: Some(lease_for(
+            OWNER,
+            Instant::now() + Duration::from_secs(20),
+            0,
+        )),
+        display: Some(display.clone()),
+        ..BrowserControl::default()
+    };
+    let watermark = control.applied_input();
+    let load = || watermark.load(std::sync::atomic::Ordering::Acquire);
+    let key = |sequence: u64, generation: &str| {
+        parse(
+            json!({ "action": ACTION, "op": "input", "controllerId": OWNER,
+            "sequence": sequence, "expectedSurfaceGeneration": generation,
+            "events": [{ "type": "input_keyboard", "eventType": "keyDown", "key": "a" }] }),
+        )
+    };
+    assert_eq!(load(), 0);
+    control.execute(key(1, &generation), None).await.unwrap();
+    assert_eq!(ops.recv().await.unwrap()["op"], "input");
+    assert_eq!(load(), 1);
+    let stale = uuid::Uuid::new_v4().to_string();
+    assert!(control.execute(key(2, &stale), None).await.is_err());
+    assert_eq!(load(), 1, "a refused batch applied nothing");
+    control.execute(key(2, &generation), None).await.unwrap();
+    assert_eq!(load(), 2);
+    control
+        .execute(parse(command("release", OWNER)), None)
+        .await
+        .unwrap();
+    assert_eq!(load(), 0);
 }

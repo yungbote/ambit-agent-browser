@@ -55,6 +55,15 @@ impl Surface {
     }
 }
 
+/// A rectangle in display pixels.
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub width: u32,
+    pub height: u32,
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct DisplayInfo {
@@ -133,6 +142,10 @@ pub(crate) struct Capture {
     #[serde(default)]
     pub patches: Vec<Patch>,
     pub cursor_included: bool,
+    /// The browser window within the frame, when the helper's framebuffer is
+    /// a size class larger than the window. Absent: the whole frame.
+    #[serde(default)]
+    pub visible: Option<Rect>,
     #[serde(default)]
     #[cfg_attr(not(test), allow(dead_code))] // Retained for capture qualification.
     pub quality: u32,

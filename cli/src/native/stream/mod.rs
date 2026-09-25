@@ -143,6 +143,28 @@ fn seq_in_serialized_frame(frame: &str) -> Option<u64> {
         .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
 }
 
+/// What a stream's capture loop and its viewers share beyond frames.
+pub(crate) struct StreamMedia {
+    /// The controller's last input sequence the display acknowledged, from
+    /// `BrowserControl`; 0 without a lease. Frames carry it as `inputSeq`.
+    applied_input: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl StreamMedia {
+    pub(crate) fn new(applied_input: Arc<std::sync::atomic::AtomicU64>) -> Self {
+        Self { applied_input }
+    }
+
+    /// The input a capture requested now is known to include, if any.
+    pub(super) fn applied_input(&self) -> Option<u64> {
+        Some(
+            self.applied_input
+                .load(std::sync::atomic::Ordering::Acquire),
+        )
+        .filter(|sequence| *sequence > 0)
+    }
+}
+
 /// Shared activity clock for daemon commands and dashboard input.
 ///
 /// The timestamp lets the idle-shutdown path re-check activity after waiting
@@ -461,7 +483,13 @@ impl StreamServer {
         let frame_watch_bg = frame_watch_tx.clone();
         let screencast_cfg_bg = screencast_config.clone();
         let presentation_bg = presentation.clone();
-        let custody_bg = browser_control.lock().await.custody();
+        let (custody_bg, media_bg) = {
+            let control = browser_control.lock().await;
+            (
+                control.custody(),
+                Arc::new(StreamMedia::new(control.applied_input())),
+            )
+        };
         let cdp_task = tokio::spawn(async move {
             cdp_loop::cdp_event_loop(
                 frame_tx_bg,
@@ -471,6 +499,7 @@ impl StreamServer {
                 display_slot_bg,
                 presentation_bg,
                 custody_bg,
+                media_bg,
                 client_notify_bg,
                 screencasting_bg,
                 client_count_bg,

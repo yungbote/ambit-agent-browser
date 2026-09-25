@@ -168,6 +168,7 @@ pub(super) async fn cdp_event_loop(
     display_slot: Arc<RwLock<Option<Arc<crate::native::display::DisplayClient>>>>,
     presentation: Arc<super::presentation::Presentation>,
     mut custody: watch::Receiver<Option<Instant>>,
+    media: Arc<super::StreamMedia>,
     client_notify: Arc<tokio::sync::Notify>,
     screencasting: Arc<Mutex<bool>>,
     client_count: Arc<Mutex<usize>>,
@@ -342,15 +343,25 @@ pub(super) async fn cdp_event_loop(
                             force: published_generation.as_deref() != Some(display.surface().generation.as_str()),
                             patches: patches_allowed,
                         };
+                        // Read before the request leaves: input acknowledged
+                        // by then is in every pixel the helper fetches.
+                        let ts = super::monotonic_us();
+                        let input_seq = media.applied_input();
                         match display.capture(request).await {
                             Ok(Some((capture, mut surface))) => {
                                 let seq = super::next_frame_seq();
                                 let patch = capture.data.is_none();
                                 surface.cursor_included = capture.cursor_included;
+                                let visible = capture.visible.unwrap_or(crate::native::display::Rect {
+                                    x: 0, y: 0, width: surface.width, height: surface.height,
+                                });
                                 let mut message = json!({
                                     "type": "frame", "seq": seq, "encoding": capture.encoding,
-                                    "surface": surface,
+                                    "surface": surface, "ts": ts, "visible": visible,
                                 });
+                                if let Some(input_seq) = input_seq {
+                                    message["inputSeq"] = json!(input_seq);
+                                }
                                 if let Some(data) = capture.data {
                                     message["data"] = json!(data);
                                 } else {
@@ -548,6 +559,7 @@ pub(super) async fn cdp_event_loop(
                                         let msg = json!({
                                             "type": "frame",
                                             "seq": seq,
+                                            "ts": super::monotonic_us(),
                                             "data": data,
                                             "pageGeneration": evt.params[crate::native::activity::FRAME_GENERATION],
                                             "metadata": {
@@ -957,6 +969,7 @@ mod tests {
             Arc::new(RwLock::new(None)),
             Arc::new(super::super::presentation::Presentation::new()),
             watch::channel(None).1,
+            Arc::new(super::super::StreamMedia::new(Default::default())),
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
             client_count,
@@ -1065,6 +1078,7 @@ mod tests {
             Arc::new(RwLock::new(Some(display))),
             presentation.clone(),
             custody,
+            Arc::new(super::super::StreamMedia::new(Default::default())),
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(1)),
@@ -1184,6 +1198,89 @@ mod tests {
         .await;
         assert!(quiet.is_err(), "one doorbell per change: {quiet:?}");
         stop_loop(harness).await;
+    }
+
+    /// Every window frame carries the media clock at its capture request, the
+    /// window rectangle within it, and, while a lease has applied input, the
+    /// last input sequence the display acknowledged before that request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_window_frames_carry_ts_visible_and_applied_input() {
+        use crate::native::display::DisplayClient;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (display, _control, frames) = DisplayClient::test_channel();
+        let (frame_tx, _messages) = broadcast::channel(64);
+        let (frame_watch, mut published) = watch::channel(None);
+        let client_notify = Arc::new(tokio::sync::Notify::new());
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (_custody, custody) = watch::channel(None);
+        let applied = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let task = tokio::spawn(cdp_event_loop(
+            frame_tx,
+            frame_watch,
+            Arc::new(super::super::ScreencastConfig::default()),
+            Arc::new(RwLock::new(None)),
+            Arc::new(RwLock::new(Some(display))),
+            Arc::new(super::super::presentation::Presentation::new()),
+            custody,
+            Arc::new(super::super::StreamMedia::new(applied.clone())),
+            client_notify.clone(),
+            Arc::new(Mutex::new(false)),
+            Arc::new(Mutex::new(1)),
+            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            Arc::new(RwLock::new(None)),
+            Arc::new(Mutex::new(1280)),
+            Arc::new(Mutex::new(720)),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new("chrome".to_string())),
+            Arc::new(Mutex::new(false)),
+            shutdown_rx,
+        ));
+        client_notify.notify_one();
+        let mut frames = BufReader::new(frames);
+        let mut answer = |visible: Option<Value>| {
+            let mut frame = json!({"changed":true,"width":2560,"height":1440,"encoding":"jpeg",
+                "data":"AA==","cursorIncluded":true,"quality":85});
+            if let Some(visible) = visible {
+                frame["visible"] = visible;
+            }
+            frame
+        };
+        let mut next_frame = async |data: Value| {
+            let mut line = String::new();
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                frames.read_line(&mut line),
+            )
+            .await
+            .expect("a capture request")
+            .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let reply =
+                json!({"id": request["id"], "success": true, "data": data}).to_string() + "\n";
+            frames.get_mut().write_all(reply.as_bytes()).await.unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(2), published.changed())
+                .await
+                .unwrap()
+                .unwrap();
+            let frame = published.borrow_and_update().clone().unwrap();
+            serde_json::from_str::<Value>(&frame.json).unwrap()
+        };
+        let before = super::super::monotonic_us();
+        let first = next_frame(answer(None)).await;
+        assert!((before..=super::super::monotonic_us()).contains(&first["ts"].as_u64().unwrap()));
+        assert_eq!(
+            first["visible"],
+            json!({"x":0,"y":0,"width":2560,"height":1440})
+        );
+        assert!(first.get("inputSeq").is_none(), "{first}");
+        applied.store(7, std::sync::atomic::Ordering::Release);
+        let window = json!({"x":0,"y":0,"width":1418,"height":1888});
+        let second = next_frame(answer(Some(window.clone()))).await;
+        assert_eq!(second["inputSeq"], 7);
+        assert_eq!(second["visible"], window);
+        assert!(second["ts"].as_u64() > first["ts"].as_u64());
+        let _ = shutdown.send(true);
+        task.await.unwrap();
     }
 
     /// Reading the float as an integer stamps every frame 0, so no client can
@@ -1543,6 +1640,7 @@ mod tests {
             Arc::new(RwLock::new(None)),
             Arc::new(super::super::presentation::Presentation::new()),
             watch::channel(None).1,
+            Arc::new(super::super::StreamMedia::new(Default::default())),
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(1)),
