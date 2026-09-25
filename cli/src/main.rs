@@ -318,6 +318,13 @@ fn attach_appearance_to_launch_command(launch_cmd: &mut serde_json::Value, flags
     }
 }
 
+/// A command for a session that is already running, such as a theme change:
+/// it never starts a daemon or sends the launch settings a first command
+/// would, in a batch too.
+fn addresses_running_session(cmd: &serde_json::Value) -> bool {
+    cmd["action"] == native::theme::ACTION
+}
+
 /// A theme from the flag, environment or config that is not dark or light.
 fn invalid_theme_error(flags: &Flags) -> Option<String> {
     flags
@@ -1909,16 +1916,11 @@ fn main() {
         return;
     }
 
-    // A theme change reaches a session that is already running: it never
-    // starts a daemon or launches a browser.
-    if cmd["action"] == native::theme::ACTION {
+    if addresses_running_session(&cmd) {
+        let action = cmd["action"].as_str().map(str::to_string);
         let resp =
             connection::send_command_if_running(cmd, &flags.session).unwrap_or_else(Response::from);
-        print_response_with_opts(
-            &resp,
-            Some(native::theme::ACTION),
-            &OutputOptions::from_flags(&flags),
-        );
+        print_response_with_opts(&resp, action.as_deref(), &OutputOptions::from_flags(&flags));
         if !resp.success {
             exit(1);
         }
@@ -2315,7 +2317,13 @@ fn run_batch(
 
         attach_pin_tab_to_command(&mut parsed, flags);
 
-        match send_command_with_respawn(parsed, &flags.session, daemon_opts) {
+        let sent = if addresses_running_session(&parsed) {
+            Ok(connection::send_command_if_running(parsed, &flags.session)
+                .unwrap_or_else(Response::from))
+        } else {
+            send_command_with_respawn(parsed, &flags.session, daemon_opts)
+        };
+        match sent {
             Ok(resp) => {
                 if flags.json {
                     let mut result = json!({
