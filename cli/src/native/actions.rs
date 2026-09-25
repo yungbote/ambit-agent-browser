@@ -10023,10 +10023,11 @@ async fn handle_mainframe(state: &mut DaemonState) -> Result<Value, String> {
 // ---------------------------------------------------------------------------
 
 /// The exact set of `find` actions `execute_subaction` dispatches. Shared by
-/// the validation guard, the error message, and the accepted-actions test,
+/// the validation guard, the error message, the MCP find schema, and the
+/// accepted-actions test,
 /// so drift between the guard and the match arms fails a test instead of
 /// silently reopening the "Unknown subaction: type" bug this fixes.
-const FIND_ACTIONS: &[&str] = &["click", "fill", "check", "hover", "text"];
+pub(crate) const FIND_ACTIONS: &[&str] = &["click", "fill", "check", "hover", "text"];
 
 /// The daemon commands that dispatch a `find` subaction through
 /// `execute_subaction` after resolving their locator.
