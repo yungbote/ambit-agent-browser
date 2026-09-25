@@ -14,14 +14,18 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Notify};
 
-use super::actions::DaemonState;
-use super::cdp::client::CdpClient;
+use super::actions::{CommandError, DaemonState};
+use super::cdp::client::{replace_lone_surrogate_escapes, CdpClient};
 
 const RUNNER: &str = include_str!("../../runtime/playwright-runner.mjs");
 const MAX_CODE: usize = 1 << 20;
 const MAX_RESULT: usize = 2 << 20;
 const MAX_DIAGNOSTICS: usize = 64 << 10;
 pub(crate) const ENVIRONMENT_FIELD: &str = "ambitProgram";
+/// A program that failed before it issued any Playwright call: nothing was
+/// done in the browser, so it is refused like any command turned away before
+/// acting, and the caller fixes the program and runs it again.
+pub(crate) const PROGRAM_ERROR: &str = "browser_program_error";
 
 /// Host-selected paths for this Action. Tokens remain in the private relay
 /// file and the existing SDK factory owns its schema and authorization.
@@ -88,11 +92,14 @@ impl InterruptReason {
         }
     }
 
-    fn stopped(self) -> String {
+    fn stopped(self) -> CommandError {
         if self == Self::HumanControl {
-            "browser_operation_interrupted: The Playwright program stopped for user control. Earlier effects may have executed; inspect a fresh observation after handback and do not replay the program.".into()
+            CommandError::with_data(
+                "browser_operation_interrupted: The Playwright program stopped for user control. Earlier effects may have executed; inspect a fresh observation after handback and do not replay the program.",
+                json!({"interruptedBy":"human","executionStopped":true,"effectsMayHaveOccurred":true}),
+            )
         } else {
-            unknown(self.message())
+            unknown(self.message()).into()
         }
     }
 }
@@ -330,7 +337,7 @@ async fn diagnostics(mut reader: impl AsyncRead + Unpin) -> (String, bool) {
 
 /// The enclosing command retains exclusive native custody until the temporary
 /// connection, every input operation and the Node group have settled.
-pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Value, String> {
+pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     #[cfg(not(unix))]
     return Err(
         "browser_operation_rejected: Supervised Playwright execution requires a Unix workspace."
@@ -369,7 +376,7 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
         // default profile and misreport cookies, so it refuses before start.
         let (download_context, isolated_contexts) = tokio::select! {
             biased;
-            _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start()),
+            _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start().into()),
             result = tokio::time::timeout_at(deadline, async {
                 let isolated = browser.isolated_context_ids().await?.len();
                 let context = browser.download_context_for_target(&target).await?;
@@ -384,7 +391,7 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
         let control = state.browser_control.clone();
         let client = tokio::select! {
             biased;
-            _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start()),
+            _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start().into()),
             result = tokio::time::timeout_at(deadline, CdpClient::connect(&endpoint)) =>
                 Arc::new(result.map_err(|_| "browser_operation_rejected: Browser attachment timed out.")?
                     .map_err(|_| "browser_operation_rejected: The existing browser could not be attached.")?),
@@ -399,7 +406,7 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
         };
         if let Err(error) = observed {
             client.disconnect();
-            return Err(error);
+            return Err(error.into());
         }
         let mut tunnel = transport::Tunnel::start(client, control.clone()).await?;
         let request = json!({ "endpoint": tunnel.endpoint(), "targetId": target, "code": code, "artifactsDir": artifacts, "environment": environment, "isolatedContexts": isolated_contexts });
@@ -536,7 +543,7 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
             // (a popup whose navigation was refused) keeps any program from
             // starting, whichever tab it selects; name it.
             Ended::Deadline if !started => {
-                Err(not_started_by_deadline(&stalled_tabs(&owner).await))
+                Err(not_started_by_deadline(&stalled_tabs(&owner).await).into())
             }
             ended => program_outcome(ended, started),
         }
@@ -548,18 +555,20 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
 }
 
 /// A cleanup failure after the program ran leaves its effects unknown, and
-/// keeps the program's own outcome in the report. Cleanup after a program
+/// keeps the program's own outcome in the report. Its data is not kept: a
+/// stop that did not settle establishes none of it. Cleanup after a program
 /// that never ran cannot change what happened: nothing did.
 fn after_cleanup(
-    outcome: Result<Value, String>,
+    outcome: Result<Value, CommandError>,
     started: bool,
     cleanup: Result<(), String>,
-) -> Result<Value, String> {
+) -> Result<Value, CommandError> {
     match cleanup {
         Err(error) if started => Err(unknown(match outcome {
             Ok(_) => format!("{error} The program itself returned before cleanup failed."),
-            Err(program) => format!("{error} The program itself reported: {program}"),
-        })),
+            Err(program) => format!("{error} The program itself reported: {}", program.error),
+        })
+        .into()),
         _ => outcome,
     }
 }
@@ -596,39 +605,132 @@ fn not_started_by_deadline(stalled: &[String]) -> String {
 
 /// What the program's own end proves, before any cleanup failure. `started`
 /// is the daemon's start record; a program cannot report itself not started.
-fn program_outcome(ended: Ended, started: bool) -> Result<Value, String> {
+fn program_outcome(ended: Ended, started: bool) -> Result<Value, CommandError> {
     let bytes = match ended {
         Ended::Record(bytes) => bytes,
         Ended::Interrupted(reason) if started => return Err(reason.stopped()),
-        Ended::Interrupted(reason) => return Err(reason.before_start()),
-        Ended::Deadline if started => return Err(unknown("The program reached its deadline.")),
-        Ended::Deadline => return Err(not_started_by_deadline(&[])),
-        Ended::Failed(error) if started => return Err(unknown(error)),
+        Ended::Interrupted(reason) => return Err(reason.before_start().into()),
+        Ended::Deadline if started => {
+            return Err(unknown("The program reached its deadline.").into())
+        }
+        Ended::Deadline => return Err(not_started_by_deadline(&[]).into()),
+        Ended::Failed(error) if started => return Err(unknown(error).into()),
         Ended::Failed(error) => {
-            return Err(format!(
-                "browser_operation_rejected: {error} The program was not started."
-            ))
+            return Err(
+                format!("browser_operation_rejected: {error} The program was not started.").into(),
+            )
         }
     };
-    let result: Value = serde_json::from_slice(&bytes).map_err(|_| {
+    let malformed = || -> CommandError {
         if started {
-            unknown("The runner did not produce a complete JSON result.")
+            unknown("The runner did not produce a complete JSON result.").into()
         } else {
             "browser_operation_rejected: The Playwright runner stopped before starting the program."
-                .to_string()
+                .into()
         }
-    })?;
-    if result["success"] != true {
-        let message = result["error"]
-            .as_str()
-            .unwrap_or("The Playwright program failed.");
-        return Err(if started {
-            unknown(message)
-        } else {
-            format!("browser_operation_rejected: {message}")
-        });
+    };
+    let text = String::from_utf8(bytes).map_err(|_| malformed())?;
+    let record: Value =
+        serde_json::from_str(&replace_lone_surrogate_escapes(text)).map_err(|_| malformed())?;
+    if record["success"] == true {
+        return Ok(record["result"].clone());
     }
-    Ok(result["result"].clone())
+    if let Some(program) = record.get("program") {
+        let failure: ProgramFailure =
+            serde_json::from_value(program.clone()).map_err(|_| malformed())?;
+        return Err(failure.settle(started));
+    }
+    // The runner itself failed: it could not attach or select the tab.
+    let message = record["error"]
+        .as_str()
+        .unwrap_or("The Playwright program failed.");
+    Err(if started {
+        unknown(message)
+    } else {
+        format!("browser_operation_rejected: {message}")
+    }
+    .into())
+}
+
+/// The runner's report of a program that failed on its own: it did not
+/// compile, it threw, or it returned a value JSON cannot carry. It says how
+/// many Playwright calls the program issued before failing and which was
+/// last, and is the failure's `data` once settled.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ProgramFailure {
+    error: ThrownError,
+    /// None when the runner could not count: its Playwright client did not
+    /// expose the calls it issues, or the attachment did not close.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    page_calls_issued: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    last_page_call: Option<String>,
+}
+
+impl ProgramFailure {
+    /// A program that issued no Playwright call did nothing in the browser,
+    /// however far it ran: the caller fixes it and runs it again. One that
+    /// issued calls, or whose calls were not counted, may have acted.
+    fn settle(mut self, started: bool) -> CommandError {
+        if !started {
+            // No start record: no program code ran, whatever the record says.
+            self.page_calls_issued = Some(0);
+        }
+        if self.page_calls_issued == Some(0) {
+            self.last_page_call = None;
+        }
+        let thrown = &self.error;
+        let error = match self.page_calls_issued {
+            Some(0) => format!(
+                "{PROGRAM_ERROR}: The program failed before it issued any Playwright call, so nothing was done in the browser. The program runs in Node, where `page` is a Playwright Page; `document` and `window` exist only inside `page.evaluate()`. Fix the program and run it again. {thrown}"
+            ),
+            Some(count) => {
+                let last = self
+                    .last_page_call
+                    .as_deref()
+                    .map(|call| format!(" (last: {call})"))
+                    .unwrap_or_default();
+                let plural = if count == 1 { "" } else { "s" };
+                format!(
+                    "{} {thrown}",
+                    unknown(format!(
+                        "The program failed after it issued {count} Playwright call{plural}{last}."
+                    ))
+                )
+            }
+            None => format!("{} {thrown}", unknown("The program failed while it ran.")),
+        };
+        let data = serde_json::to_value(&self).expect("a program failure is plain data");
+        CommandError::with_data(error, data)
+    }
+}
+
+/// What the program threw, located in the program's own lines when its
+/// stack names them.
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+struct ThrownError {
+    /// Absent when the program threw a value that is not an Error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    line: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    column: Option<u32>,
+}
+
+impl std::fmt::Display for ThrownError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let (Some(line), Some(column)) = (self.line, self.column) {
+            write!(f, "Line {line}, column {column}: ")?;
+        }
+        if let Some(name) = self.name.as_deref().filter(|name| !name.is_empty()) {
+            write!(f, "{name}: ")?;
+        }
+        f.write_str(self.message.trim_end())
+    }
 }
 
 #[cfg(test)]
@@ -716,7 +818,7 @@ mod tests {
         let named = not_started_by_deadline(&["A1".into(), "B2".into()]);
         assert!(named.starts_with(&plain), "{named}");
         assert!(named.contains("these tabs have not: A1, B2."), "{named}");
-        assert_eq!(program_outcome(Ended::Deadline, false), Err(plain));
+        assert_eq!(program_outcome(Ended::Deadline, false), Err(plain.into()));
     }
 
     #[test]
@@ -725,7 +827,8 @@ mod tests {
             Ended::Failed("The runner did not accept its invocation.".into()),
             false,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .error;
         assert!(
             before.starts_with("browser_operation_rejected:"),
             "{before}"
@@ -734,7 +837,8 @@ mod tests {
             Ended::Failed("The program result could not be read.".into()),
             true,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .error;
         assert!(
             after.starts_with("browser_operation_outcome_unknown:"),
             "{after}"
@@ -743,7 +847,8 @@ mod tests {
             Ended::Record(br#"{"success":false,"started":false,"error":"boom"}"#.to_vec()),
             true,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .error;
         assert!(
             own.starts_with("browser_operation_outcome_unknown: boom"),
             "{own}"
@@ -761,31 +866,264 @@ mod tests {
     fn a_cleanup_failure_keeps_the_program_outcome_only_when_it_ran() {
         let failed = Err("The browser connection closed.".to_string());
         let reported = after_cleanup(
-            Err("browser_operation_outcome_unknown: boom".into()),
+            Err(CommandError::with_data(
+                "browser_operation_interrupted: stopped",
+                json!({"executionStopped": true}),
+            )),
             true,
             failed.clone(),
         )
         .unwrap_err();
         assert!(
             reported
+                .error
                 .starts_with("browser_operation_outcome_unknown: The browser connection closed."),
-            "{reported}"
+            "{reported:?}"
         );
         assert!(
-            reported.contains("reported: browser_operation_outcome_unknown: boom"),
-            "{reported}"
+            reported
+                .error
+                .contains("reported: browser_operation_interrupted: stopped"),
+            "{reported:?}"
         );
-        let returned = after_cleanup(Ok(json!(1)), true, failed.clone()).unwrap_err();
+        // A stop that did not settle cannot vouch for the program's facts.
+        assert_eq!(reported.data, None);
+        let returned = after_cleanup(Ok(json!(1)), true, failed.clone())
+            .unwrap_err()
+            .error;
         assert!(
             returned.contains("returned before cleanup failed"),
             "{returned}"
         );
-        let never_ran = "browser_controlled_by_user: User control prevented this Playwright program from starting.".to_string();
+        let never_ran = "browser_controlled_by_user: User control prevented this Playwright program from starting.";
         assert_eq!(
-            after_cleanup(Err(never_ran.clone()), false, failed),
-            Err(never_ran)
+            after_cleanup(Err(never_ran.into()), false, failed),
+            Err(never_ran.into())
         );
         assert_eq!(after_cleanup(Ok(json!(1)), true, Ok(())), Ok(json!(1)));
+    }
+
+    fn settled(record: Value, started: bool) -> CommandError {
+        settled_bytes(&serde_json::to_vec(&record).unwrap(), started)
+    }
+
+    fn settled_bytes(record: &[u8], started: bool) -> CommandError {
+        program_outcome(Ended::Record(record.to_vec()), started).unwrap_err()
+    }
+
+    /// The production failure: `document` read at the program's top level
+    /// throws in Node before any Playwright call. Nothing reached the page,
+    /// so it is a program error the model fixes, located in its own lines,
+    /// and never an unknown outcome.
+    #[test]
+    fn a_program_that_failed_before_any_call_is_a_program_error() {
+        let thrown = json!({"name":"ReferenceError","message":"document is not defined","line":1,"column":15});
+        let failure = settled(
+            json!({"success":false,"program":{"error":thrown,"pageCallsIssued":0}}),
+            true,
+        );
+        assert_eq!(
+            super::super::browser::error_code(&failure.error),
+            Some(PROGRAM_ERROR)
+        );
+        assert!(
+            failure.error.contains(
+                "before it issued any Playwright call, so nothing was done in the browser"
+            ),
+            "{failure:?}"
+        );
+        assert!(
+            failure.error.contains("The program runs in Node, where `page` is a Playwright Page; `document` and `window` exist only inside `page.evaluate()`."),
+            "{failure:?}"
+        );
+        assert!(
+            failure
+                .error
+                .ends_with("Line 1, column 15: ReferenceError: document is not defined"),
+            "{failure:?}"
+        );
+        assert_eq!(
+            failure.data,
+            Some(json!({"error":thrown,"pageCallsIssued":0}))
+        );
+        // A program that did not compile never ran; it has no location.
+        let syntax = settled(
+            json!({"success":false,"program":{"error":{"name":"SyntaxError","message":"Unexpected token ';'"},"pageCallsIssued":0}}),
+            false,
+        );
+        assert!(
+            syntax
+                .error
+                .starts_with(&format!("{PROGRAM_ERROR}: The program failed before")),
+            "{syntax:?}"
+        );
+        assert!(
+            syntax
+                .error
+                .ends_with(". SyntaxError: Unexpected token ';'"),
+            "{syntax:?}"
+        );
+        assert_eq!(
+            syntax.data,
+            Some(
+                json!({"error":{"name":"SyntaxError","message":"Unexpected token ';'"},"pageCallsIssued":0})
+            )
+        );
+        // A thrown value that is not an Error has only its text.
+        let value = settled(
+            json!({"success":false,"program":{"error":{"message":"boom"},"pageCallsIssued":0}}),
+            true,
+        );
+        assert!(value.error.ends_with("run it again. boom"), "{value:?}");
+    }
+
+    /// Without its start record no program code ran, whatever the runner's
+    /// record claims; with it, a counted call keeps the outcome unknown.
+    #[test]
+    fn only_a_started_program_can_have_issued_calls() {
+        let forged = settled(
+            json!({"success":false,"program":{"error":{"name":"Error","message":"x"},"pageCallsIssued":5,"lastPageCall":"page.goto"}}),
+            false,
+        );
+        assert_eq!(
+            super::super::browser::error_code(&forged.error),
+            Some(PROGRAM_ERROR)
+        );
+        assert_eq!(
+            forged.data,
+            Some(json!({"error":{"name":"Error","message":"x"},"pageCallsIssued":0}))
+        );
+    }
+
+    /// A program that issued calls may have acted: its outcome stays unknown
+    /// and says how many calls it issued and which was last. One whose calls
+    /// were not counted claims no count.
+    #[test]
+    fn a_program_that_failed_after_its_calls_leaves_the_outcome_unknown() {
+        let thrown = json!({"name":"TimeoutError","message":"locator.click: Timeout 300ms exceeded.\nCall log:\n  - waiting for locator('#missing')\n","line":2,"column":34});
+        let after = settled(
+            json!({"success":false,"program":{"error":thrown,"pageCallsIssued":2,"lastPageCall":"locator.click"}}),
+            true,
+        );
+        assert_eq!(
+            super::super::browser::error_code(&after.error),
+            Some("browser_operation_outcome_unknown")
+        );
+        assert!(
+            after.error.starts_with("browser_operation_outcome_unknown: The program failed after it issued 2 Playwright calls (last: locator.click). Earlier effects may have executed. Inspect the browser before continuing; do not replay the program. Line 2, column 34: TimeoutError: locator.click: Timeout 300ms exceeded.\nCall log:"),
+            "{after:?}"
+        );
+        assert!(!after.error.ends_with('\n'), "{after:?}");
+        assert_eq!(
+            after.data,
+            Some(json!({"error":thrown,"pageCallsIssued":2,"lastPageCall":"locator.click"}))
+        );
+        let one = settled(
+            json!({"success":false,"program":{"error":{"name":"Error","message":"x"},"pageCallsIssued":1,"lastPageCall":"page.goto"}}),
+            true,
+        );
+        assert!(
+            one.error
+                .contains("after it issued 1 Playwright call (last: page.goto)."),
+            "{one:?}"
+        );
+        let uncounted = settled(
+            json!({"success":false,"program":{"error":{"name":"Error","message":"x"},"pageCallsIssued":null}}),
+            true,
+        );
+        assert!(
+            uncounted
+                .error
+                .starts_with("browser_operation_outcome_unknown: The program failed while it ran."),
+            "{uncounted:?}"
+        );
+        assert_eq!(
+            uncounted.data,
+            Some(json!({"error":{"name":"Error","message":"x"}}))
+        );
+    }
+
+    /// A report the runner did not write whole proves nothing about calls.
+    #[test]
+    fn a_malformed_program_report_is_not_trusted() {
+        for program in [
+            json!({"pageCallsIssued":0}),
+            json!({"error":{"message":"x"},"pageCallsIssued":-1}),
+            json!({"error":{"message":"x","line":"1"},"pageCallsIssued":0}),
+            json!({"error":{"message":"x"},"pageCallsIssued":0,"extra":true}),
+        ] {
+            let record = json!({"success":false,"program":program});
+            let started = settled(record.clone(), true);
+            assert!(
+                started
+                    .error
+                    .starts_with("browser_operation_outcome_unknown: The runner did not produce"),
+                "{program}: {started:?}"
+            );
+            assert_eq!(started.data, None);
+            let never = settled(record, false);
+            assert!(
+                never.error.starts_with("browser_operation_rejected:"),
+                "{program}: {never:?}"
+            );
+        }
+    }
+
+    /// A program can produce a lone UTF-16 surrogate (by cutting text inside
+    /// a pair), which Node's JSON.stringify writes as a `\uD800`-style escape,
+    /// as Chrome's CDP serializer does. The record is decoded as the CDP
+    /// transport decodes: the surrogate becomes U+FFFD and the program's own
+    /// outcome is kept.
+    #[test]
+    fn a_lone_surrogate_in_a_record_keeps_the_program_outcome() {
+        assert_eq!(
+            program_outcome(
+                Ended::Record(
+                    br#"{"success":true,"result":{"title":"A\ud800B","pair":"\ud83d\ude00"}}"#
+                        .to_vec()
+                ),
+                true
+            ),
+            Ok(json!({"title":"A\u{FFFD}B","pair":"\u{1F600}"}))
+        );
+        let failure = settled_bytes(
+            br#"{"success":false,"program":{"error":{"name":"Error","message":"page said \udc00"},"pageCallsIssued":0}}"#,
+            true,
+        );
+        assert_eq!(
+            failure.data,
+            Some(
+                json!({"error":{"name":"Error","message":"page said \u{FFFD}"},"pageCallsIssued":0})
+            )
+        );
+    }
+
+    /// A human takeover's stop states its own facts; no other stop does.
+    #[test]
+    fn only_a_stop_for_human_control_reports_an_interruption() {
+        let interrupted =
+            program_outcome(Ended::Interrupted(InterruptReason::HumanControl), true).unwrap_err();
+        assert!(
+            interrupted
+                .error
+                .starts_with("browser_operation_interrupted: "),
+            "{interrupted:?}"
+        );
+        assert_eq!(
+            interrupted.data,
+            Some(
+                json!({"interruptedBy":"human","executionStopped":true,"effectsMayHaveOccurred":true})
+            )
+        );
+        let shutdown =
+            program_outcome(Ended::Interrupted(InterruptReason::Shutdown), true).unwrap_err();
+        assert!(
+            shutdown
+                .error
+                .starts_with("browser_operation_outcome_unknown: "),
+            "{shutdown:?}"
+        );
+        assert_eq!(shutdown.data, None);
     }
 
     #[tokio::test]
@@ -867,6 +1205,24 @@ mod tests {
         assert_eq!(
             state.browser.as_ref().unwrap().active_target_id().unwrap(),
             target
+        );
+        // Text cut inside a surrogate pair holds a lone UTF-16 surrogate; the
+        // result keeps the program's outcome, the surrogate replaced as the
+        // CDP reader replaces one.
+        let lone = Box::pin(execute_command(&json!({"action":"run_playwright","code":"return ('Ada ' + String.fromCodePoint(0x1F600)).slice(0, 5);","timeoutMs":15000}), &mut state)).await;
+        assert_eq!(lone["success"], true, "{lone}");
+        assert_eq!(lone["data"]["result"], "Ada \u{FFFD}");
+        // A promise the program rejects and never awaits is console output,
+        // not the program's outcome.
+        let unobserved = Box::pin(execute_command(&json!({"action":"run_playwright","code":"Promise.reject(new Error('unobserved')); return 2;","timeoutMs":15000}), &mut state)).await;
+        assert_eq!(unobserved["success"], true, "{unobserved}");
+        assert_eq!(unobserved["data"]["result"], 2);
+        assert!(
+            unobserved["data"]["diagnostics"]
+                .as_str()
+                .unwrap()
+                .starts_with("Unhandled rejection: Error: unobserved"),
+            "{unobserved}"
         );
         let result = Box::pin(execute_command(&json!({"action":"run_playwright","code":"await page.waitForTimeout(60000);","timeoutMs":1500}), &mut state)).await;
         assert_eq!(
@@ -956,6 +1312,183 @@ mod tests {
         assert_eq!(lost["code"], "browser_operation_outcome_unknown", "{lost}");
         assert!(lost_ms < 10_000, "{lost_ms} ms: {lost}");
         let _ = Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
+    }
+
+    /// A failed program settles by the Playwright calls it issued, in the
+    /// owned window production uses. The production failure, `document` read
+    /// at the top level of the Node program, throws before any call: a
+    /// program error located in the program's own lines, with the page
+    /// untouched. A wait that saw nothing and a program that does not compile
+    /// issue no call either. A program that acted and then failed stays an
+    /// unknown outcome naming its calls, and its effect is on the page. A call
+    /// the program leaves running when it fails is never taken for no call,
+    /// and only the runner's own close of the attachment goes uncounted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires local Chromium, the browser display helper and installed playwright-core 1.62.1"]
+    async fn e2e_playwright_program_errors_settle_by_the_calls_they_issued() {
+        use crate::native::actions::execute_command;
+        use crate::test_utils::EnvGuard;
+        let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+        env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+        env.set("DISPLAY", "");
+        let mut state = DaemonState::new();
+        let opened = Box::pin(execute_command(
+            &json!({"action":"navigate","url":"data:text/html,<title>Untouched</title><button>Go</button>"}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(opened["success"], true, "{opened}");
+        assert!(state.browser_control.lock().await.has_native_display());
+        let target = state
+            .browser
+            .as_ref()
+            .unwrap()
+            .active_target_id()
+            .unwrap()
+            .to_owned();
+        async fn program(state: &mut DaemonState, code: &str) -> Value {
+            Box::pin(execute_command(
+                &json!({"action":"run_playwright","timeoutMs":15000,"code":code}),
+                state,
+            ))
+            .await
+        }
+        async fn title(state: &mut DaemonState) -> Value {
+            Box::pin(execute_command(&json!({"action":"title"}), state)).await["data"]["title"]
+                .clone()
+        }
+
+        let refused = program(
+            &mut state,
+            "const rows = document.querySelectorAll('tr');\nreturn rows.length;",
+        )
+        .await;
+        eprintln!("PROGRAM ERROR {refused}");
+        assert_eq!(refused["success"], false, "{refused}");
+        assert_eq!(refused["code"], PROGRAM_ERROR, "{refused}");
+        assert_eq!(
+            refused["data"],
+            json!({"error":{"name":"ReferenceError","message":"document is not defined","line":1,"column":14},"pageCallsIssued":0})
+        );
+        let text = refused["error"].as_str().unwrap();
+        assert!(
+            text.contains(
+                "before it issued any Playwright call, so nothing was done in the browser"
+            ) && text.contains("`document` and `window` exist only inside `page.evaluate()`")
+                && text.ends_with("Line 1, column 14: ReferenceError: document is not defined"),
+            "{text}"
+        );
+
+        let waited = program(
+            &mut state,
+            "await page.waitForEvent('popup', { timeout: 200 });",
+        )
+        .await;
+        assert_eq!(waited["code"], PROGRAM_ERROR, "{waited}");
+        assert_eq!(waited["data"]["pageCallsIssued"], 0, "{waited}");
+        assert_eq!(waited["data"]["error"]["name"], "TimeoutError", "{waited}");
+        assert_eq!(waited["data"]["error"]["line"], 1, "{waited}");
+        assert_eq!(waited["data"]["error"]["column"], 12, "{waited}");
+
+        // A promise the program rejects and never awaits does not end the
+        // runner before it reports.
+        let unobserved = program(
+            &mut state,
+            "Promise.reject(new Error('unobserved'));\nconst rows = document.querySelectorAll('tr');",
+        )
+        .await;
+        assert_eq!(unobserved["code"], PROGRAM_ERROR, "{unobserved}");
+        assert_eq!(
+            unobserved["data"],
+            json!({"error":{"name":"ReferenceError","message":"document is not defined","line":2,"column":14},"pageCallsIssued":0})
+        );
+
+        let syntax = program(&mut state, "const a = ;").await;
+        assert_eq!(syntax["code"], PROGRAM_ERROR, "{syntax}");
+        assert_eq!(
+            syntax["data"],
+            json!({"error":{"name":"SyntaxError","message":"Unexpected token ';'"},"pageCallsIssued":0})
+        );
+        assert_eq!(title(&mut state).await, "Untouched");
+
+        let acted = program(
+            &mut state,
+            "await page.evaluate(() => { document.title = 'Touched'; });\nawait page.locator('#missing').click({ timeout: 300 });",
+        )
+        .await;
+        eprintln!("ACTED {acted}");
+        assert_eq!(
+            acted["code"], "browser_operation_outcome_unknown",
+            "{acted}"
+        );
+        assert_eq!(acted["data"]["pageCallsIssued"], 2, "{acted}");
+        assert_eq!(acted["data"]["lastPageCall"], "locator.click", "{acted}");
+        assert_eq!(acted["data"]["error"]["name"], "TimeoutError", "{acted}");
+        assert_eq!(acted["data"]["error"]["line"], 2, "{acted}");
+        assert_eq!(acted["data"]["error"]["column"], 32, "{acted}");
+        let message = acted["data"]["error"]["message"].as_str().unwrap();
+        assert!(
+            message.starts_with("locator.click: Timeout 300ms exceeded.")
+                && !message.contains('\u{1b}'),
+            "{message:?}"
+        );
+        assert!(
+            acted["error"].as_str().unwrap().contains(
+                "The program failed after it issued 2 Playwright calls (last: locator.click). Earlier effects may have executed."
+            ),
+            "{acted}"
+        );
+        assert_eq!(title(&mut state).await, "Touched");
+
+        // A call scheduled before the failure and issued while the runner
+        // closes its attachment: whichever lands first, a program error
+        // always means the page was not touched.
+        let reset = Box::pin(execute_command(
+            &json!({"action":"evaluate","script":"document.title = 'Untouched'"}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(reset["success"], true, "{reset}");
+        let floating = program(
+            &mut state,
+            "setTimeout(() => page.evaluate(() => { document.title = 'Floating'; }), 0);\nthrow new Error('scheduled');",
+        )
+        .await;
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let after = title(&mut state).await;
+        eprintln!(
+            "FLOATING code={} calls={} title={after}",
+            floating["code"], floating["data"]["pageCallsIssued"]
+        );
+        match floating["code"].as_str() {
+            Some(PROGRAM_ERROR) => assert_eq!(after, "Untouched", "{floating}"),
+            Some("browser_operation_outcome_unknown") => {}
+            _ => panic!("{floating}"),
+        }
+
+        // Only the runner's own close goes uncounted: a program that wraps
+        // `browser.close` to act on the page first is counted.
+        let wrapped = program(
+            &mut state,
+            "const close = browser.close.bind(browser);\nbrowser.close = (...args) => { page.evaluate(() => { document.title = 'Wrapped'; }).catch(() => {}); return close(...args); };\nthrow new Error('wrapped');",
+        )
+        .await;
+        assert_eq!(
+            wrapped["code"], "browser_operation_outcome_unknown",
+            "{wrapped}"
+        );
+        assert_eq!(wrapped["data"]["pageCallsIssued"], 1, "{wrapped}");
+        assert_eq!(
+            wrapped["data"]["lastPageCall"], "page.evaluate",
+            "{wrapped}"
+        );
+        eprintln!("WRAPPED title={}", title(&mut state).await);
+
+        assert_eq!(
+            state.browser.as_ref().unwrap().active_target_id().unwrap(),
+            target
+        );
+        Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

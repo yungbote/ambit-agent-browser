@@ -3218,6 +3218,9 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
+    // A failure's facts beyond its message, stated by the handler that
+    // produced it (see `CommandError`).
+    let mut failure_data = None;
     let result = match action {
         "launch" => {
             let webmcp_enabled = cmd
@@ -3238,7 +3241,14 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         "title" => handle_title(state).await,
         "content" => handle_content(state).await,
         "evaluate" => handle_evaluate(cmd, state).await,
-        "run_playwright" => super::playwright::run(cmd, state).await,
+        "run_playwright" => {
+            super::playwright::run(cmd, state)
+                .await
+                .map_err(|CommandError { error, data }| {
+                    failure_data = data;
+                    error
+                })
+        }
         "close" => handle_close(state).await,
         "snapshot" => handle_snapshot(cmd, state).await,
         "screenshot" => handle_screenshot(cmd, state).await,
@@ -3426,6 +3436,9 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         Ok(data) => success_response(&id, data),
         Err(e) => error_response(&id, &super::browser::to_ai_friendly_error(&e)),
     };
+    if let Some(data) = failure_data {
+        resp["data"] = data;
+    }
     attach_tab_recovery(&mut resp, state).await;
 
     // A failed binding write is retried on the next command, but a pinned
@@ -13266,6 +13279,37 @@ fn inject_lifecycle(
     );
 }
 
+/// A failed command as its response states it: the error, which keeps a
+/// coded failure's `code: ` prefix, and the facts its handler reports with
+/// it under `data`. Only the handler that failed knows those facts, so it
+/// states them rather than the response builder inferring them from a code.
+#[derive(Debug, PartialEq)]
+pub(crate) struct CommandError {
+    pub(crate) error: String,
+    pub(crate) data: Option<Value>,
+}
+
+impl CommandError {
+    pub(crate) fn with_data(error: impl Into<String>, data: Value) -> Self {
+        Self {
+            error: error.into(),
+            data: Some(data),
+        }
+    }
+}
+
+impl From<String> for CommandError {
+    fn from(error: String) -> Self {
+        Self { error, data: None }
+    }
+}
+
+impl From<&str> for CommandError {
+    fn from(error: &str) -> Self {
+        error.to_string().into()
+    }
+}
+
 fn error_response(id: &str, error: &str) -> Value {
     let mut resp = json!({
         "id": id,
@@ -13276,9 +13320,6 @@ fn error_response(id: &str, error: &str) -> Value {
     // of parsing the message.
     if let Some(code) = super::browser::error_code(error) {
         resp["code"] = json!(code);
-        if code == "browser_operation_interrupted" {
-            resp["data"] = json!({"interruptedBy":"human","executionStopped":true,"effectsMayHaveOccurred":true});
-        }
     }
     resp
 }

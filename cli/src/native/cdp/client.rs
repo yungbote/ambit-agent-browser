@@ -79,15 +79,16 @@ const WS_KEEPALIVE_INTERVAL_SECS: u64 = 30;
 
 /// Chrome serializes a lone UTF-16 surrogate in page-controlled text (a
 /// title, an accessible name, a console argument) as a `\uD800`-style JSON
-/// escape. That is not a Unicode scalar value, so serde_json refuses the
-/// whole message: the command awaiting a reply would time out, and an event
-/// would go unseen. Every lone surrogate escape becomes U+FFFD before the
-/// message is parsed; a surrogate pair is kept. JSON has no backslash
+/// escape, and so does Node's `JSON.stringify` in a Playwright program's
+/// result record. That is not a Unicode scalar value, so serde_json refuses
+/// the whole message: the command awaiting a reply would time out, and an
+/// event would go unseen. Every lone surrogate escape becomes U+FFFD before
+/// the message is parsed; a surrogate pair is kept. JSON has no backslash
 /// outside a string, so every backslash starts an escape, and a two-character
 /// escape (`\\`, `\"`) is stepped over whole so its second character is never
 /// read as the start of another. A message without a lone surrogate is
 /// returned as it came, without a copy.
-fn replace_lone_surrogate_escapes(text: String) -> String {
+pub(crate) fn replace_lone_surrogate_escapes(text: String) -> String {
     let mut replaced = String::new();
     let mut copied = 0;
     let mut cursor = 0;

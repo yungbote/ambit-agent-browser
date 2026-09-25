@@ -522,3 +522,51 @@ fn host_theme_launches_from_configuration_and_switches_under_person_control() {
         false
     );
 }
+
+/// The production failure through the host-bound catalog: a program that
+/// reads `document` in Node before any Playwright call reaches the model as a
+/// program error it can fix, with the error's place in the program, and the
+/// page is untouched.
+#[test]
+#[cfg(unix)]
+#[ignore = "requires AMBIT_TEST_CHROME_EXECUTABLE, AMBIT_TEST_NODE and AMBIT_TEST_PLAYWRIGHT_MODULE"]
+fn host_playwright_program_that_fails_before_any_call_is_a_program_error() {
+    let host = Host::new();
+    let opened = host.call(
+        "agent_browser_open",
+        json!({ "url": "data:text/html,<title>Untouched</title><table><tr><td>1</td></tr></table>" }),
+    );
+    assert_eq!(opened["isError"], false, "{opened}");
+    let refused = host.call(
+        "agent_browser_run_playwright",
+        json!({ "code": "const rows = document.querySelectorAll('tr');\nreturn rows.length;" }),
+    );
+    assert_eq!(refused["isError"], true, "{refused}");
+    let response = &refused["structuredContent"]["response"];
+    assert_eq!(response["code"], "browser_program_error", "{refused}");
+    assert_eq!(
+        response["data"],
+        json!({"error":{"name":"ReferenceError","message":"document is not defined","line":1,"column":14},"pageCallsIssued":0})
+    );
+    let text = refused["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.starts_with("browser_program_error: The program failed before it issued any Playwright call, so nothing was done in the browser.")
+            && text.ends_with("Line 1, column 14: ReferenceError: document is not defined"),
+        "{text}"
+    );
+    let fixed = host.call(
+        "agent_browser_run_playwright",
+        json!({ "code": "return await page.evaluate(() => document.querySelectorAll('tr').length);" }),
+    );
+    assert_eq!(fixed["isError"], false, "{fixed}");
+    assert_eq!(fixed["structuredContent"]["response"]["data"]["result"], 1);
+    let title = host.call("agent_browser_get_title", json!({}));
+    assert_eq!(
+        title["structuredContent"]["response"]["data"]["title"], "Untouched",
+        "{title}"
+    );
+    assert_eq!(
+        host.call("agent_browser_close", json!({}))["isError"],
+        false
+    );
+}
