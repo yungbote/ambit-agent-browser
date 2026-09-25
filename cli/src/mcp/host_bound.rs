@@ -231,23 +231,10 @@ impl HostBinding {
             "session": self.config.session, "captureDirectory": self.config.capture_directory,
             "timeoutMs": invocation.timeout_ms, "expectedObservation": self.config.expected_observation,
             "launch": launch });
-        Ok(result(send(command, &flags.session)))
+        Ok(result(
+            send_command_detailed(command, &flags.session).unwrap_or_else(Response::from),
+        ))
     }
-}
-
-fn send(command: Value, session: &str) -> Response {
-    send_command_detailed(command, session).unwrap_or_else(|error| Response {
-        error: Some(error.message),
-        code: Some(
-            if error.outcome_unknown {
-                "command_outcome_unknown"
-            } else {
-                "browser_runtime_unavailable"
-            }
-            .into(),
-        ),
-        ..Response::default()
-    })
 }
 
 fn result(mut response: Response) -> Value {

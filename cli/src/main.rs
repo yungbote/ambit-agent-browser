@@ -260,9 +260,7 @@ fn build_local_launch_command(flags: &Flags) -> serde_json::Value {
     // on daemons spawned before the change.
     launch_cmd["noXvfb"] = json!(flags.no_xvfb);
 
-    if let Some(ref cs) = flags.color_scheme {
-        launch_cmd["colorScheme"] = json!(cs);
-    }
+    attach_appearance_to_launch_command(&mut launch_cmd, flags);
 
     if let Some(ref dp) = flags.download_path {
         launch_cmd["downloadPath"] = json!(dp);
@@ -309,6 +307,26 @@ fn attach_webmcp_launch_option(launch_cmd: &mut serde_json::Value, flags: &Flags
     }
 }
 
+/// The appearance a launch carries: pages' `--color-scheme` and the browser
+/// theme. The daemon applies both only when a browser actually launches.
+fn attach_appearance_to_launch_command(launch_cmd: &mut serde_json::Value, flags: &Flags) {
+    if let Some(ref scheme) = flags.color_scheme {
+        launch_cmd["colorScheme"] = json!(scheme);
+    }
+    if let Some(ref theme) = flags.theme {
+        launch_cmd["theme"] = json!(theme);
+    }
+}
+
+/// A theme from the flag, environment or config that is not dark or light.
+fn invalid_theme_error(flags: &Flags) -> Option<String> {
+    flags
+        .theme
+        .as_deref()
+        .filter(|theme| native::theme::Theme::parse(theme).is_none())
+        .map(|theme| format!("Invalid theme '{}'. Use dark or light.", theme))
+}
+
 fn attach_allowed_domains_to_launch_command(launch_cmd: &mut serde_json::Value, flags: &Flags) {
     if let Some(ref domains) = flags.allowed_domains {
         launch_cmd["allowedDomains"] = json!(domains);
@@ -351,9 +369,7 @@ fn build_provider_launch_command(provider: &str, flags: &Flags) -> serde_json::V
     attach_restore_config_to_command(&mut launch_cmd, flags);
     attach_ca_cert_to_launch_command(&mut launch_cmd, flags);
 
-    if let Some(ref cs) = flags.color_scheme {
-        launch_cmd["colorScheme"] = json!(cs);
-    }
+    attach_appearance_to_launch_command(&mut launch_cmd, flags);
 
     launch_cmd
 }
@@ -483,6 +499,7 @@ fn should_send_local_launch_config(flags: &Flags, command: &serde_json::Value) -
         || flags.no_webmcp
         || flags.cli_no_webmcp
         || flags.color_scheme.is_some()
+        || flags.theme.is_some()
         || flags.download_path.is_some()
         || flags.engine.is_some()
         || flags.allowed_domains.is_some()
@@ -1892,6 +1909,31 @@ fn main() {
         return;
     }
 
+    // A theme change reaches a session that is already running: it never
+    // starts a daemon or launches a browser.
+    if cmd["action"] == native::theme::ACTION {
+        let resp =
+            connection::send_command_if_running(cmd, &flags.session).unwrap_or_else(Response::from);
+        print_response_with_opts(
+            &resp,
+            Some(native::theme::ACTION),
+            &OutputOptions::from_flags(&flags),
+        );
+        if !resp.success {
+            exit(1);
+        }
+        return;
+    }
+
+    if let Some(msg) = invalid_theme_error(&flags) {
+        if flags.json {
+            print_json_error_with_type(msg, "invalid_value");
+        } else {
+            eprintln!("{} {}", color::error_indicator(), msg);
+        }
+        exit(1);
+    }
+
     if let Some(msg) = incompatible_launch_mode_error(&flags) {
         if flags.json {
             print_json_error(msg);
@@ -1968,9 +2010,7 @@ fn main() {
 
         attach_ca_cert_to_launch_command(&mut launch_cmd, &flags);
 
-        if let Some(ref cs) = flags.color_scheme {
-            launch_cmd["colorScheme"] = json!(cs);
-        }
+        attach_appearance_to_launch_command(&mut launch_cmd, &flags);
 
         if let Some(ref dp) = flags.download_path {
             launch_cmd["downloadPath"] = json!(dp);
@@ -2059,9 +2099,7 @@ fn main() {
 
         attach_ca_cert_to_launch_command(&mut launch_cmd, &flags);
 
-        if let Some(ref cs) = flags.color_scheme {
-            launch_cmd["colorScheme"] = json!(cs);
-        }
+        attach_appearance_to_launch_command(&mut launch_cmd, &flags);
 
         if let Some(ref dp) = flags.download_path {
             launch_cmd["downloadPath"] = json!(dp);
@@ -2531,6 +2569,7 @@ mod tests {
         flags.no_webmcp = false;
         flags.cli_no_webmcp = false;
         flags.color_scheme = None;
+        flags.theme = None;
         flags.download_path = None;
         flags.engine = None;
         flags.allowed_domains = None;
@@ -2727,6 +2766,46 @@ mod tests {
         let mut launch = json!({ "action": "launch" });
         attach_webmcp_launch_option(&mut launch, &flags);
         assert_eq!(launch["webmcp"], false);
+    }
+
+    #[test]
+    fn test_theme_rides_every_launch_command_and_requests_a_local_launch() {
+        let mut flags = neutral_launch_config_flags();
+        let command = json!({ "action": "snapshot" });
+        assert!(!should_send_local_launch_config(&flags, &command));
+        assert!(build_local_launch_command(&flags).get("theme").is_none());
+        flags.theme = Some("dark".into());
+        assert!(should_send_local_launch_config(&flags, &command));
+        assert_eq!(build_local_launch_command(&flags)["theme"], "dark");
+        assert_eq!(
+            build_provider_launch_command("browserbase", &flags)["theme"],
+            "dark"
+        );
+        assert_eq!(invalid_theme_error(&flags), None);
+        flags.theme = Some("system".into());
+        assert_eq!(
+            invalid_theme_error(&flags).as_deref(),
+            Some("Invalid theme 'system'. Use dark or light.")
+        );
+    }
+
+    #[test]
+    fn test_published_schemas_define_matching_theme() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("cli should have a repository parent");
+        let schema = |path: &str| -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(repo_root.join(path)).unwrap()).unwrap()
+        };
+        let root = schema("agent-browser.schema.json");
+        assert_eq!(
+            root["properties"]["theme"]["enum"],
+            json!(["dark", "light"])
+        );
+        assert_eq!(
+            root["properties"]["theme"],
+            schema("docs/public/schema.json")["properties"]["theme"]
+        );
     }
 
     #[test]

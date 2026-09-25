@@ -255,6 +255,54 @@ fn absent_required_daemon_never_creates_session_files() {
     }
 }
 
+/// A theme change reaches a session that is already running and nothing
+/// else: without one, no daemon starts; with one, the client sends exactly
+/// set_theme, never the launch its flags would otherwise send first.
+#[test]
+fn set_theme_never_starts_a_daemon_or_sends_a_launch() {
+    let fixture = Fixture::new();
+    let args = [
+        "--json", "--headed", "--theme", "dark", "set", "theme", "light",
+    ];
+    let output = fixture.run(&args);
+    assert!(!output.status.success(), "{output:?}");
+    let refused = response(&output);
+    assert_eq!(refused["code"], "browser_runtime_unavailable", "{refused}");
+    assert!(refused["error"]
+        .as_str()
+        .unwrap()
+        .contains("No browser session 'supervised' is running"));
+    fixture.assert_clean();
+    assert!(!fixture.path("lock").exists());
+
+    let listener = UnixListener::bind(fixture.path("sock")).unwrap();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut line = String::new();
+            // A liveness probe connects and sends nothing.
+            if BufReader::new(&stream).read_line(&mut line).unwrap_or(0) == 0 {
+                continue;
+            }
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let reply = serde_json::json!({ "id": request["id"], "success": true,
+                "data": { "theme": "light", "pages": "next_launch", "ui": "next_launch" } });
+            writeln!(stream, "{reply}").unwrap();
+            requests.push(request);
+            return requests;
+        }
+        requests
+    });
+    let output = fixture.run(&args);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(response(&output)["data"]["theme"], "light");
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["action"], "set_theme");
+    assert_eq!(requests[0]["theme"], "light");
+}
+
 #[test]
 fn mcp_server_forwards_required_daemon_policy_to_real_tool_processes() {
     let fixture = Fixture::new();

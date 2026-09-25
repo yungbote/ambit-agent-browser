@@ -339,6 +339,27 @@ fn format_vitals_text(data: &serde_json::Value) -> String {
     lines.join("\n")
 }
 
+/// Where a theme change took effect: pages now or at the next launch, and the
+/// window UI at the next launch (a browser without a UI of its own has none).
+fn format_theme_text(data: &serde_json::Value) -> String {
+    let pages = if data["pages"] == "live" {
+        "pages switched"
+    } else {
+        "pages at the next launch"
+    };
+    let ui = match data["ui"].as_str() {
+        Some("live") => ", window UI switched",
+        Some("next_launch") => ", window UI at the next launch",
+        _ => "",
+    };
+    format!(
+        "Theme {}: {}{}",
+        data["theme"].as_str().unwrap_or_default(),
+        pages,
+        ui
+    )
+}
+
 pub(crate) fn format_a11y_text(data: &serde_json::Value) -> String {
     let url = data.get("url").and_then(|v| v.as_str()).unwrap_or("-");
     let version = data
@@ -551,6 +572,10 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
         }
         if action == Some("a11y") {
             println!("{}", format_a11y_text(data));
+            return;
+        }
+        if action == Some(crate::native::theme::ACTION) {
+            println!("{} {}", color::success_indicator(), format_theme_text(data));
             return;
         }
         if action == Some("storage_get") {
@@ -2430,6 +2455,10 @@ Settings:
   credentials <user> <pass>  Set HTTP authentication for current and future tabs
   media [dark|light]         Set color scheme preference
         [reduced-motion]     Enable reduced motion
+  theme <dark|light>         Set the browser theme: Chrome's own window UI and
+                             every page's prefers-color-scheme. Pages switch
+                             now; the window UI follows at the next launch.
+                             Acts on a running session; never launches one
 
 Global Options:
   --json               Output as JSON
@@ -2445,6 +2474,7 @@ Examples:
   agent-browser set credentials admin secret123
   agent-browser set media dark
   agent-browser set media light reduced-motion
+  agent-browser set theme dark
 "##
         }
 
@@ -3878,7 +3908,7 @@ Mouse:  agent-browser mouse <action> [args]
 Browser Settings:  agent-browser set <setting> [value]
   viewport <w> <h>, device <name>, geo <lat> <lng>
   offline [on|off], headers <json>, credentials <user> <pass>
-  media [dark|light] [reduced-motion]
+  media [dark|light] [reduced-motion], theme <dark|light>
 
 Network:  agent-browser network <action>
   route <url> [--abort|--body <json>] [--resource-type <csv>]
@@ -4072,6 +4102,9 @@ Options:
                              data.lastUrl and the open tabs. Sticky per session.
   --no-pin-tab               Disable a sticky pin previously enabled with --pin-tab
   --color-scheme <scheme>    Color scheme: dark, light, no-preference (or AGENT_BROWSER_COLOR_SCHEME)
+  --theme <dark|light>       Browser theme at launch: Chrome's window UI and pages'
+                             prefers-color-scheme; --color-scheme still decides pages
+                             (or AGENT_BROWSER_THEME)
   --download-path <path>     Default download directory (or AGENT_BROWSER_DOWNLOAD_PATH)
   --content-boundaries       Wrap page output in boundary markers (or AGENT_BROWSER_CONTENT_BOUNDARIES)
   --max-output <chars>       Truncate page output to N chars (or AGENT_BROWSER_MAX_OUTPUT)
@@ -4162,6 +4195,7 @@ Environment:
   AGENT_BROWSER_ALLOW_FILE_ACCESS Allow file:// URLs to access local files
   AGENT_BROWSER_HIDE_SCROLLBARS  Hide scrollbars in headless Chromium screenshots (default: true)
   AGENT_BROWSER_COLOR_SCHEME     Color scheme preference (dark, light, no-preference)
+  AGENT_BROWSER_THEME            Browser theme at launch: window UI and pages (dark, light)
   AGENT_BROWSER_DOWNLOAD_PATH    Default download directory for browser downloads
   AGENT_BROWSER_DEFAULT_TIMEOUT  Default action timeout in ms (default: 25000)
   AGENT_BROWSER_SESSION_NAME     Legacy auto-save/load state persistence name
@@ -4224,6 +4258,7 @@ Examples:
   agent-browser stream enable            # Start runtime streaming on an auto-selected port
   agent-browser stream status            # Inspect runtime streaming state
   agent-browser --color-scheme dark open example.com  # Dark mode
+  agent-browser --theme dark --headed open example.com  # Dark window UI and pages
   agent-browser --profile Default open gmail.com        # Reuse Chrome login state
   agent-browser --profile ~/.myapp open example.com    # Persistent custom profile
   agent-browser profiles                               # List available Chrome profiles
@@ -4334,11 +4369,31 @@ pub fn print_version() {
 #[cfg(test)]
 mod tests {
     use super::{
-        boundary_origin, format_a11y_text, format_storage_text, format_vitals_text,
-        format_webmcp_availability_text, format_webmcp_text, format_webmcp_tool_text,
-        format_with_boundaries, OutputOptions,
+        boundary_origin, format_a11y_text, format_storage_text, format_theme_text,
+        format_vitals_text, format_webmcp_availability_text, format_webmcp_text,
+        format_webmcp_tool_text, format_with_boundaries, OutputOptions,
     };
     use serde_json::json;
+
+    #[test]
+    fn theme_text_says_where_the_theme_took_effect() {
+        for (data, text) in [
+            (
+                json!({ "theme": "dark", "pages": "live", "ui": "next_launch" }),
+                "Theme dark: pages switched, window UI at the next launch",
+            ),
+            (
+                json!({ "theme": "light", "pages": "live", "ui": "none" }),
+                "Theme light: pages switched",
+            ),
+            (
+                json!({ "theme": "light", "pages": "next_launch", "ui": "next_launch" }),
+                "Theme light: pages at the next launch, window UI at the next launch",
+            ),
+        ] {
+            assert_eq!(format_theme_text(&data), text);
+        }
+    }
 
     #[test]
     fn test_format_stream_status_text_for_enabled_stream() {
