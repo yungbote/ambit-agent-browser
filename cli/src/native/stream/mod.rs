@@ -1,5 +1,6 @@
 mod cdp_loop;
 pub(crate) mod chat;
+mod cursor_identity;
 mod dashboard;
 mod discovery;
 mod http;

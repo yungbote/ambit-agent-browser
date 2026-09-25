@@ -13019,7 +13019,7 @@ async fn e2e_native_cropping_viewer_resizes_during_an_agent_command_and_gets_cur
         control_test_command(&json!({"action":"stream_enable","port":0}), &mut state).await;
     assert_success(&enabled);
     let port = enabled["data"]["port"].as_u64().unwrap();
-    let html = r#"<!doctype html><style>body{margin:0}#go{position:absolute;left:40px;top:40px;width:160px;height:60px;cursor:pointer}#field{position:absolute;left:40px;top:160px;width:200px;height:40px}#busy{position:absolute;left:40px;top:260px;width:160px;height:60px;cursor:progress;background:#ddd}</style><button id=go>Go</button><input id=field><div id=busy></div><script>window.clicks=[];go.onclick=e=>clicks.push({x:e.clientX,y:e.clientY,w:innerWidth})</script>"#;
+    let html = r#"<!doctype html><style>body{margin:0}#go{position:absolute;left:40px;top:40px;width:160px;height:60px;cursor:pointer}#field{position:absolute;left:40px;top:160px;width:200px;height:40px}#busy{position:absolute;left:40px;top:260px;width:160px;height:60px;cursor:progress;background:#ddd}#deny{position:absolute;left:260px;top:40px;width:160px;height:60px;cursor:not-allowed}#grab{position:absolute;left:260px;top:160px;width:160px;height:60px;cursor:grabbing}#wait{position:absolute;left:260px;top:260px;width:160px;height:60px;cursor:wait}</style><button id=go>Go</button><input id=field><div id=busy></div><div id=deny></div><div id=grab></div><div id=wait></div><script>window.clicks=[];go.onclick=e=>clicks.push({x:e.clientX,y:e.clientY,w:innerWidth})</script>"#;
     assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
     let features = state
         .browser
@@ -13194,9 +13194,15 @@ async fn e2e_native_cropping_viewer_resizes_during_an_agent_command_and_gets_cur
         let pointer = expect_cursor("#go", "pointer").await;
         let text = expect_cursor("#field", "text").await;
         let progress = expect_cursor("#busy", "progress").await;
+        // Keywords whose cursors share one image on this image: the helper
+        // names the class, the hovered element's computed cursor the member.
+        let not_allowed = expect_cursor("#deny", "not-allowed").await;
+        let grabbing = expect_cursor("#grab", "grabbing").await;
+        let wait = expect_cursor("#wait", "wait").await;
         println!(
             "CURSOR_IDENTITY {}",
-            json!({"pointerMs": pointer, "textMs": text, "progressMs": progress})
+            json!({"pointerMs": pointer, "textMs": text, "progressMs": progress,
+                "notAllowedMs": not_allowed, "grabbingMs": grabbing, "waitMs": wait})
         );
     }
     println!("FRAMES_SEEN {frames_seen}");

@@ -179,7 +179,14 @@ pub(super) async fn cdp_event_loop(
     recording: Arc<Mutex<bool>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
+    let cursors = super::cursor_identity::CursorIdentities::new(
+        frame_tx.clone(),
+        media.clone(),
+        client_slot.clone(),
+        cdp_session_id.clone(),
+    );
     let sinks = super::window_capture::Sinks {
+        cursors: cursors.clone(),
         frame_tx: frame_tx.clone(),
         frame_watch: frame_watch.clone(),
         presentation: presentation.clone(),
@@ -219,7 +226,7 @@ pub(super) async fn cdp_event_loop(
         let client = client_slot.read().await.clone();
         let display = display_slot.read().await.clone();
         if identity_source.as_deref() != display.as_ref().map(|display| display.identity()) {
-            media.set_cursor(None);
+            cursors.reset();
             identity_source = display
                 .as_ref()
                 .map(|display| display.identity().to_string());

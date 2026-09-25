@@ -6,16 +6,18 @@
 //! pacing only caps the rate. An older helper is polled at the pacing rate.
 //! Every answer may also carry the displayed cursor's identity
 //! (`cursorIdentity`), which viewers that draw the pointer receive as a
-//! `cursor` message. A capture in flight is never cancelled: that would end
-//! the helper link. Stopping takes effect when it answers.
+//! `cursor` message (`cursor_identity`). A capture in flight is never
+//! cancelled: that would end the helper link. Stopping takes effect when it
+//! answers.
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use serde_json::{json, Value};
+use serde_json::json;
 use tokio::sync::{broadcast, watch, Mutex, Notify};
 
+use super::cursor_identity::CursorIdentities;
 use super::presentation::Presentation;
 use super::{StreamFrame, StreamMedia};
 use crate::native::browser_control::custody_active;
@@ -27,9 +29,6 @@ const CAPTURE_WAIT_MS: u32 = 100;
 /// The least time between two captures when the first found nothing, so a
 /// helper that answers unchanged early never spins the loop.
 const IDLE_SPACING: Duration = Duration::from_millis(4);
-/// A cursor record larger than this is not forwarded (the helper bounds a
-/// page's own cursor image at 4 KiB).
-const MAX_CURSOR_RECORD: usize = 96 * 1024;
 
 /// What the capture loop shares with the stream.
 #[derive(Clone)]
@@ -41,6 +40,7 @@ pub(super) struct Sinks {
     pub media: Arc<StreamMedia>,
     pub client_count: Arc<Mutex<usize>>,
     pub patch_clients: Arc<AtomicUsize>,
+    pub cursors: CursorIdentities,
 }
 
 /// A viewer needs a whole frame: a new viewer, or a writer that skipped a
@@ -178,10 +178,7 @@ async fn run(
                     } else {
                         answered
                     };
-                    if let Some(message) = cursor_message(cursor, at) {
-                        sinks.media.set_cursor(Some(message.clone()));
-                        let _ = sinks.frame_tx.send(message);
-                    }
+                    sinks.cursors.observe(cursor, at);
                 }
                 next = match captured.frame {
                     Some((capture, surface)) => {
@@ -252,33 +249,10 @@ fn publish(
     })));
 }
 
-/// The viewer message for one helper cursor identity: `serial`, a CSS
-/// keyword or null, and for a page's own cursor its `image`. A record of
-/// another shape is not forwarded.
-fn cursor_message(identity: Value, ts: u64) -> Option<String> {
-    let serial = identity["serial"]
-        .as_u64()
-        .filter(|serial| *serial <= u64::from(u32::MAX))?;
-    let css = &identity["css"];
-    let image = identity.get("image");
-    let shaped = match (css, image) {
-        (Value::String(keyword), None) => !keyword.is_empty(),
-        (Value::Null, Some(image)) => image.is_object(),
-        _ => false,
-    };
-    if !shaped {
-        return None;
-    }
-    let mut message = json!({ "type": "cursor", "ts": ts, "serial": serial, "css": css });
-    if let Some(image) = image {
-        message["image"] = image.clone();
-    }
-    Some(message.to_string()).filter(|message| message.len() <= MAX_CURSOR_RECORD)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::Value;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
 
@@ -306,6 +280,12 @@ mod tests {
         let media = Arc::new(StreamMedia::new(applied.clone()));
         media.viewer_joined(false, false);
         let sinks = Sinks {
+            cursors: CursorIdentities::new(
+                frame_tx.clone(),
+                media.clone(),
+                Arc::new(tokio::sync::RwLock::new(None)),
+                Arc::new(tokio::sync::RwLock::new(None)),
+            ),
             frame_tx,
             frame_watch,
             presentation: Arc::new(Presentation::new()),
@@ -468,28 +448,6 @@ mod tests {
         assert_eq!(cursor["css"], Value::Null);
         assert_eq!(cursor["image"], image);
         assert_eq!(cursor["ts"], frame["ts"], "the frame that carried it");
-    }
-
-    #[test]
-    fn only_a_keyword_or_an_image_is_a_cursor_identity() {
-        assert!(cursor_message(json!({"serial": 1, "css": "pointer"}), 7).is_some());
-        assert!(cursor_message(json!({"serial": 1, "css": null, "image": {}}), 7).is_some());
-        for identity in [
-            json!({"serial": 1, "css": "pointer", "image": {}}),
-            json!({"serial": 1, "css": null}),
-            json!({"serial": 1, "css": ""}),
-            json!({"serial": 1}),
-            json!({"serial": -1, "css": "text"}),
-            json!({"serial": u64::from(u32::MAX) + 1, "css": "text"}),
-            json!({"css": "text"}),
-            json!("text"),
-        ] {
-            assert!(cursor_message(identity.clone(), 7).is_none(), "{identity}");
-        }
-        let huge = "a".repeat(MAX_CURSOR_RECORD);
-        assert!(
-            cursor_message(json!({"serial": 1, "css": null, "image": {"png": huge}}), 7).is_none()
-        );
     }
 
     /// A frame dropped as taken across a layout means the helper's next
