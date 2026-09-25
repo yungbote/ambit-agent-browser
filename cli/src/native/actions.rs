@@ -45,6 +45,7 @@ use super::state;
 use super::storage;
 use super::stream::{self, IdleActivity, StreamServer};
 use super::tab_binding;
+use super::theme::{self, Theme};
 use super::tracing::{self as native_tracing, TracingState};
 use super::webdriver::appium::AppiumManager;
 use super::webdriver::backend::{BrowserBackend, WebDriverBackend, WEBDRIVER_UNSUPPORTED_ACTIONS};
@@ -476,11 +477,31 @@ fn apply_effective_ca_cert(
 
 /// Arguments of the last `Emulation.setEmulatedMedia` call, kept so the same
 /// emulation can be replayed onto a new page session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EmulatedMedia {
     pub media: Option<String>,
     /// `(name, value)` media features, e.g. `("prefers-color-scheme", "dark")`.
     pub features: Vec<(String, String)>,
+}
+
+impl EmulatedMedia {
+    /// The `Emulation.setEmulatedMedia` parameters for this emulation. Each
+    /// call replaces a page's whole emulated feature set.
+    pub(crate) fn params(&self) -> Value {
+        let mut params = json!({});
+        if let Some(ref media) = self.media {
+            params["media"] = Value::String(media.clone());
+        }
+        if !self.features.is_empty() {
+            params["features"] = Value::Array(
+                self.features
+                    .iter()
+                    .map(|(name, value)| json!({ "name": name, "value": value }))
+                    .collect(),
+            );
+        }
+        params
+    }
 }
 
 /// An init script tracked across target sessions.
@@ -689,6 +710,10 @@ pub struct DaemonState {
     /// Session-scoped setup applied to the active page, re-applied to tabs the
     /// daemon creates. See [`SessionSetup`].
     pub session_setup: SessionSetup,
+    /// The session theme: the last `set_theme`, or the theme the last launch
+    /// carried. It outlives browsers and is never launch configuration; pages
+    /// get it with the session setup (see [`theme`]).
+    pub(crate) theme: Option<Theme>,
     /// Init script sources returned by launch mutator plugins for this launch.
     pub plugin_init_scripts: Vec<String>,
     /// Provider cleanup metadata for the active external browser session.
@@ -845,6 +870,7 @@ impl DaemonState {
             viewport: None,
             window_page_error: None,
             session_setup: SessionSetup::default(),
+            theme: None,
             plugin_init_scripts: Vec::new(),
             active_provider_session: None,
             active_provider_connection: false,
@@ -2685,6 +2711,11 @@ pub(crate) async fn execute_command_received(
     state: &mut DaemonState,
     received_at: std::time::Instant,
 ) -> Value {
+    // The theme is session state, not agent activity: it passes no window,
+    // custody or observation gate and captures no host feedback.
+    if cmd["action"] == theme::ACTION {
+        return theme::set(cmd, state).await;
+    }
     if let Err((code, message)) = state.prepare_window_command(cmd, received_at).await {
         let mut response = state.window_refusal(&cmd["id"], code, message);
         if let Some(value) = cmd.get(super::feedback::REQUEST_FIELD) {
@@ -4098,6 +4129,7 @@ async fn install_network_controls_or_resume_prepared_session(
 /// True when [`apply_session_setup`] has anything to replay onto a new tab.
 async fn session_setup_pending(state: &DaemonState) -> bool {
     !state.session_setup.is_empty()
+        || state.theme.is_some()
         || !state.routes.read().await.is_empty()
         || !state.origin_headers.read().await.is_empty()
 }
@@ -4130,22 +4162,13 @@ async fn apply_session_setup(state: &mut DaemonState, session_id: &str) -> Resul
             .await;
     }
 
-    if let Some(ref emulated) = setup.emulated_media {
-        let mut params = json!({});
-        if let Some(ref m) = emulated.media {
-            params["media"] = Value::String(m.clone());
-        }
-        if !emulated.features.is_empty() {
-            params["features"] = Value::Array(
-                emulated
-                    .features
-                    .iter()
-                    .map(|(name, value)| json!({ "name": name, "value": value }))
-                    .collect(),
-            );
-        }
+    if let Some(media) = theme::page_media(setup.emulated_media.as_ref(), state.theme) {
         let _ = client
-            .send_command("Emulation.setEmulatedMedia", Some(params), Some(session_id))
+            .send_command(
+                "Emulation.setEmulatedMedia",
+                Some(media.params()),
+                Some(session_id),
+            )
             .await;
     }
 
@@ -4233,8 +4256,10 @@ async fn apply_session_setup(state: &mut DaemonState, session_id: &str) -> Resul
 /// The post-launch sequence every locally launched browser shares, a
 /// sign-in relaunch included: the daemon owns it, follows its events and
 /// dialogs, shows it, then installs network containment before any state
-/// loads or user script runs. Failure closes the browser, so a requested
-/// allowlist never degrades to an unrestricted session.
+/// loads or user script runs, and gives every page it opened with the
+/// session setup, as every page the session adopts later gets it. Failure to
+/// install containment closes the browser, so a requested allowlist never
+/// degrades to an unrestricted session.
 async fn adopt_launched_browser(
     state: &mut DaemonState,
     browser: BrowserManager,
@@ -4250,7 +4275,22 @@ async fn adopt_launched_browser(
     state.start_fetch_handler();
     state.start_dialog_handler();
     state.update_stream_client().await;
-    install_network_controls_or_close(state, has_proxy_auth).await
+    install_network_controls_or_close(state, has_proxy_auth).await?;
+    let sessions: Vec<String> = state
+        .browser
+        .as_ref()
+        .map(|browser| {
+            browser
+                .pages_list()
+                .into_iter()
+                .map(|page| page.session_id)
+                .collect()
+        })
+        .unwrap_or_default();
+    for session in sessions {
+        apply_session_setup(state, &session).await?;
+    }
+    Ok(())
 }
 
 async fn auto_launch(
@@ -4258,6 +4298,7 @@ async fn auto_launch(
     plugins: Vec<crate::plugins::PluginConfig>,
 ) -> Result<(), String> {
     let mut options = launch_options_from_env();
+    options.theme = state.theme;
     let effective_ca_cert = state.effective_ca_cert.clone();
     apply_effective_ca_cert(&mut options, &effective_ca_cert);
     state.plugin_init_scripts.clear();
@@ -4714,6 +4755,7 @@ fn launch_options_from_env() -> LaunchOptions {
         prepared_nss_home: None,
         retained_profile: None,
         color_scheme: env::var("AGENT_BROWSER_COLOR_SCHEME").ok(),
+        theme: None,
         download_path: env::var("AGENT_BROWSER_DOWNLOAD_PATH").ok(),
         hide_scrollbars: hide_scrollbars_from_env(),
         viewport_size: None,
@@ -5058,6 +5100,16 @@ async fn try_load_storage_state(state: &mut DaemonState, path: &Option<String>) 
 // ---------------------------------------------------------------------------
 
 async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    // The launch's own theme wins; otherwise the session keeps its theme.
+    let theme = match cmd.get("theme").filter(|value| !value.is_null()) {
+        Some(value) => Some(
+            value
+                .as_str()
+                .and_then(Theme::parse)
+                .ok_or("Invalid theme: use dark or light")?,
+        ),
+        None => state.theme,
+    };
     let effective_ca_cert = resolve_effective_ca_cert(cmd, state)?;
     // Absent field falls back to the daemon's spawn-time env (mirrors
     // hideScrollbars/webgpu), keeping the launch configuration stable when follow-up
@@ -5188,6 +5240,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .get("colorScheme")
             .and_then(|v| v.as_str())
             .map(String::from),
+        theme,
         download_path: cmd
             .get("downloadPath")
             .and_then(|v| v.as_str())
@@ -5308,6 +5361,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     }
     state.ref_map.clear();
     state.session_setup = SessionSetup::default();
+    state.theme = theme;
 
     let has_cdp = cdp_url.is_some() || cdp_port.is_some();
     super::browser::validate_launch_options(
@@ -7948,17 +8002,16 @@ async fn handle_set_media(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         }
     }
 
-    let features = if feat_list.is_empty() {
-        None
-    } else {
-        Some(feat_list.clone())
-    };
-
-    mgr.set_emulated_media(media, features).await?;
-    state.session_setup.emulated_media = Some(EmulatedMedia {
+    let requested = EmulatedMedia {
         media: media.map(String::from),
         features: feat_list,
-    });
+    };
+    // With a session theme, only an explicit dark or light scheme overrides it.
+    let applied = theme::page_media(Some(&requested), state.theme).unwrap_or_default();
+    let features = (!applied.features.is_empty()).then_some(applied.features);
+    mgr.set_emulated_media(applied.media.as_deref(), features)
+        .await?;
+    state.session_setup.emulated_media = Some(requested);
     Ok(json!({ "set": true }))
 }
 
@@ -15632,6 +15685,53 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             .to_string()
             .contains("private-profile-test-value"));
         assert!(!information.to_string().contains("proxyPassword"));
+    }
+
+    /// The theme is session state: a theme-only difference never relaunches
+    /// the browser and never changes whether its private profile is reused.
+    #[test]
+    fn test_launch_configuration_excludes_the_theme() {
+        let dark = LaunchOptions {
+            window_stream: true,
+            theme: Some(Theme::Dark),
+            color_scheme: Some("dark".into()),
+            ..Default::default()
+        };
+        for other in [
+            LaunchOptions {
+                theme: Some(Theme::Light),
+                color_scheme: Some("light".into()),
+                ..dark.clone()
+            },
+            LaunchOptions {
+                theme: None,
+                color_scheme: None,
+                ..dark.clone()
+            },
+        ] {
+            assert_eq!(
+                launch_configuration(&dark, &[], &[], &[], &[], Some("chrome"), "local", None),
+                launch_configuration(&other, &[], &[], &[], &[], Some("chrome"), "local", None),
+            );
+            assert_eq!(
+                private_profile_eligible(&dark, Some("chrome"), "local", &[], None),
+                private_profile_eligible(&other, Some("chrome"), "local", &[], None),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_launch_refuses_an_invalid_theme_before_anything_starts() {
+        let mut state = DaemonState::new();
+        state.theme = Some(Theme::Dark);
+        for theme in [json!("blue"), json!(1)] {
+            let error = handle_launch(&json!({ "action": "launch", "theme": theme }), &mut state)
+                .await
+                .unwrap_err();
+            assert!(error.contains("Invalid theme"), "{error}");
+        }
+        assert!(state.browser.is_none());
+        assert_eq!(state.theme, Some(Theme::Dark));
     }
 
     #[test]

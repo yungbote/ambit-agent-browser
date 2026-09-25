@@ -52,6 +52,7 @@ pub mod storage;
 pub mod stream;
 #[allow(dead_code)]
 pub mod tab_binding;
+pub(crate) mod theme;
 #[allow(dead_code)]
 pub mod tracing;
 #[allow(dead_code)]

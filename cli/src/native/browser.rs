@@ -614,6 +614,12 @@ impl BrowserManager {
         self.browser_process.is_none() || !self.headless
     }
 
+    /// Whether this browser has a window UI of its own that the daemon drew:
+    /// a headed browser it launched. Attached browsers draw their own.
+    pub(crate) fn draws_window_ui(&self) -> bool {
+        self.browser_process.is_some() && !self.headless
+    }
+
     /// Options that relaunch this locally launched Chrome exactly, into its
     /// own profile and private display.
     pub(crate) fn relaunch_options(&self) -> Result<LaunchOptions, String> {
@@ -665,8 +671,6 @@ impl BrowserManager {
         }
 
         let ignore_https_errors = options.ignore_https_errors;
-        let user_agent = options.user_agent.clone();
-        let color_scheme = options.color_scheme.clone();
         let download_path = options.download_path.clone();
         let headless = options.effectively_headless();
 
@@ -752,27 +756,8 @@ impl BrowserManager {
                 .await;
         }
 
-        if let Some(ref ua) = user_agent {
-            let _ = manager
-                .client
-                .send_command(
-                    "Emulation.setUserAgentOverride",
-                    Some(json!({ "userAgent": ua })),
-                    Some(&session_id),
-                )
-                .await;
-        }
-
-        if let Some(ref scheme) = color_scheme {
-            let _ = manager
-                .client
-                .send_command(
-                    "Emulation.setEmulatedMedia",
-                    Some(json!({ "features": [{ "name": "prefers-color-scheme", "value": scheme }] })),
-                    Some(&session_id),
-                )
-                .await;
-        }
+        // The user agent and media emulation are session setup: the daemon
+        // replays them onto every page when it adopts this browser.
 
         if engine == "chrome" {
             // Owned Chromium has a stable download directory and observes

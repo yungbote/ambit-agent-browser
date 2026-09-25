@@ -105,6 +105,7 @@ const DOCUMENTED_ACTIONS: &[&str] = &[
     "viewport",
     "user_agent",
     "set_media",
+    "set_theme",
     "download",
     "diff_snapshot",
     "diff_url",
@@ -270,6 +271,9 @@ fn minimal_command(action: &str, id: &str) -> Value {
         }
         "headers" => {
             obj.insert("headers".to_string(), json!({}));
+        }
+        "set_theme" => {
+            obj.insert("theme".to_string(), json!("dark"));
         }
         "offline" => {
             obj.insert("offline".to_string(), json!(false));
