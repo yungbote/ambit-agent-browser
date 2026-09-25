@@ -53,7 +53,7 @@ agent-browser get text @e1        # Get heading text
 
 ## Ref lifecycle
 
-Refs are invalidated when the page changes. Always re-snapshot after navigation or DOM updates:
+Refs are invalidated when the page changes. A ref used after its page navigated or reloaded is refused with `browser_observation_stale` and nothing is done; resizing the window keeps refs. Always re-snapshot after navigation or DOM updates:
 
 ```bash
 agent-browser click @e4      # Navigates to new page
