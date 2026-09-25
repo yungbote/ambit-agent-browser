@@ -46,7 +46,7 @@ fn assert_refused(response: &Value, code: &str) -> String {
     response["error"].as_str().unwrap_or_default().to_string()
 }
 
-fn control(op: &str, controller: &str) -> Value {
+pub(super) fn control(op: &str, controller: &str) -> Value {
     json!({ "action": "ambit_browser_control", "op": op, "controllerId": controller })
 }
 
@@ -58,7 +58,7 @@ fn lease_expiry() -> u64 {
         + 25_000
 }
 
-async fn acquire(state: &mut DaemonState) -> String {
+pub(super) async fn acquire(state: &mut DaemonState) -> String {
     let controller = uuid::Uuid::new_v4().to_string();
     let mut request = control("acquire", &controller);
     request["expiresAt"] = json!(lease_expiry());
@@ -75,7 +75,7 @@ async fn renew(state: &mut DaemonState, controller: &str) -> Value {
     command(&request, state).await
 }
 
-async fn sign_in(
+pub(super) async fn sign_in(
     state: &mut DaemonState,
     controller: &str,
     sequence: u64,
@@ -90,13 +90,13 @@ async fn sign_in(
 }
 
 /// The browser process behind the owned window, as its display reports it.
-struct ChromeMain {
-    pid: u32,
+pub(super) struct ChromeMain {
+    pub(super) pid: u32,
     args: Vec<String>,
 }
 
 impl ChromeMain {
-    async fn observe(state: &DaemonState) -> Self {
+    pub(super) async fn observe(state: &DaemonState) -> Self {
         let display = state.window_display().expect("an owned browser window");
         let info = display.info().await.expect("the display helper answers");
         let pid = info
@@ -127,7 +127,7 @@ impl ChromeMain {
             .collect()
     }
 
-    fn has(&self, arg: &str) -> bool {
+    pub(super) fn has(&self, arg: &str) -> bool {
         self.args.iter().any(|candidate| candidate == arg)
     }
 
