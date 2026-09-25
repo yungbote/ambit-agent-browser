@@ -1327,6 +1327,61 @@ impl DaemonState {
                 .unwrap_or_default();
     }
 
+    /// Adopt a page the session discovered rather than created: a tab the
+    /// person opened, a popup, a page a navigation promoted. Containment comes
+    /// first, then the session setup every adopted page gets (so a paused page
+    /// starts under it), then registration, and only then does the page run.
+    /// `register_discovered_page` alone decides activation: a pinned session
+    /// never activates a discovered target (that would steal the active tab
+    /// and overwrite its binding); a legacy session follows it. Explicit
+    /// agent commands (`tab new`, `window new`, `click --new-tab`) register
+    /// their own pages before these events are drained.
+    ///
+    /// A containment failure is returned; a session setup failure is not,
+    /// since the page must not stay paused over emulation or scripts.
+    async fn adopt_discovered_page(
+        &mut self,
+        target: &TargetInfo,
+        session_id: &str,
+        filter: Option<&DomainFilter>,
+        has_proxy_creds: bool,
+    ) -> Result<(), String> {
+        let Some(mgr) = self.browser.as_ref() else {
+            return Ok(());
+        };
+        mgr.prepare_domains_pub(session_id).await?;
+        if filter.is_some() || has_proxy_creds {
+            install_network_controls_for_session(&mgr.client, session_id, filter, has_proxy_creds)
+                .await?;
+        }
+        let mut page_url = target.url.clone();
+        if filter.is_some_and(|filter| should_blank_existing_url(&page_url, filter)) {
+            let _ = mgr
+                .client
+                .send_command(
+                    "Page.navigate",
+                    Some(json!({ "url": "about:blank" })),
+                    Some(session_id),
+                )
+                .await;
+            page_url = "about:blank".to_string();
+        }
+        if let Err(error) = apply_session_setup(self, session_id).await {
+            eprintln!("Warning: failed to apply the session setup to a discovered page: {error}");
+        }
+        let Some(mgr) = self.browser.as_mut() else {
+            return Ok(());
+        };
+        mgr.register_discovered_page(
+            &target.target_id,
+            session_id,
+            page_url,
+            target.title.clone(),
+            target.target_type.clone(),
+        );
+        mgr.resume_if_waiting_pub(session_id).await
+    }
+
     async fn apply_drained_events(&mut self, drained: DrainedEvents) -> Result<(), String> {
         // Popups and externally closed pages can change the active top-level
         // target without changing iframe topology. Refresh after either kind
@@ -1402,70 +1457,17 @@ impl DaemonState {
             }
         }
 
-        // Register top-level pages that browser-level auto-attach paused before
-        // their first request. Controls must be installed before resuming.
+        // Top-level pages that browser-level auto-attach paused before their
+        // first request (e.g. a tab the person opened, or a JS-opened popup):
+        // they run only once adopted.
         for (target_info, page_sid) in &drained.attached_page_sessions {
             let filter = self.domain_filter.read().await.clone();
             let has_proxy_creds = self.proxy_credentials.read().await.is_some();
-            let controls_active = filter.is_some() || has_proxy_creds;
-            let setup_result = if let Some(ref mut mgr) = self.browser {
-                async {
-                    mgr.prepare_domains_pub(page_sid).await?;
-                    if controls_active {
-                        install_network_controls_for_session(
-                            &mgr.client,
-                            page_sid,
-                            filter.as_ref(),
-                            has_proxy_creds,
-                        )
-                        .await?;
-                    }
-
-                    let mut page_url = target_info.url.clone();
-                    if let Some(ref filter) = filter {
-                        if should_blank_existing_url(&page_url, filter) {
-                            let _ = mgr
-                                .client
-                                .send_command(
-                                    "Page.navigate",
-                                    Some(json!({ "url": "about:blank" })),
-                                    Some(page_sid),
-                                )
-                                .await;
-                            page_url = "about:blank".to_string();
-                        }
-                    }
-
-                    // This handler drains `Target.attachedToTarget` for a
-                    // page that browser-level auto-attach discovered before
-                    // its own `Target.targetCreated` was drained (e.g. a
-                    // human-opened tab, or a JS-opened popup in the shared
-                    // Chrome). Explicit agent commands (`tab new`, `window
-                    // new`, `click --new-tab`) already register their own
-                    // page via `add_page` on their own path before this
-                    // event is ever drained, so this branch never runs for
-                    // agent-initiated tabs. `register_discovered_page` is the
-                    // single decision point shared with the
-                    // `Target.targetCreated` handler below: a pinned session
-                    // never activates a discovered target (that would steal
-                    // the active tab and overwrite its binding); a legacy
-                    // session follows it.
-                    mgr.register_discovered_page(
-                        &target_info.target_id,
-                        page_sid,
-                        page_url,
-                        target_info.title.clone(),
-                        target_info.target_type.clone(),
-                    );
-
-                    mgr.resume_if_waiting_pub(page_sid).await
-                }
-                .await
-            } else {
-                Ok(())
-            };
-            if let Err(error) = setup_result {
-                if controls_active {
+            let adopted = self
+                .adopt_discovered_page(target_info, page_sid, filter.as_ref(), has_proxy_creds)
+                .await;
+            if let Err(error) = adopted {
+                if filter.is_some() || has_proxy_creds {
                     return close_after_network_control_failure(self, error).await;
                 }
                 eprintln!(
@@ -1529,73 +1531,37 @@ impl DaemonState {
             self.active_iframe_sessions.remove(sid);
         }
 
-        // Attach and register new targets
+        // Pages created outside the daemon's own commands, which Chrome did
+        // not pause: attach and adopt them.
         for te in &drained.new_targets {
             let filter = self.domain_filter.read().await.clone();
             let has_proxy_creds = self.proxy_credentials.read().await.is_some();
-            let controls_active = filter.is_some() || has_proxy_creds;
-            let setup_result = if let Some(ref mut mgr) = self.browser {
-                async {
-                    let attach: AttachToTargetResult = mgr
-                        .client
-                        .send_command_typed(
-                            "Target.attachToTarget",
-                            &AttachToTargetParams {
-                                target_id: te.target_info.target_id.clone(),
-                                flatten: true,
-                            },
-                            None,
-                        )
-                        .await?;
-                    mgr.prepare_domains_pub(&attach.session_id).await?;
-                    if controls_active {
-                        install_network_controls_for_session(
-                            &mgr.client,
-                            &attach.session_id,
-                            filter.as_ref(),
-                            has_proxy_creds,
-                        )
-                        .await?;
-                    }
-
-                    let mut page_url = te.target_info.url.clone();
-                    if let Some(ref filter) = filter {
-                        if should_blank_existing_url(&page_url, filter) {
-                            let _ = mgr
-                                .client
-                                .send_command(
-                                    "Page.navigate",
-                                    Some(json!({ "url": "about:blank" })),
-                                    Some(&attach.session_id),
-                                )
-                                .await;
-                            page_url = "about:blank".to_string();
-                        }
-                    }
-
-                    // Event-discovered target (e.g. a tab the human opened in the
-                    // shared Chrome, or a JS-opened popup): register it via the
-                    // same `register_discovered_page` decision point used by the
-                    // `Target.attachedToTarget` handler above, which activates it
-                    // only for legacy sessions; a pinned session never adopts a
-                    // discovered tab (that steal would also overwrite its
-                    // binding). Explicit commands (`tab new`, `window new`,
-                    // `click --new-tab`) activate via their own paths.
-                    mgr.register_discovered_page(
-                        &te.target_info.target_id,
-                        &attach.session_id,
-                        page_url,
-                        te.target_info.title.clone(),
-                        te.target_info.target_type.clone(),
-                    );
-                    mgr.resume_if_waiting_pub(&attach.session_id).await
-                }
+            let adopted = async {
+                let Some(mgr) = self.browser.as_ref() else {
+                    return Ok(());
+                };
+                let attach: AttachToTargetResult = mgr
+                    .client
+                    .send_command_typed(
+                        "Target.attachToTarget",
+                        &AttachToTargetParams {
+                            target_id: te.target_info.target_id.clone(),
+                            flatten: true,
+                        },
+                        None,
+                    )
+                    .await?;
+                self.adopt_discovered_page(
+                    &te.target_info,
+                    &attach.session_id,
+                    filter.as_ref(),
+                    has_proxy_creds,
+                )
                 .await
-            } else {
-                Ok(())
-            };
-            if let Err(error) = setup_result {
-                if controls_active {
+            }
+            .await;
+            if let Err(error) = adopted {
+                if filter.is_some() || has_proxy_creds {
                     return close_after_network_control_failure(self, error).await;
                 }
                 eprintln!("Warning: failed to prepare new page session: {}", error);
