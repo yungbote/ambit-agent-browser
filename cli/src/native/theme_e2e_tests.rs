@@ -466,6 +466,132 @@ async fn e2e_theme_switches_every_page_live_and_the_window_ui_at_the_next_launch
     assert_success(&command(&json!({ "action": "close" }), &mut state).await);
 }
 
+/// Opens an isolated window and one sharing the browser's cookies, each on
+/// document `isolated{suffix}` or `shared{suffix}` with its cross-site frame.
+async fn open_windows(state: &mut DaemonState, site: &SchemeSite, suffix: &str) {
+    for (shared, name) in [(false, "isolated"), (true, "shared")] {
+        let window = json!({ "action": "window_new", "shared": shared });
+        assert_success(&command(&window, state).await);
+        let doc = format!("{name}{suffix}");
+        assert_success(&command(&navigate(site.top(&doc)), state).await);
+    }
+}
+
+/// A window the agent opens, isolated or sharing the browser's cookies,
+/// starts in the session theme and switches with it. Chrome's own preference
+/// does not decide it: an isolated window's context does not even follow the
+/// launch's dark window UI.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_theme_reaches_every_window_the_agent_opens() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let site = SchemeSite::start().await;
+    let mut state = DaemonState::new();
+    assert_success(&command(&json!({ "action": "launch", "theme": "dark" }), &mut state).await);
+    open_windows(&mut state, &site, "").await;
+    for doc in ["isolated", "isolated-frame", "shared", "shared-frame"] {
+        assert_eq!(
+            site.reports(&mut state, doc, 1).await,
+            [Parsed(Dark)],
+            "{doc}"
+        );
+    }
+
+    assert_success(&command(&set_theme("light"), &mut state).await);
+    settle(&mut state, &["isolated", "shared"], Light).await;
+    open_windows(&mut state, &site, "-after").await;
+    for doc in [
+        "isolated-after",
+        "isolated-after-frame",
+        "shared-after",
+        "shared-after-frame",
+    ] {
+        assert_eq!(
+            site.reports(&mut state, doc, 1).await,
+            [Parsed(Light)],
+            "{doc}"
+        );
+    }
+    assert_success(&command(&json!({ "action": "close" }), &mut state).await);
+}
+
+/// Counts the documents an init script ran in, per window.
+const COUNT_RUNS: &str = "window.__runs = (window.__runs || 0) + 1";
+
+/// How many times the init script ran in the active page's document.
+async fn runs(state: &mut DaemonState) -> Value {
+    let read = json!({ "action": "evaluate", "script": "window.__runs ?? 0" });
+    assert_success(&command(&read, state).await)["result"].clone()
+}
+
+/// Every page gets the session setup once, however it opened: the tab and
+/// the window the agent opens, whose own attachment reaches the adoption of
+/// discovered pages too, and a tab the person opens. An init script runs once
+/// in each document, and removing it removes it from every page.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_theme_every_page_gets_the_session_setup_once() {
+    let site = SchemeSite::start().await;
+    let mut state = DaemonState::new();
+    let launch = json!({ "action": "launch", "headless": true, "theme": "dark" });
+    assert_success(&command(&launch, &mut state).await);
+    assert_success(&command(&navigate(site.page("first")), &mut state).await);
+    let add = json!({ "action": "addinitscript", "script": COUNT_RUNS });
+    let identifier = assert_success(&command(&add, &mut state).await)["identifier"].clone();
+
+    let tab = json!({ "action": "tab_new", "url": site.page("tab") });
+    assert_success(&command(&tab, &mut state).await);
+    assert_eq!(runs(&mut state).await, 1, "a tab the agent opens");
+
+    assert_success(&command(&json!({ "action": "window_new" }), &mut state).await);
+    assert_success(&command(&navigate(site.page("window")), &mut state).await);
+    assert_eq!(runs(&mut state).await, 1, "a window the agent opens");
+
+    state
+        .browser
+        .as_ref()
+        .unwrap()
+        .client
+        .send_command(
+            "Target.createTarget",
+            Some(json!({ "url": site.page("person") })),
+            None,
+        )
+        .await
+        .expect("the person opens a tab");
+    site.reports(&mut state, "person", 1).await;
+    let tabs = command(&json!({ "action": "tab_list" }), &mut state).await;
+    let person = assert_success(&tabs)["tabs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tab| {
+            tab["url"]
+                .as_str()
+                .is_some_and(|url| url.ends_with("doc=person"))
+        })
+        .map(|tab| tab["tabId"].clone())
+        .expect("the person's tab is adopted");
+    // Chrome did not pause that tab, so its first document ran before the
+    // daemon adopted it; the next one runs under the setup.
+    let switch = json!({ "action": "tab_switch", "tabId": person });
+    assert_success(&command(&switch, &mut state).await);
+    assert_success(&command(&navigate(site.page("person-next")), &mut state).await);
+    assert_eq!(runs(&mut state).await, 1, "a tab the person opens");
+
+    let remove = json!({ "action": "removeinitscript", "identifier": identifier });
+    assert_success(&command(&remove, &mut state).await);
+    for tab in ["t2", "t3"] {
+        let switch = json!({ "action": "tab_switch", "tabId": tab });
+        assert_success(&command(&switch, &mut state).await);
+        assert_success(&command(&navigate(site.page("reloaded")), &mut state).await);
+        assert_eq!(runs(&mut state).await, 0, "{tab} after the removal");
+    }
+    assert_success(&command(&json!({ "action": "close" }), &mut state).await);
+}
+
 /// A page behind an open JavaScript dialog applies media emulation only
 /// once the dialog closes (measured on Chrome for Testing 152). The theme
 /// change still answers within its bound, the other pages switch at once,

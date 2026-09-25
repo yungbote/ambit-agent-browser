@@ -1327,15 +1327,19 @@ impl DaemonState {
                 .unwrap_or_default();
     }
 
-    /// Adopt a page the session discovered rather than created: a tab the
-    /// person opened, a popup, a page a navigation promoted. Containment comes
-    /// first, then the session setup every adopted page gets (so a paused page
-    /// starts under it), then registration, and only then does the page run.
-    /// `register_discovered_page` alone decides activation: a pinned session
-    /// never activates a discovered target (that would steal the active tab
-    /// and overwrite its binding); a legacy session follows it. Explicit
-    /// agent commands (`tab new`, `window new`, `click --new-tab`) register
-    /// their own pages before these events are drained.
+    /// Adopt a page attachment the session did not ask for: a tab the person
+    /// opened, a popup, a page a navigation promoted, or a second session
+    /// Chrome attached to a page the daemon already holds. Containment comes
+    /// first, then the session setup a page new to the session gets (so a
+    /// paused page starts under it), then registration, and only then does
+    /// the page run. A page the daemon opened itself (`tab new`, `window new`,
+    /// `click --new-tab`, a launch) was registered and given the session
+    /// setup by the command that opened it; its own attachment reaches this
+    /// drain too and must not get the setup again, or every init script
+    /// would run twice in it. `register_discovered_page` alone decides
+    /// activation: a pinned session never activates a discovered target
+    /// (that would steal the active tab and overwrite its binding); a legacy
+    /// session follows it.
     ///
     /// A containment failure is returned; a session setup failure is not,
     /// since the page must not stay paused over emulation or scripts.
@@ -1349,6 +1353,7 @@ impl DaemonState {
         let Some(mgr) = self.browser.as_ref() else {
             return Ok(());
         };
+        let new_to_session = !mgr.has_target(&target.target_id);
         mgr.prepare_domains_pub(session_id).await?;
         if filter.is_some() || has_proxy_creds {
             install_network_controls_for_session(&mgr.client, session_id, filter, has_proxy_creds)
@@ -1366,8 +1371,12 @@ impl DaemonState {
                 .await;
             page_url = "about:blank".to_string();
         }
-        if let Err(error) = apply_session_setup(self, session_id).await {
-            eprintln!("Warning: failed to apply the session setup to a discovered page: {error}");
+        if new_to_session {
+            if let Err(error) = apply_session_setup(self, session_id).await {
+                eprintln!(
+                    "Warning: failed to apply the session setup to a discovered page: {error}"
+                );
+            }
         }
         let Some(mgr) = self.browser.as_mut() else {
             return Ok(());
@@ -11179,6 +11188,7 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
         }
     };
 
+    apply_session_setup(state, &session_id).await?;
     let has_proxy_creds = state.proxy_credentials.read().await.is_some();
     install_network_controls_or_resume_prepared_session(state, has_proxy_creds, &session_id)
         .await?;
