@@ -9921,10 +9921,9 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     // If selector is a ref (@e1), resolve the iframe element from the ref map
     if let Some(sel) = selector {
         if let Some(ref_id) = super::element::parse_ref(sel) {
-            let entry = state
-                .ref_map
-                .get(&ref_id)
-                .ok_or_else(|| format!("Unknown ref: {}", ref_id))?;
+            let entry =
+                super::element::lookup_ref(&mgr.client, &session_id, &state.ref_map, &ref_id)
+                    .await?;
             let backend_node_id = entry
                 .backend_node_id
                 .ok_or_else(|| format!("Ref {} has no backend node id", ref_id))?;

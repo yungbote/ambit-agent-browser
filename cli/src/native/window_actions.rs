@@ -153,8 +153,9 @@ impl DaemonState {
         if let Some(server) = self.stream_server.as_ref() {
             server.clear_frame();
         }
-        self.ref_map.clear();
-        self.active_frame_id = None;
+        // Refs and the selected frame stay: a layout changes no element's
+        // identity. Each use of a ref measures its element again, and a ref
+        // outlives only the document its snapshot read (`element::lookup_ref`).
         self.window_page_error = Some("browser_layout_pending");
         let (surface, page_blocked) = browser
             .resize_window(width, height, id, page_blocked, events)
@@ -225,8 +226,8 @@ impl DaemonState {
             return;
         };
         // A viewer's layout is not human input: it needs no fresh observation
-        // from the agent. Stale coordinates are already fenced by the cleared
-        // refs, the rotated page generations and admission-time staleness.
+        // from the agent. Stale coordinates are already fenced by the rotated
+        // page generations and admission-time staleness (`layout_made_stale`).
         // Daemon command custody already excludes controller mutations and
         // native-window raw stream input is disabled. Release this gate so
         // event reconciliation and normal dialog handling can proceed.

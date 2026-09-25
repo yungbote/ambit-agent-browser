@@ -12989,6 +12989,90 @@ async fn e2e_native_binary_viewer_resizes_the_same_window() {
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
 
+/// Production, runs edecec75 and b913b29f: a click on a ref from a snapshot
+/// of the same document failed with "Unknown ref" because a person's viewer
+/// resized the window in between. A layout changes no element's identity: a
+/// ref lasts exactly as long as the document its snapshot read, however that
+/// document ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_native_refs_survive_a_layout_and_end_with_their_document() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let page = "data:text/html,<title>Refs</title><button onclick='window.clicks=(window.clicks||0)+1'>Count</button>";
+    assert_success(
+        &control_test_command(&json!({"action":"navigate","url":page}), &mut state).await,
+    );
+    let count_ref = |snapshot: &Value| {
+        get_data(snapshot)["refs"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, entry)| entry["role"] == "button" && entry["name"] == "Count")
+            .map(|(id, _)| format!("@{id}"))
+            .expect("the snapshot lists the button")
+    };
+    async fn clicks(state: &mut DaemonState) -> i64 {
+        let resp = control_test_command(
+            &json!({"action":"evaluate","script":"window.clicks ?? 0"}),
+            state,
+        )
+        .await;
+        assert_success(&resp);
+        get_data(&resp)["result"].as_i64().unwrap()
+    }
+    let snapshot = control_test_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    let button = count_ref(&snapshot);
+
+    // The viewer lays the window out at another size.
+    let surface = state.apply_window_layout(640, 480, None).await.unwrap();
+    assert_eq!((surface.width, surface.height), (1280, 960));
+    let clicked =
+        control_test_command(&json!({"action":"click","selector":button}), &mut state).await;
+    assert_success(&clicked);
+    assert_eq!(clicks(&mut state).await, 1);
+
+    // The page reloads without an agent command, as when a person reloads
+    // it: the ref's document is gone, and nothing is clicked for it.
+    let browser = state.browser.as_ref().unwrap();
+    let session = browser.active_session_id().unwrap().to_string();
+    let before = super::element::page_document(&browser.client, &session)
+        .await
+        .unwrap();
+    browser
+        .client
+        .send_command("Page.reload", None, Some(&session))
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        let browser = state.browser.as_ref().unwrap();
+        let now = super::element::page_document(&browser.client, &session).await;
+        if now.is_some_and(|now| now != before) {
+            break;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let refused =
+        control_test_command(&json!({"action":"click","selector":button}), &mut state).await;
+    assert_error_code(&refused, "browser_observation_stale");
+    assert_eq!(clicks(&mut state).await, 0);
+
+    // A snapshot of the new document lists refs that work.
+    let snapshot = control_test_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    let button = count_ref(&snapshot);
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":button}), &mut state).await,
+    );
+    assert_eq!(clicks(&mut state).await, 1);
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
 // Production 2026-09-23: a native mouse move over a Cloudflare challenge
 // iframe and a click whose element was off-screen both failed with "The
 // browser did not report the native mouse position".

@@ -13,6 +13,10 @@ pub struct RefEntry {
     pub nth: Option<usize>,
     pub selector: Option<String>,
     pub frame_id: Option<String>,
+    /// The document the snapshot that listed this ref read: its page's
+    /// main-frame loader. A ref never outlives it (see `lookup_ref`). A ref
+    /// made and used inside one command carries none.
+    pub document: Option<String>,
 }
 
 pub struct RefMap {
@@ -57,6 +61,7 @@ impl RefMap {
                 nth,
                 selector: None,
                 frame_id: frame_id.map(|s| s.to_string()),
+                document: None,
             },
         );
     }
@@ -78,6 +83,7 @@ impl RefMap {
                 nth,
                 selector: Some(selector),
                 frame_id: None,
+                document: None,
             },
         );
     }
@@ -107,6 +113,13 @@ impl RefMap {
         self.map.remove(ref_id);
     }
 
+    /// Binds the refs a snapshot just listed to the document it read.
+    pub fn bind_document(&mut self, document: &str) {
+        for entry in self.map.values_mut() {
+            entry.document.get_or_insert_with(|| document.to_string());
+        }
+    }
+
     pub fn clear(&mut self) {
         self.map.clear();
         self.next_ref = 1;
@@ -119,6 +132,46 @@ impl RefMap {
     pub fn set_next_ref_num(&mut self, n: usize) {
         self.next_ref = n;
     }
+}
+
+/// The document a page shows now: its main frame's loader, which a
+/// navigation or reload replaces and a layout, a scroll or a same-document
+/// (history API, fragment) navigation keeps. Loaders are unique across tabs.
+pub(crate) async fn page_document(client: &CdpClient, session_id: &str) -> Option<String> {
+    let tree = client
+        .send_command_no_params("Page.getFrameTree", Some(session_id))
+        .await
+        .ok()?;
+    tree["frameTree"]["frame"]["loaderId"]
+        .as_str()
+        .map(str::to_string)
+}
+
+/// The entry `ref_id` names, while the page still shows the document the
+/// snapshot that listed it read. A ref from another document is refused
+/// before anything is done: its node, and the role and name it would be
+/// found again by, belong to a page that is gone. A page that cannot tell
+/// its document now resolves the ref as before.
+pub(crate) async fn lookup_ref<'a>(
+    client: &CdpClient,
+    session_id: &str,
+    ref_map: &'a RefMap,
+    ref_id: &str,
+) -> Result<&'a RefEntry, String> {
+    let entry = ref_map.get(ref_id).ok_or_else(|| {
+        format!("Unknown ref: {ref_id}. Refs come from the latest snapshot: take one and use a ref it lists.")
+    })?;
+    if let Some(document) = entry.document.as_deref() {
+        if page_document(client, session_id)
+            .await
+            .is_some_and(|current| current != document)
+        {
+            return Err(format!(
+                "browser_observation_stale: Ref {ref_id} is from a snapshot of a page this tab no longer shows (it navigated or reloaded, or another tab is active). Nothing was done. Take a snapshot and use a ref it lists."
+            ));
+        }
+    }
+    Ok(entry)
 }
 
 pub fn parse_ref(input: &str) -> Option<String> {
@@ -304,9 +357,7 @@ pub async fn resolve_element_center(
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<(f64, f64, String), String> {
     if let Some(ref_id) = parse_ref(selector_or_ref) {
-        let entry = ref_map
-            .get(&ref_id)
-            .ok_or_else(|| format!("Unknown ref: {}", ref_id))?;
+        let entry = lookup_ref(client, session_id, ref_map, &ref_id).await?;
 
         let effective_session_id =
             resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions);
@@ -526,9 +577,7 @@ pub async fn resolve_element_object_id(
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<(String, String), String> {
     if let Some(ref_id) = parse_ref(selector_or_ref) {
-        let entry = ref_map
-            .get(&ref_id)
-            .ok_or_else(|| format!("Unknown ref: {}", ref_id))?;
+        let entry = lookup_ref(client, session_id, ref_map, &ref_id).await?;
 
         let effective_session_id =
             resolve_frame_session(entry.frame_id.as_deref(), session_id, iframe_sessions);

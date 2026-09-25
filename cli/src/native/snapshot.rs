@@ -6,7 +6,7 @@ use super::cdp::client::CdpClient;
 use super::cdp::types::{
     AXNode, AXProperty, AXValue, EvaluateParams, EvaluateResult, GetFullAXTreeResult,
 };
-use super::element::{resolve_ax_session, RefMap};
+use super::element::{page_document, resolve_ax_session, RefMap};
 
 mod projection;
 pub use projection::SnapshotObservation;
@@ -225,6 +225,10 @@ pub async fn take_snapshot(
     frame_id: Option<&str>,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<String, String> {
+    // Read before the tree: a navigation during the snapshot leaves its refs
+    // bound to the document that is gone. A page that cannot tell its
+    // document binds none, and its refs are used as before.
+    let document = page_document(client, session_id).await;
     let mut collector = ProjectionCollector::new(false, false);
     let rendered = take_snapshot_internal(
         client,
@@ -236,6 +240,9 @@ pub async fn take_snapshot(
         &mut FrameProjection::new(&mut collector, None),
     )
     .await?;
+    if let Some(document) = document {
+        ref_map.bind_document(&document);
+    }
     Ok(rendered.text)
 }
 
@@ -251,6 +258,7 @@ pub async fn take_snapshot_with_projection(
     frame_id: Option<&str>,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<SnapshotObservation, String> {
+    let document = page_document(client, session_id).await;
     let mut collector =
         ProjectionCollector::new(true, frame_id.is_some() || options.selector.is_some());
     let rendered = take_snapshot_internal(
@@ -263,6 +271,9 @@ pub async fn take_snapshot_with_projection(
         &mut FrameProjection::new(&mut collector, None),
     )
     .await?;
+    if let Some(document) = document {
+        ref_map.bind_document(&document);
+    }
     Ok(collector.finish(rendered, options))
 }
 
