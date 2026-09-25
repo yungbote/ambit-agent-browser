@@ -47,6 +47,12 @@ pub(crate) struct PresentationConfig {
     pub viewer: Uuid,
     pub width: u32,
     pub height: u32,
+    /// The presenter draws frames 1:1 from the top-left cropped to their
+    /// `visible` window (`visible=crop`), so it keeps drawing through a
+    /// resize and sets the window through `presentation` even while its
+    /// person controls input. An older presenter resizes through `viewport`
+    /// input while it controls, and its presentation waits until then.
+    pub crops: bool,
 }
 
 impl PresentationConfig {
@@ -62,7 +68,16 @@ impl PresentationConfig {
             viewer: id,
             width,
             height,
+            crops: false,
         })
+    }
+
+    /// The window this presenter asks for, in display pixels.
+    fn window(&self) -> (u32, u32) {
+        (
+            self.width * crate::native::display::DEVICE_SCALE_FACTOR,
+            self.height * crate::native::display::DEVICE_SCALE_FACTOR,
+        )
     }
 }
 
@@ -78,7 +93,18 @@ struct Attempt {
     connection: Uuid,
     config: PresentationConfig,
     session: String,
-    surface: Option<crate::native::display::Surface>,
+    /// What the layout produced; `None` when it failed, which is not retried
+    /// until the request changes.
+    applied: Option<Applied>,
+}
+
+/// An applied window layout: the display's surface (its framebuffer, which a
+/// size class may keep larger than the window) and the window, in display
+/// pixels.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Applied {
+    pub surface: crate::native::display::Surface,
+    pub window: (u32, u32),
 }
 
 #[derive(Clone, Default)]
@@ -197,7 +223,7 @@ impl Presentation {
                 if let Some(attempt) = state
                     .attempt
                     .as_mut()
-                    .filter(|attempt| attempt.config == config && attempt.surface.is_some())
+                    .filter(|attempt| attempt.config == config && attempt.applied.is_some())
                 {
                     attempt.connection = connection;
                 }
@@ -225,6 +251,15 @@ impl Presentation {
         });
     }
 
+    /// When a disconnected presenter's grace ends, if one is pending.
+    pub(crate) fn expiry(&self) -> Option<Instant> {
+        self.cell
+            .borrow()
+            .owner
+            .as_ref()
+            .and_then(|owner| owner.disconnected_until)
+    }
+
     pub(crate) fn expire(&self) {
         self.cell.send_if_modified(|state| {
             if state.owner.as_ref().is_some_and(|owner| {
@@ -241,21 +276,31 @@ impl Presentation {
         });
     }
 
-    pub(crate) fn pending(&self, session: &str) -> Option<LayoutRequest> {
+    /// The connected presenter's layout for `session` (the display and its
+    /// window), unless it was already attempted there and still holds: the
+    /// window is the requested size, and the framebuffer equals the window
+    /// unless every viewer crops to it (`size_class`). While a person
+    /// controls input, only a presenter that crops sets the window this way.
+    pub(crate) fn pending(
+        &self,
+        session: &str,
+        size_class: bool,
+        controlled: bool,
+    ) -> Option<LayoutRequest> {
         let state = self.cell.borrow();
         let owner = state
             .owner
             .as_ref()
-            .filter(|owner| owner.disconnected_until.is_none())?;
+            .filter(|owner| owner.disconnected_until.is_none())
+            .filter(|owner| !controlled || owner.config.crops)?;
         if state.attempt.as_ref().is_some_and(|attempt| {
             attempt.connection == owner.connection
                 && attempt.config == owner.config
                 && attempt.session == session
-                && attempt.surface.as_ref().is_none_or(|surface| {
-                    surface.width
-                        == owner.config.width * crate::native::display::DEVICE_SCALE_FACTOR
-                        && surface.height
-                            == owner.config.height * crate::native::display::DEVICE_SCALE_FACTOR
+                && attempt.applied.as_ref().is_none_or(|applied| {
+                    applied.window == owner.config.window()
+                        && (size_class
+                            || (applied.surface.width, applied.surface.height) == applied.window)
                 })
         }) {
             return None;
@@ -270,7 +315,7 @@ impl Presentation {
         &self,
         request: &LayoutRequest,
         session: String,
-        surface: Option<crate::native::display::Surface>,
+        applied: Option<Applied>,
     ) {
         self.cell.send_if_modified(|state| {
             if !state.owner.as_ref().is_some_and(|owner| {
@@ -284,25 +329,36 @@ impl Presentation {
                 connection: request.connection,
                 config: request.config,
                 session,
-                surface,
+                applied,
             });
             true
         });
     }
 
-    pub(crate) fn update_surface(&self, surface: &crate::native::display::Surface) {
+    /// Another layout (the agent's, or a controller's `viewport` input)
+    /// changed the window after the presenter's: the presenter's layout is
+    /// pending again unless it still holds.
+    pub(crate) fn update_surface(
+        &self,
+        surface: &crate::native::display::Surface,
+        window: (u32, u32),
+    ) {
         self.cell.send_if_modified(|state| {
-            let Some(attempt) = state
+            let Some(applied) = state
                 .attempt
                 .as_mut()
-                .filter(|attempt| attempt.surface.is_some())
+                .and_then(|attempt| attempt.applied.as_mut())
             else {
                 return false;
             };
-            if attempt.surface.as_ref() == Some(surface) {
+            let next = Applied {
+                surface: surface.clone(),
+                window,
+            };
+            if *applied == next {
                 return false;
             }
-            attempt.surface = Some(surface.clone());
+            *applied = next;
             true
         });
     }
@@ -319,8 +375,8 @@ impl Presentation {
                 owner.connection == attempt.connection && owner.config == attempt.config
             })
         }) {
-            if let Some(surface) = attempt.surface.as_ref() {
-                value["applied"] = json!(surface);
+            if let Some(applied) = attempt.applied.as_ref() {
+                value["applied"] = json!(applied.surface);
             } else if primary {
                 value["error"] = json!("viewport_unavailable");
             }
@@ -350,6 +406,13 @@ impl Drop for PresentationConnection {
 mod tests {
     use super::*;
 
+    fn applied(width: u32, height: u32) -> Applied {
+        Applied {
+            surface: crate::native::display::Surface::new(width, height),
+            window: (width, height),
+        }
+    }
+
     #[test]
     fn one_presenter_reconnects_without_secondary_or_old_disconnect_taking_over() {
         let state = Presentation::new();
@@ -357,11 +420,13 @@ mod tests {
             viewer: Uuid::new_v4(),
             width: 540,
             height: 620,
+            crops: false,
         };
         let secondary = PresentationConfig {
             viewer: Uuid::new_v4(),
             width: 900,
             height: 700,
+            crops: false,
         };
         let first = Uuid::new_v4();
         let second = Uuid::new_v4();
@@ -371,7 +436,7 @@ mod tests {
         assert_eq!(state.acknowledgment(second, secondary)["role"], "secondary");
         state.disconnect(first);
         state.configure(second, secondary);
-        assert!(state.pending("page").is_none());
+        assert!(state.pending("page", false, false).is_none());
         state.configure(
             replacement,
             PresentationConfig {
@@ -380,15 +445,11 @@ mod tests {
             },
         );
         state.disconnect(first);
-        let pending = state.pending("page").unwrap();
+        let pending = state.pending("page", false, false).unwrap();
         assert_eq!(pending.config.width, 640);
-        state.complete(
-            &pending,
-            "page".into(),
-            Some(crate::native::display::Surface::new(1280, 1240)),
-        );
-        assert!(state.pending("page").is_none());
-        assert!(state.pending("new-page").is_some());
+        state.complete(&pending, "page".into(), Some(applied(1280, 1240)));
+        assert!(state.pending("page", false, false).is_none());
+        assert!(state.pending("new-page", false, false).is_some());
         assert_eq!(
             state.acknowledgment(replacement, pending.config)["applied"]["width"],
             1280
@@ -415,27 +476,27 @@ mod tests {
             viewer: Uuid::new_v4(),
             width: 780,
             height: 600,
+            crops: false,
         };
         let first = Uuid::new_v4();
         state.configure(first, config);
-        let request = state.pending("owned-window").unwrap();
-        state.complete(
-            &request,
-            "owned-window".into(),
-            Some(crate::native::display::Surface::new(1560, 1200)),
+        let request = state.pending("owned-window", false, false).unwrap();
+        state.complete(&request, "owned-window".into(), Some(applied(1560, 1200)));
+        state.update_surface(
+            &crate::native::display::Surface::new(1280, 960),
+            (1280, 960),
         );
-        state.update_surface(&crate::native::display::Surface::new(1280, 960));
-        let restore = state.pending("owned-window").unwrap();
+        let restore = state.pending("owned-window", false, false).unwrap();
         assert_eq!(restore.config, config);
         state.complete(&restore, "owned-window".into(), None);
-        assert!(state.pending("owned-window").is_none());
+        assert!(state.pending("owned-window", false, false).is_none());
         assert_eq!(
             state.acknowledgment(first, config)["error"],
             "viewport_unavailable"
         );
         let reconnect = Uuid::new_v4();
         state.configure(reconnect, config);
-        assert!(state.pending("owned-window").is_some());
+        assert!(state.pending("owned-window", false, false).is_some());
         state.disconnect(first);
         assert_eq!(state.acknowledgment(reconnect, config)["role"], "primary");
     }
@@ -449,6 +510,7 @@ mod tests {
             viewer: Uuid::new_v4(),
             width: 780,
             height: 600,
+            crops: false,
         };
         assert_eq!(state.capture_pacing(false), FramePacing::PASSIVE);
         assert_eq!(state.client_fps(primary, 60, false), 60);
@@ -477,6 +539,7 @@ mod tests {
             viewer: Uuid::new_v4(),
             width: 780,
             height: 600,
+            crops: false,
         };
         assert_eq!(state.capture_pacing(true), FramePacing::CONTROLLED);
         state.configure(primary, config);
@@ -502,5 +565,84 @@ mod tests {
             FramePacing::PRESENTED.period(),
             Duration::from_micros(33_333)
         );
+    }
+
+    /// A framebuffer larger than the window satisfies a layout only while
+    /// every viewer crops to the window; otherwise it is laid out again.
+    #[test]
+    fn a_size_class_layout_holds_only_while_every_viewer_crops() {
+        let state = Presentation::new();
+        let config = PresentationConfig {
+            viewer: Uuid::new_v4(),
+            width: 780,
+            height: 600,
+            crops: true,
+        };
+        state.configure(Uuid::new_v4(), config);
+        let request = state.pending("window", true, false).unwrap();
+        state.complete(
+            &request,
+            "window".into(),
+            Some(Applied {
+                surface: crate::native::display::Surface::new(1792, 1280),
+                window: (1560, 1200),
+            }),
+        );
+        assert!(state.pending("window", true, false).is_none());
+        assert!(state.pending("window", false, false).is_some());
+        // Another layout moved the window: the presenter's is pending again.
+        state.update_surface(
+            &crate::native::display::Surface::new(1792, 1280),
+            (1280, 960),
+        );
+        assert!(state.pending("window", true, false).is_some());
+    }
+
+    /// While a person controls input, an older presenter resizes through its
+    /// controller's `viewport` input; only a cropping presenter sets the
+    /// window through its presentation then.
+    #[test]
+    fn under_control_only_a_cropping_presenter_sets_the_window() {
+        let state = Presentation::new();
+        let connection = Uuid::new_v4();
+        let config = PresentationConfig {
+            viewer: Uuid::new_v4(),
+            width: 780,
+            height: 600,
+            crops: false,
+        };
+        state.configure(connection, config);
+        assert!(state.pending("window", false, true).is_none());
+        assert!(state.pending("window", false, false).is_some());
+        state.configure(
+            connection,
+            PresentationConfig {
+                crops: true,
+                ..config
+            },
+        );
+        assert!(state.pending("window", true, true).is_some());
+    }
+
+    /// A disconnected presenter's grace has a deadline its follower waits on.
+    #[test]
+    fn a_disconnected_presenter_expires_on_its_deadline() {
+        let state = Presentation::new();
+        let connection = Uuid::new_v4();
+        state.configure(
+            connection,
+            PresentationConfig {
+                viewer: Uuid::new_v4(),
+                width: 780,
+                height: 600,
+                crops: false,
+            },
+        );
+        assert!(state.expiry().is_none());
+        state.disconnect(connection);
+        let deadline = state.expiry().unwrap();
+        assert!(deadline > Instant::now() && deadline <= Instant::now() + RECONNECT_GRACE);
+        state.expire();
+        assert!(state.configured(), "not before its deadline");
     }
 }

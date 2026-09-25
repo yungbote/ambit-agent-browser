@@ -990,6 +990,7 @@ mod tests {
             viewer: uuid::Uuid::new_v4(),
             width: 800,
             height: 600,
+            crops: false,
         };
         presentation.configure(connection, config);
         let (shutdown, shutdown_rx) = watch::channel(false);

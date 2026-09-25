@@ -360,19 +360,14 @@ async fn run_socket_server(
 }
 
 /// Periodic CDP maintenance shares command custody and is cancelled on stop.
-/// A viewer's layout request also wakes it at once: the window follows the
-/// dock without waiting for the next tick or command.
+/// A viewer's layout never waits for it: the stream applies that layout
+/// itself (`stream::layout`).
 async fn maintain_browser(state: Arc<tokio::sync::Mutex<DaemonState>>, autosave_interval_ms: u64) {
     let mut interval = tokio::time::interval(Duration::from_millis(100));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut layout = LayoutWakeup::default();
     loop {
-        tokio::select! {
-            _ = interval.tick() => {}
-            _ = layout.changed() => {}
-        }
+        interval.tick().await;
         let mut state = state.lock().await;
-        layout.follow(state.stream_server.as_ref());
         if let Err(error) = state.expire_browser_control().await {
             let _ = writeln!(std::io::stderr(), "{}: {}", error.code, error.message);
         }
@@ -391,45 +386,8 @@ async fn maintain_browser(state: Arc<tokio::sync::Mutex<DaemonState>>, autosave_
                     error
                 );
             } else {
-                state.apply_pending_window_layout().await;
                 maybe_autosave_restore_state(&mut state, autosave_interval_ms).await;
             }
-        }
-    }
-}
-
-/// The presentation cell of the current stream server, re-subscribed whenever
-/// the server is replaced. Without a server there is nothing to wake for.
-#[derive(Default)]
-struct LayoutWakeup {
-    server: Option<std::sync::Weak<StreamServer>>,
-    changes: Option<tokio::sync::watch::Receiver<super::stream::presentation::PresentationState>>,
-}
-
-impl LayoutWakeup {
-    fn follow(&mut self, server: Option<&Arc<StreamServer>>) {
-        let same = match (self.server.as_ref(), server) {
-            (Some(current), Some(server)) => std::ptr::eq(current.as_ptr(), Arc::as_ptr(server)),
-            (None, None) => true,
-            _ => false,
-        };
-        if same {
-            return;
-        }
-        self.server = server.map(Arc::downgrade);
-        self.changes = server.map(|server| server.presentation.subscribe());
-    }
-
-    async fn changed(&mut self) {
-        match self.changes.as_mut() {
-            Some(changes) => {
-                if changes.changed().await.is_err() {
-                    // The server is gone; the next tick re-subscribes.
-                    self.changes = None;
-                    self.server = None;
-                }
-            }
-            None => std::future::pending().await,
         }
     }
 }

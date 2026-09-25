@@ -206,6 +206,12 @@ pub(crate) struct Patch {
 }
 
 impl Capture {
+    /// Whether this frame describes `surface`'s raster. A frame of another
+    /// size was taken across a layout: stale, never a helper failure.
+    fn fits(&self, surface: &Surface) -> bool {
+        self.width == surface.width && self.height == surface.height
+    }
+
     fn coherent(&self, request: CaptureRequest, surface: &Surface) -> bool {
         let whole = self.data.is_some();
         let patched = !self.patches.is_empty();
@@ -213,8 +219,19 @@ impl Capture {
         // ever answers to a request that allowed them.
         whole != patched
             && (request.patches && !request.force || !patched)
-            && self.width == surface.width
-            && self.height == surface.height
+            && self.fits(surface)
+            && self.visible.is_none_or(|visible| {
+                visible.x >= 0
+                    && visible.y >= 0
+                    && visible.width > 0
+                    && visible.height > 0
+                    && (visible.x as u32)
+                        .checked_add(visible.width)
+                        .is_some_and(|edge| edge <= surface.width)
+                    && (visible.y as u32)
+                        .checked_add(visible.height)
+                        .is_some_and(|edge| edge <= surface.height)
+            })
             && self.encoding == "jpeg"
             && self.cursor_included == request.cursor
             && self.patches.len() <= 64
@@ -307,6 +324,9 @@ mod platform {
 
     type Wire = BufReader<tokio::net::UnixStream>;
 
+    /// How long a layout waits for the agent's held button to be released.
+    const GESTURE_BOUND: std::time::Duration = std::time::Duration::from_secs(1);
+
     pub(crate) struct DisplayClient {
         identity: String,
         /// Ordered control operations: info, resize, input, reset, copy.
@@ -323,12 +343,36 @@ mod platform {
         surface: RwLock<SurfaceState>,
         /// What the helper's `info` last advertised.
         features: RwLock<Vec<String>>,
+        /// Agent pointer input and window layouts exclude each other: one
+        /// atomic agent input (its geometry proof and its native send) holds
+        /// this shared, a layout holds it exclusively.
+        input_lease: tokio::sync::RwLock<()>,
+        /// The agent's held button, as a nonzero hold id: a layout waits for
+        /// it to end (a click between press and release, a drag), bounded by
+        /// `GESTURE_BOUND`, so a resize does not land mid-gesture.
+        gesture: tokio::sync::watch::Sender<u64>,
+        next_gesture: AtomicU64,
+        /// A hold that outlived the bound once: layouts no longer wait for
+        /// it. Its next input finds the window changed and releases.
+        overridden_gesture: AtomicU64,
     }
+
+    /// Exclusive custody of the window geometry for one layout.
+    pub(crate) struct LayoutGuard<'a>(#[allow(dead_code)] tokio::sync::RwLockWriteGuard<'a, ()>);
+
+    /// Shared custody of the window geometry for one atomic agent input.
+    pub(crate) type AtomicInput<'a> = tokio::sync::RwLockReadGuard<'a, ()>;
 
     struct SurfaceState {
         value: Surface,
         changed_at: std::time::Instant,
         ready: bool,
+        /// The browser window's size in display pixels: the whole surface,
+        /// or the top-left part of a size-class framebuffer.
+        window: (u32, u32),
+        /// Counts applied layouts, so the agent's next command can prove the
+        /// page follows the newest one exactly once.
+        layout_epoch: u64,
     }
 
     struct InFlight<'a> {
@@ -380,11 +424,17 @@ mod platform {
                 retired: AtomicBool::new(false),
                 next_id: AtomicU64::new(1),
                 surface: RwLock::new(SurfaceState {
+                    window: (surface.width, surface.height),
                     value: surface,
                     changed_at: std::time::Instant::now(),
                     ready,
+                    layout_epoch: 0,
                 }),
                 features: RwLock::new(Vec::new()),
+                input_lease: tokio::sync::RwLock::new(()),
+                gesture: tokio::sync::watch::channel(0).0,
+                next_gesture: AtomicU64::new(1),
+                overridden_gesture: AtomicU64::new(0),
             }))
         }
 
@@ -421,6 +471,16 @@ mod platform {
             self.surface.read().unwrap().value.clone()
         }
 
+        /// The browser window's size in display pixels.
+        pub(crate) fn window(&self) -> (u32, u32) {
+            self.surface.read().unwrap().window
+        }
+
+        /// Moves on every applied layout.
+        pub(crate) fn layout_epoch(&self) -> u64 {
+            self.surface.read().unwrap().layout_epoch
+        }
+
         /// Whether the helper advertised a protocol extension.
         pub(crate) fn has(&self, feature: &str) -> bool {
             self.features
@@ -428,6 +488,50 @@ mod platform {
                 .unwrap()
                 .iter()
                 .any(|advertised| advertised == feature)
+        }
+
+        /// Shared custody for one atomic agent pointer input: no layout
+        /// lands between its geometry proof and its native send.
+        pub(crate) async fn atomic_input(&self) -> AtomicInput<'_> {
+            self.input_lease.read().await
+        }
+
+        /// Whether the agent holds a button. Layouts wait for a held
+        /// gesture to end, within `GESTURE_BOUND`.
+        pub(crate) fn set_gesture(&self, held: bool) {
+            self.gesture.send_if_modified(|hold| match (held, *hold) {
+                (true, 0) => {
+                    *hold = self.next_gesture.fetch_add(1, Ordering::Relaxed);
+                    true
+                }
+                (false, 1..) => {
+                    *hold = 0;
+                    true
+                }
+                _ => false,
+            });
+        }
+
+        /// Exclusive custody for a layout: after the atomic agent input in
+        /// flight, and after a held gesture ends or outlives its bound.
+        pub(crate) async fn layout(&self) -> LayoutGuard<'_> {
+            let deadline = tokio::time::Instant::now() + GESTURE_BOUND;
+            let mut hold = self.gesture.subscribe();
+            loop {
+                // While the exclusive lease is held no new gesture can start,
+                // so a hold observed as ended here stays ended.
+                let guard = self.input_lease.write().await;
+                let held = *hold.borrow_and_update();
+                if held == 0 || held == self.overridden_gesture.load(Ordering::Acquire) {
+                    return LayoutGuard(guard);
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    self.overridden_gesture.store(held, Ordering::Release);
+                    return LayoutGuard(guard);
+                }
+                drop(guard);
+                let _ = tokio::time::timeout_at(deadline, hold.wait_for(|now| *now != held)).await;
+            }
         }
 
         pub(crate) fn changed_since(&self, received_at: std::time::Instant) -> bool {
@@ -520,28 +624,61 @@ mod platform {
             Ok(info)
         }
 
+        /// Lays the window out at `width` × `height` display pixels under
+        /// `layout` custody. With `size_class` (only when the helper
+        /// advertises it) the framebuffer may stay larger than the window, so
+        /// a drag never reallocates it; the surface is then the framebuffer
+        /// and `window()` the window. The surface generation names the
+        /// window, not its size: it does not move here, so a person's input
+        /// and the frames continue across a resize. Every answered attempt
+        /// moves the layout epoch, which the agent's next command proves.
         pub(crate) async fn resize(
             &self,
+            _layout: &LayoutGuard<'_>,
             width: u32,
             height: u32,
             window_id: Option<u32>,
+            size_class: bool,
         ) -> Result<DisplayInfo, DisplayError> {
+            let size_class = size_class && self.has("sizeClass");
             let mut wire = self.control.lock().await;
             // Geometry can change before a failed or cancelled reply. Fence
-            // queued coordinates and frame publication before that effect.
+            // queued agent coordinates on that possibility; captures wait
+            // only when the helper cannot gate them on the paint itself.
             {
                 let mut surface = self.surface.write().unwrap();
-                surface.value.generation = uuid::Uuid::new_v4().to_string();
                 surface.changed_at = std::time::Instant::now();
                 surface.ready = false;
             }
-            let info: DisplayInfo = serde_json::from_value(
-                self.command(&mut wire, json!({ "op": "resize", "width": width, "height": height, "windowId": window_id.unwrap_or(0) }))
-                    .await?,
-            )
-            .map_err(|_| DisplayError::unavailable())?;
+            let mut request = json!({ "op": "resize", "width": width, "height": height, "windowId": window_id.unwrap_or(0) });
+            if size_class {
+                request["sizeClass"] = json!(true);
+            }
+            let answered = |surface: &mut SurfaceState| {
+                surface.layout_epoch += 1;
+                surface.changed_at = std::time::Instant::now();
+                surface.ready = true;
+            };
+            let reply = match self.command(&mut wire, request).await {
+                Ok(reply) => reply,
+                Err(error) => {
+                    // A refusal leaves the helper usable; its geometry is
+                    // still proven again by the agent's next command.
+                    if self.available() {
+                        answered(&mut self.surface.write().unwrap());
+                    }
+                    return Err(error);
+                }
+            };
+            let Ok(info) = serde_json::from_value::<DisplayInfo>(reply) else {
+                self.abort();
+                return Err(DisplayError::unavailable());
+            };
             if !(1..=MAX_DISPLAY_SIZE).contains(&info.width)
                 || !(1..=MAX_DISPLAY_SIZE).contains(&info.height)
+                || info.width < width
+                || info.height < height
+                || !size_class && (info.width, info.height) != (width, height)
             {
                 self.abort();
                 return Err(DisplayError::unavailable());
@@ -549,6 +686,8 @@ mod platform {
             let mut surface = self.surface.write().unwrap();
             surface.value.width = info.width;
             surface.value.height = info.height;
+            surface.window = (width, height);
+            answered(&mut surface);
             Ok(info)
         }
 
@@ -559,18 +698,11 @@ mod platform {
             surface.changed_at = std::time::Instant::now();
         }
 
-        pub(crate) async fn finish_layout(&self) {
-            let _wire = self.control.lock().await;
-            let mut surface = self.surface.write().unwrap();
-            surface.ready = true;
-            surface.changed_at = std::time::Instant::now();
-        }
-
         /// One capture: a frame when the display changed since the previous
         /// capture, and the cursor's identity when asked and changed. A
-        /// generation rotated while the frame was in flight makes the frame
-        /// stale (transient), never a helper failure, and so does
-        /// retirement: a closing window is never published.
+        /// generation rotated or a layout applied while the frame was in
+        /// flight makes the frame stale (transient), never a helper failure,
+        /// and so does retirement: a closing window is never published.
         pub(crate) async fn capture(
             &self,
             request: CaptureRequest,
@@ -582,6 +714,14 @@ mod platform {
             captured
         }
 
+        fn stale() -> DisplayError {
+            DisplayError {
+                code: "display_frame_stale".into(),
+                message: "The browser window changed while this frame was captured.".into(),
+                operation_performed: Some(json!(false)),
+            }
+        }
+
         async fn capture_current(&self, request: CaptureRequest) -> Result<Captured, DisplayError> {
             if self.retired.load(Ordering::Acquire) {
                 return Err(DisplayError::retired());
@@ -589,7 +729,10 @@ mod platform {
             let mut wire = self.frames.lock().await;
             let before = {
                 let state = self.surface.read().unwrap();
-                if !state.ready {
+                // A helper that gates frames on the browser's own paint
+                // answers unchanged through a layout; an older one must not
+                // be asked while a resize is in flight.
+                if !state.ready && !self.has("layoutGate") {
                     return Err(DisplayError {
                         code: "display_layout_pending".into(),
                         message: "The browser is applying its window layout.".into(),
@@ -623,12 +766,11 @@ mod platform {
             let capture: Capture =
                 serde_json::from_value(reply).map_err(|_| DisplayError::unavailable())?;
             let after = self.surface();
-            if after.generation != before.generation {
-                return Err(DisplayError {
-                    code: "display_frame_stale".into(),
-                    message: "The browser window changed while this frame was captured.".into(),
-                    operation_performed: Some(json!(false)),
-                });
+            if after.generation != before.generation
+                || (after.width, after.height) != (before.width, before.height)
+                || !capture.fits(&after)
+            {
+                return Err(Self::stale());
             }
             if !capture.coherent(request, &after) {
                 self.abort();
@@ -770,6 +912,188 @@ mod platform {
             wait_ms: 0,
             cursor_identity: false,
         };
+
+        /// Answers one `resize` on the control peer with a framebuffer.
+        async fn answer_resize(
+            peer: &mut BufReader<tokio::net::UnixStream>,
+            framebuffer: (u32, u32),
+        ) -> Value {
+            let request = read_request(peer).await;
+            assert_eq!(request["op"], "resize");
+            reply(
+                peer,
+                json!({"id":request["id"],"success":true,
+                    "data":{"width":framebuffer.0,"height":framebuffer.1,"windows":[]}}),
+            )
+            .await;
+            request
+        }
+
+        /// A layout lands between atomic agent inputs, never inside one, and
+        /// after a held button is released; a hold that outlives the bound
+        /// stops holding layouts back, once.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_layout_waits_for_the_atomic_input_and_a_held_button_within_its_bound() {
+            let (display, _peer, _frames) = DisplayClient::test_channel();
+            let atomic = display.atomic_input().await;
+            let owner = display.clone();
+            let layout = tokio::spawn(async move {
+                let _guard = owner.layout().await;
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(
+                !layout.is_finished(),
+                "a layout waits for the input in flight"
+            );
+            drop(atomic);
+            tokio::time::timeout(Duration::from_secs(1), layout)
+                .await
+                .expect("the layout follows the input")
+                .unwrap();
+
+            display.set_gesture(true);
+            let owner = display.clone();
+            let layout = tokio::spawn(async move {
+                let _guard = owner.layout().await;
+            });
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            assert!(!layout.is_finished(), "a layout waits for a held button");
+            // Input continues while the layout waits for the release.
+            drop(display.atomic_input().await);
+            display.set_gesture(false);
+            tokio::time::timeout(Duration::from_millis(500), layout)
+                .await
+                .expect("the layout follows the release")
+                .unwrap();
+
+            display.set_gesture(true);
+            let started = std::time::Instant::now();
+            drop(display.layout().await);
+            let waited = started.elapsed();
+            assert!(
+                waited >= GESTURE_BOUND && waited < GESTURE_BOUND * 2,
+                "a stuck hold is waited out once: {waited:?}"
+            );
+            let started = std::time::Instant::now();
+            drop(display.layout().await);
+            assert!(started.elapsed() < Duration::from_millis(100));
+        }
+
+        /// A resize keeps the window's surface generation, so a person's
+        /// input and the frames continue across it, and moves the layout
+        /// epoch the agent's next command proves. The framebuffer may be a
+        /// size class larger than the window only when the helper serves
+        /// one; a refused resize still moves the epoch.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn a_resize_keeps_the_generation_and_moves_the_layout_epoch() {
+            let (display, peer, _frames) = DisplayClient::test_channel();
+            let generation = display.surface().generation;
+            let mut peer = BufReader::new(peer);
+            let owner = display.clone();
+            let resized = tokio::spawn(async move {
+                let layout = owner.layout().await;
+                owner
+                    .resize(&layout, 1560, 1200, Some(7), true)
+                    .await
+                    .map(|_| ())
+            });
+            let request = answer_resize(&mut peer, (1560, 1200)).await;
+            assert!(
+                request.get("sizeClass").is_none(),
+                "not advertised: {request}"
+            );
+            resized.await.unwrap().unwrap();
+            assert_eq!(display.surface().generation, generation);
+            assert_eq!(display.layout_epoch(), 1);
+            assert_eq!(display.window(), (1560, 1200));
+
+            display.advertise(&["sizeClass"]);
+            let owner = display.clone();
+            let resized = tokio::spawn(async move {
+                let layout = owner.layout().await;
+                owner
+                    .resize(&layout, 1400, 1100, Some(7), true)
+                    .await
+                    .map(|_| ())
+            });
+            let request = answer_resize(&mut peer, (1536, 1280)).await;
+            assert_eq!(request["sizeClass"], true);
+            resized.await.unwrap().unwrap();
+            let surface = display.surface();
+            assert_eq!((surface.width, surface.height), (1536, 1280));
+            assert_eq!(surface.generation, generation);
+            assert_eq!(display.window(), (1400, 1100));
+            assert_eq!(display.layout_epoch(), 2);
+
+            let owner = display.clone();
+            let refused = tokio::spawn(async move {
+                let layout = owner.layout().await;
+                owner
+                    .resize(&layout, 1400, 1000, Some(7), false)
+                    .await
+                    .map(|_| ())
+            });
+            let request = read_request(&mut peer).await;
+            reply(&mut peer, json!({"id":request["id"],"success":false,"error":{"code":"display_window_missing","message":"missing","operationPerformed":false}})).await;
+            assert!(refused.await.unwrap().is_err());
+            assert!(display.available() && display.ready());
+            assert_eq!(display.layout_epoch(), 3, "its geometry is proven again");
+
+            // An exact resize answered with another size is a broken helper.
+            let owner = display.clone();
+            let broken = tokio::spawn(async move {
+                let layout = owner.layout().await;
+                owner
+                    .resize(&layout, 1400, 1000, Some(7), false)
+                    .await
+                    .map(|_| ())
+            });
+            answer_resize(&mut peer, (1536, 1280)).await;
+            assert!(broken.await.unwrap().is_err());
+            assert!(!display.available());
+        }
+
+        /// A helper that gates frames on the browser's paint is captured
+        /// through a layout; an older one is not asked while it lays out.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn captures_continue_through_a_layout_only_with_a_paint_gated_helper() {
+            for gated in [false, true] {
+                let (display, peer, frames) = DisplayClient::test_channel();
+                if gated {
+                    display.advertise(&["layoutGate"]);
+                }
+                let mut peer = BufReader::new(peer);
+                let owner = display.clone();
+                let resized = tokio::spawn(async move {
+                    let layout = owner.layout().await;
+                    owner
+                        .resize(&layout, 1560, 1200, Some(7), false)
+                        .await
+                        .map(|_| ())
+                });
+                let request = read_request(&mut peer).await;
+                assert_eq!(request["op"], "resize");
+                assert!(!display.ready());
+                let owner = display.clone();
+                let capture = tokio::spawn(async move { owner.capture(CAPTURE).await });
+                let mut frames = BufReader::new(frames);
+                if gated {
+                    let capture_request = read_request(&mut frames).await;
+                    assert_eq!(capture_request["op"], "capture");
+                    reply(
+                        &mut frames,
+                        json!({"id":capture_request["id"],"success":true,"data":{"changed":false}}),
+                    )
+                    .await;
+                    assert!(capture.await.unwrap().unwrap().frame.is_none());
+                } else {
+                    let error = capture.await.unwrap().unwrap_err();
+                    assert_eq!(error.code, "display_layout_pending");
+                }
+                reply(&mut peer, json!({"id":request["id"],"success":true,"data":{"width":1560,"height":1200,"windows":[]}})).await;
+                resized.await.unwrap().unwrap();
+            }
+        }
 
         #[tokio::test]
         async fn reset_waits_for_the_prior_input_response_on_the_same_channel() {
@@ -1086,12 +1410,18 @@ mod platform {
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) use platform::{DisplayClient, DisplayProcess};
+pub(crate) use platform::{AtomicInput, DisplayClient, DisplayProcess};
 
 /// There is no private X11 backend on other platforms. The uninhabited type
 /// keeps the optional browser capability honest without a fake implementation.
 #[cfg(not(target_os = "linux"))]
 pub(crate) enum DisplayClient {}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct LayoutGuard<'a>(std::marker::PhantomData<&'a ()>);
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) struct AtomicInput<'a>(std::marker::PhantomData<&'a ()>);
 
 #[cfg(not(target_os = "linux"))]
 impl DisplayClient {
@@ -1110,7 +1440,23 @@ impl DisplayClient {
     pub(crate) fn changed_since(&self, _: std::time::Instant) -> bool {
         match *self {}
     }
+    pub(crate) fn window(&self) -> (u32, u32) {
+        match *self {}
+    }
+    pub(crate) fn layout_epoch(&self) -> u64 {
+        match *self {}
+    }
     pub(crate) fn has(&self, _: &str) -> bool {
+        match *self {}
+    }
+    pub(crate) async fn atomic_input(&self) -> AtomicInput<'_> {
+        match *self {}
+    }
+
+    pub(crate) fn set_gesture(&self, _: bool) {
+        match *self {}
+    }
+    pub(crate) async fn layout(&self) -> LayoutGuard<'_> {
         match *self {}
     }
     pub(crate) fn retire(&self) {
@@ -1124,16 +1470,16 @@ impl DisplayClient {
     }
     pub(crate) async fn resize(
         &self,
+        _: &LayoutGuard<'_>,
         _: u32,
         _: u32,
         _: Option<u32>,
+        _: bool,
     ) -> Result<DisplayInfo, DisplayError> {
         match *self {}
     }
+
     pub(crate) async fn invalidate(&self) {
-        match *self {}
-    }
-    pub(crate) async fn finish_layout(&self) {
         match *self {}
     }
     pub(crate) async fn capture(&self, _: CaptureRequest) -> Result<Captured, DisplayError> {

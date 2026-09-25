@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 
 use crate::native::activity::{InputSource, NativePointer};
 use crate::native::cdp::client::CdpClient;
-use crate::native::display::{DisplayClient, Surface};
+use crate::native::display::{AtomicInput, DisplayClient, Surface};
 
 const GEOMETRY: &str = "({scale:devicePixelRatio*(visualViewport?.scale??1),width:innerWidth,height:innerHeight,offsetX:visualViewport?.offsetLeft??0,offsetY:visualViewport?.offsetTop??0})";
 
@@ -27,6 +27,10 @@ fn outcome_unknown(message: impl AsRef<str>) -> String {
 
 const UNMEASURED: &str =
     "The browser did not report the native mouse position. No native button was sent.";
+
+/// A person's view resized the window after this command began: whatever
+/// it resolved on the page may have moved, so its pointer input is refused.
+const RESIZED: &str = "The browser window was resized while this command ran, so this mouse input was not sent. Observe the page before choosing the next action.";
 
 /// A CDP move whose trusted renderer event, when this page's own document
 /// receives it, measures where page coordinates are on the native display.
@@ -153,12 +157,26 @@ pub(super) struct NativeMouse {
     modifiers: i64,
     /// Set before the helper can perform input. Cancellation cannot clear it.
     unknown: bool,
+    /// The window layout this command began under. Layouts no longer wait
+    /// for a whole command, so pointer input after a newer layout is refused
+    /// before it is sent.
+    layout_epoch: Option<u64>,
 }
 
 impl NativeMouse {
-    pub(super) fn begin_command(&mut self) {
+    pub(super) fn begin_command(&mut self, layout_epoch: Option<u64>) {
         if self.buttons == 0 {
             self.mappings.clear();
+        }
+        self.layout_epoch = layout_epoch;
+    }
+
+    /// Checked under atomic input custody, so no layout can land between
+    /// this check and the native send.
+    fn same_layout(&self, display: &DisplayClient) -> Result<(), String> {
+        match self.layout_epoch {
+            Some(epoch) if epoch != display.layout_epoch() => Err(RESIZED.into()),
+            _ => Ok(()),
         }
     }
 
@@ -184,7 +202,10 @@ impl NativeMouse {
         display.reset().await.map_err(|error| {
             outcome_unknown(format!("Native input release is unconfirmed ({error}). Close the browser before sending more mouse input."))
         })?;
+        display.set_gesture(false);
+        let layout_epoch = self.layout_epoch;
         self.reset();
+        self.layout_epoch = layout_epoch;
         Ok(())
     }
 
@@ -317,12 +338,18 @@ impl NativeMouse {
             Ok(point) => point,
             Err(error) => return self.finish(Err(error), display).await,
         };
+        let atomic = display.atomic_input().await;
+        if let Err(error) = self.same_layout(display) {
+            drop(atomic);
+            return self.finish(Err(error), display).await;
+        }
         let mapping = match self.prepare(client, session, display, x, y).await {
             Ok(mapping) => mapping,
             Err(error) => {
                 // An explicit release needs no stale page coordinates. This
                 // branch precedes any new native dispatch; a failed attempted
                 // input below must retain its original failure instead.
+                drop(atomic);
                 if allow_release_cleanup && params["type"] == "mouseReleased" && self.buttons != 0 {
                     self.release(display).await?;
                     return Ok(false);
@@ -332,13 +359,25 @@ impl NativeMouse {
         };
         let result = async {
             let point = mapping.point(x, y, &display.surface())?;
-            self.dispatch_at(params, point, &mapping, client, display, dialog_sessions)
-                .await
+            self.dispatch_at(
+                params,
+                point,
+                &mapping,
+                client,
+                display,
+                dialog_sessions,
+                atomic,
+            )
+            .await
         }
         .await;
         self.finish(result, display).await
     }
 
+    /// Sends one native mouse event. `atomic` is the input custody its
+    /// geometry proof ran under: it ends at the helper's receipt, before the
+    /// page readback, so a slow renderer never holds a layout back.
+    #[allow(clippy::too_many_arguments)]
     async fn dispatch_at(
         &mut self,
         params: Value,
@@ -347,6 +386,7 @@ impl NativeMouse {
         client: &CdpClient,
         display: &DisplayClient,
         dialog_sessions: &[&str],
+        atomic: AtomicInput<'_>,
     ) -> Result<bool, String> {
         let session = mapping.session.as_str();
         let event_type = params["type"].as_str().ok_or("Missing mouse event type")?;
@@ -404,6 +444,9 @@ impl NativeMouse {
         self.buttons = buttons;
         self.modifiers = modifiers;
         self.unknown = false;
+        // A held button keeps layouts back until it is released.
+        display.set_gesture(buttons != 0);
+        drop(atomic);
         observation.acknowledged();
         if !observe {
             return Ok(false);
@@ -459,6 +502,8 @@ impl NativeMouse {
         source: (&str, f64, f64),
         target: (&str, f64, f64),
     ) -> Result<bool, String> {
+        let atomic = display.atomic_input().await;
+        self.same_layout(display)?;
         let end_mapping = self
             .prepare(client, target.0, display, target.1, target.2)
             .await?;
@@ -476,12 +521,15 @@ impl NativeMouse {
                 client,
                 display,
                 &[source.0, page_session],
+                atomic,
             )
             .await?
         {
             return Ok(true);
         }
         for step in 1..=10 {
+            let atomic = display.atomic_input().await;
+            self.same_layout(display)?;
             self.current(&start_mapping, client, display).await?;
             let fraction = f64::from(step) / 10.0;
             let point = (
@@ -495,10 +543,13 @@ impl NativeMouse {
                 client,
                 display,
                 &[source.0, page_session],
+                atomic,
             )
             .await?;
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        let atomic = display.atomic_input().await;
+        self.same_layout(display)?;
         self.current(&end_mapping, client, display).await?;
         self.dispatch_at(
             params("mouseReleased", target.1, target.2, 0),
@@ -507,6 +558,7 @@ impl NativeMouse {
             client,
             display,
             &[target.0, page_session],
+            atomic,
         )
         .await
     }
@@ -569,12 +621,12 @@ mod tests {
     fn mappings_survive_only_a_held_gesture_and_unknown_input_requires_explicit_reset() {
         let mut mouse = NativeMouse::default();
         mouse.mappings.insert("page".into(), mapping(2.0, 262.0));
-        mouse.begin_command();
+        mouse.begin_command(None);
         assert!(mouse.mappings.is_empty());
         mouse.mappings.insert("page".into(), mapping(2.0, 262.0));
         mouse.buttons = 1;
         mouse.unknown = true;
-        mouse.begin_command();
+        mouse.begin_command(None);
         assert_eq!(mouse.mappings.len(), 1);
         assert!(mouse.unknown);
         mouse.reset();
@@ -643,7 +695,7 @@ mod tests {
         assert!(error.contains("release is unconfirmed"));
         assert!(mouse.unknown);
         assert_eq!(mouse.buttons, 1);
-        mouse.begin_command();
+        mouse.begin_command(None);
         assert_eq!(mouse.mappings.len(), 1);
         assert!(mouse
             .require_known()
@@ -750,5 +802,64 @@ mod tests {
         if let Ok(path) = std::env::var("AMBIT_TEST_NATIVE_MOUSE_MCP_RESULT") {
             std::fs::write(path, serde_json::to_vec_pretty(&result).unwrap()).unwrap();
         }
+    }
+
+    /// Layouts no longer wait for a whole command: pointer input a command
+    /// resolved before a person's view resized the window is refused before
+    /// anything is sent, and the next command works at the new layout.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn pointer_input_after_a_newer_layout_is_refused_before_it_is_sent() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cdp_server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let _socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        });
+        let client = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let (display, peer, _frames) = DisplayClient::test_channel();
+        let mut control = super::super::BrowserControl::default();
+        control.set_display(Some(display.clone()));
+        control.begin_agent_command();
+        let owner = display.clone();
+        let resized = tokio::spawn(async move {
+            let layout = owner.layout().await;
+            owner
+                .resize(&layout, 1560, 1200, Some(7), false)
+                .await
+                .map(|_| ())
+        });
+        let mut peer = BufReader::new(peer);
+        let mut line = String::new();
+        peer.read_line(&mut line).await.unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["op"], "resize");
+        let response = json!({"id":request["id"],"success":true,"data":{"width":1560,"height":1200,"windows":[]}});
+        peer.get_mut()
+            .write_all(format!("{response}\n").as_bytes())
+            .await
+            .unwrap();
+        resized.await.unwrap().unwrap();
+        let error = control
+            .agent_native_mouse(
+                json!({"type":"mousePressed","x":210,"y":175,"button":"left","buttons":1}),
+                &client,
+                "page",
+                &["page"],
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error, RESIZED);
+        line.clear();
+        let quiet =
+            tokio::time::timeout(Duration::from_millis(100), peer.read_line(&mut line)).await;
+        assert!(quiet.is_err(), "nothing was sent: {line}");
+        control.begin_agent_command();
+        assert!(control.native_mouse.same_layout(&display).is_ok());
+        cdp_server.abort();
     }
 }

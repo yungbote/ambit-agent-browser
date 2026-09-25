@@ -292,7 +292,12 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
         .map(|(_, value)| value.trim());
     cfg.presentation = match (viewer, width, height) {
         (Some(viewer), Some(width), Some(height)) => {
-            PresentationConfig::parse(viewer, width, height)
+            PresentationConfig::parse(viewer, width, height).map(|presentation| {
+                PresentationConfig {
+                    crops: cfg.crops_visible,
+                    ..presentation
+                }
+            })
         }
         _ => None,
     };
@@ -309,10 +314,11 @@ fn updated_presentation(mut config: ClientConfig, message: &Value) -> Option<Cli
         return None;
     }
     config.presentation = Some(PresentationConfig {
-        viewer: current.viewer,
         width: width as u32,
         height: height as u32,
+        ..current
     });
+
     Some(config)
 }
 
@@ -1102,6 +1108,23 @@ mod tests {
         }
     }
 
+    /// A presenter that crops sets the window through `presentation` even
+    /// while it controls input; an older presenter does not claim that.
+    #[test]
+    fn a_cropping_presenter_declares_it_with_its_layout() {
+        let viewer = uuid::Uuid::new_v4();
+        let presenter = |query: &str| {
+            config_from_upgrade(&format!(
+                "GET /?width=780&height=600{query} HTTP/1.1\r\nX-Ambit-Browser-Viewer: {viewer}\r\n\r\n"
+            ))
+            .presentation
+            .unwrap()
+        };
+        assert!(presenter("&visible=crop").crops);
+        assert!(!presenter("").crops);
+        assert_eq!(presenter("&visible=crop").width, 780);
+    }
+
     #[test]
     fn test_config_from_upgrade_reads_patch_compositing() {
         assert!(config_from_upgrade(&upgrade("/?patches=1")).patches);
@@ -1332,6 +1355,7 @@ mod tests {
                 viewer,
                 width: 800,
                 height: 600,
+                crops: true,
             }),
             binary: true,
             ..ClientConfig::default()
@@ -1346,10 +1370,12 @@ mod tests {
             PresentationConfig {
                 viewer,
                 width: 390,
-                height: 844
+                height: 844,
+                crops: true,
             }
         );
         assert!(changed.binary);
+
         assert!(
             updated_presentation(ClientConfig::default(), &json!({"width":390,"height":844}))
                 .is_none()

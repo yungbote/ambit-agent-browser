@@ -2777,7 +2777,6 @@ pub(crate) async fn execute_command_received(
     if response["success"] == true && window_actions::observes_page(&command) {
         state.browser_control.lock().await.observed();
     }
-    state.apply_pending_window_layout().await;
     super::feedback::attach(&request, &mut response, state).await;
     response
 }
@@ -2808,7 +2807,9 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
             if let (Some(server), Some(display)) =
                 (state.stream_server.as_ref(), state.window_display())
             {
-                server.presentation.update_surface(&display.surface());
+                server
+                    .presentation
+                    .update_surface(&display.surface(), display.window());
             }
             state.last_command_finished = Some(std::time::Instant::now());
             return match result {
@@ -2832,8 +2833,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         if request.observes_files() {
             let control = state.browser_control.clone();
             let result =
-                browser_control::observe_files(&control, request, Some(ControlPage(state, None)))
-                    .await;
+                browser_control::observe_files(&control, request, Some(ControlPage(state))).await;
             state.last_command_finished = Some(std::time::Instant::now());
             return match result {
                 Ok(data) => success_response(&id, data),
@@ -2855,22 +2855,6 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
                 .as_array()
                 .is_some_and(|events| events.iter().any(|event| event["type"] == "viewport"));
         let operation = async {
-            // A window without DevTools has no page renderer to observe.
-            let layout_events = state
-                .browser
-                .as_ref()
-                .filter(|_| resizes_window)
-                .map(|browser| browser.client.subscribe());
-            if layout_events.is_some() {
-                // Observe the exact existing dialog owner before deciding
-                // whether a renderer readback can participate in readiness.
-                state.drain_cdp_events_background().await.map_err(|_| {
-                    browser_control::ControlError {
-                        code: "browser_control_unavailable",
-                        message: "The browser window could not be observed before resizing.".into(),
-                    }
-                })?;
-            }
             let mut control = control.lock().await;
             control.set_display(display);
             control
@@ -2879,7 +2863,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
                     browser
                         .as_ref()
                         .map(|(client, session)| (client.as_ref(), session.as_str())),
-                    Some(ControlPage(state, layout_events)),
+                    Some(ControlPage(state)),
                 )
                 .await
         };
@@ -2906,7 +2890,9 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         if let (Some(server), Some(display)) =
             (state.stream_server.as_ref(), state.window_display())
         {
-            server.presentation.update_surface(&display.surface());
+            server
+                .presentation
+                .update_surface(&display.surface(), display.window());
         }
         state.last_command_finished = Some(std::time::Instant::now());
         return match result {
@@ -7674,10 +7660,7 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
 
 /// The controller borrows canonical page operations under existing command
 /// custody. Navigation and viewport changes share the same state owners as CLI.
-pub(crate) struct ControlPage<'a>(
-    &'a mut DaemonState,
-    Option<tokio::sync::broadcast::Receiver<super::cdp::types::CdpEvent>>,
-);
+pub(crate) struct ControlPage<'a>(&'a mut DaemonState);
 
 impl ControlPage<'_> {
     pub(crate) fn files_supported(&self) -> bool {
@@ -7806,14 +7789,14 @@ impl ControlPage<'_> {
         if event["type"] == "viewport" {
             if self.0.window_display().is_some() {
                 self.0
-                    .apply_window_layout(
+                    .apply_controller_layout(
                         event["width"].as_u64().unwrap() as u32,
                         event["height"].as_u64().unwrap() as u32,
-                        self.1.take(),
                     )
                     .await?;
                 return Ok(());
             }
+
             let (_, _, scale, mobile) = self.0.viewport.unwrap_or((1280, 720, 1.0, false));
             handle_viewport(
                 &json!({ "width": event["width"], "height": event["height"],

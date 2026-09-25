@@ -3,6 +3,7 @@ pub(crate) mod chat;
 mod dashboard;
 mod discovery;
 mod http;
+pub(crate) mod layout;
 pub(crate) mod presentation;
 mod websocket;
 mod window_capture;
@@ -359,6 +360,10 @@ pub struct StreamServer {
     patch_clients: Arc<std::sync::atomic::AtomicUsize>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<super::display::DisplayClient>>>>,
+    /// Rings when `display_slot` holds another display.
+    display_changed: watch::Sender<()>,
+    /// The connected viewers' declarations, cursor identity and applied input.
+    pub(crate) media: Arc<StreamMedia>,
     /// The active CDP page session ID (from Target.attachToTarget).
     cdp_session_id: Arc<RwLock<Option<String>>>,
     client_notify: Arc<Notify>,
@@ -373,6 +378,7 @@ pub struct StreamServer {
     shutdown_tx: watch::Sender<bool>,
     accept_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     cdp_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    layout_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl StreamServer {
@@ -450,16 +456,13 @@ impl StreamServer {
     /// Update the stored viewport dimensions and restart the active screencast (if any)
     /// so frames are captured at the new size.
     pub async fn set_viewport(&self, width: u32, height: u32) {
-        let mut vw = self.viewport_width.lock().await;
-        let mut vh = self.viewport_height.lock().await;
-        if *vw == width && *vh == height {
-            return;
+        layout::Viewport {
+            width: self.viewport_width.clone(),
+            height: self.viewport_height.clone(),
+            changed: self.client_notify.clone(),
         }
-        *vw = width;
-        *vh = height;
-        drop(vw);
-        drop(vh);
-        self.client_notify.notify_one();
+        .set(width, height)
+        .await;
     }
 
     /// Get the current viewport dimensions.
@@ -493,6 +496,9 @@ impl StreamServer {
             let _ = task.await;
         }
         if let Some(task) = self.cdp_task.lock().await.take() {
+            let _ = task.await;
+        }
+        if let Some(task) = self.layout_task.lock().await.take() {
             let _ = task.await;
         }
     }
@@ -536,15 +542,30 @@ impl StreamServer {
         let last_engine = Arc::new(RwLock::new("chrome".to_string()));
         let recording = Arc::new(Mutex::new(false));
         let display_slot = Arc::new(RwLock::new(None));
+        let (display_changed, _) = watch::channel(());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let display_slot_accept = display_slot.clone();
-        let (custody_bg, media) = {
+        let (custody_bg, custody_layout, media) = {
             let control = browser_control.lock().await;
             (
+                control.custody(),
                 control.custody(),
                 Arc::new(StreamMedia::new(control.applied_input())),
             )
         };
+        let layout_task = tokio::spawn(layout::follow_presentation(
+            presentation.clone(),
+            display_slot.clone(),
+            display_changed.subscribe(),
+            media.clone(),
+            custody_layout,
+            layout::Viewport {
+                width: viewport_width.clone(),
+                height: viewport_height.clone(),
+                changed: client_notify.clone(),
+            },
+            shutdown_rx.clone(),
+        ));
         let media_accept = media.clone();
 
         let frame_tx_clone = frame_tx.clone();
@@ -648,6 +669,8 @@ impl StreamServer {
                 patch_clients,
                 client_slot: client_slot.clone(),
                 display_slot,
+                display_changed,
+                media,
                 cdp_session_id,
                 client_notify,
                 idle_activity,
@@ -660,6 +683,7 @@ impl StreamServer {
                 shutdown_tx,
                 accept_task: Mutex::new(Some(accept_task)),
                 cdp_task: Mutex::new(Some(cdp_task)),
+                layout_task: Mutex::new(Some(layout_task)),
             },
             client_slot,
         ))
@@ -675,11 +699,8 @@ impl StreamServer {
             *slot = display;
             self.frame_watch.send_replace(None);
             self.client_notify.notify_one();
+            self.display_changed.send_replace(());
         }
-    }
-
-    pub(crate) fn clear_frame(&self) {
-        self.frame_watch.send_replace(None);
     }
 
     /// Broadcast a raw frame string (legacy). The caller owns the payload, so
@@ -1297,7 +1318,11 @@ mod tests {
                 break;
             }
         }
-        let pending = server.presentation.pending("same-page").unwrap();
+        let pending = server
+            .presentation
+            .pending("same-page", false, false)
+            .unwrap();
+
         assert_eq!(pending.config.viewer, viewer);
         assert_eq!((pending.config.width, pending.config.height), (390, 844));
         server.shutdown().await;

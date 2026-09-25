@@ -469,8 +469,11 @@ impl BrowserControl {
         self.display = display;
     }
 
+    /// An agent command (or one Playwright input) starts under the current
+    /// window layout; a later layout refuses its pointer input.
     pub(crate) fn begin_agent_command(&mut self) {
-        self.native_mouse.begin_command();
+        let layout = self.display.as_ref().map(|display| display.layout_epoch());
+        self.native_mouse.begin_command(layout);
     }
 
     /// Observe lease deadlines without holding this gate. Frame pacing and

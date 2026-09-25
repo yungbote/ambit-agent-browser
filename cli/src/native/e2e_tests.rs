@@ -12804,7 +12804,6 @@ async fn e2e_native_controlled_stream_patches_and_input_latency() {
         .headers_mut()
         .insert("X-Ambit-Browser-Viewer", viewer.parse().unwrap());
     let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
-    state.apply_pending_window_layout().await;
     let controller = uuid::Uuid::new_v4().to_string();
     let expiry = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -12938,7 +12937,6 @@ async fn e2e_native_binary_viewer_resizes_the_same_window() {
         .unwrap();
         let mut observed = false;
         while started.elapsed() < std::time::Duration::from_secs(5) {
-            state.apply_pending_window_layout().await;
             let Ok(Some(Ok(message))) =
                 tokio::time::timeout(std::time::Duration::from_millis(5), ws.next()).await
             else {
@@ -12968,7 +12966,16 @@ async fn e2e_native_binary_viewer_resizes_the_same_window() {
                     frame["byteLength"].is_number(),
                     "new geometry must start with a whole frame"
                 );
-                assert!(previous.as_ref() != Some(&frame["surface"]["generation"]));
+                assert_eq!(frame["visible"]["width"], width * 2, "{frame}");
+                assert_eq!(frame["visible"]["height"], height * 2, "{frame}");
+                // The generation names the window, not its size: input and
+                // frames continue across a resize.
+                assert!(
+                    previous
+                        .as_ref()
+                        .is_none_or(|generation| generation == &frame["surface"]["generation"]),
+                    "a resize must not rotate the surface generation: {frame}"
+                );
                 previous = Some(frame["surface"]["generation"].clone());
                 timings.push(json!({"width":width,"height":height,"firstFrameMs":started.elapsed().as_secs_f64()*1000.0,"jpegBytes":length}));
                 observed = true;
@@ -12991,6 +12998,210 @@ async fn e2e_native_binary_viewer_resizes_the_same_window() {
         "Not changed: a person's open view of this browser sets its window to 733x896 CSS pixels. Keep working at that size; set_viewport applies only while no view is open."
     );
     drop(ws);
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+/// A viewer that crops and draws the pointer (the r6 viewer): its dock
+/// resize reaches the window while an agent command holds the daemon, frames
+/// keep the window's generation (and, with a size-class helper, its
+/// framebuffer) through the drag, the agent's next command acts at the new
+/// geometry, and the pointer's state arrives as `cursor` identities.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn e2e_native_cropping_viewer_resizes_during_an_agent_command_and_gets_cursor_identities() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let enabled =
+        control_test_command(&json!({"action":"stream_enable","port":0}), &mut state).await;
+    assert_success(&enabled);
+    let port = enabled["data"]["port"].as_u64().unwrap();
+    let html = r#"<!doctype html><style>body{margin:0}#go{position:absolute;left:40px;top:40px;width:160px;height:60px;cursor:pointer}#field{position:absolute;left:40px;top:160px;width:200px;height:40px}#busy{position:absolute;left:40px;top:260px;width:160px;height:60px;cursor:progress;background:#ddd}</style><button id=go>Go</button><input id=field><div id=busy></div><script>window.clicks=[];go.onclick=e=>clicks.push({x:e.clientX,y:e.clientY,w:innerWidth})</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
+    let features = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .display_client()
+        .unwrap()
+        .info()
+        .await
+        .unwrap()
+        .features;
+    let size_class = features.iter().any(|feature| feature == "sizeClass");
+    let identities = features.iter().any(|feature| feature == "cursorIdentity");
+    let mut request = format!(
+        "ws://127.0.0.1:{port}/?frames=binary&patches=1&pacing=ack&maxFps=60&width=733&height=896&cursor=viewer&visible=crop"
+    )
+    .into_client_request()
+    .unwrap();
+    request.headers_mut().insert(
+        "X-Ambit-Browser-Viewer",
+        uuid::Uuid::new_v4().to_string().parse().unwrap(),
+    );
+    let (ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let (mut sink, mut source) = futures_util::StreamExt::split(ws);
+    // The viewer: acknowledges every frame, reports the window sizes it
+    // sees and the cursor identities it is given.
+    let (events_tx, mut events) = tokio::sync::mpsc::unbounded_channel::<Value>();
+    let reader = tokio::spawn(async move {
+        while let Some(Ok(message)) = source.next().await {
+            match message {
+                Message::Binary(bytes) => {
+                    let end = 4 + u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+                    let frame: Value = serde_json::from_slice(&bytes[4..end]).unwrap();
+                    let _ = events_tx.send(frame);
+                }
+                Message::Text(text) => {
+                    let message: Value = serde_json::from_str(&text).unwrap();
+                    if message["type"] == "cursor" {
+                        let _ = events_tx.send(message);
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+    let mut frames_seen = 0;
+    let mut generation: Option<Value> = None;
+    // Waits for a frame whose window is `width` × `height` CSS pixels.
+    macro_rules! window_frame {
+        ($width:expr, $height:expr) => {{
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+            loop {
+                let event = tokio::time::timeout_at(deadline, events.recv())
+                    .await
+                    .expect("a frame at the requested window size")
+                    .unwrap();
+                if event["type"] != "frame" {
+                    continue;
+                }
+                frames_seen += 1;
+                sink.send(Message::Text(json!({"type":"ack","seq":event["seq"]}).to_string()))
+                    .await
+                    .unwrap();
+                let surface = &event["surface"];
+                assert!(
+                    generation.as_ref().is_none_or(|g| *g == surface["generation"]),
+                    "a resize must keep the window's generation: {event}"
+                );
+                generation = Some(surface["generation"].clone());
+                assert!(event["ts"].as_u64().is_some(), "{event}");
+                if event["visible"]["width"] == $width * 2 && event["visible"]["height"] == $height * 2 {
+                    assert!(surface["width"].as_u64() >= event["visible"]["width"].as_u64());
+                    break event;
+                }
+            }
+        }};
+    }
+    let first = window_frame!(733, 896);
+    let framebuffer = Some((
+        first["surface"]["width"].clone(),
+        first["surface"]["height"].clone(),
+    ));
+    // A drag of the dock divider while the agent's command holds the daemon.
+    let steps = [(700u32, 896u32), (660, 896), (620, 880), (600, 860)];
+    let command_started = std::time::Instant::now();
+    let wait = json!({"action":"wait","timeout":2500});
+    let command = control_test_command(&wait, &mut state);
+    let drag = async {
+        // The command is admitted first: a layout while a command is queued
+        // refuses it as stale, by design.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let mut timings = Vec::new();
+        for (width, height) in steps {
+            let started = std::time::Instant::now();
+            sink.send(Message::Text(
+                json!({"type":"presentation","width":width,"height":height}).to_string(),
+            ))
+            .await
+            .unwrap();
+            let frame = window_frame!(width, height);
+            if size_class {
+                assert_eq!(
+                    Some((
+                        frame["surface"]["width"].clone(),
+                        frame["surface"]["height"].clone()
+                    )),
+                    framebuffer,
+                    "a drag inside the size class keeps the framebuffer: {frame}"
+                );
+            }
+            timings.push(json!({"width":width,"height":height,
+                "firstFrameMs": started.elapsed().as_secs_f64() * 1000.0,
+                "whole": frame["byteLength"].is_number()}));
+        }
+        (timings, command_started.elapsed())
+    };
+    let (waited, (timings, dragged)) = tokio::join!(command, drag);
+    assert_success(&waited);
+    assert!(
+        dragged < std::time::Duration::from_millis(2500),
+        "the window followed the view during the agent's command ({dragged:?})"
+    );
+    println!(
+        "CROPPED_RESIZE {}",
+        json!({"sizeClass": size_class, "steps": timings})
+    );
+    // The agent's next command acts at the new geometry, proven first.
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#go"}), &mut state).await,
+    );
+    let clicks =
+        control_test_command(&json!({"action":"evaluate","script":"clicks"}), &mut state).await;
+    assert_success(&clicks);
+    let click = &clicks["data"]["result"][0];
+    assert_eq!(click["w"], 600, "{clicks}");
+    assert!(
+        (40..=200).contains(&click["x"].as_i64().unwrap()),
+        "{clicks}"
+    );
+    assert!(
+        (40..=100).contains(&click["y"].as_i64().unwrap()),
+        "{clicks}"
+    );
+    if identities {
+        let mut expect_cursor = async |selector: &str, keyword: &str| {
+            let started = std::time::Instant::now();
+            assert_success(
+                &control_test_command(&json!({"action":"hover","selector":selector}), &mut state)
+                    .await,
+            );
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            let mut seen = Vec::new();
+            loop {
+                let event = tokio::time::timeout_at(deadline, events.recv())
+                    .await
+                    .unwrap_or_else(|_| panic!("a {keyword} cursor identity; seen {seen:?}"))
+                    .unwrap();
+                if event["type"] == "frame" {
+                    sink.send(Message::Text(
+                        json!({"type":"ack","seq":event["seq"]}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+                    continue;
+                }
+                if event["css"] == keyword {
+                    return started.elapsed().as_secs_f64() * 1000.0;
+                }
+                seen.push(event);
+            }
+        };
+        let pointer = expect_cursor("#go", "pointer").await;
+        let text = expect_cursor("#field", "text").await;
+        let progress = expect_cursor("#busy", "progress").await;
+        println!(
+            "CURSOR_IDENTITY {}",
+            json!({"pointerMs": pointer, "textMs": text, "progressMs": progress})
+        );
+    }
+    println!("FRAMES_SEEN {frames_seen}");
+    drop(sink);
+    reader.abort();
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
 
