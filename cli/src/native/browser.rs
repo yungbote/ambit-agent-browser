@@ -728,13 +728,16 @@ impl BrowserManager {
 
         if let Some(display) = manager.display_client() {
             let layout_events = manager.client.subscribe();
-            // The owned headed browser may start on its native New Tab page
-            // without a window manager to activate it. Select by observation
-            // first, then use the existing native activation primitive once.
-            manager
-                .synchronize_visible_page()
-                .await
-                .map_err(str::to_string)?;
+            // The owned headed browser may start on its native New Tab page,
+            // or restore several tabs, without a window manager to activate
+            // any of them. Keep the page the window shows when observation
+            // can tell which one it is; when it cannot (no focus yet, a
+            // restored renderer still busy loading), keep the live page
+            // discovery chose. Either way activate it once. Choosing a page
+            // never fails a launch: a later command that cannot tell which
+            // page is active is refused alone, with the open tabs listed
+            // (`prepare_window_command`).
+            let _ = manager.synchronize_visible_page().await;
             manager.bring_to_front().await?;
             let info = display.info().await.map_err(|error| error.to_string())?;
             let window = info
@@ -1135,7 +1138,29 @@ impl BrowserManager {
     /// on the dead first one (#1036). Probing is browser-safe: a `Runtime.evaluate`
     /// to a discarded session simply never answers (cleaned up when the probe
     /// times out) and does not reload or focus the tab.
+    ///
+    /// An owned window selects its page by observation right after discovery
+    /// (`launch_window`); discovery only needs a live page to start from. It
+    /// takes the first page to answer, so restored tabs whose renderers are
+    /// still busy loading cost nothing instead of a probe timeout each.
     async fn find_live_page_index(&self, session_ids: &[String]) -> Option<usize> {
+        if self.display_client().is_some() {
+            let mut probes: futures_util::stream::FuturesUnordered<_> = session_ids
+                .iter()
+                .enumerate()
+                .map(|(index, session_id)| async move {
+                    self.renderer_responds(session_id, RENDERER_PROBE_TIMEOUT_MS)
+                        .await
+                        .then_some(index)
+                })
+                .collect();
+            while let Some(answer) = futures_util::StreamExt::next(&mut probes).await {
+                if answer.is_some() {
+                    return answer;
+                }
+            }
+            return None;
+        }
         if let Some(first) = session_ids.first() {
             if self
                 .renderer_responds(first, RENDERER_PROBE_TIMEOUT_MS)

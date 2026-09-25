@@ -5,6 +5,7 @@ use super::BrowserManager;
 use crate::native::cdp::client::CdpClient;
 use crate::native::display::{window_pixels, DisplayInfo, Surface};
 use base64::{engine::general_purpose::STANDARD, Engine};
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use serde_json::{json, Value};
 use std::time::Duration;
 
@@ -53,6 +54,31 @@ async fn page_geometry(client: &CdpClient, session: &str) -> Result<Value, Strin
     observe_page(client, session, &visibility_expression())
         .await
         .and_then(visibility)
+}
+
+/// The content size in device pixels, and the page's pixel ratio, of a page
+/// that reports itself visible on a `width` × `height` CSS pixel screen: the
+/// size its paint must have once it is laid out. Page zoom changes CSS
+/// dimensions and the page's pixel ratio, independently of the native UI's
+/// raster scale.
+fn laid_out_size(geometry: &Value, width: u32, height: u32) -> Option<(f64, f64, f64)> {
+    if geometry["visible"] != true
+        || geometry["screenWidth"].as_u64() != Some(u64::from(width))
+        || geometry["screenHeight"].as_u64() != Some(u64::from(height))
+    {
+        return None;
+    }
+    let positive = |key: &str| {
+        geometry[key]
+            .as_f64()
+            .filter(|value| value.is_finite() && *value > 0.0)
+    };
+    let page_dpr = positive("dpr")?;
+    Some((
+        positive("innerWidth")? * page_dpr,
+        positive("innerHeight")? * page_dpr,
+        page_dpr,
+    ))
 }
 
 impl BrowserManager {
@@ -133,87 +159,72 @@ impl BrowserManager {
         // necessarily reflowed. Require its visible page metrics to agree
         // before publishing the applied surface or a host observation.
         let paint = async {
-            // An earlier page emulation must not keep this layout at an
-            // unrelated fixed width. A newly opened modal can block this
-            // command too, so it shares the same bounded observation phase.
-            for page in &self.pages {
-                self.client
-                    .send_command_no_params(
-                        "Emulation.clearDeviceMetricsOverride",
-                        Some(&page.session_id),
-                    )
-                    .await?;
-            }
-            loop {
-                let mut ready = Vec::new();
-                for page in &self.pages {
-                    let geometry = page_geometry(&self.client, &page.session_id).await?;
-                    if geometry["visible"] == true
-                        && geometry["screenWidth"].as_u64() == Some(u64::from(width))
-                        && geometry["screenHeight"].as_u64() == Some(u64::from(height))
-                    {
-                        let positive = |key: &str| {
-                            geometry[key]
-                                .as_f64()
-                                .filter(|value| value.is_finite() && *value > 0.0)
-                        };
-                        if let (Some(content_width), Some(content_height), Some(page_dpr)) = (
-                            positive("innerWidth"),
-                            positive("innerHeight"),
-                            positive("dpr"),
-                        ) {
-                            // Page zoom changes CSS dimensions and page DPR,
-                            // independently of the native UI's raster scale.
-                            ready.push((
-                                page.session_id.clone(),
-                                content_width * page_dpr,
-                                content_height * page_dpr,
-                                page_dpr,
-                            ));
+            // Each page clears any earlier page emulation, which must not
+            // keep this layout at an unrelated fixed width, then reports its
+            // geometry until it is visible at the new size. The first page to
+            // report that is the one the window paints. A page whose renderer
+            // does not answer (busy loading, suspended, discarded) is not
+            // painted: it neither holds the layout nor fails it. A newly
+            // opened modal can block this command too, so it shares the same
+            // bounded observation phase.
+            let client = &self.client;
+            let mut reports: FuturesUnordered<_> = self
+                .pages
+                .iter()
+                .map(|page| async move {
+                    let session = page.session_id.as_str();
+                    let _ = client
+                        .send_command_no_params(
+                            "Emulation.clearDeviceMetricsOverride",
+                            Some(session),
+                        )
+                        .await;
+                    loop {
+                        if let Ok(geometry) = page_geometry(client, session).await {
+                            if let Some(size) = laid_out_size(&geometry, width, height) {
+                                return (session, size);
+                            }
                         }
+                        tokio::time::sleep(Duration::from_millis(16)).await;
                     }
-                }
-                if !ready.is_empty() {
-                    // Native XSync acknowledges the top-level window. This
-                    // existing CDP compositor readback additionally commits
-                    // its visible page before the first full-window capture.
-                    // It is performed once per layout, never per video frame.
-                    for (session, expected_width, expected_height, page_dpr) in ready {
-                        let painted = self
-                            .client
-                            .send_command(
-                                "Page.captureScreenshot",
-                                Some(json!({
-                                    "format": "jpeg", "quality": 1, "fromSurface": true,
-                                    "captureBeyondViewport": false,
-                                })),
-                                Some(&session),
-                            )
-                            .await?;
-                        let data = painted["data"]
-                            .as_str()
-                            .filter(|data| data.len() <= 32 * 1024 * 1024)
-                            .ok_or("The browser page paint could not be observed")?;
-                        let bytes = STANDARD
-                            .decode(data)
-                            .map_err(|_| "The browser page paint was invalid")?;
-                        let dimensions = image::ImageReader::new(std::io::Cursor::new(bytes))
-                            .with_guessed_format()
-                            .map_err(|_| "The browser page paint format was invalid")?
-                            .into_dimensions()
-                            .map_err(|_| "The browser page paint dimensions were invalid")?;
-                        if (f64::from(dimensions.0) - expected_width).abs() > page_dpr
-                            || (f64::from(dimensions.1) - expected_height).abs() > page_dpr
-                        {
-                            return Err(
-                                "The browser compositor has not applied its new viewport".into()
-                            );
-                        }
-                    }
-                    return Ok::<(), String>(());
-                }
-                tokio::time::sleep(Duration::from_millis(16)).await;
+                })
+                .collect();
+            let (session, (expected_width, expected_height, page_dpr)) = reports
+                .next()
+                .await
+                .ok_or("The browser window has no page to lay out")?;
+            // Native XSync acknowledges the top-level window. This existing
+            // CDP compositor readback additionally commits its visible page
+            // before the first full-window capture. It is performed once per
+            // layout, never per video frame.
+            let painted = client
+                .send_command(
+                    "Page.captureScreenshot",
+                    Some(json!({
+                        "format": "jpeg", "quality": 1, "fromSurface": true,
+                        "captureBeyondViewport": false,
+                    })),
+                    Some(session),
+                )
+                .await?;
+            let data = painted["data"]
+                .as_str()
+                .filter(|data| data.len() <= 32 * 1024 * 1024)
+                .ok_or("The browser page paint could not be observed")?;
+            let bytes = STANDARD
+                .decode(data)
+                .map_err(|_| "The browser page paint was invalid")?;
+            let dimensions = image::ImageReader::new(std::io::Cursor::new(bytes))
+                .with_guessed_format()
+                .map_err(|_| "The browser page paint format was invalid")?
+                .into_dimensions()
+                .map_err(|_| "The browser page paint dimensions were invalid")?;
+            if (f64::from(dimensions.0) - expected_width).abs() > page_dpr
+                || (f64::from(dimensions.1) - expected_height).abs() > page_dpr
+            {
+                return Err("The browser compositor has not applied its new viewport".into());
             }
+            Ok::<(), String>(())
         };
         let modal = async {
             loop {
