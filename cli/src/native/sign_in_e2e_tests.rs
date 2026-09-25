@@ -624,9 +624,12 @@ async fn e2e_sign_in_relaunches_without_automation_and_hands_back() {
         "the restored page sees automation again"
     );
 
-    // The agent observes before acting, then finds its session intact.
+    // A command that names its target runs at once; key input, which goes
+    // to whatever has focus, waits for an observation. Then the agent finds
+    // its session intact.
+    assert_eq!(evaluate(&mut state, "1").await, 1);
     assert_refused(
-        &command(&json!({ "action": "evaluate", "script": "1" }), &mut state).await,
+        &command(&json!({ "action": "press", "key": "Enter" }), &mut state).await,
         "browser_observation_required",
     );
     let started = Instant::now();
@@ -843,11 +846,15 @@ async fn e2e_sign_in_that_cannot_start_returns_the_browser_to_automation() {
         assert_success(&command(&control("release", &controller), &mut state).await)["status"],
         "released"
     );
+    assert_eq!(evaluate(&mut state, "location.pathname").await, "/");
     assert_refused(
-        &command(&json!({ "action": "evaluate", "script": "1" }), &mut state).await,
+        &command(
+            &json!({ "action": "keyboard", "subaction": "type", "text": "x" }),
+            &mut state,
+        )
+        .await,
         "browser_observation_required",
     );
     assert_success(&command(&json!({ "action": "snapshot" }), &mut state).await);
-    assert_eq!(evaluate(&mut state, "location.pathname").await, "/");
     assert_success(&command(&json!({ "action": "close" }), &mut state).await);
 }
