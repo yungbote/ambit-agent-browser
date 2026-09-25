@@ -138,7 +138,8 @@ impl CursorIdentities {
     /// The display that reported the identities is gone: none is current,
     /// and a refinement still in flight is never published.
     pub(super) fn reset(&self) {
-        let _ = self.next_order();
+        let mut newest = self.0.newest.lock().unwrap_or_else(|e| e.into_inner());
+        *newest += 1;
         self.0.media.set_cursor(None);
     }
 
