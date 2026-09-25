@@ -2687,7 +2687,8 @@ pub(crate) async fn execute_command_received(
     received_at: std::time::Instant,
 ) -> Value {
     // The theme is session state, not agent activity: it passes no window,
-    // custody or observation gate and captures no host feedback.
+    // custody, observation or action-policy gate and captures no host
+    // feedback.
     if cmd["action"] == theme::ACTION {
         return theme::set(cmd, state).await;
     }
