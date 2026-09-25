@@ -1916,6 +1916,15 @@ fn main() {
         return;
     }
 
+    if let Some(msg) = invalid_theme_error(&flags) {
+        if flags.json {
+            print_json_error_with_type(msg, "invalid_value");
+        } else {
+            eprintln!("{} {}", color::error_indicator(), msg);
+        }
+        exit(1);
+    }
+
     if addresses_running_session(&cmd) {
         let action = cmd["action"].as_str().map(str::to_string);
         let resp =
@@ -1925,15 +1934,6 @@ fn main() {
             exit(1);
         }
         return;
-    }
-
-    if let Some(msg) = invalid_theme_error(&flags) {
-        if flags.json {
-            print_json_error_with_type(msg, "invalid_value");
-        } else {
-            eprintln!("{} {}", color::error_indicator(), msg);
-        }
-        exit(1);
     }
 
     if let Some(msg) = incompatible_launch_mode_error(&flags) {

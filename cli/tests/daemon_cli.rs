@@ -261,6 +261,12 @@ fn absent_required_daemon_never_creates_session_files() {
 #[test]
 fn set_theme_never_starts_a_daemon_or_sends_a_launch() {
     let fixture = Fixture::new();
+    // An invalid theme from any source is refused before anything is sent.
+    let invalid = fixture.run(&["--json", "--theme", "blue", "set", "theme", "light"]);
+    assert!(!invalid.status.success(), "{invalid:?}");
+    assert_eq!(response(&invalid)["type"], "invalid_value");
+    fixture.assert_clean();
+
     let args = [
         "--json", "--headed", "--theme", "dark", "set", "theme", "light",
     ];
