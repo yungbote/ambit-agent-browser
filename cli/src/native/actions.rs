@@ -2716,16 +2716,16 @@ pub(crate) async fn execute_command_received(
         .remove(super::feedback::REQUEST_FIELD);
     let expiry_error = state.expire_browser_control().await.err();
     let controlled = expiry_error.or(state.browser_control.lock().await.agent_error());
+    // The command still carries the host's request here: whether its point
+    // is fenced by the image it came from is part of that request.
     let requires_observation = window_actions::observation_required(
-        &command,
+        cmd,
         state.browser_control.lock().await.needs_observation(),
     );
     let mut response = if let Some(error) = controlled {
         json!({ "id": command["id"], "success": false, "code": error.code, "error": error.message })
     } else if requires_observation {
-        state.ref_map.clear();
-        state.active_frame_id = None;
-        json!({ "id": command["id"], "success": false, "code": "browser_observation_required", "error": "Browser control returned from the user. Inspect this fresh observation and choose the next action." })
+        json!({ "id": command["id"], "success": false, "code": "browser_observation_required", "error": window_actions::OBSERVATION_REQUIRED })
     } else if !super::feedback::matches_expected(&request, state).await {
         json!({ "id": command["id"], "success": false, "code": "browser_observation_stale", "error": "The browser page or viewport changed since this image. Inspect the fresh observation before sending coordinates." })
     } else {
@@ -13303,6 +13303,13 @@ fn error_response(id: &str, error: &str) -> Value {
         resp["code"] = json!(code);
     }
     resp
+}
+
+/// Whether `command` waits for a fresh observation after a person released
+/// the browser (see `window_actions::observation_required`).
+#[cfg(test)]
+pub(crate) fn observation_required_after_handback_for_test(command: &Value) -> bool {
+    window_actions::observation_required(command, true)
 }
 
 #[cfg(test)]

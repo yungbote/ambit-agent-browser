@@ -317,6 +317,101 @@ mod tests {
         );
     }
 
+    /// Arguments that satisfy a tool's schema: each required property with a
+    /// value of its type (the first of an enumeration).
+    fn schema_arguments(schema: &Value, file: &str) -> Value {
+        let mut arguments = serde_json::Map::new();
+        for name in schema["required"].as_array().into_iter().flatten() {
+            let name = name.as_str().unwrap();
+            let property = &schema["properties"][name];
+            let value = if let Some(first) = property["enum"].get(0) {
+                first.clone()
+            } else {
+                match property["type"].as_str() {
+                    Some("number" | "integer") => json!(10),
+                    Some("boolean") => json!(false),
+                    Some("array") => json!(["value"]),
+                    Some("object") => json!({ "X-Test": "value" }),
+                    _ => json!(match name {
+                        "url" | "url1" | "url2" => "https://example.test/",
+                        "selector" | "source" | "target" | "frame" => "#element",
+                        "path" => "/workspace/file",
+                        "file" => file,
+                        "key" => "Enter",
+                        "tab" => "t1",
+                        _ => "value",
+                    }),
+                }
+            };
+            arguments.insert(name.to_string(), value);
+        }
+        Value::Object(arguments)
+    }
+
+    /// Every tool in the host catalog, as the daemon receives it: only input
+    /// that goes to the focused element, the pointer or a point no image
+    /// fences waits for a fresh observation after a person used the browser.
+    /// Every other tool names what it acts on and runs.
+    #[test]
+    fn only_input_without_a_named_target_waits_after_a_handback() {
+        use crate::native::actions::observation_required_after_handback_for_test as held;
+        let flags = parse_flags_from_config(&[], Config::default());
+        let implicit = [
+            TOOL_PRESS,
+            TOOL_KEYDOWN,
+            TOOL_KEYUP,
+            TOOL_KEYBOARD_TYPE,
+            TOOL_KEYBOARD_INSERT_TEXT,
+            TOOL_CLIPBOARD_COPY,
+            TOOL_CLIPBOARD_PASTE,
+            TOOL_MOUSE_DOWN,
+            TOOL_MOUSE_UP,
+            TOOL_MOUSE_MOVE,
+            TOOL_MOUSE_WHEEL,
+            TOOL_SWIPE,
+        ];
+        // `cookies set --curl` reads its file while parsing.
+        let curl = tempfile::NamedTempFile::new().unwrap();
+        fs::write(curl.path(), "curl 'https://example.test/' -H 'Cookie: a=b'").unwrap();
+        let tools = tools();
+        for name in implicit {
+            assert!(tools.iter().any(|tool| tool["name"] == name), "{name}");
+        }
+        for tool in &tools {
+            let name = tool["name"].as_str().unwrap();
+            let mut arguments =
+                schema_arguments(&tool["inputSchema"], curl.path().to_str().unwrap());
+            // The parser needs more than these schemas require.
+            match name {
+                TOOL_DIFF_SCREENSHOT => arguments["baseline"] = json!("/workspace/base.png"),
+                TOOL_RECORD_START | TOOL_RECORD_RESTART => {
+                    arguments["path"] = json!("/workspace/a.webm")
+                }
+                _ => {}
+            }
+            let invocation = prepare_tool(name, &arguments)
+                .unwrap_or_else(|error| panic!("{name} {arguments}: {error:?}"));
+            let command = parse_command_with_input(
+                &invocation.command_args,
+                &flags,
+                invocation.stdin_body.as_deref(),
+            )
+            .unwrap_or_else(|error| panic!("{name} {arguments}: {}", error.format()));
+            assert_eq!(
+                held(&command),
+                implicit.contains(&name),
+                "{name}: {command}"
+            );
+        }
+        // A point the host read from an image is fenced by that image.
+        let invocation = prepare_tool(TOOL_MOUSE_MOVE, &json!({ "x": 10, "y": 20 })).unwrap();
+        let mut command = parse_command_with_input(&invocation.command_args, &flags, None).unwrap();
+        command[REQUEST_FIELD] = json!({ "expectedObservation": {
+            "targetId": "T", "loaderId": "L", "pageGeneration": "G", "geometrySha256": "sha256:0",
+        } });
+        assert!(!held(&command), "{command}");
+    }
+
     #[test]
     fn data_is_not_reparsed_as_host_options() {
         let flags = parse_flags_from_config(&[], Config::default());
