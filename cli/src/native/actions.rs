@@ -3143,12 +3143,21 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
             lifecycle_reused = true;
         }
 
-        if let Some(ref mut mgr) = state.browser {
-            if mgr.page_count() == 0 {
+        let replacement = match state.browser.as_mut() {
+            Some(mgr) if mgr.page_count() == 0 => {
                 // ensure_page itself skips creation for a pinned tab_gone
                 // session, so a closed sole tab stays tab_gone instead of
                 // silently recovering onto a fresh blank page.
                 let _ = mgr.ensure_page().await;
+                mgr.active_session_id().ok().map(str::to_string)
+            }
+            _ => None,
+        };
+        // The page that replaces the last one is the daemon's own: it gets
+        // the session setup, as every page a command opens does.
+        if let Some(session) = replacement {
+            if let Err(error) = apply_session_setup(state, &session).await {
+                eprintln!("Warning: failed to apply the session setup to a new page: {error}");
             }
         }
     }

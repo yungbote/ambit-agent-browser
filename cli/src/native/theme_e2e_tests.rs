@@ -592,6 +592,48 @@ async fn e2e_theme_every_page_gets_the_session_setup_once() {
     assert_success(&command(&json!({ "action": "close" }), &mut state).await);
 }
 
+/// A page the daemon opens because the last one closed gets the session
+/// setup like any page it opens: the theme, not Chrome's own preference, and
+/// each init script once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_theme_reaches_the_page_that_replaces_the_last_one() {
+    let site = SchemeSite::start().await;
+    let mut state = DaemonState::new();
+    // Headless Chrome prefers light on its own; the session theme is dark.
+    let launch = json!({ "action": "launch", "headless": true, "theme": "dark" });
+    assert_success(&command(&launch, &mut state).await);
+    assert_success(&command(&navigate(site.page("first")), &mut state).await);
+    let add = json!({ "action": "addinitscript", "script": COUNT_RUNS });
+    assert_success(&command(&add, &mut state).await);
+
+    let browser = state.browser.as_ref().unwrap();
+    let only = browser.pages_list()[0].target_id.clone();
+    browser
+        .client
+        .send_command(
+            "Target.closeTarget",
+            Some(json!({ "targetId": only })),
+            None,
+        )
+        .await
+        .expect("the last page closes");
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while state.browser.as_ref().unwrap().page_count() > 0 {
+        assert!(Instant::now() < deadline, "the closed page is still listed");
+        maintain(&mut state).await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    assert_success(&command(&navigate(site.page("replacement")), &mut state).await);
+    assert_eq!(
+        site.reports(&mut state, "replacement", 1).await,
+        [Parsed(Dark)]
+    );
+    assert_eq!(runs(&mut state).await, 1);
+    assert_success(&command(&json!({ "action": "close" }), &mut state).await);
+}
+
 /// A page behind an open JavaScript dialog applies media emulation only
 /// once the dialog closes (measured on Chrome for Testing 152). The theme
 /// change still answers within its bound, the other pages switch at once,
