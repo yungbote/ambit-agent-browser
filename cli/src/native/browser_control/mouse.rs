@@ -202,7 +202,6 @@ impl NativeMouse {
         display.reset().await.map_err(|error| {
             outcome_unknown(format!("Native input release is unconfirmed ({error}). Close the browser before sending more mouse input."))
         })?;
-        display.set_gesture(false);
         let layout_epoch = self.layout_epoch;
         self.reset();
         self.layout_epoch = layout_epoch;

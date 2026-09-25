@@ -788,8 +788,13 @@ mod platform {
             Ok(())
         }
 
+        /// Releases every button and key the helper holds. A confirmed
+        /// reset also ends the agent's held gesture, whoever asked for it
+        /// (the agent's cleanup, a person taking control), so layouts stop
+        /// waiting for a button that is no longer down.
         pub(crate) async fn reset(&self) -> Result<(), DisplayError> {
             self.request(json!({ "op": "reset" })).await?;
+            self.set_gesture(false);
             Ok(())
         }
     }

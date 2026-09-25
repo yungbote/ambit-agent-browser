@@ -1477,3 +1477,29 @@ async fn applied_input_watermark_follows_acknowledged_input_only() {
     assert_eq!(load(), 0);
     assert_eq!(watermark.at(between), Some(1));
 }
+
+/// Taking control releases whatever the agent held at the helper, so the
+/// agent's held button no longer holds layouts back: the person's first
+/// resize lands at once, not after the gesture bound.
+#[tokio::test]
+async fn taking_control_ends_the_agents_held_gesture_for_layouts() {
+    let (display, mut ops, _frames) = acknowledging_display();
+    let mut control = BrowserControl {
+        display: Some(display.clone()),
+        ..BrowserControl::default()
+    };
+    // The agent's `mouse down` left its button held across commands.
+    display.set_gesture(true);
+    control
+        .execute(parse(command("acquire", OWNER)), None)
+        .await
+        .unwrap();
+    assert_eq!(ops.recv().await.unwrap()["op"], "reset");
+    let started = Instant::now();
+    drop(display.layout().await);
+    assert!(
+        started.elapsed() < Duration::from_millis(250),
+        "the layout waited {:?} for a hold the reset ended",
+        started.elapsed()
+    );
+}
