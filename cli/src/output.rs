@@ -2167,6 +2167,7 @@ agent-browser run-playwright - Run Playwright in the existing browser
 Usage: agent-browser run-playwright [--target <id>] [--timeout-ms <ms>] <code|--stdin>
 
 Run an async JavaScript body with page, context and browser. Return a JSON value.
+The body runs in Node; document and window exist only inside page.evaluate().
 The default page is the native driver's current tab. Open the browser first.
 Requires Node and installed playwright-core 1.62.1 or a qualified newer version.
 
@@ -2186,7 +2187,10 @@ Linux private windows default to ANGLE software GLES with software compositing;
 explicit browser arguments override it and --webgpu keeps its backend. Fresh
 owned profiles open about:blank; retained profiles and custom startup arguments
 preserve their startup behavior.
-A failed or interrupted program may have performed effects; never replay it.
+A program that fails before any Playwright call did nothing in the browser
+(code=browser_program_error; data.error names the error and its line): fix it
+and run it again. Any other failed or interrupted program may have performed
+effects; never replay it.
 Console output is bounded diagnostics. Returned JSON is limited to 2 MiB.
 
 Examples:

@@ -206,6 +206,7 @@ pub(crate) fn error_code(error: &str) -> Option<&str> {
         TAB_GONE
             | TAB_CLOSED_DURING_COMMAND
             | TAB_NOT_FOUND
+            | super::playwright::PROGRAM_ERROR
             | "browser_control_outcome_unknown"
             | "browser_controlled_by_user"
     ) || code.starts_with("webmcp_")
@@ -4320,6 +4321,10 @@ mod tests {
             (
                 "browser_operation_rejected: Browser setup timeout".to_string(),
                 "browser_operation_rejected",
+            ),
+            (
+                format!("{}: The program failed before it issued any Playwright call. TimeoutError: page.waitForEvent: Timeout 200ms exceeded while waiting for event \"popup\"", crate::native::playwright::PROGRAM_ERROR),
+                "browser_program_error",
             ),
         ] {
             assert_eq!(error_code(&error), Some(code), "{error}");
