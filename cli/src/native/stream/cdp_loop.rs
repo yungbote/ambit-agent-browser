@@ -980,6 +980,7 @@ mod tests {
     /// wakes the capture loop at once instead of waiting for the next tick of
     /// the current interval, so the first frame of a new geometry is captured
     /// as soon as the layout is ready.
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_presentation_change_wakes_capture_before_the_next_tick() {
         use crate::native::display::DisplayClient;
@@ -1137,6 +1138,7 @@ mod tests {
     /// Every window frame carries the media clock at its capture, the window
     /// rectangle within it, and, while a lease has applied input, the last
     /// input sequence the display acknowledged before that capture.
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_window_frames_carry_ts_visible_and_applied_input() {
         use crate::native::display::DisplayClient;
@@ -1222,6 +1224,7 @@ mod tests {
     /// stream keeps it for later viewers across a capture loop restarted for
     /// the same display (the last viewer left and one returned), and drops
     /// it with the display.
+    #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn test_cursor_identity_outlives_a_capture_restart_and_ends_with_its_display() {
         use crate::native::display::DisplayClient;

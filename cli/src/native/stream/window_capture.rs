@@ -249,7 +249,8 @@ fn publish(
     })));
 }
 
-#[cfg(test)]
+// The display helper is a private X11 process: Linux only.
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
     use serde_json::Value;
