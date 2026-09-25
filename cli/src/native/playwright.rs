@@ -14,7 +14,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::{watch, Notify};
 
-use super::actions::DaemonState;
+use super::actions::{CommandError, DaemonState};
 use super::cdp::client::CdpClient;
 
 const RUNNER: &str = include_str!("../../runtime/playwright-runner.mjs");
@@ -88,11 +88,14 @@ impl InterruptReason {
         }
     }
 
-    fn stopped(self) -> String {
+    fn stopped(self) -> CommandError {
         if self == Self::HumanControl {
-            "browser_operation_interrupted: The Playwright program stopped for user control. Earlier effects may have executed; inspect a fresh observation after handback and do not replay the program.".into()
+            CommandError::with_data(
+                "browser_operation_interrupted: The Playwright program stopped for user control. Earlier effects may have executed; inspect a fresh observation after handback and do not replay the program.",
+                json!({"interruptedBy":"human","executionStopped":true,"effectsMayHaveOccurred":true}),
+            )
         } else {
-            unknown(self.message())
+            unknown(self.message()).into()
         }
     }
 }
@@ -330,7 +333,7 @@ async fn diagnostics(mut reader: impl AsyncRead + Unpin) -> (String, bool) {
 
 /// The enclosing command retains exclusive native custody until the temporary
 /// connection, every input operation and the Node group have settled.
-pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Value, String> {
+pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     #[cfg(not(unix))]
     return Err(
         "browser_operation_rejected: Supervised Playwright execution requires a Unix workspace."
@@ -369,7 +372,7 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
         // default profile and misreport cookies, so it refuses before start.
         let (download_context, isolated_contexts) = tokio::select! {
             biased;
-            _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start()),
+            _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start().into()),
             result = tokio::time::timeout_at(deadline, async {
                 let isolated = browser.isolated_context_ids().await?.len();
                 let context = browser.download_context_for_target(&target).await?;
@@ -384,7 +387,7 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
         let control = state.browser_control.clone();
         let client = tokio::select! {
             biased;
-            _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start()),
+            _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start().into()),
             result = tokio::time::timeout_at(deadline, CdpClient::connect(&endpoint)) =>
                 Arc::new(result.map_err(|_| "browser_operation_rejected: Browser attachment timed out.")?
                     .map_err(|_| "browser_operation_rejected: The existing browser could not be attached.")?),
@@ -399,7 +402,7 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
         };
         if let Err(error) = observed {
             client.disconnect();
-            return Err(error);
+            return Err(error.into());
         }
         let mut tunnel = transport::Tunnel::start(client, control.clone()).await?;
         let request = json!({ "endpoint": tunnel.endpoint(), "targetId": target, "code": code, "artifactsDir": artifacts, "environment": environment, "isolatedContexts": isolated_contexts });
@@ -536,7 +539,7 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
             // (a popup whose navigation was refused) keeps any program from
             // starting, whichever tab it selects; name it.
             Ended::Deadline if !started => {
-                Err(not_started_by_deadline(&stalled_tabs(&owner).await))
+                Err(not_started_by_deadline(&stalled_tabs(&owner).await).into())
             }
             ended => program_outcome(ended, started),
         }
@@ -548,18 +551,20 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
 }
 
 /// A cleanup failure after the program ran leaves its effects unknown, and
-/// keeps the program's own outcome in the report. Cleanup after a program
+/// keeps the program's own outcome in the report. Its data is not kept: a
+/// stop that did not settle establishes none of it. Cleanup after a program
 /// that never ran cannot change what happened: nothing did.
 fn after_cleanup(
-    outcome: Result<Value, String>,
+    outcome: Result<Value, CommandError>,
     started: bool,
     cleanup: Result<(), String>,
-) -> Result<Value, String> {
+) -> Result<Value, CommandError> {
     match cleanup {
         Err(error) if started => Err(unknown(match outcome {
             Ok(_) => format!("{error} The program itself returned before cleanup failed."),
-            Err(program) => format!("{error} The program itself reported: {program}"),
-        })),
+            Err(program) => format!("{error} The program itself reported: {}", program.error),
+        })
+        .into()),
         _ => outcome,
     }
 }
@@ -596,26 +601,28 @@ fn not_started_by_deadline(stalled: &[String]) -> String {
 
 /// What the program's own end proves, before any cleanup failure. `started`
 /// is the daemon's start record; a program cannot report itself not started.
-fn program_outcome(ended: Ended, started: bool) -> Result<Value, String> {
+fn program_outcome(ended: Ended, started: bool) -> Result<Value, CommandError> {
     let bytes = match ended {
         Ended::Record(bytes) => bytes,
         Ended::Interrupted(reason) if started => return Err(reason.stopped()),
-        Ended::Interrupted(reason) => return Err(reason.before_start()),
-        Ended::Deadline if started => return Err(unknown("The program reached its deadline.")),
-        Ended::Deadline => return Err(not_started_by_deadline(&[])),
-        Ended::Failed(error) if started => return Err(unknown(error)),
+        Ended::Interrupted(reason) => return Err(reason.before_start().into()),
+        Ended::Deadline if started => {
+            return Err(unknown("The program reached its deadline.").into())
+        }
+        Ended::Deadline => return Err(not_started_by_deadline(&[]).into()),
+        Ended::Failed(error) if started => return Err(unknown(error).into()),
         Ended::Failed(error) => {
-            return Err(format!(
-                "browser_operation_rejected: {error} The program was not started."
-            ))
+            return Err(
+                format!("browser_operation_rejected: {error} The program was not started.").into(),
+            )
         }
     };
-    let result: Value = serde_json::from_slice(&bytes).map_err(|_| {
+    let result: Value = serde_json::from_slice(&bytes).map_err(|_| -> CommandError {
         if started {
-            unknown("The runner did not produce a complete JSON result.")
+            unknown("The runner did not produce a complete JSON result.").into()
         } else {
             "browser_operation_rejected: The Playwright runner stopped before starting the program."
-                .to_string()
+                .into()
         }
     })?;
     if result["success"] != true {
@@ -626,7 +633,8 @@ fn program_outcome(ended: Ended, started: bool) -> Result<Value, String> {
             unknown(message)
         } else {
             format!("browser_operation_rejected: {message}")
-        });
+        }
+        .into());
     }
     Ok(result["result"].clone())
 }
@@ -716,7 +724,7 @@ mod tests {
         let named = not_started_by_deadline(&["A1".into(), "B2".into()]);
         assert!(named.starts_with(&plain), "{named}");
         assert!(named.contains("these tabs have not: A1, B2."), "{named}");
-        assert_eq!(program_outcome(Ended::Deadline, false), Err(plain));
+        assert_eq!(program_outcome(Ended::Deadline, false), Err(plain.into()));
     }
 
     #[test]
@@ -725,7 +733,8 @@ mod tests {
             Ended::Failed("The runner did not accept its invocation.".into()),
             false,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .error;
         assert!(
             before.starts_with("browser_operation_rejected:"),
             "{before}"
@@ -734,7 +743,8 @@ mod tests {
             Ended::Failed("The program result could not be read.".into()),
             true,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .error;
         assert!(
             after.starts_with("browser_operation_outcome_unknown:"),
             "{after}"
@@ -743,7 +753,8 @@ mod tests {
             Ended::Record(br#"{"success":false,"started":false,"error":"boom"}"#.to_vec()),
             true,
         )
-        .unwrap_err();
+        .unwrap_err()
+        .error;
         assert!(
             own.starts_with("browser_operation_outcome_unknown: boom"),
             "{own}"
@@ -761,31 +772,69 @@ mod tests {
     fn a_cleanup_failure_keeps_the_program_outcome_only_when_it_ran() {
         let failed = Err("The browser connection closed.".to_string());
         let reported = after_cleanup(
-            Err("browser_operation_outcome_unknown: boom".into()),
+            Err(CommandError::with_data(
+                "browser_operation_interrupted: stopped",
+                json!({"executionStopped": true}),
+            )),
             true,
             failed.clone(),
         )
         .unwrap_err();
         assert!(
             reported
+                .error
                 .starts_with("browser_operation_outcome_unknown: The browser connection closed."),
-            "{reported}"
+            "{reported:?}"
         );
         assert!(
-            reported.contains("reported: browser_operation_outcome_unknown: boom"),
-            "{reported}"
+            reported
+                .error
+                .contains("reported: browser_operation_interrupted: stopped"),
+            "{reported:?}"
         );
-        let returned = after_cleanup(Ok(json!(1)), true, failed.clone()).unwrap_err();
+        // A stop that did not settle cannot vouch for the program's facts.
+        assert_eq!(reported.data, None);
+        let returned = after_cleanup(Ok(json!(1)), true, failed.clone())
+            .unwrap_err()
+            .error;
         assert!(
             returned.contains("returned before cleanup failed"),
             "{returned}"
         );
-        let never_ran = "browser_controlled_by_user: User control prevented this Playwright program from starting.".to_string();
+        let never_ran = "browser_controlled_by_user: User control prevented this Playwright program from starting.";
         assert_eq!(
-            after_cleanup(Err(never_ran.clone()), false, failed),
-            Err(never_ran)
+            after_cleanup(Err(never_ran.into()), false, failed),
+            Err(never_ran.into())
         );
         assert_eq!(after_cleanup(Ok(json!(1)), true, Ok(())), Ok(json!(1)));
+    }
+
+    /// A human takeover's stop states its own facts; no other stop does.
+    #[test]
+    fn only_a_stop_for_human_control_reports_an_interruption() {
+        let interrupted =
+            program_outcome(Ended::Interrupted(InterruptReason::HumanControl), true).unwrap_err();
+        assert!(
+            interrupted
+                .error
+                .starts_with("browser_operation_interrupted: "),
+            "{interrupted:?}"
+        );
+        assert_eq!(
+            interrupted.data,
+            Some(
+                json!({"interruptedBy":"human","executionStopped":true,"effectsMayHaveOccurred":true})
+            )
+        );
+        let shutdown =
+            program_outcome(Ended::Interrupted(InterruptReason::Shutdown), true).unwrap_err();
+        assert!(
+            shutdown
+                .error
+                .starts_with("browser_operation_outcome_unknown: "),
+            "{shutdown:?}"
+        );
+        assert_eq!(shutdown.data, None);
     }
 
     #[tokio::test]
