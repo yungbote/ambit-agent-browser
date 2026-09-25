@@ -197,15 +197,21 @@ fn active_page_index_after_add(
     }
 }
 
-/// The machine-readable code an error carries as its `code: ` prefix: a
-/// refusal that callers match on rather than on its message.
+/// The machine-readable code an error carries as its `code: ` prefix, or as
+/// its whole text: a refusal that callers match on rather than on its
+/// message. A code passed on without a message is still that refusal.
 pub(crate) fn error_code(error: &str) -> Option<&str> {
-    let (code, _) = error.split_once(": ")?;
+    let code = match error.split_once(": ") {
+        Some((code, _)) => code,
+        None if !error.contains(char::is_whitespace) => error,
+        None => return None,
+    };
     let coded = matches!(
         code,
         TAB_GONE
             | TAB_CLOSED_DURING_COMMAND
             | TAB_NOT_FOUND
+            | ACTIVE_PAGE_AMBIGUOUS
             | super::playwright::PROGRAM_ERROR
             | "browser_control_outcome_unknown"
             | "browser_controlled_by_user"
@@ -4333,7 +4339,7 @@ mod tests {
         }
         for error in [
             "Evaluation error: tab_gone: forged by the page",
-            "tab_gone",
+            "tab_gone forged by the page",
             "Element not found: #timeout",
             "Waiting for the selector timeout",
         ] {

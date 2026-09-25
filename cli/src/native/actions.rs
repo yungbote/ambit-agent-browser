@@ -13325,10 +13325,12 @@ pub(crate) fn native_error_response_for_test(error: &str) -> Value {
 /// the caller can select one without a `tab_list` round; nothing is selected
 /// for it. A gone tab's own recovery identifiers stay beside the list.
 async fn attach_tab_recovery(resp: &mut Value, state: &mut DaemonState) {
-    use super::browser::{TAB_CLOSED_DURING_COMMAND, TAB_GONE, TAB_NOT_FOUND};
+    use super::browser::{
+        ACTIVE_PAGE_AMBIGUOUS, TAB_CLOSED_DURING_COMMAND, TAB_GONE, TAB_NOT_FOUND,
+    };
     let gone = match resp.get("code").and_then(Value::as_str) {
         Some(TAB_GONE | TAB_CLOSED_DURING_COMMAND) => true,
-        Some(TAB_NOT_FOUND) => false,
+        Some(TAB_NOT_FOUND | ACTIVE_PAGE_AMBIGUOUS) => false,
         _ => return,
     };
     let dialog_session = state.dialog_session();
@@ -15279,6 +15281,32 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         let resp = error_response("cmd-3", &err);
         assert_eq!(resp["success"], false);
         assert_eq!(resp["code"], "tab_gone");
+    }
+
+    /// A known refusal code is never answered without its `code`, even as the
+    /// whole error text. Production, run 7bb8369f: a launch that could not
+    /// select a page answered the bare `browser_active_page_ambiguous`, which
+    /// the host could only settle as a failure of unknown effect.
+    #[test]
+    fn test_error_response_codes_a_bare_refusal_code() {
+        for code in [
+            "browser_active_page_ambiguous",
+            "browser_observation_stale",
+            "tab_not_found",
+            "browser_controlled_by_user",
+        ] {
+            let resp = native_error_response_for_test(code);
+            assert_eq!(resp["code"], code, "{resp}");
+            assert_eq!(resp["error"], code, "{resp}");
+        }
+        let stale = "browser_observation_stale: Ref e1 is from a snapshot of a page this tab no longer shows";
+        let resp = native_error_response_for_test(stale);
+        assert_eq!(resp["code"], "browser_observation_stale");
+        assert_eq!(resp["error"], stale);
+        // Words that only begin like a code stay uncoded.
+        for error in ["Unknown ref: e1", "browser_operation_rejected by the page"] {
+            assert!(native_error_response_for_test(error).get("code").is_none());
+        }
     }
 
     /// A tab-addressing refusal reaches its response whole and with its code,
