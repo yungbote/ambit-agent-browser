@@ -337,8 +337,10 @@ pub(super) async fn cdp_event_loop(
                             published_generation = None;
                         }
                         let request = CaptureRequest {
-                            // A controlling client renders its own pointer.
-                            cursor: !controlled,
+                            // Only a viewer that does not draw the pointer
+                            // itself needs it in frames, and never while a
+                            // person controls (their own cursor is it).
+                            cursor: media.composites_cursor(controlled),
                             budget_bytes: pacing.budget_bytes,
                             force: published_generation.as_deref() != Some(display.surface().generation.as_str()),
                             patches: patches_allowed,
@@ -1214,6 +1216,9 @@ mod tests {
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (_custody, custody) = watch::channel(None);
         let applied = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        // One viewer that does not draw the pointer: frames composite it.
+        let media = Arc::new(super::super::StreamMedia::new(applied.clone()));
+        media.viewer_joined(false, false);
         let task = tokio::spawn(cdp_event_loop(
             frame_tx,
             frame_watch,
@@ -1222,7 +1227,7 @@ mod tests {
             Arc::new(RwLock::new(Some(display))),
             Arc::new(super::super::presentation::Presentation::new()),
             custody,
-            Arc::new(super::super::StreamMedia::new(applied.clone())),
+            media,
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
             Arc::new(Mutex::new(1)),
@@ -1237,15 +1242,7 @@ mod tests {
         ));
         client_notify.notify_one();
         let mut frames = BufReader::new(frames);
-        let mut answer = |visible: Option<Value>| {
-            let mut frame = json!({"changed":true,"width":2560,"height":1440,"encoding":"jpeg",
-                "data":"AA==","cursorIncluded":true,"quality":85});
-            if let Some(visible) = visible {
-                frame["visible"] = visible;
-            }
-            frame
-        };
-        let mut next_frame = async |data: Value| {
+        let mut next_frame = async |visible: Option<Value>| {
             let mut line = String::new();
             tokio::time::timeout(
                 std::time::Duration::from_secs(2),
@@ -1255,6 +1252,12 @@ mod tests {
             .expect("a capture request")
             .unwrap();
             let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["cursor"], true, "{request}");
+            let mut data = json!({"changed":true,"width":2560,"height":1440,"encoding":"jpeg",
+                "data":"AA==","cursorIncluded":true,"quality":85});
+            if let Some(visible) = visible {
+                data["visible"] = visible;
+            }
             let reply =
                 json!({"id": request["id"], "success": true, "data": data}).to_string() + "\n";
             frames.get_mut().write_all(reply.as_bytes()).await.unwrap();
@@ -1266,7 +1269,7 @@ mod tests {
             serde_json::from_str::<Value>(&frame.json).unwrap()
         };
         let before = super::super::monotonic_us();
-        let first = next_frame(answer(None)).await;
+        let first = next_frame(None).await;
         assert!((before..=super::super::monotonic_us()).contains(&first["ts"].as_u64().unwrap()));
         assert_eq!(
             first["visible"],
@@ -1275,7 +1278,7 @@ mod tests {
         assert!(first.get("inputSeq").is_none(), "{first}");
         applied.store(7, std::sync::atomic::Ordering::Release);
         let window = json!({"x":0,"y":0,"width":1418,"height":1888});
-        let second = next_frame(answer(Some(window.clone()))).await;
+        let second = next_frame(Some(window.clone())).await;
         assert_eq!(second["inputSeq"], 7);
         assert_eq!(second["visible"], window);
         assert!(second["ts"].as_u64() > first["ts"].as_u64());

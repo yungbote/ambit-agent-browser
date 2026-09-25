@@ -21,7 +21,7 @@ use crate::native::input::keyboard_params;
 
 use super::http::handle_http_request;
 use super::presentation::{Presentation, PresentationConfig};
-use super::{is_allowed_origin, timestamp_ms, IdleActivity, StreamFrame};
+use super::{is_allowed_origin, timestamp_ms, IdleActivity, StreamFrame, StreamMedia};
 
 /// Highest per-client frame rate a client may request via the `config` message.
 const MAX_CONFIGURABLE_FPS: u32 = 120;
@@ -49,6 +49,13 @@ struct ClientConfig {
     /// Maximum outstanding frames. One preserves the existing ack protocol;
     /// a negotiated window covers network delay without an unbounded queue.
     frame_window: usize,
+    /// The viewer draws the pointer itself (`cursor=viewer`), from pointer
+    /// samples and cursor identities; frames need not composite it.
+    draws_pointer: bool,
+    /// The viewer draws frames 1:1 from the top-left cropped to the frame's
+    /// `visible` window (`visible=crop`), so the framebuffer may be a size
+    /// class larger than the window.
+    crops_visible: bool,
 }
 
 impl Default for ClientConfig {
@@ -60,6 +67,8 @@ impl Default for ClientConfig {
             patches: false,
             binary: false,
             frame_window: 1,
+            draws_pointer: false,
+            crops_visible: false,
         }
     }
 }
@@ -261,6 +270,8 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
                 _ => {}
             },
             "patches" => cfg.patches = value == "1",
+            "cursor" => cfg.draws_pointer = value == "viewer",
+            "visible" => cfg.crops_visible = value == "crop",
             "frames" => cfg.binary = value == "binary",
             "frameWindow" => {
                 if let Some(window) = value
@@ -330,6 +341,7 @@ pub(super) async fn accept_loop(
     frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
     client_count: Arc<Mutex<usize>>,
     patch_clients: Arc<AtomicUsize>,
+    media: Arc<StreamMedia>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<DisplayClient>>>>,
     client_notify: Arc<Notify>,
@@ -368,6 +380,7 @@ pub(super) async fn accept_loop(
                 let frame_watch = frame_watch.clone();
                 let client_count = client_count.clone();
                 let patch_clients = patch_clients.clone();
+                let media = media.clone();
                 let client_slot = client_slot.clone();
                 let display_slot = display_slot.clone();
                 let client_notify = client_notify.clone();
@@ -392,6 +405,7 @@ pub(super) async fn accept_loop(
                         frame_watch,
                         client_count,
                         patch_clients,
+                        media,
                         client_slot,
                         display_slot,
                         client_notify,
@@ -444,6 +458,7 @@ async fn handle_connection(
     frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
     client_count: Arc<Mutex<usize>>,
     patch_clients: Arc<AtomicUsize>,
+    media: Arc<StreamMedia>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<DisplayClient>>>>,
     client_notify: Arc<Notify>,
@@ -478,6 +493,7 @@ async fn handle_connection(
             frame_watch,
             client_count,
             patch_clients,
+            media,
             client_slot,
             display_slot,
             client_notify,
@@ -512,6 +528,7 @@ async fn handle_ws_client(
     mut frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
     client_count: Arc<Mutex<usize>>,
     patch_clients: Arc<AtomicUsize>,
+    media: Arc<StreamMedia>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<DisplayClient>>>>,
     client_notify: Arc<Notify>,
@@ -566,6 +583,7 @@ async fn handle_ws_client(
         if initial_config.patches {
             patch_clients.fetch_add(1, Ordering::AcqRel);
         }
+        media.viewer_joined(initial_config.draws_pointer, initial_config.crops_visible);
     }
 
     let (mut ws_tx, ws_rx) = ws_stream.split();
@@ -657,7 +675,8 @@ async fn handle_ws_client(
                 retire_viewer(
                     &client_count,
                     &patch_clients,
-                    initial_config.patches,
+                    &media,
+                    initial_config,
                     &client_notify,
                 )
                 .await;
@@ -813,7 +832,8 @@ async fn handle_ws_client(
     retire_viewer(
         &client_count,
         &patch_clients,
-        initial_config.patches,
+        &media,
+        initial_config,
         &client_notify,
     )
     .await;
@@ -822,14 +842,16 @@ async fn handle_ws_client(
 async fn retire_viewer(
     client_count: &Mutex<usize>,
     patch_clients: &AtomicUsize,
-    patches: bool,
+    media: &StreamMedia,
+    config: ClientConfig,
     client_notify: &Notify,
 ) {
     let mut count = client_count.lock().await;
     *count = count.saturating_sub(1);
-    if patches {
+    if config.patches {
         patch_clients.fetch_sub(1, Ordering::AcqRel);
     }
+    media.viewer_left(config.draws_pointer, config.crops_visible);
     drop(count);
     client_notify.notify_one();
 }
@@ -1058,6 +1080,21 @@ mod tests {
                 "target {} should leave the defaults alone",
                 target
             );
+        }
+    }
+
+    #[test]
+    fn test_config_from_upgrade_reads_pointer_drawing_and_visible_cropping() {
+        let both = config_from_upgrade(&upgrade("/?patches=1&cursor=viewer&visible=crop"));
+        assert!(both.draws_pointer && both.crops_visible);
+        for query in [
+            "/",
+            "/?cursor=frame&visible=1",
+            "/?cursor=1",
+            "/?cursor=&visible=",
+        ] {
+            let cfg = config_from_upgrade(&upgrade(query));
+            assert!(!cfg.draws_pointer && !cfg.crops_visible, "{query}");
         }
     }
 

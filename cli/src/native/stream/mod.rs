@@ -143,16 +143,97 @@ fn seq_in_serialized_frame(frame: &str) -> Option<u64> {
         .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
 }
 
+/// What the connected viewers declared on their upgrade, counted so the
+/// capture loop and the window layout can follow the roster's capabilities.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ViewerRoster {
+    pub viewers: usize,
+    /// Viewers that draw the pointer themselves (`cursor=viewer`), from
+    /// pointer samples and cursor identities.
+    pub draw_pointer: usize,
+    /// Viewers that draw frames 1:1 from the top-left cropped to `visible`
+    /// (`visible=crop`), so the framebuffer may be a size class larger than
+    /// the window.
+    pub crop_visible: usize,
+}
+
+impl ViewerRoster {
+    /// Whether frames must carry the native pointer: some viewer does not
+    /// draw it, and no person controls the window (their own cursor is the
+    /// pointer). Pointer motion is then never frame damage.
+    pub(crate) fn composites_cursor(self, controlled: bool) -> bool {
+        !controlled && self.draw_pointer < self.viewers
+    }
+
+    /// Whether every connected viewer crops to the window: only then may the
+    /// framebuffer stay at a size class through a resize.
+    pub(crate) fn crops_visible(self) -> bool {
+        self.viewers > 0 && self.crop_visible == self.viewers
+    }
+}
+
 /// What a stream's capture loop and its viewers share beyond frames.
 pub(crate) struct StreamMedia {
     /// The controller's last input sequence the display acknowledged, from
     /// `BrowserControl`; 0 without a lease. Frames carry it as `inputSeq`.
     applied_input: Arc<std::sync::atomic::AtomicU64>,
+    roster: watch::Sender<ViewerRoster>,
+    /// The newest cursor identity message, replayed to each new viewer.
+    cursor: std::sync::Mutex<Option<String>>,
 }
 
 impl StreamMedia {
     pub(crate) fn new(applied_input: Arc<std::sync::atomic::AtomicU64>) -> Self {
-        Self { applied_input }
+        Self {
+            applied_input,
+            roster: watch::channel(ViewerRoster::default()).0,
+            cursor: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub(super) fn viewer_joined(&self, draws_pointer: bool, crops_visible: bool) {
+        self.roster.send_modify(|roster| {
+            roster.viewers += 1;
+            roster.draw_pointer += usize::from(draws_pointer);
+            roster.crop_visible += usize::from(crops_visible);
+        });
+    }
+
+    pub(super) fn viewer_left(&self, draws_pointer: bool, crops_visible: bool) {
+        self.roster.send_modify(|roster| {
+            roster.viewers = roster.viewers.saturating_sub(1);
+            roster.draw_pointer = roster
+                .draw_pointer
+                .saturating_sub(usize::from(draws_pointer));
+            roster.crop_visible = roster
+                .crop_visible
+                .saturating_sub(usize::from(crops_visible));
+        });
+    }
+
+    pub(crate) fn roster(&self) -> ViewerRoster {
+        *self.roster.borrow()
+    }
+
+    /// Observe roster changes without holding anything.
+    pub(crate) fn subscribe_roster(&self) -> watch::Receiver<ViewerRoster> {
+        self.roster.subscribe()
+    }
+
+    pub(super) fn composites_cursor(&self, controlled: bool) -> bool {
+        self.roster().composites_cursor(controlled)
+    }
+
+    /// Remember the newest cursor identity for viewers that connect later.
+    pub(super) fn set_cursor(&self, message: String) {
+        *self.cursor.lock().unwrap_or_else(|e| e.into_inner()) = Some(message);
+    }
+
+    pub(super) fn cursor(&self) -> Option<String> {
+        self.cursor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     /// The input a capture requested now is known to include, if any.
@@ -421,6 +502,14 @@ impl StreamServer {
         let display_slot = Arc::new(RwLock::new(None));
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let display_slot_accept = display_slot.clone();
+        let (custody_bg, media) = {
+            let control = browser_control.lock().await;
+            (
+                control.custody(),
+                Arc::new(StreamMedia::new(control.applied_input())),
+            )
+        };
+        let media_accept = media.clone();
 
         let frame_tx_clone = frame_tx.clone();
         let client_count_clone = client_count.clone();
@@ -448,6 +537,7 @@ impl StreamServer {
                 frame_watch_accept,
                 client_count_clone,
                 patch_clients_accept,
+                media_accept,
                 client_slot_clone,
                 display_slot_accept,
                 notify_clone,
@@ -483,13 +573,7 @@ impl StreamServer {
         let frame_watch_bg = frame_watch_tx.clone();
         let screencast_cfg_bg = screencast_config.clone();
         let presentation_bg = presentation.clone();
-        let (custody_bg, media_bg) = {
-            let control = browser_control.lock().await;
-            (
-                control.custody(),
-                Arc::new(StreamMedia::new(control.applied_input())),
-            )
-        };
+        let media_bg = media.clone();
         let cdp_task = tokio::spawn(async move {
             cdp_loop::cdp_event_loop(
                 frame_tx_bg,
@@ -823,6 +907,37 @@ pub fn is_allowed_origin(origin: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Frames composite the native pointer only while a viewer that does not
+    /// draw it is connected and no person controls the window; the size
+    /// class is allowed only while every viewer crops to the window.
+    #[test]
+    fn the_roster_decides_pointer_compositing_and_visible_cropping() {
+        let media = StreamMedia::new(Default::default());
+        assert!(
+            !media.composites_cursor(false),
+            "no viewer needs the pointer"
+        );
+        assert!(!media.roster().crops_visible(), "no viewer crops");
+        media.viewer_joined(true, true);
+        assert!(!media.composites_cursor(false));
+        assert!(media.roster().crops_visible());
+        media.viewer_joined(false, false);
+        assert!(media.composites_cursor(false));
+        assert!(
+            !media.composites_cursor(true),
+            "a controlling person's own cursor is the pointer"
+        );
+        assert!(!media.roster().crops_visible());
+        media.viewer_left(false, false);
+        assert!(!media.composites_cursor(false));
+        assert!(media.roster().crops_visible());
+        media.viewer_left(true, true);
+        assert_eq!(media.roster(), ViewerRoster::default());
+        assert!(media.cursor().is_none());
+        media.set_cursor("{\"type\":\"cursor\"}".into());
+        assert_eq!(media.cursor().as_deref(), Some("{\"type\":\"cursor\"}"));
+    }
 
     #[test]
     fn test_screencast_config_defaults_when_unset() {
