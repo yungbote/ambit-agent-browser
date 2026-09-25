@@ -325,6 +325,15 @@ fn addresses_running_session(cmd: &serde_json::Value) -> bool {
     cmd["action"] == native::theme::ACTION
 }
 
+/// Whether a batch needs a daemon: one of its commands does. A command for a
+/// running session never starts one, and a command that does not parse sends
+/// nothing, so a batch of theme changes starts nothing, as each alone would.
+fn batch_needs_daemon(commands: &[Vec<String>], flags: &Flags) -> bool {
+    commands.iter().any(|args| {
+        parse_command(args, flags).is_ok_and(|command| !addresses_running_session(&command))
+    })
+}
+
 /// A theme from the flag, environment or config that is not dark or light.
 fn invalid_theme_error(flags: &Flags) -> Option<String> {
     flags
@@ -1927,12 +1936,25 @@ fn main() {
 
     if addresses_running_session(&cmd) {
         let action = cmd["action"].as_str().map(str::to_string);
-        let resp =
-            connection::send_command_if_running(cmd, &flags.session).unwrap_or_else(Response::from);
+        let resp = connection::send_command_if_running(cmd, &flags.session);
         print_response_with_opts(&resp, action.as_deref(), &OutputOptions::from_flags(&flags));
         if !resp.success {
             exit(1);
         }
+        return;
+    }
+
+    // A batch's commands are read before anything starts, so a batch that
+    // needs no daemon starts none and sends no launch settings.
+    let batch = (cmd["action"] == "batch").then(|| batch_commands(&cmd, &flags));
+    let bail = cmd["bail"].as_bool().unwrap_or(false);
+    if let Some(commands) = batch
+        .as_deref()
+        .filter(|commands| !batch_needs_daemon(commands, &flags))
+    {
+        run_batch(&flags, bail, commands, |command| {
+            Ok(connection::send_command_if_running(command, &flags.session))
+        });
         return;
     }
 
@@ -2142,16 +2164,14 @@ fn main() {
         }
     }
 
-    // Handle batch command: from args or stdin
-    if cmd.get("action").and_then(|v| v.as_str()) == Some("batch") {
-        let bail = cmd.get("bail").and_then(|v| v.as_bool()).unwrap_or(false);
-        let arg_commands = cmd.get("commands").and_then(|v| v.as_array()).map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(commands::shell_words_split)
-                .collect::<Vec<Vec<String>>>()
+    if let Some(commands) = batch.as_deref() {
+        run_batch(&flags, bail, commands, |command| {
+            if addresses_running_session(&command) {
+                Ok(connection::send_command_if_running(command, &flags.session))
+            } else {
+                send_command_with_respawn(command, &flags.session, &daemon_opts)
+            }
         });
-        run_batch(&flags, &daemon_opts, bail, arg_commands);
         return;
     }
 
@@ -2213,47 +2233,55 @@ fn send_command_with_respawn(
     }
 }
 
-fn run_batch(
-    flags: &Flags,
-    daemon_opts: &DaemonOptions,
-    bail: bool,
-    arg_commands: Option<Vec<Vec<String>>>,
-) {
-    let commands: Vec<Vec<String>> = if let Some(cmds) = arg_commands {
-        cmds
-    } else {
-        use std::io::Read as _;
+/// A batch's commands: its arguments, or else a JSON array of string arrays
+/// on stdin. Unreadable input ends the process with its error.
+fn batch_commands(cmd: &serde_json::Value, flags: &Flags) -> Vec<Vec<String>> {
+    use std::io::Read as _;
 
-        let mut input = String::new();
-        if let Err(e) = std::io::stdin().read_to_string(&mut input) {
+    if let Some(commands) = cmd["commands"].as_array() {
+        return commands
+            .iter()
+            .filter_map(|command| command.as_str())
+            .map(commands::shell_words_split)
+            .collect();
+    }
+    let mut input = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut input) {
+        if flags.json {
+            print_json_error(format!("Failed to read stdin: {}", e));
+        } else {
+            eprintln!("{} Failed to read stdin: {}", color::error_indicator(), e);
+        }
+        exit(1);
+    }
+    match serde_json::from_str(&input) {
+        Ok(commands) => commands,
+        Err(e) => {
             if flags.json {
-                print_json_error(format!("Failed to read stdin: {}", e));
+                print_json_error(format!(
+                    "Invalid JSON input: {}. Expected an array of string arrays, e.g. [[\"open\", \"https://example.com\"], [\"snapshot\"]]",
+                    e
+                ));
             } else {
-                eprintln!("{} Failed to read stdin: {}", color::error_indicator(), e);
+                eprintln!(
+                    "{} Invalid JSON input: {}. Expected an array of string arrays.",
+                    color::error_indicator(),
+                    e
+                );
             }
             exit(1);
         }
+    }
+}
 
-        match serde_json::from_str(&input) {
-            Ok(c) => c,
-            Err(e) => {
-                if flags.json {
-                    print_json_error(format!(
-                        "Invalid JSON input: {}. Expected an array of string arrays, e.g. [[\"open\", \"https://example.com\"], [\"snapshot\"]]",
-                        e
-                    ));
-                } else {
-                    eprintln!(
-                        "{} Invalid JSON input: {}. Expected an array of string arrays.",
-                        color::error_indicator(),
-                        e
-                    );
-                }
-                exit(1);
-            }
-        }
-    };
-
+/// Runs a batch's commands in order, each delivered by `deliver`, and prints
+/// their results.
+fn run_batch(
+    flags: &Flags,
+    bail: bool,
+    commands: &[Vec<String>],
+    mut deliver: impl FnMut(serde_json::Value) -> Result<Response, String>,
+) {
     if commands.is_empty() {
         if flags.json {
             println!("[]");
@@ -2317,13 +2345,7 @@ fn run_batch(
 
         attach_pin_tab_to_command(&mut parsed, flags);
 
-        let sent = if addresses_running_session(&parsed) {
-            Ok(connection::send_command_if_running(parsed, &flags.session)
-                .unwrap_or_else(Response::from))
-        } else {
-            send_command_with_respawn(parsed, &flags.session, daemon_opts)
-        };
-        match sent {
+        match deliver(parsed) {
             Ok(resp) => {
                 if flags.json {
                     let mut result = json!({

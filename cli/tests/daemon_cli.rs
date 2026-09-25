@@ -55,6 +55,19 @@ impl Fixture {
         Process(Some(self.command(args).spawn().unwrap())).finish()
     }
 
+    fn run_with_stdin(&self, args: &[&str], stdin: &str) -> Output {
+        let mut command = self.command(args);
+        command.stdin(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        Process(Some(child)).finish()
+    }
+
     fn start(&self, args: &[&str]) -> Process {
         let mut command = self.command(args);
         command.arg("daemon");
@@ -87,6 +100,24 @@ impl Fixture {
     fn assert_clean(&self) {
         for extension in ["sock", "pid", "config", "version", "stream", "supervised"] {
             assert!(!self.path(extension).exists(), "leftover {extension}");
+        }
+    }
+}
+
+impl Drop for Fixture {
+    /// A daemon a failing test left running is stopped, and closes its
+    /// browser, rather than outliving the test.
+    fn drop(&mut self) {
+        let Some(pid) = fs::read_to_string(self.path("pid"))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        else {
+            return;
+        };
+        let ours = fs::read(format!("/proc/{pid}/cmdline"))
+            .is_ok_and(|cmdline| cmdline.starts_with(BIN.as_bytes()));
+        if ours {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
         }
     }
 }
@@ -307,6 +338,69 @@ fn set_theme_never_starts_a_daemon_or_sends_a_launch() {
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0]["action"], "set_theme");
     assert_eq!(requests[0]["theme"], "light");
+}
+
+/// A batch of theme changes starts nothing either, with its commands given
+/// as arguments or on stdin as the MCP batch tool sends them: without a
+/// running session no daemon starts, and a running one receives exactly the
+/// theme changes, never the launch the flags would otherwise send first.
+#[test]
+fn a_batch_of_theme_changes_never_starts_a_daemon_or_sends_a_launch() {
+    let fixture = Fixture::new();
+    let flags = ["--json", "--headed", "--theme", "dark"];
+    let batch = |fixture: &Fixture| {
+        [
+            fixture.run(&[&flags[..], &["batch", "set theme light"]].concat()),
+            fixture.run_with_stdin(
+                &[&flags[..], &["batch"]].concat(),
+                r#"[["set", "theme", "light"]]"#,
+            ),
+        ]
+    };
+    for output in batch(&fixture) {
+        assert!(!output.status.success(), "{output:?}");
+        let results = response(&output);
+        assert_eq!(
+            results[0]["code"], "browser_runtime_unavailable",
+            "{results}"
+        );
+        fixture.assert_clean();
+        assert!(!fixture.path("lock").exists());
+    }
+
+    let listener = UnixListener::bind(fixture.path("sock")).unwrap();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut line = String::new();
+            // A liveness probe connects and sends nothing.
+            if BufReader::new(&stream).read_line(&mut line).unwrap_or(0) == 0 {
+                continue;
+            }
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let reply = serde_json::json!({ "id": request["id"], "success": true,
+                "data": { "theme": "light", "pages": "live", "ui": "next_launch" } });
+            writeln!(stream, "{reply}").unwrap();
+            requests.push(request);
+            if requests.len() == 2 {
+                return requests;
+            }
+        }
+        requests
+    });
+    for output in batch(&fixture) {
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(response(&output)[0]["result"]["pages"], "live");
+    }
+    let requests = server.join().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| &request["action"])
+            .collect::<Vec<_>>(),
+        ["set_theme", "set_theme"]
+    );
 }
 
 #[test]

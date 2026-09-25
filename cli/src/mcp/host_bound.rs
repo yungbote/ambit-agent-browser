@@ -226,9 +226,7 @@ impl HostBinding {
         )
         .map_err(|error| ProtocolError::invalid_params(error.format()))?;
         if HOST_OPERATIONS.contains(&name) {
-            return Ok(result(
-                send_command_if_running(command, &flags.session).unwrap_or_else(Response::from),
-            ));
+            return Ok(result(send_command_if_running(command, &flags.session)));
         }
         crate::attach_plugins_to_command(&mut command, &flags.plugins);
         crate::attach_pin_tab_to_command(&mut command, &flags);

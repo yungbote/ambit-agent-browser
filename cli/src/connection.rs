@@ -1204,13 +1204,10 @@ impl From<CommandFailure> for Response {
 
 /// Deliver `cmd` to the session's daemon only if one is already running. It
 /// never starts, restarts or replaces a daemon, whatever its configuration;
-/// with none running, nothing is sent.
-pub(crate) fn send_command_if_running(
-    cmd: Value,
-    session: &str,
-) -> Result<Response, CommandFailure> {
+/// with none running, nothing is sent. A failure is the response's own code.
+pub(crate) fn send_command_if_running(cmd: Value, session: &str) -> Response {
     if !daemon_ready(session) {
-        return Err(CommandFailure {
+        return Response::from(CommandFailure {
             outcome_unknown: false,
             message: format!(
                 "No browser session '{}' is running. Nothing was changed.",
@@ -1218,7 +1215,7 @@ pub(crate) fn send_command_if_running(
             ),
         });
     }
-    send_command_detailed(cmd, session)
+    send_command_detailed(cmd, session).unwrap_or_else(Response::from)
 }
 
 pub(crate) fn send_command_detailed(cmd: Value, session: &str) -> Result<Response, CommandFailure> {
