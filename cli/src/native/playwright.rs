@@ -15,7 +15,7 @@ use tokio::process::{Child, Command};
 use tokio::sync::{watch, Notify};
 
 use super::actions::{CommandError, DaemonState};
-use super::cdp::client::CdpClient;
+use super::cdp::client::{replace_lone_surrogate_escapes, CdpClient};
 
 const RUNNER: &str = include_str!("../../runtime/playwright-runner.mjs");
 const MAX_CODE: usize = 1 << 20;
@@ -629,7 +629,9 @@ fn program_outcome(ended: Ended, started: bool) -> Result<Value, CommandError> {
                 .into()
         }
     };
-    let record: Value = serde_json::from_slice(&bytes).map_err(|_| malformed())?;
+    let text = String::from_utf8(bytes).map_err(|_| malformed())?;
+    let record: Value =
+        serde_json::from_str(&replace_lone_surrogate_escapes(text)).map_err(|_| malformed())?;
     if record["success"] == true {
         return Ok(record["result"].clone());
     }
@@ -902,7 +904,11 @@ mod tests {
     }
 
     fn settled(record: Value, started: bool) -> CommandError {
-        program_outcome(Ended::Record(serde_json::to_vec(&record).unwrap()), started).unwrap_err()
+        settled_bytes(&serde_json::to_vec(&record).unwrap(), started)
+    }
+
+    fn settled_bytes(record: &[u8], started: bool) -> CommandError {
+        program_outcome(Ended::Record(record.to_vec()), started).unwrap_err()
     }
 
     /// The production failure: `document` read at the program's top level
@@ -1063,6 +1069,35 @@ mod tests {
         }
     }
 
+    /// A program can produce a lone UTF-16 surrogate (by cutting text inside
+    /// a pair), which Node's JSON.stringify writes as a `\uD800`-style escape,
+    /// as Chrome's CDP serializer does. The record is decoded as the CDP
+    /// transport decodes: the surrogate becomes U+FFFD and the program's own
+    /// outcome is kept.
+    #[test]
+    fn a_lone_surrogate_in_a_record_keeps_the_program_outcome() {
+        assert_eq!(
+            program_outcome(
+                Ended::Record(
+                    br#"{"success":true,"result":{"title":"A\ud800B","pair":"\ud83d\ude00"}}"#
+                        .to_vec()
+                ),
+                true
+            ),
+            Ok(json!({"title":"A\u{FFFD}B","pair":"\u{1F600}"}))
+        );
+        let failure = settled_bytes(
+            br#"{"success":false,"program":{"error":{"name":"Error","message":"page said \udc00"},"pageCallsIssued":0}}"#,
+            true,
+        );
+        assert_eq!(
+            failure.data,
+            Some(
+                json!({"error":{"name":"Error","message":"page said \u{FFFD}"},"pageCallsIssued":0})
+            )
+        );
+    }
+
     /// A human takeover's stop states its own facts; no other stop does.
     #[test]
     fn only_a_stop_for_human_control_reports_an_interruption() {
@@ -1171,6 +1206,12 @@ mod tests {
             state.browser.as_ref().unwrap().active_target_id().unwrap(),
             target
         );
+        // Text cut inside a surrogate pair holds a lone UTF-16 surrogate; the
+        // result keeps the program's outcome, the surrogate replaced as the
+        // CDP reader replaces one.
+        let lone = Box::pin(execute_command(&json!({"action":"run_playwright","code":"return ('Ada ' + String.fromCodePoint(0x1F600)).slice(0, 5);","timeoutMs":15000}), &mut state)).await;
+        assert_eq!(lone["success"], true, "{lone}");
+        assert_eq!(lone["data"]["result"], "Ada \u{FFFD}");
         // A promise the program rejects and never awaits is console output,
         // not the program's outcome.
         let unobserved = Box::pin(execute_command(&json!({"action":"run_playwright","code":"Promise.reject(new Error('unobserved')); return 2;","timeoutMs":15000}), &mut state)).await;
