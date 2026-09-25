@@ -2173,29 +2173,6 @@ impl BrowserManager {
         Ok(())
     }
 
-    pub async fn set_emulated_media(
-        &self,
-        media: Option<&str>,
-        features: Option<Vec<(String, String)>>,
-    ) -> Result<(), String> {
-        let session_id = self.active_session_id()?;
-        let mut params = json!({});
-        if let Some(m) = media {
-            params["media"] = Value::String(m.to_string());
-        }
-        if let Some(feats) = features {
-            let features_arr: Vec<Value> = feats
-                .iter()
-                .map(|(name, value)| json!({ "name": name, "value": value }))
-                .collect();
-            params["features"] = Value::Array(features_arr);
-        }
-        self.client
-            .send_command("Emulation.setEmulatedMedia", Some(params), Some(session_id))
-            .await?;
-        Ok(())
-    }
-
     pub async fn bring_to_front(&self) -> Result<(), String> {
         let session_id = self.active_session_id()?;
         self.client

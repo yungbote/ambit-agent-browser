@@ -7996,8 +7996,12 @@ async fn handle_set_media(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     };
     // With a session theme, only an explicit dark or light scheme overrides it.
     let applied = theme::page_media(Some(&requested), state.theme).unwrap_or_default();
-    let features = (!applied.features.is_empty()).then_some(applied.features);
-    mgr.set_emulated_media(applied.media.as_deref(), features)
+    mgr.client
+        .send_command(
+            "Emulation.setEmulatedMedia",
+            Some(applied.params()),
+            Some(mgr.active_session_id()?),
+        )
         .await?;
     state.session_setup.emulated_media = Some(requested);
     Ok(json!({ "set": true }))
@@ -15714,18 +15718,11 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             color_scheme: Some("dark".into()),
             ..Default::default()
         };
-        for other in [
-            LaunchOptions {
-                theme: Some(Theme::Light),
-                color_scheme: Some("light".into()),
+        for theme in [Some(Theme::Light), None] {
+            let other = LaunchOptions {
+                theme,
                 ..dark.clone()
-            },
-            LaunchOptions {
-                theme: None,
-                color_scheme: None,
-                ..dark.clone()
-            },
-        ] {
+            };
             assert_eq!(
                 launch_configuration(&dark, &[], &[], &[], &[], Some("chrome"), "local", None),
                 launch_configuration(&other, &[], &[], &[], &[], Some("chrome"), "local", None),

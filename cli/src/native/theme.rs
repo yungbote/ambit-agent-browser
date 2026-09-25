@@ -7,10 +7,20 @@
 //!
 //! Measured on Chrome for Testing 152 in the workspace image:
 //! `--force-dark-mode` draws a headed window's UI dark and makes pages prefer
-//! dark without repainting them, and nothing switches the UI of a running
-//! window (the image has no GTK and no settings portal, and the switch holds
-//! for the process lifetime). So pages switch live through
-//! `Emulation.setEmulatedMedia`, and the window UI follows at the next launch.
+//! dark without repainting them, for the life of the process. The image has
+//! no GTK and no settings portal, so nothing outside Chrome can switch a
+//! running window's UI. Chrome's own Mode setting can, in about 20 ms, but
+//! only from a chrome://settings tab the person would see in the tab strip
+//! (a hidden one crashes Chrome), through internal WebUI interfaces, and it
+//! writes a profile preference; the driver does not use it. So pages switch
+//! live through `Emulation.setEmulatedMedia`, and the window UI follows at
+//! the next launch.
+//!
+//! A page's emulation reaches its cross-site frames; while its tab is hidden
+//! Chrome may defer a frame until the tab is shown. A page Chrome does not
+//! pause for the daemon (without network controls, a tab the person opens
+//! or a popup) runs its first document under Chrome's own preference and
+//! switches when the daemon adopts it.
 //!
 //! The session theme is the last `set_theme`, or the theme the last launch
 //! carried. It is session state, not launch configuration: changing it never
@@ -60,8 +70,8 @@ impl Theme {
     }
 
     /// The Chrome switch that draws a headed browser's own window UI in this
-    /// theme. Chrome's UI is light by default, and a headless browser has no
-    /// UI to draw.
+    /// theme. Without a desktop theme, as in the workspace image, Chrome's UI
+    /// is light by default, and a headless browser has no UI to draw.
     pub(crate) fn chrome_switch(self, headless: bool) -> Option<&'static str> {
         (self == Self::Dark && !headless).then_some("--force-dark-mode")
     }
@@ -107,10 +117,12 @@ pub(crate) fn page_media(
 /// supersedes an explicit page scheme (`set media dark`).
 ///
 /// The result says where the theme took effect: `pages` is `live` when page
-/// sessions switched now and `next_launch` when no automated browser runs
-/// (none, or a window a person is signing in to, which has no DevTools);
-/// `ui` is `none` for a browser without a window UI of its own (headless or
-/// attached) and otherwise `next_launch`, as the UI cannot switch live.
+/// sessions switched now (a page behind an open dialog switches when the
+/// dialog closes) and `next_launch` when no automated browser runs (none, or
+/// a window a person is signing in to, which has no DevTools); `ui` is
+/// `none` for a browser without a window UI the daemon drew (headless or
+/// attached) and otherwise `next_launch`, as the driver does not switch a
+/// running window's UI (see the module note).
 pub(crate) async fn set(command: &Value, state: &mut DaemonState) -> Value {
     let id = &command["id"];
     let Some(theme) = command["theme"].as_str().and_then(Theme::parse) else {
