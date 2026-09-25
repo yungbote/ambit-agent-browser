@@ -46,15 +46,13 @@ pub(crate) enum Theme {
 }
 
 impl Theme {
+    pub(crate) const ALL: [Self; 2] = [Self::Dark, Self::Light];
+
     pub(crate) fn parse(value: &str) -> Option<Self> {
-        match value {
-            "dark" => Some(Self::Dark),
-            "light" => Some(Self::Light),
-            _ => None,
-        }
+        Self::ALL.into_iter().find(|theme| theme.as_str() == value)
     }
 
-    pub(crate) fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Dark => "dark",
             Self::Light => "light",
@@ -179,7 +177,8 @@ mod tests {
 
     #[test]
     fn theme_values_are_exactly_dark_and_light() {
-        for theme in [Theme::Dark, Theme::Light] {
+        assert_eq!(Theme::ALL.map(Theme::as_str), ["dark", "light"]);
+        for theme in Theme::ALL {
             assert_eq!(Theme::parse(theme.as_str()), Some(theme));
             assert_eq!(serde_json::to_value(theme).unwrap(), theme.as_str());
             assert_eq!(

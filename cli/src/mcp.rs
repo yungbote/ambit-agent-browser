@@ -105,6 +105,7 @@ const TOOL_SET_OFFLINE: &str = "agent_browser_set_offline";
 const TOOL_SET_HEADERS: &str = "agent_browser_set_headers";
 const TOOL_SET_CREDENTIALS: &str = "agent_browser_set_credentials";
 const TOOL_SET_MEDIA: &str = "agent_browser_set_media";
+const TOOL_SET_THEME: &str = "agent_browser_set_theme";
 const TOOL_NETWORK_ROUTE: &str = "agent_browser_network_route";
 const TOOL_NETWORK_UNROUTE: &str = "agent_browser_network_unroute";
 const TOOL_NETWORK_REQUESTS: &str = "agent_browser_network_requests";
@@ -305,7 +306,7 @@ impl ToolProfile {
             Self::Debug => "Console/errors, highlighting, DevTools, tracing, profiling, accessibility audits, PDF, downloads/uploads, recording, clipboard, plugin registry and plugin command.run, doctor, dashboard, install, upgrade, and chat.",
             Self::Tabs => "Tab, window, frame, and JavaScript dialog management.",
             Self::React => "React tree inspection, render recording, Suspense inspection, Web Vitals, SPA pushstate, and init-script removal.",
-            Self::Mobile => "Viewport/device/geolocation/media emulation plus touch, swipe, and lower-level mouse tools.",
+            Self::Mobile => "Viewport/device/geolocation/media emulation and the browser theme, plus touch, swipe, and lower-level mouse tools.",
             Self::Webmcp => "Experimental page-provided WebMCP discovery, invocation, detached results, and cancellation.",
             Self::All => "Every MCP tool, including the full typed CLI parity surface.",
         }
@@ -546,6 +547,7 @@ const MOBILE_PROFILE_TOOLS: &[&str] = &[
     TOOL_SET_DEVICE,
     TOOL_SET_GEO,
     TOOL_SET_MEDIA,
+    TOOL_SET_THEME,
     TOOL_TAP,
     TOOL_SWIPE,
     TOOL_DEVICE,
@@ -847,6 +849,7 @@ fn tools() -> Vec<Value> {
                 "headed": { "type": "boolean", "description": "Show the browser window. Explicit true/false overrides AGENT_BROWSER_HEADED and config; omit to use those defaults." },
                 "webgpu": { "type": "boolean", "description": "Enable WebGPU (SwiftShader software Vulkan on Linux; no GPU required). Explicit true/false overrides AGENT_BROWSER_WEBGPU and config; omit to use those defaults." }
                 ,"webmcp": { "type": "boolean", "description": "Enable experimental WebMCP support. Defaults to true for locally launched Chrome; set false to pass --no-webmcp." }
+                ,"theme": described(theme_schema(), "Browser theme when a browser launches: Chrome's own window UI and every page's prefers-color-scheme. Overrides AGENT_BROWSER_THEME and config; omit to use those defaults.")
             }),
             &[],
         ),
@@ -1264,6 +1267,13 @@ fn parity_tools() -> Vec<Value> {
             "Set media emulation.",
             json!({ "colorScheme": { "type": "string", "enum": ["dark", "light", "no-preference"] }, "reducedMotion": { "type": "string", "enum": ["reduce", "no-preference"] } }),
             &[],
+        ),
+        tool(
+            TOOL_SET_THEME,
+            "Set theme",
+            "Set the browser theme: Chrome's own window UI and every page's prefers-color-scheme. Pages switch now; the window UI follows at the next launch.",
+            json!({ "theme": theme_schema() }),
+            &["theme"],
         ),
         tool(
             TOOL_NETWORK_ROUTE,
@@ -1998,6 +2008,17 @@ fn int_schema() -> Value {
     json!({ "type": "integer" })
 }
 
+/// The browser theme's values, taken from the one type that parses them.
+fn theme_schema() -> Value {
+    use crate::native::theme::Theme;
+    json!({ "type": "string", "enum": Theme::ALL.map(Theme::as_str) })
+}
+
+fn described(mut schema: Value, description: &str) -> Value {
+    schema["description"] = json!(description);
+    schema
+}
+
 fn wait_timeout_schema() -> Value {
     json!({
         "type": "integer",
@@ -2367,6 +2388,7 @@ fn prepare_tool(name: &str, arguments: &Value) -> Result<CliInvocation, Protocol
         TOOL_SET_HEADERS => call_set_headers(arguments),
         TOOL_SET_CREDENTIALS => call_set_credentials(arguments),
         TOOL_SET_MEDIA => call_set_media(arguments),
+        TOOL_SET_THEME => call_set_theme(arguments),
         TOOL_NETWORK_ROUTE => call_network_route(arguments),
         TOOL_NETWORK_UNROUTE => call_optional_one(arguments, &["network", "unroute"], "url"),
         TOOL_NETWORK_REQUESTS => call_network_requests(arguments),
@@ -2650,6 +2672,10 @@ fn open_args(arguments: &Value) -> Result<Vec<String>, ProtocolError> {
     if let Some(webmcp) = optional_bool(arguments, "webmcp")? {
         args.push("--no-webmcp".to_string());
         args.push((!webmcp).to_string());
+    }
+    if let Some(theme) = optional_theme(arguments)? {
+        args.push("--theme".to_string());
+        args.push(theme);
     }
     args.push("open".to_string());
     if let Some(url) = optional_string(arguments, "url")? {
@@ -3072,6 +3098,27 @@ fn call_set_credentials(arguments: &Value) -> Result<CliInvocation, ProtocolErro
         ],
         None,
     )
+}
+
+fn call_set_theme(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
+    let theme = required_theme(arguments)?;
+    call_cli_tool(arguments, vec!["set".into(), "theme".into(), theme], None)
+}
+
+/// The `theme` argument: dark or light, or an invalid-params error.
+fn required_theme(arguments: &Value) -> Result<String, ProtocolError> {
+    optional_theme(arguments)?.ok_or_else(|| ProtocolError::invalid_params("theme is required"))
+}
+
+fn optional_theme(arguments: &Value) -> Result<Option<String>, ProtocolError> {
+    let theme = optional_string(arguments, "theme")?;
+    if theme
+        .as_deref()
+        .is_some_and(|theme| crate::native::theme::Theme::parse(theme).is_none())
+    {
+        return Err(ProtocolError::invalid_params("theme must be dark or light"));
+    }
+    Ok(theme)
 }
 
 fn call_set_media(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
@@ -4716,6 +4763,58 @@ mod tests {
         append_react_raw_json_arg(&json!({ "json": true }), &mut args).unwrap();
 
         assert_eq!(args, vec!["react", "tree", RAW_JSON_ARG]);
+    }
+
+    /// One tool, one CLI command, one daemon action: the theme reaches the
+    /// daemon through the canonical parser, with the same two values.
+    #[test]
+    fn set_theme_tool_parses_through_the_cli_into_the_daemon_action() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == TOOL_SET_THEME)
+            .unwrap();
+        assert_eq!(tool["inputSchema"]["required"], json!(["theme"]));
+        assert_eq!(
+            tool["inputSchema"]["properties"]["theme"]["enum"],
+            json!(["dark", "light"])
+        );
+        assert!(McpConfig::from_profiles(vec![ToolProfile::Mobile]).allows(TOOL_SET_THEME));
+        for theme in ["dark", "light"] {
+            let invocation = call_set_theme(&json!({ "theme": theme })).unwrap();
+            assert_eq!(invocation.command_args, vec!["set", "theme", theme]);
+            let command = crate::commands::parse_command_with_input(
+                &invocation.command_args,
+                &crate::flags::parse_flags_from_config(&[], crate::flags::Config::default()),
+                None,
+            )
+            .unwrap();
+            assert_eq!(command["action"], crate::native::theme::ACTION);
+            assert_eq!(command["theme"], theme);
+        }
+        for arguments in [
+            json!({}),
+            json!({ "theme": "system" }),
+            json!({ "theme": 1 }),
+        ] {
+            assert!(call_set_theme(&arguments).is_err(), "{arguments}");
+        }
+    }
+
+    #[test]
+    fn open_forwards_the_theme_as_the_launch_flag() {
+        let open = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == TOOL_OPEN)
+            .unwrap();
+        assert_eq!(
+            open["inputSchema"]["properties"]["theme"]["enum"],
+            json!(["dark", "light"])
+        );
+        assert_eq!(
+            open_args(&json!({ "theme": "dark", "url": "https://example.com" })).unwrap(),
+            vec!["--theme", "dark", "open", "https://example.com"]
+        );
+        assert!(open_args(&json!({ "theme": "sepia" })).is_err());
     }
 
     #[test]
