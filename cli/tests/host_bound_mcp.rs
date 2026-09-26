@@ -261,43 +261,83 @@ fn host_real_chromium_outcomes_pixels_and_coordinate_identity() {
     );
 }
 
+/// After a person hands the browser back, a command that names what it acts
+/// on runs and returns a fresh observation; only input addressed to the
+/// focused element or the pointer waits for one, and a point from an image
+/// taken before the hand-back is stale.
 #[test]
 #[cfg(unix)]
 #[ignore = "requires AMBIT_TEST_CHROME_EXECUTABLE with working Chrome sandbox"]
-fn host_human_handoff_requires_fresh_observation_and_rejects_old_image_coordinates() {
+fn host_human_handoff_holds_only_input_without_a_named_target() {
     let host = Host::new();
-    let opened = host.call("agent_browser_open", json!({ "url": "data:text/html,<style>input,button{display:block;height:40px;width:200px}</style><input id=field><button onclick='window.clicks++'>Count</button><script>window.clicks=0</script>" }));
+    let opened = host.call("agent_browser_open", json!({ "url": "data:text/html,<title>Form</title><style>input,button{display:block;height:40px;width:200px}</style><input id=field><button onclick='window.clicks++'>Count</button><script>window.clicks=0;window.enters=0;addEventListener('keydown',e=>{if(e.key==='Enter')window.enters++})</script>" }));
     let before = host.capture(&opened);
-    let owner = uuid::Uuid::new_v4().to_string();
-    let expires = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-        + 25000;
-    host.control(json!({ "op": "acquire", "controllerId": owner, "expiresAt": expires }));
-    let blocked = host.call("agent_browser_click", json!({ "selector": "button" }));
-    assert_eq!(
-        blocked["structuredContent"]["response"]["code"],
-        "browser_controlled_by_user"
-    );
-    host.control(json!({ "op": "input", "controllerId": owner, "sequence": 1, "events": [
+    let hand_over = |events: Value| {
+        let owner = uuid::Uuid::new_v4().to_string();
+        let expires = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64
+            + 25000;
+        host.control(json!({ "op": "acquire", "controllerId": owner, "expiresAt": expires }));
+        let blocked = host.call("agent_browser_click", json!({ "selector": "button" }));
+        assert_eq!(
+            blocked["structuredContent"]["response"]["code"],
+            "browser_controlled_by_user"
+        );
+        if events.as_array().is_some_and(|events| !events.is_empty()) {
+            host.control(
+                json!({ "op": "input", "controllerId": owner, "sequence": 1, "events": events }),
+            );
+        }
+        host.control(json!({ "op": "release", "controllerId": owner }));
+    };
+    let eval = |script: &str| {
+        let result = host.call("agent_browser_eval", json!({ "script": script }));
+        assert_eq!(result["isError"], false, "{result}");
+        result["structuredContent"]["response"]["data"]["result"].clone()
+    };
+
+    // The person types into the field; the agent's next command names its
+    // target and runs, with an observation of the page the person left.
+    hand_over(json!([
         { "type": "input_mouse", "eventType": "mousePressed", "x": 20, "y": 20, "button": "left", "buttons": 1, "clickCount": 1 },
         { "type": "input_mouse", "eventType": "mouseReleased", "x": 20, "y": 20, "button": "left", "buttons": 0, "clickCount": 1 },
         { "type": "input_keyboard", "eventType": "insertText", "text": "Human changed this" }
-    ] }));
-    host.control(json!({ "op": "release", "controllerId": owner }));
-    let resumed = host.call("agent_browser_click", json!({ "selector": "button" }));
-    assert_eq!(
-        resumed["structuredContent"]["response"]["code"],
-        "browser_observation_required"
-    );
-    let current = host.capture(&resumed);
+    ]));
+    let url = host.call("agent_browser_get_url", json!({}));
+    assert_eq!(url["isError"], false, "{url}");
+    let current = host.capture(&url);
     assert_ne!(
         current["page"]["pageGeneration"],
         before["page"]["pageGeneration"]
     );
-    let count = host.call("agent_browser_eval", json!({ "script": "window.clicks" }));
-    assert_eq!(count["structuredContent"]["response"]["data"]["result"], 0);
+    let value = host.call("agent_browser_get_value", json!({ "selector": "#field" }));
+    assert_eq!(
+        value["structuredContent"]["response"]["data"]["value"],
+        "Human changed this"
+    );
+    assert_eq!(
+        host.call("agent_browser_click", json!({ "selector": "button" }))["isError"],
+        false
+    );
+    assert_eq!(eval("window.clicks"), 1);
+
+    // A key goes to whatever has focus, which the person may have moved:
+    // it waits for one observation, which its refusal carries.
+    hand_over(json!([]));
+    let held = host.call("agent_browser_press", json!({ "key": "Enter" }));
+    assert_eq!(
+        held["structuredContent"]["response"]["code"], "browser_observation_required",
+        "{held}"
+    );
+    host.capture(&held);
+    assert_eq!(eval("window.enters"), 0);
+    let pressed = host.call("agent_browser_press", json!({ "key": "Enter" }));
+    assert_eq!(pressed["isError"], false, "{pressed}");
+    assert_eq!(eval("window.enters"), 1);
+
+    // A point read from the image taken before the hand-back is stale.
     host.configure(Some(
         json!({ "targetId": before["page"]["targetId"], "loaderId": before["page"]["loaderId"],
         "pageGeneration": before["page"]["pageGeneration"],
@@ -309,17 +349,18 @@ fn host_human_handoff_requires_fresh_observation_and_rejects_old_image_coordinat
         "browser_observation_stale"
     );
     host.configure(None);
-    let value = host.call("agent_browser_get_value", json!({ "selector": "#field" }));
-    assert_eq!(
-        value["structuredContent"]["response"]["data"]["value"],
-        "Human changed this"
+
+    // Opening a page is the first command after a hand-back most often.
+    hand_over(json!([]));
+    let reopened = host.call(
+        "agent_browser_open",
+        json!({ "url": "data:text/html,<title>Next page</title><p>next</p>" }),
     );
+    assert_eq!(reopened["isError"], false, "{reopened}");
     assert_eq!(
-        host.call("agent_browser_click", json!({ "selector": "button" }))["isError"],
-        false
+        host.capture(&reopened)["page"]["url"],
+        "data:text/html,<title>Next page</title><p>next</p>"
     );
-    let count = host.call("agent_browser_eval", json!({ "script": "window.clicks" }));
-    assert_eq!(count["structuredContent"]["response"]["data"]["result"], 1);
     assert_eq!(
         host.call("agent_browser_close", json!({}))["isError"],
         false

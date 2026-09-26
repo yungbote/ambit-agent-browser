@@ -555,7 +555,7 @@ async fn test_daemon_state_new_defaults() {
     assert!(state.pending_confirmation.is_none());
     assert!(!state.request_tracking);
     assert!(state.tracked_requests.is_empty());
-    assert!(state.active_frame_id.is_none());
+    assert!(state.active_frame.is_none());
     assert!(state.iframe_sessions.is_empty());
     assert!(state.active_iframe_sessions.is_empty());
     assert!(state.webdriver_backend.is_none());
@@ -679,15 +679,24 @@ async fn test_addscript_and_addinitscript_separate_dispatch() {
 #[tokio::test]
 async fn test_frame_context_management() {
     let mut state = DaemonState::new();
-    assert!(state.active_frame_id.is_none());
+    assert!(state.active_frame.is_none());
 
     // Set a frame ID and verify it persists
-    state.active_frame_id = Some("child-frame-123".to_string());
-    assert_eq!(state.active_frame_id.as_deref(), Some("child-frame-123"));
+    state.active_frame = Some(crate::native::element::FrameScope {
+        frame_id: "child-frame-123".to_string(),
+        document: Some("loader-1".to_string()),
+    });
+    assert_eq!(
+        state
+            .active_frame
+            .as_ref()
+            .map(|scope| scope.frame_id.as_str()),
+        Some("child-frame-123")
+    );
 
     // Clearing the frame ID (what mainframe does)
-    state.active_frame_id = None;
-    assert!(state.active_frame_id.is_none());
+    state.active_frame = None;
+    assert!(state.active_frame.is_none());
 }
 
 #[tokio::test]

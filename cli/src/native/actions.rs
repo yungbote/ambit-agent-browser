@@ -625,7 +625,9 @@ pub struct DaemonState {
     pub routes: Arc<RwLock<Vec<RouteEntry>>>,
     pub tracked_requests: Vec<TrackedRequest>,
     pub request_tracking: bool,
-    pub active_frame_id: Option<String>,
+    /// The frame `frame` selected, bound to the document it was selected in
+    /// (`element::scoped_frame`). `None` is the main frame.
+    pub active_frame: Option<super::element::FrameScope>,
     /// Cross-origin iframe frame_id → dedicated CDP session_id.
     /// Populated by Target.attachedToTarget events from Target.setAutoAttach.
     /// Entries are retained across tab changes because Chrome does not emit a
@@ -811,7 +813,7 @@ impl DaemonState {
             routes: Arc::new(RwLock::new(Vec::new())),
             tracked_requests: Vec::new(),
             request_tracking: false,
-            active_frame_id: None,
+            active_frame: None,
             iframe_sessions: HashMap::new(),
             active_iframe_sessions: HashSet::new(),
             origin_headers: Arc::new(RwLock::new(HashMap::new())),
@@ -2716,16 +2718,16 @@ pub(crate) async fn execute_command_received(
         .remove(super::feedback::REQUEST_FIELD);
     let expiry_error = state.expire_browser_control().await.err();
     let controlled = expiry_error.or(state.browser_control.lock().await.agent_error());
+    // The command still carries the host's request here: whether its point
+    // is fenced by the image it came from is part of that request.
     let requires_observation = window_actions::observation_required(
-        &command,
+        cmd,
         state.browser_control.lock().await.needs_observation(),
     );
     let mut response = if let Some(error) = controlled {
         json!({ "id": command["id"], "success": false, "code": error.code, "error": error.message })
     } else if requires_observation {
-        state.ref_map.clear();
-        state.active_frame_id = None;
-        json!({ "id": command["id"], "success": false, "code": "browser_observation_required", "error": "Browser control returned from the user. Inspect this fresh observation and choose the next action." })
+        json!({ "id": command["id"], "success": false, "code": "browser_observation_required", "error": window_actions::OBSERVATION_REQUIRED })
     } else if !super::feedback::matches_expected(&request, state).await {
         json!({ "id": command["id"], "success": false, "code": "browser_observation_stale", "error": "The browser page or viewport changed since this image. Inspect the fresh observation before sending coordinates." })
     } else {
@@ -2740,6 +2742,17 @@ pub(crate) async fn execute_command_received(
                 let response = Box::pin(execute_command_inner(&launch, state)).await;
                 if response["success"] != true {
                     return response;
+                }
+                // The window preparation above ran before this browser
+                // existed. The command meets it now, against the browser it
+                // will act on: which of its pages is active, and whether a
+                // point it carries was chosen for this window.
+                if response["data"]["reused"] != true {
+                    if let Err((code, message)) =
+                        state.prepare_window_command(cmd, received_at).await
+                    {
+                        return state.window_refusal(&command["id"], code, message);
+                    }
                 }
             }
             Box::pin(execute_command_inner(&command, state)).await
@@ -2970,7 +2983,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
 
     // Keep element resolution in sync with the `frame` selection (see
     // element::set_active_frame for why this is mirrored).
-    super::element::set_active_frame(state.active_frame_id.as_deref());
+    super::element::set_active_frame(state.active_frame.as_ref());
 
     // `--pin-tab` from the client enables strict tab binding even when the
     // daemon was started without the flag, and `--no-pin-tab` (pinTab: false)
@@ -5721,7 +5734,7 @@ async fn clear_active_page_context(state: &mut DaemonState) {
 
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
-    state.active_frame_id = None;
+    state.active_frame = None;
 }
 
 async fn navigate_active_page(
@@ -5953,13 +5966,15 @@ async fn handle_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
         urls: cmd.get("urls").and_then(|v| v.as_bool()).unwrap_or(false),
     };
 
+    let frame =
+        super::element::scoped_frame(&mgr.client, &session_id, state.active_frame.as_ref()).await?;
     state.ref_map.clear();
     let observation = snapshot::take_snapshot_with_projection(
         &mgr.client,
         &session_id,
         &options,
         &mut state.ref_map,
-        state.active_frame_id.as_deref(),
+        frame,
         &state.iframe_sessions,
     )
     .await?;
@@ -6059,6 +6074,9 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
     };
 
     if annotate {
+        let frame =
+            super::element::scoped_frame(&mgr.client, &session_id, state.active_frame.as_ref())
+                .await?;
         state.ref_map.clear();
         let _ = snapshot::take_snapshot(
             &mgr.client,
@@ -6068,7 +6086,7 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
                 ..SnapshotOptions::default()
             },
             &mut state.ref_map,
-            state.active_frame_id.as_deref(),
+            frame,
             &state.iframe_sessions,
         )
         .await?;
@@ -6158,7 +6176,7 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 
         state.ref_map.clear();
         state.active_iframe_sessions.clear();
-        state.active_frame_id = None;
+        state.active_frame = None;
         state.webmcp.clear_invocations();
         let new_session_id = {
             let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
@@ -6547,7 +6565,9 @@ async fn handle_wait(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
             .and_then(|v| v.as_str())
             .unwrap_or("visible");
         // Honor an active `frame <sel>` selection, like element resolution does.
-        match state.active_frame_id.as_deref() {
+        match super::element::scoped_frame(&mgr.client, &session_id, state.active_frame.as_ref())
+            .await?
+        {
             Some(frame_id) => match state.iframe_sessions.get(frame_id) {
                 Some(frame_session) => {
                     wait_for_selector(&mgr.client, frame_session, selector, state_str, timeout_ms)
@@ -7242,12 +7262,14 @@ async fn handle_diff_snapshot(cmd: &Value, state: &mut DaemonState) -> Result<Va
     // Start from the same ref base as a normal baseline snapshot so unchanged lines align.
     // Build the replacement separately so a failed diff leaves the existing refs usable.
     let mut current_ref_map = RefMap::new();
+    let frame =
+        super::element::scoped_frame(&mgr.client, &session_id, state.active_frame.as_ref()).await?;
     let current = snapshot::take_snapshot(
         &mgr.client,
         &session_id,
         &options,
         &mut current_ref_map,
-        state.active_frame_id.as_deref(),
+        frame,
         &state.iframe_sessions,
     )
     .await?;
@@ -7539,7 +7561,7 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
 
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
-    state.active_frame_id = None;
+    state.active_frame = None;
     state.webmcp.clear_invocations();
     let (mut result, new_session_id) = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
@@ -7595,7 +7617,7 @@ async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value
     // the user on the old tab with dead refs and frame scope.
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
-    state.active_frame_id = None;
+    state.active_frame = None;
     state.webmcp.clear_invocations();
 
     let has_proxy_creds = state.proxy_credentials.read().await.is_some();
@@ -7654,7 +7676,7 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
     state.webmcp.clear_invocations();
-    state.active_frame_id = None;
+    state.active_frame = None;
     state.refresh_active_iframe_sessions().await;
     Ok(result)
 }
@@ -9917,14 +9939,18 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     }
 
     let frame_tree = &tree_result["frameTree"];
+    // The selection lasts as long as the document it was made in.
+    let scope = |frame_id: String| super::element::FrameScope {
+        frame_id,
+        document: frame_tree["frame"]["loaderId"].as_str().map(str::to_string),
+    };
 
     // If selector is a ref (@e1), resolve the iframe element from the ref map
     if let Some(sel) = selector {
         if let Some(ref_id) = super::element::parse_ref(sel) {
-            let entry = state
-                .ref_map
-                .get(&ref_id)
-                .ok_or_else(|| format!("Unknown ref: {}", ref_id))?;
+            let entry =
+                super::element::lookup_ref(&mgr.client, &session_id, &state.ref_map, &ref_id)
+                    .await?;
             let backend_node_id = entry
                 .backend_node_id
                 .ok_or_else(|| format!("Ref {} has no backend node id", ref_id))?;
@@ -9980,7 +10006,7 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
                 })
                 .unwrap_or(&ref_id);
 
-            state.active_frame_id = Some(frame_id.to_string());
+            state.active_frame = Some(scope(frame_id.to_string()));
             return Ok(json!({ "frame": label }));
         }
 
@@ -9999,14 +10025,14 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         let result = mgr.evaluate(&js, None).await?;
         let frame_name = result.as_str().ok_or("Could not find frame for selector")?;
         if let Some(frame_id) = find_frame(frame_tree, Some(frame_name), None) {
-            state.active_frame_id = Some(frame_id);
+            state.active_frame = Some(scope(frame_id));
             return Ok(json!({ "frame": frame_name }));
         }
     }
 
     if let Some(frame_id) = find_frame(frame_tree, name, url) {
         let label = name.or(url).unwrap_or("frame");
-        state.active_frame_id = Some(frame_id);
+        state.active_frame = Some(scope(frame_id));
         return Ok(json!({ "frame": label }));
     }
 
@@ -10014,7 +10040,7 @@ async fn handle_frame(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
 }
 
 async fn handle_mainframe(state: &mut DaemonState) -> Result<Value, String> {
-    state.active_frame_id = None;
+    state.active_frame = None;
     Ok(json!({ "frame": "main" }))
 }
 
@@ -10271,9 +10297,12 @@ async fn handle_presentational_getbyrole(
     let located = {
         let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
         let top_session = mgr.active_session_id()?.to_string();
+        let frame =
+            super::element::scoped_frame(&mgr.client, &top_session, state.active_frame.as_ref())
+                .await?;
         eval_body_in_active_frame(
             mgr,
-            state.active_frame_id.as_deref(),
+            frame,
             &top_session,
             &state.iframe_sessions,
             &locate_body,
@@ -10297,7 +10326,7 @@ async fn handle_presentational_getbyrole(
             let top_session = top_session.to_string();
             let _ = eval_body_in_active_frame(
                 mgr,
-                state.active_frame_id.as_deref(),
+                state.active_frame.as_ref().map(|scope| scope.frame_id.as_str()),
                 &top_session,
                 &state.iframe_sessions,
                 "(root) => { root.querySelector('[data-agent-browser-located]')?.removeAttribute('data-agent-browser-located'); }",
@@ -10388,11 +10417,10 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     // Query the accessibility tree via CDP: the browser engine is the
     // authoritative source for implicit roles (e.g. <h2> -> "heading",
     // <a href> -> "link"), which a CSS selector cannot approximate.
-    let (ax_params, effective_session_id) = super::element::resolve_ax_session(
-        state.active_frame_id.as_deref(),
-        &session_id,
-        &state.iframe_sessions,
-    );
+    let frame =
+        super::element::scoped_frame(&mgr.client, &session_id, state.active_frame.as_ref()).await?;
+    let (ax_params, effective_session_id) =
+        super::element::resolve_ax_session(frame, &session_id, &state.iframe_sessions);
 
     let ax_tree: GetFullAXTreeResult = mgr
         .client
@@ -10413,7 +10441,7 @@ async fn handle_getbyrole(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         role,
         &actual_name,
         None,
-        state.active_frame_id.as_deref(),
+        frame,
     );
     state.ref_map.set_next_ref_num(ref_num + 1);
 
@@ -13306,6 +13334,13 @@ fn error_response(id: &str, error: &str) -> Value {
     resp
 }
 
+/// Whether `command` waits for a fresh observation after a person released
+/// the browser (see `window_actions::observation_required`).
+#[cfg(test)]
+pub(crate) fn observation_required_after_handback_for_test(command: &Value) -> bool {
+    window_actions::observation_required(command, true)
+}
+
 #[cfg(test)]
 pub(crate) fn native_error_response_for_test(error: &str) -> Value {
     error_response(
@@ -13320,10 +13355,12 @@ pub(crate) fn native_error_response_for_test(error: &str) -> Value {
 /// the caller can select one without a `tab_list` round; nothing is selected
 /// for it. A gone tab's own recovery identifiers stay beside the list.
 async fn attach_tab_recovery(resp: &mut Value, state: &mut DaemonState) {
-    use super::browser::{TAB_CLOSED_DURING_COMMAND, TAB_GONE, TAB_NOT_FOUND};
+    use super::browser::{
+        ACTIVE_PAGE_AMBIGUOUS, TAB_CLOSED_DURING_COMMAND, TAB_GONE, TAB_NOT_FOUND,
+    };
     let gone = match resp.get("code").and_then(Value::as_str) {
         Some(TAB_GONE | TAB_CLOSED_DURING_COMMAND) => true,
-        Some(TAB_NOT_FOUND) => false,
+        Some(TAB_NOT_FOUND | ACTIVE_PAGE_AMBIGUOUS) => false,
         _ => return,
     };
     let dialog_session = state.dialog_session();
@@ -15274,6 +15311,32 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         let resp = error_response("cmd-3", &err);
         assert_eq!(resp["success"], false);
         assert_eq!(resp["code"], "tab_gone");
+    }
+
+    /// A known refusal code is never answered without its `code`, even as the
+    /// whole error text. Production, run 7bb8369f: a launch that could not
+    /// select a page answered the bare `browser_active_page_ambiguous`, which
+    /// the host could only settle as a failure of unknown effect.
+    #[test]
+    fn test_error_response_codes_a_bare_refusal_code() {
+        for code in [
+            "browser_active_page_ambiguous",
+            "browser_observation_stale",
+            "tab_not_found",
+            "browser_controlled_by_user",
+        ] {
+            let resp = native_error_response_for_test(code);
+            assert_eq!(resp["code"], code, "{resp}");
+            assert_eq!(resp["error"], code, "{resp}");
+        }
+        let stale = "browser_observation_stale: Ref e1 is from a snapshot of a page this tab no longer shows";
+        let resp = native_error_response_for_test(stale);
+        assert_eq!(resp["code"], "browser_observation_stale");
+        assert_eq!(resp["error"], stale);
+        // Words that only begin like a code stay uncoded.
+        for error in ["Unknown ref: e1", "browser_operation_rejected by the page"] {
+            assert!(native_error_response_for_test(error).get("code").is_none());
+        }
     }
 
     /// A tab-addressing refusal reaches its response whole and with its code,

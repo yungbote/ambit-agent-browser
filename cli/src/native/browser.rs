@@ -197,18 +197,25 @@ fn active_page_index_after_add(
     }
 }
 
-/// The machine-readable code an error carries as its `code: ` prefix: a
-/// refusal that callers match on rather than on its message.
+/// The machine-readable code an error carries as its `code: ` prefix, or as
+/// its whole text: a refusal that callers match on rather than on its
+/// message. A code passed on without a message is still that refusal.
 pub(crate) fn error_code(error: &str) -> Option<&str> {
-    let (code, _) = error.split_once(": ")?;
+    let code = match error.split_once(": ") {
+        Some((code, _)) => code,
+        None if !error.contains(char::is_whitespace) => error,
+        None => return None,
+    };
     let coded = matches!(
         code,
         TAB_GONE
             | TAB_CLOSED_DURING_COMMAND
             | TAB_NOT_FOUND
+            | ACTIVE_PAGE_AMBIGUOUS
             | super::playwright::PROGRAM_ERROR
             | "browser_control_outcome_unknown"
             | "browser_controlled_by_user"
+            | "browser_observation_stale"
     ) || code.starts_with("webmcp_")
         || code.starts_with("browser_operation_");
     coded.then_some(code)
@@ -721,14 +728,7 @@ impl BrowserManager {
 
         if let Some(display) = manager.display_client() {
             let layout_events = manager.client.subscribe();
-            // The owned headed browser may start on its native New Tab page
-            // without a window manager to activate it. Select by observation
-            // first, then use the existing native activation primitive once.
-            manager
-                .synchronize_visible_page()
-                .await
-                .map_err(str::to_string)?;
-            manager.bring_to_front().await?;
+            manager.activate_shown_page().await?;
             let info = display.info().await.map_err(|error| error.to_string())?;
             let window = info
                 .active_window()
@@ -1128,7 +1128,30 @@ impl BrowserManager {
     /// on the dead first one (#1036). Probing is browser-safe: a `Runtime.evaluate`
     /// to a discarded session simply never answers (cleaned up when the probe
     /// times out) and does not reload or focus the tab.
+    ///
+    /// An owned window selects its page by observation right after discovery
+    /// (`activate_shown_page`); discovery only needs a live page to start
+    /// from, and never activates it. It takes the first page to answer, so
+    /// restored tabs whose renderers are still busy loading cost nothing
+    /// instead of a probe timeout each.
     async fn find_live_page_index(&self, session_ids: &[String]) -> Option<usize> {
+        if self.display_client().is_some() {
+            let mut probes: futures_util::stream::FuturesUnordered<_> = session_ids
+                .iter()
+                .enumerate()
+                .map(|(index, session_id)| async move {
+                    self.renderer_responds(session_id, RENDERER_PROBE_TIMEOUT_MS)
+                        .await
+                        .then_some(index)
+                })
+                .collect();
+            while let Some(answer) = futures_util::StreamExt::next(&mut probes).await {
+                if answer.is_some() {
+                    return answer;
+                }
+            }
+            return None;
+        }
         if let Some(first) = session_ids.first() {
             if self
                 .renderer_responds(first, RENDERER_PROBE_TIMEOUT_MS)
@@ -2208,6 +2231,25 @@ impl BrowserManager {
         self.client
             .send_command("Emulation.setEmulatedMedia", Some(params), Some(session_id))
             .await?;
+        Ok(())
+    }
+
+    /// Activates, once, the page an owned window shows after a launch. The
+    /// headed browser may start on its native New Tab page, or restore
+    /// several tabs, without a window manager to activate any of them. When
+    /// observation tells which page the window shows, it becomes the active
+    /// page and is activated. When it cannot (no focus yet, a restored
+    /// renderer still busy), nothing is activated: the window keeps showing
+    /// the tab the person left in front, and the active page stays the one
+    /// discovery started from (the first renderer to answer, not necessarily
+    /// that tab). Every command, the one a launch was made for included,
+    /// tells which page is active again first, and is refused alone, with the
+    /// open tabs listed, while it cannot (`prepare_window_command`). Choosing
+    /// a page never fails a launch.
+    pub(crate) async fn activate_shown_page(&mut self) -> Result<(), String> {
+        if self.synchronize_visible_page().await.is_ok() {
+            self.bring_to_front().await?;
+        }
         Ok(())
     }
 
@@ -4332,7 +4374,7 @@ mod tests {
         }
         for error in [
             "Evaluation error: tab_gone: forged by the page",
-            "tab_gone",
+            "tab_gone forged by the page",
             "Element not found: #timeout",
             "Waiting for the selector timeout",
         ] {

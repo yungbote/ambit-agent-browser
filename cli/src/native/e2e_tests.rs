@@ -39,7 +39,12 @@ fn assert_error_code(resp: &Value, code: &str) {
         "Expected failure but got: {}",
         serde_json::to_string_pretty(resp).unwrap_or_default()
     );
-    assert_eq!(resp.get("code").and_then(Value::as_str), Some(code));
+    assert_eq!(
+        resp.get("code").and_then(Value::as_str),
+        Some(code),
+        "{}",
+        serde_json::to_string_pretty(resp).unwrap_or_default()
+    );
 }
 
 /// Full-window pixels of a page point and the surface generation that
@@ -3103,7 +3108,7 @@ async fn e2e_tab_close_with_tab_id_closes_active_tab() {
     assert_eq!(get_data(&resp)["title"], "A");
     assert!(state.ref_map.get("e1").is_none());
     assert!(state.iframe_sessions.is_empty());
-    assert!(state.active_frame_id.is_none());
+    assert!(state.active_frame.is_none());
 
     let resp = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
     assert_success(&resp);
@@ -11548,7 +11553,10 @@ async fn e2e_a11y_uses_vendored_engine_and_preserves_shadow_targets() {
     state
         .ref_map
         .add("e999".to_string(), Some(999), "button", "stale", None);
-    state.active_frame_id = Some("stale-frame".to_string());
+    state.active_frame = Some(super::element::FrameScope {
+        frame_id: "stale-frame".to_string(),
+        document: None,
+    });
     state
         .iframe_sessions
         .insert("stale-frame".to_string(), "stale-session".to_string());
@@ -11565,7 +11573,7 @@ async fn e2e_a11y_uses_vendored_engine_and_preserves_shadow_targets() {
     .await;
     assert_success(&resp);
     assert!(state.ref_map.get("e999").is_none());
-    assert!(state.active_frame_id.is_none());
+    assert!(state.active_frame.is_none());
     assert!(!state.iframe_sessions.contains_key("stale-frame"));
 
     let _ = execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await;
@@ -12986,6 +12994,377 @@ async fn e2e_native_binary_viewer_resizes_the_same_window() {
         "Not changed: a person's open view of this browser sets its window to 733x896 CSS pixels. Keep working at that size; set_viewport applies only while no view is open."
     );
     drop(ws);
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+/// Production, runs edecec75 and b913b29f: a click on a ref from a snapshot
+/// of the same document failed with "Unknown ref" because a person's viewer
+/// resized the window in between. A layout changes no element's identity: a
+/// ref lasts exactly as long as the document its snapshot read, however that
+/// document ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_native_refs_survive_a_layout_and_end_with_their_document() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let page = "data:text/html,<title>Refs</title><button onclick='window.clicks=(window.clicks||0)+1'>Count</button>";
+    assert_success(
+        &control_test_command(&json!({"action":"navigate","url":page}), &mut state).await,
+    );
+    let count_ref = |snapshot: &Value| {
+        get_data(snapshot)["refs"]
+            .as_object()
+            .unwrap()
+            .iter()
+            .find(|(_, entry)| entry["role"] == "button" && entry["name"] == "Count")
+            .map(|(id, _)| format!("@{id}"))
+            .expect("the snapshot lists the button")
+    };
+    async fn clicks(state: &mut DaemonState) -> i64 {
+        let resp = control_test_command(
+            &json!({"action":"evaluate","script":"window.clicks ?? 0"}),
+            state,
+        )
+        .await;
+        assert_success(&resp);
+        get_data(&resp)["result"].as_i64().unwrap()
+    }
+    let snapshot = control_test_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    let button = count_ref(&snapshot);
+
+    // The viewer lays the window out at another size.
+    let surface = state.apply_window_layout(640, 480, None).await.unwrap();
+    assert_eq!((surface.width, surface.height), (1280, 960));
+    let clicked =
+        control_test_command(&json!({"action":"click","selector":button}), &mut state).await;
+    assert_success(&clicked);
+    assert_eq!(clicks(&mut state).await, 1);
+
+    // The page reloads without an agent command, as when a person reloads
+    // it: the ref's document is gone, and nothing is clicked for it.
+    reload_without_a_command(&state).await;
+    let refused =
+        control_test_command(&json!({"action":"click","selector":button}), &mut state).await;
+    assert_error_code(&refused, "browser_observation_stale");
+    assert_eq!(clicks(&mut state).await, 0);
+
+    // A snapshot of the new document lists refs that work.
+    let snapshot = control_test_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    let button = count_ref(&snapshot);
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":button}), &mut state).await,
+    );
+    assert_eq!(clicks(&mut state).await, 1);
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+/// Reloads the active page the way a person or the page itself would,
+/// outside any agent command, and returns once it shows its new document.
+async fn reload_without_a_command(state: &DaemonState) {
+    let browser = state.browser.as_ref().unwrap();
+    let session = browser.active_session_id().unwrap().to_string();
+    let before = super::element::page_document(&browser.client, &session)
+        .await
+        .unwrap();
+    browser
+        .client
+        .send_command("Page.reload", None, Some(&session))
+        .await
+        .unwrap();
+    let started = std::time::Instant::now();
+    loop {
+        let now = super::element::page_document(&browser.client, &session).await;
+        if now.is_some_and(|now| now != before) {
+            return;
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(10));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+/// A frame selection ends with the document it was made in, as a ref does.
+/// Before, a hand-back after a sign-in relaunch or a person's navigation
+/// left the daemon selecting a frame that no longer existed: every selector
+/// command and snapshot then failed on an uncoded CDP error about that frame
+/// (DOM.getFrameOwner, Accessibility.getFullAXTree), which the host could
+/// only settle as a failure of unknown effect, until the agent happened to
+/// select the main frame. Now each such command is refused, coded, before
+/// anything is done, and says what to select.
+#[tokio::test]
+#[ignore]
+async fn e2e_frame_selection_ends_with_its_document() {
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(
+            &json!({ "id": "1", "action": "launch", "headless": true }),
+            &mut state,
+        )
+        .await,
+    );
+    // `srcdoc` keeps the frame same-origin with its page.
+    let page = "<title>Frames</title><button id=go onclick='window.outer=(window.outer||0)+1'>Outer</button><iframe id=f name=f srcdoc=\"<button id=go onclick='parent.inner=(parent.inner||0)+1'>Inner</button>\"></iframe>";
+    let url = format!("data:text/html;base64,{}", STANDARD.encode(page));
+    assert_success(
+        &execute_command(&json!({ "action": "navigate", "url": url }), &mut state).await,
+    );
+    async fn clicks(state: &mut DaemonState) -> Value {
+        let resp = execute_command(
+            &json!({ "action": "evaluate", "script": "[window.inner ?? 0, window.outer ?? 0]" }),
+            state,
+        )
+        .await;
+        assert_success(&resp);
+        get_data(&resp)["result"].clone()
+    }
+    let click = json!({ "action": "click", "selector": "#go" });
+
+    assert_success(
+        &execute_command(&json!({ "action": "frame", "selector": "#f" }), &mut state).await,
+    );
+    assert_success(&execute_command(&click, &mut state).await);
+    assert_eq!(clicks(&mut state).await, json!([1, 0]));
+    assert_success(&execute_command(&json!({ "action": "snapshot" }), &mut state).await);
+
+    // The page reloads outside the agent's commands: its frames are new.
+    reload_without_a_command(&state).await;
+    for command in [
+        click.clone(),
+        json!({ "action": "snapshot" }),
+        json!({ "action": "wait", "selector": "#go", "timeout": 1000 }),
+        json!({ "action": "getbyrole", "role": "button", "subaction": "click" }),
+    ] {
+        let refused = execute_command(&command, &mut state).await;
+        assert_error_code(&refused, "browser_observation_stale");
+        let error = refused["error"].as_str().unwrap();
+        assert!(error.contains("frame"), "{command}: {error}");
+        assert!(error.contains("Nothing was done"), "{command}: {error}");
+    }
+    assert_eq!(clicks(&mut state).await, json!([0, 0]));
+
+    // Selecting a frame again (the main frame or one of this page) goes on.
+    assert_success(&execute_command(&json!({ "action": "mainframe" }), &mut state).await);
+    assert_success(&execute_command(&click, &mut state).await);
+    assert_eq!(clicks(&mut state).await, json!([0, 1]));
+    assert_success(
+        &execute_command(&json!({ "action": "frame", "selector": "#f" }), &mut state).await,
+    );
+    assert_success(&execute_command(&click, &mut state).await);
+    assert_eq!(clicks(&mut state).await, json!([1, 1]));
+    let _ = execute_command(&json!({ "action": "close" }), &mut state).await;
+}
+
+/// A ref is bound to its document, so a change of visible tab ends it only
+/// while that tab is not the one shown. Before, the daemon wiped every ref
+/// when it saw a person had selected another tab natively: the agent's next
+/// ref failed as an uncoded "Unknown ref", which the host could only settle
+/// as a failure of unknown effect, and the ref stayed lost when the person
+/// went back. Now it is refused, coded as a stale observation, before
+/// anything is done; it acts again once its tab is shown again. A ref no
+/// snapshot lists is refused with the same code.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_native_refs_from_another_tab_are_refused_as_stale() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let first = "data:text/html,<title>First</title><button onclick='window.clicks=(window.clicks||0)+1'>Count</button>";
+    assert_success(
+        &control_test_command(&json!({"action":"navigate","url":first}), &mut state).await,
+    );
+    let second = control_test_command(
+        &json!({"action":"tab_new","url":"data:text/html,<title>Second</title><p>Second</p>"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&second);
+    let second_target = second["data"]["targetId"].as_str().unwrap().to_string();
+    assert_success(
+        &control_test_command(&json!({"action":"tab_switch","tabId":"t1"}), &mut state).await,
+    );
+    let first_target = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .active_target_id()
+        .unwrap()
+        .to_string();
+    let snapshot = control_test_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    let button = get_data(&snapshot)["refs"]
+        .as_object()
+        .unwrap()
+        .iter()
+        .find(|(_, entry)| entry["role"] == "button")
+        .map(|(id, _)| format!("@{id}"))
+        .expect("the snapshot lists the button");
+    async fn select_natively(state: &DaemonState, target: &str) {
+        state
+            .browser
+            .as_ref()
+            .unwrap()
+            .client
+            .send_command(
+                "Target.activateTarget",
+                Some(json!({ "targetId": target })),
+                None,
+            )
+            .await
+            .unwrap();
+    }
+
+    // The person selects the second tab in the native window.
+    select_natively(&state, &second_target).await;
+    let refused =
+        control_test_command(&json!({"action":"click","selector":button}), &mut state).await;
+    assert_error_code(&refused, "browser_observation_stale");
+    let title = control_test_command(&json!({"action":"title"}), &mut state).await;
+    assert_eq!(get_data(&title)["title"], "Second");
+
+    // Back on the first tab, the ref's document is shown again.
+    select_natively(&state, &first_target).await;
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":button}), &mut state).await,
+    );
+    let clicks = control_test_command(
+        &json!({"action":"evaluate","script":"window.clicks ?? 0"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(get_data(&clicks)["result"], 1);
+
+    let unknown =
+        control_test_command(&json!({"action":"click","selector":"@e999"}), &mut state).await;
+    assert_error_code(&unknown, "browser_observation_stale");
+    assert!(unknown["error"]
+        .as_str()
+        .unwrap()
+        .contains("Unknown ref: e999"));
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+/// What a launch does once it has discovered the pages of its owned window:
+/// activate the page the window shows, and only when it can tell which one
+/// that is. Here the person selected the first tab natively, so the daemon
+/// still starts from the second (as discovery may start from any tab that
+/// answers first), and the first tab's renderer is busy, so observation
+/// cannot tell. Before, the launch activated the page it started from: the
+/// window switched away from the person's tab. Now nothing is activated,
+/// and the next command acts on the tab the window shows once it can tell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_native_a_launch_that_cannot_tell_the_shown_tab_activates_none() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"navigate","url":"data:text/html,<title>First</title><p>First</p>"}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"tab_new","url":"data:text/html,<title>Second</title><p>Second</p>"}),
+            &mut state,
+        )
+        .await,
+    );
+    let browser = state.browser.as_mut().unwrap();
+    let first = browser.pages_list()[0].clone();
+    // The person selects the first tab; the daemon has not observed it yet.
+    browser
+        .client
+        .send_command(
+            "Target.activateTarget",
+            Some(json!({ "targetId": first.target_id })),
+            None,
+        )
+        .await
+        .unwrap();
+    // Its renderer is busy past the page observation's bound (2 s).
+    let client = browser.client.clone();
+    let session = first.session_id.clone();
+    let busy = tokio::spawn(async move {
+        let _ = client
+            .send_command(
+                "Runtime.evaluate",
+                Some(json!({ "expression": "{const until=Date.now()+3500;while(Date.now()<until){}}" })),
+                Some(&session),
+            )
+            .await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    browser.activate_shown_page().await.unwrap();
+    busy.await.unwrap();
+
+    let title = control_test_command(&json!({"action":"title"}), &mut state).await;
+    assert_success(&title);
+    assert_eq!(get_data(&title)["title"], "First");
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+/// The window preparation every command meets runs before the command's
+/// launch step, when there is no browser yet. A command that launched the
+/// browser meets it after the launch, against the browser it will act on:
+/// which page is active (a launch that cannot tell leaves it unchosen), and
+/// whether a point it carries was chosen for this window. A point sent
+/// before the window existed is refused, nothing sent; a command that names
+/// its target runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_native_a_command_that_launches_the_browser_meets_the_window_gate() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let captures = tempfile::tempdir().unwrap();
+    let with_launch = |mut command: Value, state: &DaemonState| {
+        command["ambitFeedback"] = json!({
+            "namespace": std::env::var("AGENT_BROWSER_NAMESPACE").unwrap_or_default(),
+            "session": state.session_id, "captureDirectory": captures.path(),
+            "timeoutMs": 60_000, "launch": { "action": "launch" },
+        });
+        command
+    };
+
+    let mut state = DaemonState::new();
+    let moved = control_test_command(
+        &with_launch(json!({"action":"mousemove","x":40,"y":40}), &state),
+        &mut state,
+    )
+    .await;
+    assert_error_code(&moved, "browser_observation_stale");
+    assert!(state.browser.is_some(), "the launch step ran");
+    assert!(moved["error"]
+        .as_str()
+        .unwrap()
+        .contains("Nothing was sent"));
+    // The browser is reused now, and the next point is admitted as usual.
+    assert_success(
+        &control_test_command(
+            &with_launch(json!({"action":"mousemove","x":40,"y":40}), &state),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+
+    let mut state = DaemonState::new();
+    let url = "data:text/html,<title>Launched</title><p>Launched</p>";
+    let opened = control_test_command(
+        &with_launch(json!({"action":"navigate","url":url}), &state),
+        &mut state,
+    )
+    .await;
+    assert_success(&opened);
+    let title = control_test_command(&json!({"action":"title"}), &mut state).await;
+    assert_eq!(get_data(&title)["title"], "Launched");
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
 

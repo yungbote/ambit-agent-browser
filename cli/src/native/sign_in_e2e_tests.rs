@@ -165,6 +165,8 @@ struct Site {
     url: String,
     reports: Arc<Mutex<Vec<HashMap<String, String>>>>,
     paths: Arc<Mutex<Vec<String>>>,
+    /// While set, every `/busy` page that loads keeps its renderer busy.
+    busy: Arc<std::sync::atomic::AtomicBool>,
     _server: tokio::task::JoinHandle<()>,
 }
 
@@ -184,10 +186,11 @@ impl Site {
         let url = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
         let reports = Arc::new(Mutex::new(Vec::new()));
         let paths = Arc::new(Mutex::new(Vec::new()));
-        let (recorded, visited) = (reports.clone(), paths.clone());
+        let busy = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (recorded, visited, held) = (reports.clone(), paths.clone(), busy.clone());
         let server = tokio::spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
-                let (recorded, visited) = (recorded.clone(), visited.clone());
+                let (recorded, visited, held) = (recorded.clone(), visited.clone(), held.clone());
                 tokio::spawn(async move {
                     let mut buffer = vec![0u8; 16 * 1024];
                     let read = stream.read(&mut buffer).await.unwrap_or(0);
@@ -211,6 +214,20 @@ impl Site {
                             "Content-Type: text/html\r\n",
                             "<!doctype html><title>Second tab</title><p>Second tab</p>",
                         ),
+                        // A heavy page: while the site holds it busy, its
+                        // renderer is blocked from the moment it loads, as
+                        // when a restored session reloads it.
+                        "/busy" => (
+                            "200 OK",
+                            "Content-Type: text/html\r\n",
+                            "<!doctype html><title>Busy tab</title><script>const x=new XMLHttpRequest();x.open('GET','/hold',false);x.send()</script><p>Busy tab</p>",
+                        ),
+                        "/hold" => {
+                            while held.load(std::sync::atomic::Ordering::SeqCst) {
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                            }
+                            ("200 OK", "Content-Type: text/plain\r\n", "released")
+                        }
                         "/report" => {
                             recorded.lock().unwrap().push(
                                 url::form_urlencoded::parse(query.as_bytes())
@@ -234,6 +251,7 @@ impl Site {
             url,
             reports,
             paths,
+            busy,
             _server: server,
         }
     }
@@ -287,6 +305,10 @@ impl Site {
         })
         .await
         .is_ok()
+    }
+
+    fn hold_busy_pages(&self, busy: bool) {
+        self.busy.store(busy, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn visited(&self, path: &str) -> bool {
@@ -624,9 +646,12 @@ async fn e2e_sign_in_relaunches_without_automation_and_hands_back() {
         "the restored page sees automation again"
     );
 
-    // The agent observes before acting, then finds its session intact.
+    // A command that names its target runs at once; key input, which goes
+    // to whatever has focus, waits for an observation. Then the agent finds
+    // its session intact.
+    assert_eq!(evaluate(&mut state, "1").await, 1);
     assert_refused(
-        &command(&json!({ "action": "evaluate", "script": "1" }), &mut state).await,
+        &command(&json!({ "action": "press", "key": "Enter" }), &mut state).await,
         "browser_observation_required",
     );
     let started = Instant::now();
@@ -843,11 +868,99 @@ async fn e2e_sign_in_that_cannot_start_returns_the_browser_to_automation() {
         assert_success(&command(&control("release", &controller), &mut state).await)["status"],
         "released"
     );
+    assert_eq!(evaluate(&mut state, "location.pathname").await, "/");
     assert_refused(
-        &command(&json!({ "action": "evaluate", "script": "1" }), &mut state).await,
+        &command(
+            &json!({ "action": "keyboard", "subaction": "type", "text": "x" }),
+            &mut state,
+        )
+        .await,
         "browser_observation_required",
     );
     assert_success(&command(&json!({ "action": "snapshot" }), &mut state).await);
-    assert_eq!(evaluate(&mut state, "location.pathname").await, "/");
+    assert_success(&command(&json!({ "action": "close" }), &mut state).await);
+}
+
+/// Production, run 7bb8369f: after a sign-in hand-back every command failed
+/// with the bare `browser_active_page_ambiguous` until the browser was
+/// closed, because a launch that could not tell which page its window shows
+/// failed as a whole. A relaunched window has no focus, so telling needs
+/// every restored tab to answer, and a background tab whose renderer is
+/// still busy loading does not; it also held every window layout, which
+/// waited on each page in turn. Automation now comes back with the person's
+/// tabs, and the next command acts, or is refused alone with the open tabs
+/// listed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_hand_back_with_a_busy_restored_tab_keeps_the_browser_and_its_tabs() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let site = Site::start().await;
+    let mut state = DaemonState::new();
+    let _viewer = open_form(&mut state, &site).await;
+    // A heavy page in a background tab; the person stays on the form.
+    assert_success(
+        &command(
+            &json!({ "action": "tab_new", "url": site.page("/busy") }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &command(
+            &json!({ "action": "tab_switch", "tabId": "t2" }),
+            &mut state,
+        )
+        .await,
+    );
+
+    let controller = acquire(&mut state).await;
+    let (entered, _) = sign_in(&mut state, &controller, 1, 600_000).await;
+    assert_success(&entered);
+    // Hand back while the restored heavy page loads again.
+    site.hold_busy_pages(true);
+    let started = Instant::now();
+    let released = command(&control("release", &controller), &mut state).await;
+    assert_eq!(assert_success(&released)["status"], "released");
+    assert!(
+        started.elapsed() < Duration::from_secs(8),
+        "{:?}",
+        started.elapsed()
+    );
+    assert!(
+        state.browser.is_some(),
+        "automation did not come back: its relaunch failed"
+    );
+
+    let url = command(&json!({ "action": "url" }), &mut state).await;
+    if url["success"] != true {
+        assert_eq!(url["code"], "browser_active_page_ambiguous", "{url:#}");
+        assert!(url["data"]["tabs"].is_array(), "{url:#}");
+    }
+    // Every tab is restored; a busy one commits its address when it can.
+    let restored: Vec<String> = ["/second", "/", "/busy"]
+        .iter()
+        .map(|path| site.page(path))
+        .collect();
+    let mut urls = Vec::new();
+    for _ in 0..25 {
+        let tabs = command(&json!({ "action": "tab_list" }), &mut state).await;
+        urls = assert_success(&tabs)["tabs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tab| tab["url"].as_str().map(str::to_string))
+            .collect::<Vec<_>>();
+        if restored.iter().all(|url| urls.contains(url)) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    assert!(restored.iter().all(|url| urls.contains(url)), "{urls:?}");
+    // Once the heavy page settles, the browser is observed as usual.
+    site.hold_busy_pages(false);
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_success(&command(&json!({ "action": "snapshot" }), &mut state).await);
     assert_success(&command(&json!({ "action": "close" }), &mut state).await);
 }

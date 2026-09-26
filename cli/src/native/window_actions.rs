@@ -29,12 +29,95 @@ pub(super) fn observes_page(command: &Value) -> bool {
     matches!(command["action"].as_str(), Some("snapshot" | "screenshot"))
 }
 
-/// Whether a command must be refused until the agent observes the browser
-/// again. Observing commands are never refused: they are how the requirement
-/// is satisfied.
-pub(super) fn observation_required(command: &Value, needs_observation: bool) -> bool {
-    needs_observation && !observes_page(command)
+/// What a command's effect lands on, as far as browser events outside the
+/// agent's commands can change it. A command that names its target (a URL,
+/// tab, window, selector, ref or script) resolves it against the live
+/// browser when it runs, so no such event makes it stale.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Target {
+    /// Named by the command itself.
+    Named,
+    /// Whatever has focus: key and text input with no element, and the
+    /// answer to a JavaScript dialog, which goes to whichever one is open.
+    Focus,
+    /// Wherever the pointer is: a button pressed or released in place.
+    Pointer,
+    /// Viewport coordinates, as current as the view they were read from.
+    Point,
+    /// Anything: a supervised program can send input to focus, the pointer
+    /// and any point, and no image fences its points.
+    Any,
 }
+
+/// The target of a daemon command. Handlers that dispatch input without
+/// resolving an element are the only ones that do not name theirs.
+pub(super) fn target(command: &Value) -> Target {
+    match command["action"].as_str().unwrap_or_default() {
+        "press" | "keydown" | "keyup" | "keyboard" | "inserttext" | "input_keyboard" => {
+            Target::Focus
+        }
+        // A pending dialog may be one a person's actions opened; reading its
+        // status names nothing to act on.
+        "dialog" => match command["response"].as_str() {
+            Some("status") => Target::Named,
+            _ => Target::Focus,
+        },
+        "run_playwright" => Target::Any,
+        // Copy and paste press the platform shortcut on the focused element.
+        "clipboard" => match command
+            .get("subAction")
+            .or_else(|| command.get("operation"))
+            .and_then(Value::as_str)
+        {
+            Some("copy" | "paste") => Target::Focus,
+            _ => Target::Named,
+        },
+        "mousedown" | "mouseup" => Target::Pointer,
+        "mousemove" | "mouse" | "wheel" | "input_mouse" | "input_touch" | "swipe" => Target::Point,
+        _ => Target::Named,
+    }
+}
+
+/// Whether the host checked this command's point against the image it was
+/// read from: the daemon then refuses it as `browser_observation_stale` when
+/// the page, its generation or its geometry no longer match that image.
+pub(super) fn point_fenced(command: &Value) -> bool {
+    command
+        .get(crate::native::feedback::REQUEST_FIELD)
+        .and_then(|request| request.get("expectedObservation"))
+        .is_some_and(|expected| !expected.is_null())
+}
+
+/// Whether a command must wait for a fresh observation because the browser
+/// changed outside the agent's commands (a person held it, or an input's
+/// outcome is unknown). Only focus, the pointer and unfenced points can have
+/// moved under the agent; a command that names its target runs, and the
+/// host's feedback shows it the page it acted on.
+pub(super) fn observation_required(command: &Value, needs_observation: bool) -> bool {
+    needs_observation
+        && match target(command) {
+            Target::Named => false,
+            Target::Focus | Target::Pointer | Target::Any => true,
+            Target::Point => !point_fenced(command),
+        }
+}
+
+/// Whether a window layout applied after this command was received made its
+/// target stale. Layout moves content under the pointer and under viewport
+/// coordinates the host did not fence; it changes no focus and no element's
+/// identity.
+pub(super) fn layout_made_stale(command: &Value) -> bool {
+    match target(command) {
+        Target::Named | Target::Focus => false,
+        Target::Pointer | Target::Any => true,
+        Target::Point => !point_fenced(command),
+    }
+}
+
+/// The refusal of a command `observation_required` holds back. Host-bound
+/// callers receive a fresh observation with it, which is the observation it
+/// asks for; others take a snapshot or screenshot.
+pub(super) const OBSERVATION_REQUIRED: &str = "The browser changed outside your commands since your last observation (a person used it, or an earlier input's outcome is unknown), so focus, the pointer and any open dialog may have changed. This command can act on them without naming an element, so nothing was sent. Observe the page, then send it again, or address an element by selector or ref.";
 
 impl DaemonState {
     pub(crate) async fn apply_window_layout(
@@ -81,8 +164,9 @@ impl DaemonState {
         if let Some(server) = self.stream_server.as_ref() {
             server.clear_frame();
         }
-        self.ref_map.clear();
-        self.active_frame_id = None;
+        // Refs and the selected frame stay: a layout changes no element's
+        // identity. Each use of a ref measures its element again, and a ref
+        // outlives only the document its snapshot read (`element::lookup_ref`).
         self.window_page_error = Some("browser_layout_pending");
         let (surface, page_blocked) = browser
             .resize_window(width, height, id, page_blocked, events)
@@ -153,8 +237,8 @@ impl DaemonState {
             return;
         };
         // A viewer's layout is not human input: it needs no fresh observation
-        // from the agent. Stale coordinates are already fenced by the cleared
-        // refs, the rotated page generations and admission-time staleness.
+        // from the agent. Stale coordinates are already fenced by the rotated
+        // page generations and admission-time staleness (`layout_made_stale`).
         // Daemon command custody already excludes controller mutations and
         // native-window raw stream input is disabled. Release this gate so
         // event reconciliation and normal dialog handling can proceed.
@@ -204,10 +288,11 @@ impl DaemonState {
             return Ok(());
         }
         // Admission time is taken before waiting for command custody. A
-        // queued legacy operation cannot become safe merely because another
-        // queued screenshot cleared the one-shot observation requirement.
-        if !observes_page(command) && display.changed_since(received_at) {
-            return Err(("browser_observation_stale", "The browser window changed while this command was queued. Observe its current page before choosing another action."));
+        // queued point or pointer input cannot become safe merely because
+        // another queued screenshot cleared the one-shot observation
+        // requirement; a command that names its target resolves it now.
+        if layout_made_stale(command) && display.changed_since(received_at) {
+            return Err(("browser_observation_stale", "The browser window changed after this command was sent, so a point or the pointer it uses may no longer be over what you chose. Nothing was sent. Observe its current page, then send it again."));
         }
         self.drain_cdp_events_background().await.map_err(|_| (ACTIVE_PAGE_AMBIGUOUS, "The active browser page is not observable. Inspect the browser or select an existing tab explicitly."))?;
         if self.window_page_error == Some("browser_dialog_open")
@@ -240,8 +325,9 @@ impl DaemonState {
             Ok(changed) => {
                 self.window_page_error = None;
                 if changed {
-                    self.ref_map.clear();
-                    self.active_frame_id = None;
+                    // Refs and the selected frame stay: each is bound to the
+                    // document it was taken from, which the page shown now
+                    // does not have (`element::lookup_ref`, `scoped_frame`).
                     self.refresh_active_iframe_sessions().await;
                     self.update_stream_client().await;
                 }
@@ -259,7 +345,7 @@ impl DaemonState {
                 self.browser_control.lock().await.needs_observation(),
             )
         {
-            return Err(("browser_observation_required", "The browser changed during window control. Run snapshot or screenshot and choose the next action from that fresh observation."));
+            return Err(("browser_observation_required", OBSERVATION_REQUIRED));
         }
         Ok(())
     }
@@ -268,7 +354,15 @@ impl DaemonState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::feedback::REQUEST_FIELD;
     use serde_json::json;
+
+    fn fenced(mut command: Value) -> Value {
+        command[REQUEST_FIELD] = json!({ "expectedObservation": {
+            "targetId": "T", "loaderId": "L", "pageGeneration": "G", "geometrySha256": "sha256:0",
+        } });
+        command
+    }
 
     #[test]
     fn observing_commands_are_never_refused_for_lack_of_an_observation() {
@@ -277,11 +371,112 @@ mod tests {
             assert!(observes_page(&command));
             assert!(!observation_required(&command, true));
         }
-        for action in ["click", "frame", "type", "mouse", "scroll"] {
-            let command = json!({ "action": action });
-            assert!(!observes_page(&command));
-            assert!(observation_required(&command, true));
-            assert!(!observation_required(&command, false));
+    }
+
+    /// Production refused all of these after a person released the browser
+    /// (open, tab_list, reload, eval, errors, set_viewport, auth_list), though
+    /// each names what it acts on and resolves it against the live browser.
+    #[test]
+    fn commands_that_name_their_target_run_after_a_handback() {
+        for command in [
+            json!({ "action": "navigate", "url": "https://example.test/" }),
+            json!({ "action": "url" }),
+            json!({ "action": "title" }),
+            json!({ "action": "tab_list" }),
+            json!({ "action": "tab_new", "url": "https://example.test/" }),
+            json!({ "action": "tab_switch", "tabId": "t2" }),
+            json!({ "action": "window_new" }),
+            json!({ "action": "auth_list" }),
+            json!({ "action": "errors" }),
+            json!({ "action": "evaluate", "script": "1" }),
+            json!({ "action": "reload" }),
+            json!({ "action": "viewport", "width": 800, "height": 600 }),
+            json!({ "action": "click", "selector": "#go" }),
+            json!({ "action": "click", "selector": "@e3" }),
+            json!({ "action": "fill", "selector": "#q", "value": "x" }),
+            json!({ "action": "type", "selector": "#q", "text": "x" }),
+            json!({ "action": "scroll", "direction": "down", "amount": 300 }),
+            json!({ "action": "drag", "source": "@e1", "target": "#drop" }),
+            json!({ "action": "frame", "selector": "#embed" }),
+            json!({ "action": "clipboard", "operation": "read" }),
+            json!({ "action": "clipboard", "operation": "write", "text": "x" }),
+            json!({ "action": "dialog", "response": "status" }),
+        ] {
+            assert_eq!(target(&command), Target::Named, "{command}");
+            assert!(!observation_required(&command, true), "{command}");
+            assert!(!layout_made_stale(&command), "{command}");
         }
+    }
+
+    /// What a person's control can move under the agent: focus (and the
+    /// dialog it may have opened), the pointer and any point the host did not
+    /// check against its image. A program can send any of these.
+    #[test]
+    fn input_to_focus_pointer_or_an_unfenced_point_waits_for_an_observation() {
+        for command in [
+            json!({ "action": "press", "key": "Enter" }),
+            json!({ "action": "keydown", "key": "Shift" }),
+            json!({ "action": "keyup", "key": "Shift" }),
+            json!({ "action": "keyboard", "subaction": "type", "text": "x" }),
+            json!({ "action": "keyboard", "subaction": "insertText", "text": "x" }),
+            json!({ "action": "inserttext", "text": "x" }),
+            json!({ "action": "clipboard", "operation": "copy" }),
+            json!({ "action": "clipboard", "operation": "paste" }),
+            json!({ "action": "mousedown", "button": "left" }),
+            json!({ "action": "mouseup", "button": "left" }),
+            json!({ "action": "mousemove", "x": 10, "y": 20 }),
+            json!({ "action": "wheel", "deltaX": 0, "deltaY": 100 }),
+            json!({ "action": "swipe", "direction": "up" }),
+            // The pending dialog may be one the person's actions opened.
+            json!({ "action": "dialog", "response": "accept" }),
+            json!({ "action": "dialog", "response": "dismiss" }),
+            // A program can press keys or click points the image it was
+            // written from no longer shows.
+            json!({ "action": "run_playwright", "code": "await page.keyboard.press('Enter')" }),
+        ] {
+            assert_ne!(target(&command), Target::Named, "{command}");
+            assert!(observation_required(&command, true), "{command}");
+            assert!(!observation_required(&command, false), "{command}");
+        }
+        // A point read from an image is fenced by that image instead: the
+        // daemon refuses it as stale when the page no longer matches it.
+        let point = json!({ "action": "mousemove", "x": 10, "y": 20 });
+        assert!(!observation_required(&fenced(point.clone()), true));
+        let mut unfenced = point;
+        unfenced[REQUEST_FIELD] = json!({ "expectedObservation": null });
+        assert!(observation_required(&unfenced, true));
+        // A button has no point to fence: it goes wherever the pointer is.
+        assert!(observation_required(
+            &fenced(json!({ "action": "mousedown" })),
+            true
+        ));
+        // Nor has a program: whatever image it came with, it can press keys.
+        assert!(observation_required(
+            &fenced(json!({ "action": "run_playwright", "code": "return 1" })),
+            true
+        ));
+    }
+
+    /// A layout changes no focus and no element's identity; it moves content
+    /// under the pointer and under viewport coordinates, which a program may
+    /// use.
+    #[test]
+    fn a_layout_makes_only_pointer_input_and_unfenced_points_stale() {
+        assert!(!layout_made_stale(
+            &json!({ "action": "press", "key": "Enter" })
+        ));
+        assert!(!layout_made_stale(
+            &json!({ "action": "click", "selector": "@e1" })
+        ));
+        assert!(layout_made_stale(&json!({ "action": "mouseup" })));
+        assert!(!layout_made_stale(
+            &json!({ "action": "dialog", "response": "accept" })
+        ));
+        assert!(layout_made_stale(
+            &json!({ "action": "run_playwright", "code": "return 1" })
+        ));
+        let point = json!({ "action": "mousemove", "x": 10, "y": 20 });
+        assert!(layout_made_stale(&point));
+        assert!(!layout_made_stale(&fenced(point)));
     }
 }

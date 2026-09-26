@@ -525,9 +525,9 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
                     (String::new(), true)
                 }
             };
-        // Native refs and frame scope predate the program, whatever settled.
-        state.ref_map.clear();
-        state.active_frame_id = None;
+        // Native refs and the selected frame outlive the program only while
+        // its page keeps their document (`element::lookup_ref`,
+        // `scoped_frame`), whatever the program did.
         let cleanup = process_cleanup.and(tunnel_cleanup).and(input_cleanup);
         // A program that ran and did not end cleanly may have left input
         // held; release it, and the next observation is taken afresh. One
