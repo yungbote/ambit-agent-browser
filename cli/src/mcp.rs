@@ -1176,17 +1176,17 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_FIND,
             "Find element",
-            "Find an element with semantic locators and optionally act on it.",
+            "Find an element with a semantic locator and act on it.",
             json!({
                 "locator": { "type": "string", "enum": ["role", "text", "label", "placeholder", "alt", "title", "testid", "first", "last", "nth"] },
                 "value": { "type": "string", "description": "Role, text, label, selector, or test id." },
-                "action": { "type": "string", "description": "Optional action: click, fill, check, hover, text." },
-                "text": { "type": "string", "description": "Optional value for the fill action." },
+                "action": { "type": "string", "enum": crate::native::actions::FIND_ACTIONS, "description": "What to do with the element: click, fill it with text, check, hover, or text to read its text without acting on it." },
+                "text": { "type": "string", "description": "Value for the fill action." },
                 "index": { "type": "integer", "description": "Index for nth locator." },
                 "name": { "type": "string", "description": "Accessible name filter for role locator." },
                 "exact": { "type": "boolean", "description": "Exact, case-sensitive match. For the role locator it applies to the accessible name, whose default is a case-insensitive substring. The role value itself always matches case-insensitively, with or without exact.", "default": false }
             }),
-            &["locator", "value"],
+            &["locator", "value", "action"],
         ),
         tool(
             TOOL_MOUSE_MOVE,
@@ -2949,21 +2949,19 @@ fn call_is(arguments: &Value, what: &str) -> Result<CliInvocation, ProtocolError
 fn call_find(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
     let locator = required_string(arguments, "locator")?;
     let value = required_string(arguments, "value")?;
+    // Always explicit: the CLI's `find` clicks when its action is left out,
+    // so a find sent as a lookup would click whatever it matched.
+    let action = required_string(arguments, "action")?;
     let mut args = vec!["find".to_string(), locator.clone()];
     if locator == "nth" {
         let index = optional_i64(arguments, "index")?.unwrap_or(0);
         args.push(index.to_string());
     }
     args.push(value);
-    let action = optional_string(arguments, "action")?;
+    args.push(action);
     let text = optional_string(arguments, "text")?;
     let name = optional_string(arguments, "name")?;
     let exact = optional_bool(arguments, "exact")?.unwrap_or(false);
-    if let Some(action) = action {
-        args.push(action);
-    } else if name.is_some() || exact || text.is_some() {
-        args.push("click".to_string());
-    }
     if let Some(text) = text {
         args.push(text);
     }
@@ -4265,6 +4263,61 @@ fn write_json_line(stdout: &mut io::Stdout, value: &Value) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Production 09-25, run 643dd77f: `find {locator:"text", value:"San
+    /// Gaku"}`, meant as a lookup, reached the CLI without an action, and the
+    /// CLI's `find` clicks when none is given. The schema requires the action
+    /// and lists every one; a find without it is refused, never clicked.
+    #[test]
+    fn find_acts_only_as_its_action_says() {
+        let tools = tools();
+        let find = tools
+            .iter()
+            .find(|t| t["name"].as_str() == Some(TOOL_FIND))
+            .unwrap();
+        let schema = &find["inputSchema"];
+        assert!(schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&json!("action")));
+        assert_eq!(
+            schema["properties"]["action"]["enum"],
+            json!(crate::native::actions::FIND_ACTIONS)
+        );
+
+        for without_action in [
+            json!({"locator": "text", "value": "San Gaku"}),
+            json!({"locator": "role", "value": "link", "name": "San Gaku"}),
+            json!({"locator": "label", "value": "Email", "text": "a@b.test"}),
+        ] {
+            assert!(call_find(&without_action).is_err(), "{without_action}");
+        }
+
+        let parsed = |arguments: Value| {
+            let invocation = call_find(&arguments).unwrap();
+            let flags = crate::flags::parse_flags(&invocation.cli_args);
+            crate::commands::parse_command(&crate::flags::clean_args(&invocation.cli_args), &flags)
+                .unwrap()
+        };
+        let read = parsed(json!({"locator": "text", "value": "San Gaku", "action": "text"}));
+        assert_eq!(read["action"], "getbytext");
+        assert_eq!(read["subaction"], "text");
+        let named = parsed(json!({
+            "locator": "role", "value": "link", "action": "hover",
+            "name": "San Gaku", "exact": true
+        }));
+        assert_eq!(named["subaction"], "hover");
+        assert_eq!(named["name"], "San Gaku");
+        assert_eq!(named["exact"], true);
+        let filled = parsed(json!({
+            "locator": "label", "value": "Email", "action": "fill", "text": "a@b.test"
+        }));
+        assert_eq!(filled["subaction"], "fill");
+        assert_eq!(filled["value"], "a@b.test");
+        let nth = parsed(json!({"locator": "nth", "index": 2, "value": "li", "action": "text"}));
+        assert_eq!(nth["subaction"], "text");
+        assert_eq!(nth["index"], 2);
+    }
 
     #[test]
     fn download_tools_keep_cli_destination_and_timeout_semantics() {
