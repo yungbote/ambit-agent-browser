@@ -541,6 +541,9 @@ fn host_theme_launches_from_configuration_and_switches_under_person_control() {
         blocked["structuredContent"]["response"]["code"],
         "browser_controlled_by_user"
     );
+    // The app commits its preference before pushing the live update. Later
+    // Action envelopes read that same current host authority.
+    host.configure_with(json!({ "theme": "light" }));
     let switched = host.call("agent_browser_set_theme", json!({ "theme": "light" }));
     assert_eq!(switched["isError"], false, "{switched}");
     assert_eq!(
