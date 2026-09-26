@@ -552,7 +552,7 @@ fn host_theme_launches_from_configuration_and_switches_under_person_control() {
 
     let again = host.call("agent_browser_set_theme", json!({ "theme": "light" }));
     assert_eq!(again["isError"], false, "{again}");
-    let owed = host.call("agent_browser_click", json!({ "selector": "button" }));
+    let owed = host.call("agent_browser_press", json!({ "key": "Enter" }));
     assert_eq!(
         owed["structuredContent"]["response"]["code"],
         "browser_observation_required"
