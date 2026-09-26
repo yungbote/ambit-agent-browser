@@ -469,11 +469,12 @@ impl BrowserControl {
         self.display = display;
     }
 
-    /// An agent command (or one Playwright input) starts under the current
-    /// window layout; a later layout refuses its pointer input.
+    /// An agent command, or one Playwright mouse event, starts a new unheld
+    /// gesture's page/window measurement. Its pointer input is sent only
+    /// under a layout the agent's page was proven at, which a person's
+    /// resize during the command or program ends.
     pub(crate) fn begin_agent_command(&mut self) {
-        let layout = self.display.as_ref().map(|display| display.layout_epoch());
-        self.native_mouse.begin_command(layout);
+        self.native_mouse.begin_command();
     }
 
     /// Observe lease deadlines without holding this gate. Frame pacing and

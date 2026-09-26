@@ -373,6 +373,9 @@ mod platform {
         /// Counts applied layouts, so the agent's next command can prove the
         /// page follows the newest one exactly once.
         layout_epoch: u64,
+        /// The layout epoch the agent's page proof last ran at, and whether
+        /// a JavaScript dialog kept the proof from the page.
+        proof: Option<(u64, bool)>,
     }
 
     struct InFlight<'a> {
@@ -429,6 +432,7 @@ mod platform {
                     changed_at: std::time::Instant::now(),
                     ready,
                     layout_epoch: 0,
+                    proof: None,
                 }),
                 features: RwLock::new(Vec::new()),
                 input_lease: tokio::sync::RwLock::new(()),
@@ -479,6 +483,28 @@ mod platform {
         /// Moves on every applied layout.
         pub(crate) fn layout_epoch(&self) -> u64 {
             self.surface.read().unwrap().layout_epoch
+        }
+
+        /// Records the agent's page proof of the layout at `epoch`: the page
+        /// follows the window, or a JavaScript dialog kept the proof from it.
+        pub(crate) fn record_proof(&self, epoch: u64, page_blocked: bool) {
+            self.surface.write().unwrap().proof = Some((epoch, page_blocked));
+        }
+
+        /// The newest page proof: its layout epoch and whether a dialog
+        /// blocked it.
+        pub(crate) fn proof(&self) -> Option<(u64, bool)> {
+            self.surface.read().unwrap().proof
+        }
+
+        /// Whether the page was proven to follow the window's current
+        /// layout. Agent pointer input is sent only then: coordinates the
+        /// agent resolved before a newer layout (a person's resize landing
+        /// during a command or a Playwright program) may name another
+        /// element now.
+        pub(crate) fn layout_proven(&self) -> bool {
+            let state = self.surface.read().unwrap();
+            state.proof == Some((state.layout_epoch, false))
         }
 
         /// Whether the helper advertised a protocol extension.
@@ -1449,6 +1475,12 @@ impl DisplayClient {
         match *self {}
     }
     pub(crate) fn layout_epoch(&self) -> u64 {
+        match *self {}
+    }
+    pub(crate) fn record_proof(&self, _: u64, _: bool) {
+        match *self {}
+    }
+    pub(crate) fn proof(&self) -> Option<(u64, bool)> {
         match *self {}
     }
     pub(crate) fn has(&self, _: &str) -> bool {

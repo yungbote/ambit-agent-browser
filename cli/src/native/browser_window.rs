@@ -142,7 +142,9 @@ impl BrowserManager {
     /// Proves the pages follow the window's newest layout: page metrics at
     /// the window's size, then one compositor readback per visible page.
     /// Returns whether a JavaScript dialog kept the proof from the page.
-    /// The proof is recorded for that layout epoch, so it runs once.
+    /// The proof is recorded on the display for that layout epoch, so it
+    /// runs once, and agent pointer input is sent only under a proven
+    /// layout (`DisplayClient::layout_proven`).
     pub(crate) async fn prove_window_layout(
         &mut self,
         page_blocked: bool,
@@ -165,7 +167,7 @@ impl BrowserManager {
             // cannot answer metrics or screenshots until the user resolves
             // it. The daemon keeps page feedback unavailable and retains any
             // emulation; the proof runs again once the dialog is gone.
-            self.layout_proof = Some((epoch, true));
+            display.record_proof(epoch, true);
             return Ok(true);
         }
 
@@ -278,7 +280,7 @@ impl BrowserManager {
         })
         .await
         .map_err(|_| "The browser has not acknowledged the new page layout")??;
-        self.layout_proof = Some((epoch, page_blocked));
+        display.record_proof(epoch, page_blocked);
         Ok(page_blocked)
     }
 
@@ -288,7 +290,7 @@ impl BrowserManager {
         let Some(display) = self.display_client() else {
             return false;
         };
-        match self.layout_proof {
+        match display.proof() {
             Some((epoch, false)) => epoch != display.layout_epoch(),
             Some((epoch, true)) => epoch != display.layout_epoch() || !page_blocked,
             None => true,

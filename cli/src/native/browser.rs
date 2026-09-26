@@ -536,10 +536,6 @@ pub struct BrowserManager {
     /// long as its window's pages, as a private window's session does: the
     /// destruction of its last page disposes it.
     window_contexts: HashSet<String>,
-    /// The owned window's layout epoch whose page geometry was last proven,
-    /// and whether a JavaScript dialog kept that proof from reaching the
-    /// page (it is then proven again once the dialog is gone).
-    pub(crate) layout_proof: Option<(u64, bool)>,
 }
 
 #[path = "browser_tabs.rs"]
@@ -718,7 +714,6 @@ impl BrowserManager {
                 bound_target_gone: None,
                 headless,
                 window_contexts: HashSet::new(),
-                layout_proof: None,
             };
             manager.discover_and_attach_targets().await?;
             manager
@@ -832,7 +827,6 @@ impl BrowserManager {
             bound_target_gone: None,
             headless: true,
             window_contexts: HashSet::new(),
-            layout_proof: None,
         };
 
         if direct_page {
@@ -2950,7 +2944,6 @@ async fn initialize_lightpanda_manager(
             bound_target_gone: None,
             headless: true,
             window_contexts: HashSet::new(),
-            layout_proof: None,
         };
 
         match discover_and_attach_lightpanda_targets(&mut manager, deadline).await {
@@ -3703,7 +3696,6 @@ pub(crate) mod tests {
             bound_target_gone: None,
             headless: true,
             window_contexts: HashSet::new(),
-            layout_proof: None,
         }
     }
 

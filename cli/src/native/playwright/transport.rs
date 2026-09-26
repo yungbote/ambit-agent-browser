@@ -575,6 +575,107 @@ mod tests {
         assert!((1..=MAX_PENDING_COMMANDS).contains(&most_outstanding));
     }
 
+    /// A program's coordinates are page geometry it read earlier. A layout
+    /// that lands while the program runs (a person dragging the dock) is not
+    /// proven until the next command, so each later tunnel mouse event is
+    /// refused before any pre-hover or native input, instead of starting
+    /// under the new layout; once proven, the same event goes through.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_layout_during_a_program_refuses_its_later_mouse_events() {
+        use crate::native::display::DisplayClient;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let (reached, mut page) = mpsc::unbounded_channel::<String>();
+        let server = tokio::spawn(async move {
+            let (socket, _) = upstream.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let command: Value = serde_json::from_str(&text).unwrap();
+                let method = command["method"].as_str().unwrap().to_owned();
+                let reply = match method.as_str() {
+                    "Target.getTargetInfo" => json!({"id":command["id"],
+                        "result":{"targetInfo":{"type":"page","targetId":"T"}}}),
+                    "Target.activateTarget" => json!({"id":command["id"],"result":{}}),
+                    _ => {
+                        let _ = reached.send(method);
+                        json!({"id":command["id"],"error":{"code":-32000,"message":"not in this test"}})
+                    }
+                };
+                socket.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+        });
+        let client = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let (display, helper, _frames) = DisplayClient::test_channel();
+        let mut helper = BufReader::new(helper);
+        let control = Mutex::new(BrowserControl::default());
+        control.lock().await.set_display(Some(display.clone()));
+        // The run_playwright command proved the page before the program.
+        display.record_proof(display.layout_epoch(), false);
+        control.lock().await.begin_agent_command();
+
+        let owner = display.clone();
+        let resized = tokio::spawn(async move {
+            let layout = owner.layout().await;
+            owner
+                .resize(&layout, 1560, 1200, Some(7), false)
+                .await
+                .map(|_| ())
+        });
+        let mut line = String::new();
+        helper.read_line(&mut line).await.unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["op"], "resize");
+        let reply = json!({"id":request["id"],"success":true,"data":{"width":1560,"height":1200,"windows":[]}});
+        helper
+            .get_mut()
+            .write_all(format!("{reply}\n").as_bytes())
+            .await
+            .unwrap();
+        resized.await.unwrap().unwrap();
+
+        // `page.mouse.click` at a point read before the layout.
+        let moved = json!({"id":3,"sessionId":"S","method":"Input.dispatchMouseEvent",
+            "params":{"type":"mouseMoved","x":605,"y":105,"button":"none"}});
+        for _ in 0..2 {
+            let error = native_input(&moved, &client, &control).await.unwrap_err();
+            assert!(error.contains("was resized"), "{error}");
+        }
+        assert!(page.try_recv().is_err(), "no pre-hover reached the page");
+        line.clear();
+        let quiet =
+            tokio::time::timeout(Duration::from_millis(100), helper.read_line(&mut line)).await;
+        assert!(quiet.is_err(), "no native input was sent: {line}");
+
+        // The next command's proof lets the same event through: it measures
+        // the page (the helper's window info, then a CDP pre-hover).
+        display.record_proof(display.layout_epoch(), false);
+        let helper_side = async {
+            line.clear();
+            helper.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["op"], "info");
+            let info = json!({"id":request["id"],"success":true,"data":{"width":1560,"height":1200,
+                "windows":[{"id":7,"pid":1,"x":0,"y":0,"width":1560,"height":1200,"mapped":true,
+                "focused":true,"overrideRedirect":false,"windowType":"normal"}]}});
+            helper
+                .get_mut()
+                .write_all(format!("{info}\n").as_bytes())
+                .await
+                .unwrap();
+        };
+        let (measured, ()) = tokio::join!(native_input(&moved, &client, &control), helper_side);
+        assert!(!measured.unwrap_err().contains("was resized"));
+        assert_eq!(page.recv().await.unwrap(), "Input.dispatchMouseEvent");
+        server.abort();
+    }
+
     #[tokio::test]
     async fn browser_origins_and_foreign_paths_cannot_consume_the_native_connection() {
         use tokio_tungstenite::tungstenite::client::IntoClientRequest;

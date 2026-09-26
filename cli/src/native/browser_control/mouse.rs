@@ -28,9 +28,10 @@ fn outcome_unknown(message: impl AsRef<str>) -> String {
 const UNMEASURED: &str =
     "The browser did not report the native mouse position. No native button was sent.";
 
-/// A person's view resized the window after this command began: whatever
-/// it resolved on the page may have moved, so its pointer input is refused.
-const RESIZED: &str = "The browser window was resized while this command ran, so this mouse input was not sent. Observe the page before choosing the next action.";
+/// A person's view resized the window after the agent's page was last
+/// proven: whatever a command or program resolved on the page may have
+/// moved, so its pointer input is refused until the next command proves it.
+const RESIZED: &str = "The browser window was resized after this page was last observed, so this mouse input was not sent. Observe the page before choosing the next action.";
 
 /// A CDP move whose trusted renderer event, when this page's own document
 /// receives it, measures where page coordinates are on the native display.
@@ -157,26 +158,24 @@ pub(super) struct NativeMouse {
     modifiers: i64,
     /// Set before the helper can perform input. Cancellation cannot clear it.
     unknown: bool,
-    /// The window layout this command began under. Layouts no longer wait
-    /// for a whole command, so pointer input after a newer layout is refused
-    /// before it is sent.
-    layout_epoch: Option<u64>,
 }
 
 impl NativeMouse {
-    pub(super) fn begin_command(&mut self, layout_epoch: Option<u64>) {
+    pub(super) fn begin_command(&mut self) {
         if self.buttons == 0 {
             self.mappings.clear();
         }
-        self.layout_epoch = layout_epoch;
     }
 
-    /// Checked under atomic input custody, so no layout can land between
-    /// this check and the native send.
+    /// Layouts land between atomic inputs, not between commands, and a
+    /// layout is proven only by the agent's next command. Checked under
+    /// atomic input custody, so no layout lands between this check and the
+    /// native send.
     fn same_layout(&self, display: &DisplayClient) -> Result<(), String> {
-        match self.layout_epoch {
-            Some(epoch) if epoch != display.layout_epoch() => Err(RESIZED.into()),
-            _ => Ok(()),
+        if display.layout_proven() {
+            Ok(())
+        } else {
+            Err(RESIZED.into())
         }
     }
 
@@ -202,9 +201,7 @@ impl NativeMouse {
         display.reset().await.map_err(|error| {
             outcome_unknown(format!("Native input release is unconfirmed ({error}). Close the browser before sending more mouse input."))
         })?;
-        let layout_epoch = self.layout_epoch;
         self.reset();
-        self.layout_epoch = layout_epoch;
         Ok(())
     }
 
@@ -620,12 +617,12 @@ mod tests {
     fn mappings_survive_only_a_held_gesture_and_unknown_input_requires_explicit_reset() {
         let mut mouse = NativeMouse::default();
         mouse.mappings.insert("page".into(), mapping(2.0, 262.0));
-        mouse.begin_command(None);
+        mouse.begin_command();
         assert!(mouse.mappings.is_empty());
         mouse.mappings.insert("page".into(), mapping(2.0, 262.0));
         mouse.buttons = 1;
         mouse.unknown = true;
-        mouse.begin_command(None);
+        mouse.begin_command();
         assert_eq!(mouse.mappings.len(), 1);
         assert!(mouse.unknown);
         mouse.reset();
@@ -694,7 +691,7 @@ mod tests {
         assert!(error.contains("release is unconfirmed"));
         assert!(mouse.unknown);
         assert_eq!(mouse.buttons, 1);
-        mouse.begin_command(None);
+        mouse.begin_command();
         assert_eq!(mouse.mappings.len(), 1);
         assert!(mouse
             .require_known()
@@ -773,6 +770,7 @@ mod tests {
         let mut control = super::super::BrowserControl::default();
         control.set_display(Some(display.clone()));
         control.native_mouse = mouse;
+        display.record_proof(display.layout_epoch(), false);
         let error = control
             .agent_native_mouse(
                 json!({"type":"mousePressed","x":210,"y":175,"button":"left","buttons":1}),
@@ -803,9 +801,11 @@ mod tests {
         }
     }
 
-    /// Layouts no longer wait for a whole command: pointer input a command
-    /// resolved before a person's view resized the window is refused before
-    /// anything is sent, and the next command works at the new layout.
+    /// Layouts no longer wait for a whole command: pointer input is refused
+    /// before anything is sent when a person's view resized the window after
+    /// the command's page proof, whether the layout landed while the command
+    /// ran or between its proof and its start. A new command alone does not
+    /// make the old proof current; the next proof does.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn pointer_input_after_a_newer_layout_is_refused_before_it_is_sent() {
@@ -820,45 +820,65 @@ mod tests {
         let client = CdpClient::connect(&format!("ws://{address}"))
             .await
             .unwrap();
-        let (display, peer, _frames) = DisplayClient::test_channel();
-        let mut control = super::super::BrowserControl::default();
-        control.set_display(Some(display.clone()));
-        control.begin_agent_command();
-        let owner = display.clone();
-        let resized = tokio::spawn(async move {
-            let layout = owner.layout().await;
-            owner
-                .resize(&layout, 1560, 1200, Some(7), false)
+        for layout_before_command in [false, true] {
+            let (display, peer, _frames) = DisplayClient::test_channel();
+            let mut control = super::super::BrowserControl::default();
+            control.set_display(Some(display.clone()));
+            // The command's preparation proved the page at the current layout.
+            display.record_proof(display.layout_epoch(), false);
+            if !layout_before_command {
+                control.begin_agent_command();
+            }
+            let owner = display.clone();
+            let resized = tokio::spawn(async move {
+                let layout = owner.layout().await;
+                owner
+                    .resize(&layout, 1560, 1200, Some(7), false)
+                    .await
+                    .map(|_| ())
+            });
+            let mut peer = BufReader::new(peer);
+            let mut line = String::new();
+            peer.read_line(&mut line).await.unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["op"], "resize");
+            let response = json!({"id":request["id"],"success":true,"data":{"width":1560,"height":1200,"windows":[]}});
+            peer.get_mut()
+                .write_all(format!("{response}\n").as_bytes())
                 .await
-                .map(|_| ())
-        });
-        let mut peer = BufReader::new(peer);
-        let mut line = String::new();
-        peer.read_line(&mut line).await.unwrap();
-        let request: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(request["op"], "resize");
-        let response = json!({"id":request["id"],"success":true,"data":{"width":1560,"height":1200,"windows":[]}});
-        peer.get_mut()
-            .write_all(format!("{response}\n").as_bytes())
-            .await
-            .unwrap();
-        resized.await.unwrap().unwrap();
-        let error = control
-            .agent_native_mouse(
-                json!({"type":"mousePressed","x":210,"y":175,"button":"left","buttons":1}),
-                &client,
-                "page",
-                &["page"],
-            )
-            .await
-            .unwrap_err();
-        assert_eq!(error, RESIZED);
-        line.clear();
-        let quiet =
-            tokio::time::timeout(Duration::from_millis(100), peer.read_line(&mut line)).await;
-        assert!(quiet.is_err(), "nothing was sent: {line}");
-        control.begin_agent_command();
-        assert!(control.native_mouse.same_layout(&display).is_ok());
+                .unwrap();
+            resized.await.unwrap().unwrap();
+            if layout_before_command {
+                control.begin_agent_command();
+            }
+            let error = control
+                .agent_native_mouse(
+                    json!({"type":"mousePressed","x":210,"y":175,"button":"left","buttons":1}),
+                    &client,
+                    "page",
+                    &["page"],
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                error, RESIZED,
+                "layout before the command: {layout_before_command}"
+            );
+            line.clear();
+            let quiet =
+                tokio::time::timeout(Duration::from_millis(100), peer.read_line(&mut line)).await;
+            assert!(quiet.is_err(), "nothing was sent: {line}");
+            control.begin_agent_command();
+            assert_eq!(
+                control.native_mouse.same_layout(&display).unwrap_err(),
+                RESIZED
+            );
+            display.record_proof(display.layout_epoch(), false);
+            assert!(control.native_mouse.same_layout(&display).is_ok());
+            // A proof a dialog blocked does not let pointer input through.
+            display.record_proof(display.layout_epoch(), true);
+            assert!(control.native_mouse.same_layout(&display).is_err());
+        }
         cdp_server.abort();
     }
 }
