@@ -672,6 +672,73 @@ async fn e2e_sign_in_relaunches_without_automation_and_hands_back() {
     assert_success(&command(&json!({ "action": "close" }), &mut state).await);
 }
 
+/// Inside a size class a cropping presenter leaves the framebuffer larger
+/// than the window. Sign-in relaunches Chrome at the window's size, and so
+/// does the hand-back, with no presenter connected to correct either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_sign_in_and_hand_back_keep_the_window_size_inside_a_size_class() {
+    use super::stream::layout;
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let site = Site::start().await;
+    let mut state = DaemonState::new();
+    assert_success(
+        &command(
+            &json!({ "action": "navigate", "url": site.page("/") }),
+            &mut state,
+        )
+        .await,
+    );
+    let display = state.window_display().expect("an owned browser window");
+    let features = display.info().await.unwrap().features;
+    if !features.iter().any(|feature| feature == "sizeClass") {
+        eprintln!("SIZE_CLASS_UNAVAILABLE: this helper keeps the framebuffer at the window");
+        assert_success(&command(&json!({ "action": "close" }), &mut state).await);
+        return;
+    }
+    let framebuffer = |display: &super::display::DisplayClient| {
+        let surface = display.surface();
+        (surface.width, surface.height)
+    };
+    // What a cropping presenter's layout leaves while no viewer is connected.
+    layout::apply(&display, 780, 600, true).await.unwrap();
+    assert_eq!(display.window(), (1560, 1200));
+    assert_ne!(framebuffer(&display), (1560, 1200), "a larger size class");
+
+    let controller = acquire(&mut state).await;
+    assert_success(&sign_in(&mut state, &controller, 1, 600_000).await.0);
+    let signing_in = state.window_display().expect("the sign-in window");
+    assert_eq!(
+        signing_in.window(),
+        (1560, 1200),
+        "sign-in keeps the window"
+    );
+    // The dock narrows during sign-in, in a size class, and then closes.
+    layout::apply(&signing_in, 700, 500, true).await.unwrap();
+    assert_eq!(signing_in.window(), (1400, 1000));
+    assert_ne!(
+        framebuffer(&signing_in),
+        (1400, 1000),
+        "a larger size class"
+    );
+
+    assert_eq!(
+        assert_success(&command(&control("release", &controller), &mut state).await)["status"],
+        "released"
+    );
+    let automation = state.window_display().expect("the automation window");
+    assert_eq!(
+        automation.window(),
+        (1400, 1000),
+        "hand-back keeps the window"
+    );
+    assert_success(&command(&json!({ "action": "snapshot" }), &mut state).await);
+    assert_eq!(evaluate(&mut state, "innerWidth").await, 700);
+    assert_success(&command(&json!({ "action": "close" }), &mut state).await);
+}
+
 /// The watchdog ends a sign-in nobody is using, and a person closing the
 /// browser ends it without relaunching automation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
