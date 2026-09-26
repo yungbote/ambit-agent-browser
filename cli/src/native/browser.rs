@@ -3087,7 +3087,7 @@ async fn resolve_cdp_url(input: &str) -> Result<String, String> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use tokio::time::sleep;
 
@@ -3709,7 +3709,7 @@ mod tests {
     /// Build a `BrowserManager` backed by a dummy WebSocket server that
     /// accepts the connection and then stays silent. Enough for the binding
     /// logic, which never awaits a CDP response in these tests.
-    pub(super) async fn test_manager(pages: Vec<PageInfo>) -> BrowserManager {
+    pub(crate) async fn test_manager(pages: Vec<PageInfo>) -> BrowserManager {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         tokio::spawn(async move {

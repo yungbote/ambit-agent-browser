@@ -1,10 +1,13 @@
 mod cdp_loop;
 pub(crate) mod chat;
+mod cursor_identity;
 mod dashboard;
 mod discovery;
 mod http;
+pub(crate) mod layout;
 pub(crate) mod presentation;
 mod websocket;
+mod window_capture;
 mod wire;
 
 pub use cdp_loop::{ack_screencast_frame, start_screencast, stop_screencast};
@@ -143,6 +146,144 @@ fn seq_in_serialized_frame(frame: &str) -> Option<u64> {
         .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
 }
 
+/// What the connected viewers declared on their upgrade, counted so the
+/// capture loop and the window layout can follow the roster's capabilities.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ViewerRoster {
+    pub viewers: usize,
+    /// Viewers that draw the pointer themselves (`cursor=viewer`), from
+    /// pointer samples and cursor identities.
+    pub draw_pointer: usize,
+    /// Viewers that draw frames 1:1 from the top-left cropped to `visible`
+    /// (`visible=crop`), so the framebuffer may be a size class larger than
+    /// the window.
+    pub crop_visible: usize,
+}
+
+impl ViewerRoster {
+    /// Whether frames must carry the native pointer: some viewer does not
+    /// draw it, and no person controls the window (their own cursor is the
+    /// pointer). Pointer motion is then never frame damage.
+    pub(crate) fn composites_cursor(self, controlled: bool) -> bool {
+        !controlled && self.draw_pointer < self.viewers
+    }
+
+    /// Whether every connected viewer crops to the window: only then may the
+    /// framebuffer stay at a size class through a resize.
+    pub(crate) fn crops_visible(self) -> bool {
+        self.viewers > 0 && self.crop_visible == self.viewers
+    }
+}
+
+/// The controller's applied input over the media clock: each sequence the
+/// display acknowledged, with when. A frame carries the last sequence
+/// acknowledged before its capture began (`inputSeq`), even when the capture
+/// waited in the helper while that input arrived.
+#[derive(Default)]
+pub(crate) struct AppliedInput {
+    /// (media-clock µs, sequence), oldest first; 0 is "no lease".
+    log: std::sync::Mutex<std::collections::VecDeque<(u64, u64)>>,
+}
+
+impl AppliedInput {
+    /// Far more acknowledgements than fit in one capture's wait.
+    const RETAINED: usize = 256;
+
+    /// The lease's applied sequence is now `sequence` (0 without a lease).
+    pub(crate) fn record(&self, sequence: u64) {
+        let mut log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        if log.back().is_some_and(|(_, last)| *last == sequence) {
+            return;
+        }
+        if log.len() == Self::RETAINED {
+            log.pop_front();
+        }
+        log.push_back((monotonic_us(), sequence));
+    }
+
+    /// The sequence applied at media time `ts`: none before the first
+    /// acknowledgement, without a lease, or older than the retained log.
+    pub(crate) fn at(&self, ts: u64) -> Option<u64> {
+        let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
+        let newer = log.iter().rev().take_while(|(at, _)| *at > ts).count();
+        if newer == log.len() {
+            return None;
+        }
+        Some(log[log.len() - newer - 1].1).filter(|sequence| *sequence > 0)
+    }
+}
+
+/// What a stream's capture loop and its viewers share beyond frames.
+pub(crate) struct StreamMedia {
+    /// The controller's acknowledged input, from `BrowserControl`. Frames
+    /// carry it as `inputSeq`.
+    applied_input: Arc<AppliedInput>,
+    roster: watch::Sender<ViewerRoster>,
+    /// The newest cursor identity message, replayed to each new viewer.
+    cursor: std::sync::Mutex<Option<String>>,
+}
+
+impl StreamMedia {
+    pub(crate) fn new(applied_input: Arc<AppliedInput>) -> Self {
+        Self {
+            applied_input,
+            roster: watch::channel(ViewerRoster::default()).0,
+            cursor: std::sync::Mutex::new(None),
+        }
+    }
+
+    pub(super) fn viewer_joined(&self, draws_pointer: bool, crops_visible: bool) {
+        self.roster.send_modify(|roster| {
+            roster.viewers += 1;
+            roster.draw_pointer += usize::from(draws_pointer);
+            roster.crop_visible += usize::from(crops_visible);
+        });
+    }
+
+    pub(super) fn viewer_left(&self, draws_pointer: bool, crops_visible: bool) {
+        self.roster.send_modify(|roster| {
+            roster.viewers = roster.viewers.saturating_sub(1);
+            roster.draw_pointer = roster
+                .draw_pointer
+                .saturating_sub(usize::from(draws_pointer));
+            roster.crop_visible = roster
+                .crop_visible
+                .saturating_sub(usize::from(crops_visible));
+        });
+    }
+
+    pub(crate) fn roster(&self) -> ViewerRoster {
+        *self.roster.borrow()
+    }
+
+    /// Observe roster changes without holding anything.
+    pub(crate) fn subscribe_roster(&self) -> watch::Receiver<ViewerRoster> {
+        self.roster.subscribe()
+    }
+
+    pub(super) fn composites_cursor(&self, controlled: bool) -> bool {
+        self.roster().composites_cursor(controlled)
+    }
+
+    /// Remember the newest cursor identity for viewers that connect later;
+    /// `None` when the display that had it is gone.
+    pub(super) fn set_cursor(&self, message: Option<String>) {
+        *self.cursor.lock().unwrap_or_else(|e| e.into_inner()) = message;
+    }
+
+    pub(super) fn cursor(&self) -> Option<String> {
+        self.cursor
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// The input a capture that began at media time `ts` includes, if any.
+    pub(super) fn applied_input_at(&self, ts: u64) -> Option<u64> {
+        self.applied_input.at(ts)
+    }
+}
+
 /// Shared activity clock for daemon commands and dashboard input.
 ///
 /// The timestamp lets the idle-shutdown path re-check activity after waiting
@@ -220,6 +361,10 @@ pub struct StreamServer {
     patch_clients: Arc<std::sync::atomic::AtomicUsize>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<super::display::DisplayClient>>>>,
+    /// Rings when `display_slot` holds another display.
+    display_changed: watch::Sender<()>,
+    /// The connected viewers' declarations, cursor identity and applied input.
+    pub(crate) media: Arc<StreamMedia>,
     /// The active CDP page session ID (from Target.attachToTarget).
     cdp_session_id: Arc<RwLock<Option<String>>>,
     client_notify: Arc<Notify>,
@@ -234,6 +379,7 @@ pub struct StreamServer {
     shutdown_tx: watch::Sender<bool>,
     accept_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     cdp_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    layout_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl StreamServer {
@@ -311,16 +457,13 @@ impl StreamServer {
     /// Update the stored viewport dimensions and restart the active screencast (if any)
     /// so frames are captured at the new size.
     pub async fn set_viewport(&self, width: u32, height: u32) {
-        let mut vw = self.viewport_width.lock().await;
-        let mut vh = self.viewport_height.lock().await;
-        if *vw == width && *vh == height {
-            return;
+        layout::Viewport {
+            width: self.viewport_width.clone(),
+            height: self.viewport_height.clone(),
+            changed: self.client_notify.clone(),
         }
-        *vw = width;
-        *vh = height;
-        drop(vw);
-        drop(vh);
-        self.client_notify.notify_one();
+        .set(width, height)
+        .await;
     }
 
     /// Get the current viewport dimensions.
@@ -354,6 +497,9 @@ impl StreamServer {
             let _ = task.await;
         }
         if let Some(task) = self.cdp_task.lock().await.take() {
+            let _ = task.await;
+        }
+        if let Some(task) = self.layout_task.lock().await.take() {
             let _ = task.await;
         }
     }
@@ -397,8 +543,31 @@ impl StreamServer {
         let last_engine = Arc::new(RwLock::new("chrome".to_string()));
         let recording = Arc::new(Mutex::new(false));
         let display_slot = Arc::new(RwLock::new(None));
+        let (display_changed, _) = watch::channel(());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let display_slot_accept = display_slot.clone();
+        let (custody_bg, custody_layout, media) = {
+            let control = browser_control.lock().await;
+            (
+                control.custody(),
+                control.custody(),
+                Arc::new(StreamMedia::new(control.applied_input())),
+            )
+        };
+        let layout_task = tokio::spawn(layout::follow_presentation(
+            presentation.clone(),
+            display_slot.clone(),
+            display_changed.subscribe(),
+            media.clone(),
+            custody_layout,
+            layout::Viewport {
+                width: viewport_width.clone(),
+                height: viewport_height.clone(),
+                changed: client_notify.clone(),
+            },
+            shutdown_rx.clone(),
+        ));
+        let media_accept = media.clone();
 
         let frame_tx_clone = frame_tx.clone();
         let client_count_clone = client_count.clone();
@@ -426,6 +595,7 @@ impl StreamServer {
                 frame_watch_accept,
                 client_count_clone,
                 patch_clients_accept,
+                media_accept,
                 client_slot_clone,
                 display_slot_accept,
                 notify_clone,
@@ -461,7 +631,7 @@ impl StreamServer {
         let frame_watch_bg = frame_watch_tx.clone();
         let screencast_cfg_bg = screencast_config.clone();
         let presentation_bg = presentation.clone();
-        let custody_bg = browser_control.lock().await.custody();
+        let media_bg = media.clone();
         let cdp_task = tokio::spawn(async move {
             cdp_loop::cdp_event_loop(
                 frame_tx_bg,
@@ -471,6 +641,7 @@ impl StreamServer {
                 display_slot_bg,
                 presentation_bg,
                 custody_bg,
+                media_bg,
                 client_notify_bg,
                 screencasting_bg,
                 client_count_bg,
@@ -499,6 +670,8 @@ impl StreamServer {
                 patch_clients,
                 client_slot: client_slot.clone(),
                 display_slot,
+                display_changed,
+                media,
                 cdp_session_id,
                 client_notify,
                 idle_activity,
@@ -511,6 +684,7 @@ impl StreamServer {
                 shutdown_tx,
                 accept_task: Mutex::new(Some(accept_task)),
                 cdp_task: Mutex::new(Some(cdp_task)),
+                layout_task: Mutex::new(Some(layout_task)),
             },
             client_slot,
         ))
@@ -526,11 +700,8 @@ impl StreamServer {
             *slot = display;
             self.frame_watch.send_replace(None);
             self.client_notify.notify_one();
+            self.display_changed.send_replace(());
         }
-    }
-
-    pub(crate) fn clear_frame(&self) {
-        self.frame_watch.send_replace(None);
     }
 
     /// Broadcast a raw frame string (legacy). The caller owns the payload, so
@@ -746,6 +917,27 @@ pub(super) async fn history_availability(
     (index < length).then_some((index > 0, index + 1 < length))
 }
 
+/// The media clock: microseconds of the sandbox's monotonic clock. Frames,
+/// pointer samples, cursor identities and file doorbells carry it as `ts`,
+/// so a viewer can place them on one timeline. On Unix it is
+/// `CLOCK_MONOTONIC`, which every process in the container shares; elsewhere
+/// it counts from this process's first reading.
+pub(crate) fn monotonic_us() -> u64 {
+    #[cfg(unix)]
+    {
+        let mut now = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: clock_gettime writes one timespec through a valid pointer.
+        if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut now) } == 0 {
+            return now.tv_sec as u64 * 1_000_000 + now.tv_nsec as u64 / 1_000;
+        }
+    }
+    static ORIGIN: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    ORIGIN.get_or_init(Instant::now).elapsed().as_micros() as u64
+}
+
 pub(crate) fn timestamp_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -773,6 +965,37 @@ pub fn is_allowed_origin(origin: Option<&str>) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Frames composite the native pointer only while a viewer that does not
+    /// draw it is connected and no person controls the window; the size
+    /// class is allowed only while every viewer crops to the window.
+    #[test]
+    fn the_roster_decides_pointer_compositing_and_visible_cropping() {
+        let media = StreamMedia::new(Default::default());
+        assert!(
+            !media.composites_cursor(false),
+            "no viewer needs the pointer"
+        );
+        assert!(!media.roster().crops_visible(), "no viewer crops");
+        media.viewer_joined(true, true);
+        assert!(!media.composites_cursor(false));
+        assert!(media.roster().crops_visible());
+        media.viewer_joined(false, false);
+        assert!(media.composites_cursor(false));
+        assert!(
+            !media.composites_cursor(true),
+            "a controlling person's own cursor is the pointer"
+        );
+        assert!(!media.roster().crops_visible());
+        media.viewer_left(false, false);
+        assert!(!media.composites_cursor(false));
+        assert!(media.roster().crops_visible());
+        media.viewer_left(true, true);
+        assert_eq!(media.roster(), ViewerRoster::default());
+        assert!(media.cursor().is_none());
+        media.set_cursor(Some("{\"type\":\"cursor\"}".into()));
+        assert_eq!(media.cursor().as_deref(), Some("{\"type\":\"cursor\"}"));
+    }
 
     #[test]
     fn test_screencast_config_defaults_when_unset() {
@@ -1096,7 +1319,11 @@ mod tests {
                 break;
             }
         }
-        let pending = server.presentation.pending("same-page").unwrap();
+        let pending = server
+            .presentation
+            .pending("same-page", false, false)
+            .unwrap();
+
         assert_eq!(pending.config.viewer, viewer);
         assert_eq!((pending.config.width, pending.config.height), (390, 844));
         server.shutdown().await;
@@ -1167,6 +1394,52 @@ mod tests {
             );
             server.shutdown().await;
         }
+    }
+
+    /// A viewer whose writer falls behind skips records. The pointer's
+    /// identity is sent only when it changes, so a skipped one would stay
+    /// wrong until the next change: the lagging viewer is sent the current
+    /// state again (and the files doorbell it may have missed).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lagging_viewer_is_sent_the_current_state_again() {
+        let (server, _slot) = StreamServer::start_without_client(
+            0,
+            "lagging-viewer".into(),
+            true,
+            Arc::new(IdleActivity::new()),
+        )
+        .await
+        .unwrap();
+        let mut client = connect_client_to(server.port(), "/").await;
+        async fn next(client: &mut WsClient) -> Option<Value> {
+            match tokio::time::timeout(std::time::Duration::from_secs(1), client.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str(&text).ok(),
+                _ => None,
+            }
+        }
+        // The viewer's writer is running: it has sent the joining state.
+        assert_eq!(next(&mut client).await.unwrap()["type"], "status");
+        // Nothing else runs while these are published, so the writer falls
+        // more than the channel's capacity behind: the identity is skipped.
+        let cursor = json!({"type":"cursor","ts":1,"serial":5,"css":"text"}).to_string();
+        server.media.set_cursor(Some(cursor.clone()));
+        let _ = server.frame_tx.send(cursor);
+        for sample in 0..100 {
+            let _ = server
+                .frame_tx
+                .send(json!({"type":"activity","sample":sample}).to_string());
+        }
+        let mut seen = Vec::new();
+        while let Some(message) = next(&mut client).await {
+            seen.push(message["type"].as_str().unwrap_or_default().to_string());
+            if message["type"] == "cursor" {
+                assert_eq!(message["css"], "text");
+            }
+        }
+        assert!(seen.iter().any(|kind| kind == "cursor"), "{seen:?}");
+        assert!(seen.iter().any(|kind| kind == "files"), "{seen:?}");
+        assert!(seen.iter().filter(|kind| *kind == "activity").count() < 100);
+        server.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

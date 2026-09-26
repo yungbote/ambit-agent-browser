@@ -112,9 +112,11 @@ async fn capture_fixture(state: &DaemonState, name: &str) {
                     budget_bytes: 0,
                     force: true,
                     patches: false,
+                    ..Default::default()
                 })
                 .await
                 .unwrap()
+                .frame
                 .expect("a forced capture always returns a frame");
             std::fs::write(
                 directory.join(format!("{name}-window.jpg")),

@@ -300,6 +300,11 @@ impl ControlRequest {
         self.op == Operation::Release
     }
 
+    /// A read-only file or download observation, served by `observe_files`.
+    pub(crate) fn observes_files(&self) -> bool {
+        matches!(self.op, Operation::Files | Operation::Downloads)
+    }
+
     /// The idle timeout a sign-in batch asks for, or why its event is invalid.
     pub(crate) fn sign_in(&self) -> Option<Result<Duration, ControlError>> {
         self.sign_in
@@ -383,6 +388,10 @@ pub(crate) struct BrowserControl {
     /// The current lease deadline, published for frame pacing. Readers
     /// compare it with their own clock; no timer expires it.
     custody: watch::Sender<Option<Instant>>,
+    /// The lease's applied input sequence over the media clock (0 without a
+    /// lease or before its first input), recorded after the helper
+    /// acknowledged that input. A capture that began later shows it.
+    applied_input: std::sync::Arc<crate::native::stream::AppliedInput>,
 }
 
 impl Default for BrowserControl {
@@ -397,6 +406,7 @@ impl Default for BrowserControl {
             display: None,
             native_mouse: mouse::NativeMouse::default(),
             custody: watch::channel(None).0,
+            applied_input: Default::default(),
         }
     }
 }
@@ -459,6 +469,10 @@ impl BrowserControl {
         self.display = display;
     }
 
+    /// An agent command, or one Playwright mouse event, starts a new unheld
+    /// gesture's page/window measurement. Its pointer input is sent only
+    /// under a layout the agent's page was proven at, which a person's
+    /// resize during the command or program ends.
     pub(crate) fn begin_agent_command(&mut self) {
         self.native_mouse.begin_command();
     }
@@ -469,7 +483,15 @@ impl BrowserControl {
         self.custody.subscribe()
     }
 
+    /// The lease's applied input over the media clock, for frames' `inputSeq`.
+    pub(crate) fn applied_input(&self) -> std::sync::Arc<crate::native::stream::AppliedInput> {
+        self.applied_input.clone()
+    }
+
     fn publish_custody(&self) {
+        self.applied_input
+            .record(self.lease.as_ref().map_or(0, |lease| lease.last_sequence));
+
         let deadline = self.lease.as_ref().map(|lease| lease.deadline);
         self.custody.send_if_modified(|current| {
             if *current == deadline {
@@ -1019,28 +1041,10 @@ impl BrowserControl {
                 }
                 Ok(inspected)
             }
-            Operation::Downloads => {
-                let page = page.as_mut().ok_or_else(|| {
-                    ControlError::new(
-                        "browser_control_files_unavailable",
-                        "The browser page is unavailable.",
-                    )
-                })?;
-                // Completed downloads are owned by the browser process, not
-                // by a page. Listing them must stay cheap: the Product polls
-                // it beside human input, under the same command custody.
-                let downloads = tokio::time::timeout(ACK_TIMEOUT, page.completed_downloads(0))
-                    .await
-                    .map_err(|_| {
-                        ControlError::new(
-                            "browser_control_files_unavailable",
-                            "The browser downloads could not be observed.",
-                        )
-                    })??;
-                Ok(
-                    json!({"supported":true,"controlled":self.agent_error().is_some(),"filesSupported":page.files_supported(),"downloads":downloads}),
-                )
-            }
+            // Their page work runs outside this gate; see `observe_files`.
+            Operation::Downloads | Operation::Files => Err(ControlError::invalid(
+                "File observations are served by observe_files.",
+            )),
             Operation::Acquire => {
                 self.expire(browser).await?;
                 request.deadline(now)?;
@@ -1196,10 +1200,9 @@ impl BrowserControl {
                     json!({ "bytes": text.len(), "text": text, "complete": true });
                 Ok(response)
             }
-            Operation::Files | Operation::Drop | Operation::Setfiles | Operation::Dismissfiles => {
+            Operation::Drop | Operation::Setfiles | Operation::Dismissfiles => {
                 let lease = self.require_owner(&request.controller_id)?;
                 let deadline = lease.deadline.min(Instant::now() + ACK_TIMEOUT);
-                let download_cursor = lease.download_cursor;
                 if let Some(sequence) = request.sequence {
                     if sequence <= lease.last_sequence {
                         return Ok(lease.response("duplicate"));
@@ -1236,29 +1239,43 @@ impl BrowserControl {
                 if mutating {
                     self.lease.as_mut().unwrap().outcome_unknown = true;
                 }
-                let result = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
-                    let file_page = page.file_page().await?;
-                    match request.op {
-                        Operation::Files => {
-                            let chooser = file_page.chooser(&request.controller_id).await?;
-                            let downloads = page.completed_downloads(download_cursor).await?;
-                            Ok(json!({"status":"files","chooser":chooser,"downloads":downloads}))
+                let result =
+                    tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+                        let file_page = page.file_page().await?;
+                        match request.op {
+                            Operation::Drop => {
+                                let destination = file_page
+                                    .drop_destination(
+                                        &request.controller_id,
+                                        request.x.unwrap(),
+                                        request.y.unwrap(),
+                                        deadline,
+                                    )
+                                    .await?;
+                                Ok(json!({"status":"destination","destination":destination}))
+                            }
+                            Operation::Setfiles => {
+                                file_page
+                                    .set_files(
+                                        &request.controller_id,
+                                        request.destination_id.as_deref().unwrap(),
+                                        request.files.as_ref().unwrap(),
+                                        deadline,
+                                    )
+                                    .await?;
+                                Ok(json!({"status":"applied"}))
+                            }
+                            Operation::Dismissfiles => {
+                                file_page.client.files.dismiss(
+                                    &request.controller_id,
+                                    request.destination_id.as_deref().unwrap(),
+                                )?;
+                                Ok(json!({"status":"dismissed"}))
+                            }
+                            _ => unreachable!(),
                         }
-                        Operation::Drop => {
-                            let destination = file_page.drop_destination(&request.controller_id, request.x.unwrap(), request.y.unwrap(), deadline).await?;
-                            Ok(json!({"status":"destination","destination":destination}))
-                        }
-                        Operation::Setfiles => {
-                            file_page.set_files(&request.controller_id, request.destination_id.as_deref().unwrap(), request.files.as_ref().unwrap(), deadline).await?;
-                            Ok(json!({"status":"applied"}))
-                        }
-                        Operation::Dismissfiles => {
-                            file_page.client.files.dismiss(&request.controller_id, request.destination_id.as_deref().unwrap())?;
-                            Ok(json!({"status":"dismissed"}))
-                        }
-                        _ => unreachable!(),
-                    }
-                }).await;
+                    })
+                    .await;
                 let data = match result {
                     Ok(result) => result,
                     Err(_) if matches!(request.op, Operation::Setfiles | Operation::Drop) => {
@@ -1472,6 +1489,133 @@ impl BrowserControl {
         }
         Ok(lease)
     }
+}
+
+fn files_unavailable(message: &str) -> ControlError {
+    ControlError::new("browser_control_files_unavailable", message)
+}
+
+/// Serves the read-only `files` and `downloads` observations. Their DevTools
+/// round trips (visible page, frames, chooser, downloads) run outside the
+/// gate, so a person's input never queues behind them; `files` checks the
+/// controller's lease before and again after observing, under the gate.
+pub(crate) async fn observe_files(
+    gate: &tokio::sync::Mutex<BrowserControl>,
+    request: ControlRequest,
+    mut page: Option<super::actions::ControlPage<'_>>,
+) -> Result<Value, ControlError> {
+    if request.op == Operation::Downloads {
+        let page = page
+            .as_mut()
+            .ok_or_else(|| files_unavailable("The browser page is unavailable."))?;
+        // Completed downloads are owned by the browser process, not by a
+        // page. Listing them must stay cheap: the Product polls it beside
+        // human input.
+        let downloads = tokio::time::timeout(ACK_TIMEOUT, page.completed_downloads(0))
+            .await
+            .map_err(|_| files_unavailable("The browser downloads could not be observed."))??;
+        let control = gate.lock().await;
+        return Ok(control.acknowledge(json!({"supported":true,
+            "controlled":control.agent_error().is_some(),
+            "filesSupported":page.files_supported(),"downloads":downloads})));
+    }
+    if request.op != Operation::Files {
+        return Err(ControlError::invalid(
+            "Only files and downloads are observations.",
+        ));
+    }
+    let (deadline, download_cursor) = {
+        let control = gate.lock().await;
+        let lease = control.require_owner(&request.controller_id)?;
+        (
+            lease.deadline.min(Instant::now() + ACK_TIMEOUT),
+            lease.download_cursor,
+        )
+    };
+    let page = page
+        .as_mut()
+        .ok_or_else(|| files_unavailable("The browser page is unavailable."))?;
+    let observed = tokio::time::timeout_at(tokio::time::Instant::from_std(deadline), async {
+        let file_page = page.file_page().await?;
+        let chooser = file_page.chooser(&request.controller_id).await?;
+        let downloads = page.completed_downloads(download_cursor).await?;
+        Ok::<_, ControlError>(json!({"chooser":chooser,"downloads":downloads}))
+    })
+    .await
+    .unwrap_or_else(|_| {
+        Err(files_unavailable(
+            "The browser did not finish observing files. Try again.",
+        ))
+    })?;
+    let control = gate.lock().await;
+    let mut response = control
+        .require_owner(&request.controller_id)?
+        .response("files");
+    response
+        .as_object_mut()
+        .unwrap()
+        .extend(observed.as_object().unwrap().clone());
+    Ok(control.acknowledge(response))
+}
+
+/// Whether a control request is only native window input: mouse and keyboard
+/// events a person sends to the owned window. Navigation, viewport, touch and
+/// sign-in batches, and every other operation, use the daemon command path.
+fn window_input_shape(command: &Value) -> bool {
+    command["action"] == ACTION
+        && command["op"] == "input"
+        && command["events"].as_array().is_some_and(|events| {
+            !events.is_empty()
+                && events.iter().all(|event| {
+                    matches!(
+                        event["type"].as_str(),
+                        Some("input_mouse" | "input_keyboard")
+                    )
+                })
+        })
+}
+
+/// Serves a person's window input under this gate alone, never waiting for
+/// daemon command custody: a running agent command, a layout or a file
+/// observation cannot hold a keystroke. The window's display helper orders
+/// the input on its own control socket. `None` means the request needs the
+/// command path instead: it is not native window input, it is invalid (the
+/// command path reports why), there is no owned window, or a sign-in is due
+/// to end first. The acknowledgment reports where the input's time went.
+pub(crate) async fn serve_window_input(
+    control: &tokio::sync::Mutex<BrowserControl>,
+    command: &Value,
+    received_at: Instant,
+) -> Option<Value> {
+    if !window_input_shape(command) {
+        return None;
+    }
+    let request = ControlRequest::parse(command).ok()?;
+    let mut control = control.lock().await;
+    let admitted_at = Instant::now();
+    if control
+        .display
+        .as_ref()
+        .is_none_or(|display| !display.available())
+        || control.sign_in_due(admitted_at)
+    {
+        return None;
+    }
+    let result = control.execute_with_page(request, None, None).await;
+    let timing = json!({
+        "queueUs": admitted_at.saturating_duration_since(received_at).as_micros() as u64,
+        "injectUs": admitted_at.elapsed().as_micros() as u64,
+    });
+    let id = command["id"].as_str().unwrap_or_default();
+    Some(match result {
+        Ok(mut data) => {
+            data["timing"] = timing;
+            json!({ "id": id, "success": true, "data": data })
+        }
+        Err(error) => {
+            json!({ "id": id, "success": false, "code": error.code, "error": error.message })
+        }
+    })
 }
 
 fn canonical_uuid(value: &str) -> bool {

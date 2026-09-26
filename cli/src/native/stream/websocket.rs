@@ -21,7 +21,7 @@ use crate::native::input::keyboard_params;
 
 use super::http::handle_http_request;
 use super::presentation::{Presentation, PresentationConfig};
-use super::{is_allowed_origin, timestamp_ms, IdleActivity, StreamFrame};
+use super::{is_allowed_origin, timestamp_ms, IdleActivity, StreamFrame, StreamMedia};
 
 /// Highest per-client frame rate a client may request via the `config` message.
 const MAX_CONFIGURABLE_FPS: u32 = 120;
@@ -49,6 +49,13 @@ struct ClientConfig {
     /// Maximum outstanding frames. One preserves the existing ack protocol;
     /// a negotiated window covers network delay without an unbounded queue.
     frame_window: usize,
+    /// The viewer draws the pointer itself (`cursor=viewer`), from pointer
+    /// samples and cursor identities; frames need not composite it.
+    draws_pointer: bool,
+    /// The viewer draws frames 1:1 from the top-left cropped to the frame's
+    /// `visible` window (`visible=crop`), so the framebuffer may be a size
+    /// class larger than the window.
+    crops_visible: bool,
 }
 
 impl Default for ClientConfig {
@@ -60,6 +67,8 @@ impl Default for ClientConfig {
             patches: false,
             binary: false,
             frame_window: 1,
+            draws_pointer: false,
+            crops_visible: false,
         }
     }
 }
@@ -261,6 +270,8 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
                 _ => {}
             },
             "patches" => cfg.patches = value == "1",
+            "cursor" => cfg.draws_pointer = value == "viewer",
+            "visible" => cfg.crops_visible = value == "crop",
             "frames" => cfg.binary = value == "binary",
             "frameWindow" => {
                 if let Some(window) = value
@@ -281,7 +292,12 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
         .map(|(_, value)| value.trim());
     cfg.presentation = match (viewer, width, height) {
         (Some(viewer), Some(width), Some(height)) => {
-            PresentationConfig::parse(viewer, width, height)
+            PresentationConfig::parse(viewer, width, height).map(|presentation| {
+                PresentationConfig {
+                    crops: cfg.crops_visible,
+                    ..presentation
+                }
+            })
         }
         _ => None,
     };
@@ -298,10 +314,11 @@ fn updated_presentation(mut config: ClientConfig, message: &Value) -> Option<Cli
         return None;
     }
     config.presentation = Some(PresentationConfig {
-        viewer: current.viewer,
         width: width as u32,
         height: height as u32,
+        ..current
     });
+
     Some(config)
 }
 
@@ -330,6 +347,7 @@ pub(super) async fn accept_loop(
     frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
     client_count: Arc<Mutex<usize>>,
     patch_clients: Arc<AtomicUsize>,
+    media: Arc<StreamMedia>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<DisplayClient>>>>,
     client_notify: Arc<Notify>,
@@ -368,6 +386,7 @@ pub(super) async fn accept_loop(
                 let frame_watch = frame_watch.clone();
                 let client_count = client_count.clone();
                 let patch_clients = patch_clients.clone();
+                let media = media.clone();
                 let client_slot = client_slot.clone();
                 let display_slot = display_slot.clone();
                 let client_notify = client_notify.clone();
@@ -392,6 +411,7 @@ pub(super) async fn accept_loop(
                         frame_watch,
                         client_count,
                         patch_clients,
+                        media,
                         client_slot,
                         display_slot,
                         client_notify,
@@ -444,6 +464,7 @@ async fn handle_connection(
     frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
     client_count: Arc<Mutex<usize>>,
     patch_clients: Arc<AtomicUsize>,
+    media: Arc<StreamMedia>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<DisplayClient>>>>,
     client_notify: Arc<Notify>,
@@ -478,6 +499,7 @@ async fn handle_connection(
             frame_watch,
             client_count,
             patch_clients,
+            media,
             client_slot,
             display_slot,
             client_notify,
@@ -499,6 +521,45 @@ async fn handle_connection(
     }
 }
 
+/// The records a viewer is sent only when they change: the stream's status,
+/// its tabs (with the active tab's URL) and the pointer's identity. A viewer
+/// is sent them when it joins, and again when its writer fell behind and
+/// skipped records, since a skipped change is never repeated.
+struct StreamState<'a> {
+    client_slot: &'a RwLock<Option<Arc<CdpClient>>>,
+    display_slot: &'a RwLock<Option<Arc<DisplayClient>>>,
+    screencasting: &'a Mutex<bool>,
+    viewport_width: &'a Mutex<u32>,
+    viewport_height: &'a Mutex<u32>,
+    last_engine: &'a RwLock<String>,
+    recording: &'a Mutex<bool>,
+    last_tabs: &'a RwLock<Vec<Value>>,
+    media: &'a StreamMedia,
+}
+
+impl StreamState<'_> {
+    async fn messages(&self) -> Vec<String> {
+        let status = json!({
+            "type": "status",
+            "connected": super::source_connected(self.client_slot, self.display_slot).await,
+            "screencasting": *self.screencasting.lock().await,
+            "viewportWidth": *self.viewport_width.lock().await,
+            "viewportHeight": *self.viewport_height.lock().await,
+            "engine": self.last_engine.read().await.clone(),
+            "recording": *self.recording.lock().await,
+        });
+        let mut messages = vec![status.to_string()];
+        let tabs = self.last_tabs.read().await;
+        if !tabs.is_empty() {
+            messages.push(
+                json!({ "type": "tabs", "tabs": *tabs, "timestamp": timestamp_ms() }).to_string(),
+            );
+        }
+        messages.extend(self.media.cursor());
+        messages
+    }
+}
+
 /// One WebSocket client, split in two halves: a reader task dispatching input
 /// to CDP, and a writer loop delivering frames latest-first under an optional
 /// per-client cap. Invariant: the halves never wait on each other, which is
@@ -512,6 +573,7 @@ async fn handle_ws_client(
     mut frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
     client_count: Arc<Mutex<usize>>,
     patch_clients: Arc<AtomicUsize>,
+    media: Arc<StreamMedia>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<DisplayClient>>>>,
     client_notify: Arc<Notify>,
@@ -566,6 +628,7 @@ async fn handle_ws_client(
         if initial_config.patches {
             patch_clients.fetch_add(1, Ordering::AcqRel);
         }
+        media.viewer_joined(initial_config.draws_pointer, initial_config.crops_visible);
     }
 
     let (mut ws_tx, ws_rx) = ws_stream.split();
@@ -602,33 +665,19 @@ async fn handle_ws_client(
         presentation_rx.borrow_and_update();
     }
 
-    {
-        let connected = super::source_connected(&client_slot, &display_slot).await;
-        let sc = *screencasting.lock().await;
-        let vw = *viewport_width.lock().await;
-        let vh = *viewport_height.lock().await;
-        let eng = last_engine.read().await.clone();
-        let rec = *recording.lock().await;
-        let status = json!({
-            "type": "status",
-            "connected": connected,
-            "screencasting": sc,
-            "viewportWidth": vw,
-            "viewportHeight": vh,
-            "engine": eng,
-            "recording": rec,
-        });
-        let _ = ws_tx.send(Message::Text(status.to_string())).await;
-
-        let tabs = last_tabs.read().await;
-        if !tabs.is_empty() {
-            let tabs_msg = json!({
-                "type": "tabs",
-                "tabs": *tabs,
-                "timestamp": timestamp_ms(),
-            });
-            let _ = ws_tx.send(Message::Text(tabs_msg.to_string())).await;
-        }
+    let state = StreamState {
+        client_slot: &client_slot,
+        display_slot: &display_slot,
+        screencasting: &screencasting,
+        viewport_width: &viewport_width,
+        viewport_height: &viewport_height,
+        last_engine: &last_engine,
+        recording: &recording,
+        last_tabs: &last_tabs,
+        media: &media,
+    };
+    for message in state.messages().await {
+        let _ = ws_tx.send(Message::Text(message)).await;
     }
 
     // Invariant: only a successful send writes `last_sent`. `None` means
@@ -657,7 +706,8 @@ async fn handle_ws_client(
                 retire_viewer(
                     &client_count,
                     &patch_clients,
-                    initial_config.patches,
+                    &media,
+                    initial_config,
                     &client_notify,
                 )
                 .await;
@@ -707,7 +757,21 @@ async fn handle_ws_client(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        continue;
+                        // Skipped records are never repeated: send what they
+                        // changed again, and ring the files doorbell in case
+                        // it was one of them.
+                        let mut messages = state.messages().await;
+                        messages.push(super::cdp_loop::files_doorbell());
+                        let mut open = true;
+                        for message in messages {
+                            if ws_tx.send(Message::Text(message)).await.is_err() {
+                                open = false;
+                                break;
+                            }
+                        }
+                        if !open {
+                            break;
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -813,7 +877,8 @@ async fn handle_ws_client(
     retire_viewer(
         &client_count,
         &patch_clients,
-        initial_config.patches,
+        &media,
+        initial_config,
         &client_notify,
     )
     .await;
@@ -822,14 +887,16 @@ async fn handle_ws_client(
 async fn retire_viewer(
     client_count: &Mutex<usize>,
     patch_clients: &AtomicUsize,
-    patches: bool,
+    media: &StreamMedia,
+    config: ClientConfig,
     client_notify: &Notify,
 ) {
     let mut count = client_count.lock().await;
     *count = count.saturating_sub(1);
-    if patches {
+    if config.patches {
         patch_clients.fetch_sub(1, Ordering::AcqRel);
     }
+    media.viewer_left(config.draws_pointer, config.crops_visible);
     drop(count);
     client_notify.notify_one();
 }
@@ -1062,6 +1129,38 @@ mod tests {
     }
 
     #[test]
+    fn test_config_from_upgrade_reads_pointer_drawing_and_visible_cropping() {
+        let both = config_from_upgrade(&upgrade("/?patches=1&cursor=viewer&visible=crop"));
+        assert!(both.draws_pointer && both.crops_visible);
+        for query in [
+            "/",
+            "/?cursor=frame&visible=1",
+            "/?cursor=1",
+            "/?cursor=&visible=",
+        ] {
+            let cfg = config_from_upgrade(&upgrade(query));
+            assert!(!cfg.draws_pointer && !cfg.crops_visible, "{query}");
+        }
+    }
+
+    /// A presenter that crops sets the window through `presentation` even
+    /// while it controls input; an older presenter does not claim that.
+    #[test]
+    fn a_cropping_presenter_declares_it_with_its_layout() {
+        let viewer = uuid::Uuid::new_v4();
+        let presenter = |query: &str| {
+            config_from_upgrade(&format!(
+                "GET /?width=780&height=600{query} HTTP/1.1\r\nX-Ambit-Browser-Viewer: {viewer}\r\n\r\n"
+            ))
+            .presentation
+            .unwrap()
+        };
+        assert!(presenter("&visible=crop").crops);
+        assert!(!presenter("").crops);
+        assert_eq!(presenter("&visible=crop").width, 780);
+    }
+
+    #[test]
     fn test_config_from_upgrade_reads_patch_compositing() {
         assert!(config_from_upgrade(&upgrade("/?patches=1")).patches);
         assert!(!config_from_upgrade(&upgrade("/?patches=0")).patches);
@@ -1291,6 +1390,7 @@ mod tests {
                 viewer,
                 width: 800,
                 height: 600,
+                crops: true,
             }),
             binary: true,
             ..ClientConfig::default()
@@ -1305,10 +1405,12 @@ mod tests {
             PresentationConfig {
                 viewer,
                 width: 390,
-                height: 844
+                height: 844,
+                crops: true,
             }
         );
         assert!(changed.binary);
+
         assert!(
             updated_presentation(ClientConfig::default(), &json!({"width":390,"height":844}))
                 .is_none()

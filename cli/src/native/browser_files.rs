@@ -63,10 +63,26 @@ struct State {
     destination: Option<Destination>,
 }
 
-#[derive(Default)]
-pub(crate) struct FileDestinations(Mutex<State>);
+/// Human file destinations, and a revision that moves whenever a picker
+/// opens or a destination ends, so viewers learn of it without polling.
+pub(crate) struct FileDestinations(Mutex<State>, tokio::sync::watch::Sender<u64>);
+
+impl Default for FileDestinations {
+    fn default() -> Self {
+        Self(Mutex::default(), tokio::sync::watch::channel(0).0)
+    }
+}
 
 impl FileDestinations {
+    /// Moves whenever the pending destination appears or goes away.
+    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.1.subscribe()
+    }
+
+    fn changed(&self) {
+        self.1.send_modify(|revision| *revision += 1);
+    }
+
     pub(crate) fn active(&self) -> bool {
         self.0
             .lock()
@@ -79,14 +95,18 @@ impl FileDestinations {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.controller.as_deref() != Some(controller) {
             state.controller = Some(controller.into());
-            state.destination = None;
+            if state.destination.take().is_some() {
+                self.changed();
+            }
         }
     }
 
     pub(crate) fn end(&self) -> Vec<String> {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         state.controller = None;
-        state.destination = None;
+        if state.destination.take().is_some() {
+            self.changed();
+        }
         state.sessions.drain().collect()
     }
 
@@ -114,6 +134,7 @@ impl FileDestinations {
                             .is_some_and(|binding| binding.root_session == detached)
                 }) {
                     state.destination = None;
+                    self.changed();
                 }
             }
             return;
@@ -142,6 +163,7 @@ impl FileDestinations {
             })
         {
             state.destination = None;
+            self.changed();
         }
         if method != "Page.fileChooserOpened" || !state.sessions.contains(session) {
             return;
@@ -160,6 +182,7 @@ impl FileDestinations {
             backend: params["backendNodeId"].as_i64(),
             binding: None,
         });
+        self.changed();
     }
 
     fn pending(&self, controller: &str) -> Option<Destination> {
@@ -210,6 +233,7 @@ impl FileDestinations {
             return Err(stale());
         }
         state.destination = None;
+        self.changed();
         Ok(())
     }
 }

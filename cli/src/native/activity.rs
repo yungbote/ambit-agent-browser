@@ -112,6 +112,8 @@ impl ActivityObservation {
 
     pub(crate) fn acknowledged(mut self) {
         self.event.params["timestamp"] = json!(super::stream::timestamp_ms());
+        // The media clock places the executed sample on the frames' timeline.
+        self.event.params["ts"] = json!(super::stream::monotonic_us());
         if let Some((session, generation)) = self.published_as.take() {
             self.event.session_id = Some(session);
             self.event.params["pageGeneration"] = json!(generation);
@@ -204,7 +206,7 @@ pub(crate) fn reset(session: &str, generation: &str) -> CdpEvent {
         session_id: Some(session.into()),
         params: json!({
             "type": "pointer", "eventType": "reset", "pageGeneration": generation,
-            "timestamp": super::stream::timestamp_ms(),
+            "timestamp": super::stream::timestamp_ms(), "ts": super::stream::monotonic_us(),
         }),
     }
 }

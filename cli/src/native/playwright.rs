@@ -1610,9 +1610,11 @@ try {
                     budget_bytes: 0,
                     force: true,
                     patches: false,
+                    ..Default::default()
                 })
                 .await
                 .unwrap()
+                .frame
                 .unwrap();
             let bytes = base64::engine::general_purpose::STANDARD
                 .decode(capture.data.unwrap())
@@ -2048,6 +2050,80 @@ return {main: await page.evaluate(() => pointerLog), frame: await frame.evaluate
             }),
             "{activity:?}"
         );
+        Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
+    }
+
+    /// A person's dock drag lays the window out while a program runs. The
+    /// program's coordinates are page geometry it read before the layout, so
+    /// its pointer input after it is refused instead of pressing whatever the
+    /// reflow moved under the old point. The next command proves the new
+    /// layout, and pointer input works again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires local Chromium, the browser display helper and installed playwright-core 1.62.1"]
+    async fn e2e_playwright_pointer_after_a_layout_during_the_program_is_refused() {
+        use crate::native::actions::execute_command;
+        use crate::test_utils::EnvGuard;
+        let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+        env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+        env.set("DISPLAY", "");
+        // At 1000 CSS px #save spans x 600..720. At 700, #delete (130 px
+        // right of #save) spans 550..670 and is under #save's old point.
+        let html = "<!doctype html><style>body{margin:0}button{position:absolute;top:100px;width:120px;height:40px}#save{left:60vw}#delete{left:calc(60vw + 130px)}</style><button id=save onclick=\"window.clicked='save'\">Save</button><button id=delete onclick=\"window.clicked='delete'\">Delete</button>";
+        let mut state = DaemonState::new();
+        let opened = Box::pin(execute_command(
+            &json!({"action":"navigate","url":format!("data:text/html,{}", urlencoding::encode(html))}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(opened["success"], true, "{opened}");
+        let resized = Box::pin(execute_command(
+            &json!({"action":"viewport","width":1000,"height":700}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(resized["success"], true, "{resized}");
+        let display = state.window_display().expect("an owned browser window");
+        // What the stream's presenter layout does while the program waits.
+        let dock = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(800)).await;
+            let info = display.info().await.unwrap();
+            let window = info.active_window().unwrap().id;
+            let layout = display.layout().await;
+            display
+                .resize(&layout, 1400, 1400, Some(window), false)
+                .await
+                .unwrap();
+        });
+        let code = r#"
+const box = await page.locator('#save').boundingBox();
+await new Promise(resolve => setTimeout(resolve, 2000));
+let error = null;
+try { await page.mouse.click(box.x + 5, box.y + 5); } catch (e) { error = e.message; }
+return {clicked: await page.evaluate(() => window.clicked ?? null), width: await page.evaluate(() => innerWidth), error};
+"#;
+        let result = Box::pin(execute_command(
+            &json!({"action":"run_playwright","code":code,"timeoutMs":30000}),
+            &mut state,
+        ))
+        .await;
+        dock.await.unwrap();
+        assert_eq!(result["success"], true, "{result}");
+        let values = &result["data"]["result"];
+        assert_eq!(values["width"], 700, "{result}");
+        assert_eq!(values["clicked"], Value::Null, "{result}");
+        assert!(
+            values["error"]
+                .as_str()
+                .is_some_and(|error| error.contains("was resized")),
+            "{result}"
+        );
+        let clicked = Box::pin(execute_command(
+            &json!({"action":"run_playwright","code":"await page.locator('#save').click(); return await page.evaluate(() => window.clicked);","timeoutMs":30000}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(clicked["success"], true, "{clicked}");
+        assert_eq!(clicked["data"]["result"], "save", "{clicked}");
         Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
     }
 

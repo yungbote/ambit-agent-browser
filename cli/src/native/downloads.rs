@@ -36,17 +36,26 @@ struct State {
 pub(crate) struct Downloads {
     state: Mutex<State>,
     changed: watch::Sender<u64>,
+    /// Moves only when a download ends (completed or canceled) or the
+    /// observer fails: what a person's file list shows, not every progress tick.
+    settled: watch::Sender<u64>,
 }
 impl Default for Downloads {
     fn default() -> Self {
         let (changed, _) = watch::channel(0);
+        let (settled, _) = watch::channel(0);
         Self {
             state: Mutex::new(State::default()),
             changed,
+            settled,
         }
     }
 }
 impl Downloads {
+    pub(crate) fn subscribe_settled(&self) -> watch::Receiver<u64> {
+        self.settled.subscribe()
+    }
+
     pub fn seed_frames(&self, tree: &Value) {
         fn seed(
             tree: &Value,
@@ -191,6 +200,7 @@ impl Downloads {
                         "Too many active downloads to observe their completion reliably".into(),
                     );
                     self.changed.send_modify(|revision| *revision += 1);
+                    self.settled.send_modify(|revision| *revision += 1);
                     return;
                 }
             }
@@ -232,6 +242,9 @@ impl Downloads {
                 Some("inProgress") => {}
                 _ => return,
             }
+            if item.status != DownloadStatus::InProgress {
+                self.settled.send_modify(|revision| *revision += 1);
+            }
         } else {
             return;
         }
@@ -241,6 +254,7 @@ impl Downloads {
         self.state.lock().unwrap_or_else(|e| e.into_inner()).failure =
             Some("Browser download connection closed".into());
         self.changed.send_modify(|revision| *revision += 1);
+        self.settled.send_modify(|revision| *revision += 1);
     }
     pub fn cursor(&self) -> u64 {
         self.state

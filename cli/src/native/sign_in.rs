@@ -86,16 +86,19 @@ impl Transition {
             return Err("This browser's network policy is enforced through the automation channel, so sign-in mode is unavailable.".to_string());
         }
         let sign_in = automation.clone().without_automation()?;
-        let surface = display.surface();
         Ok(Self {
             automation,
             sign_in,
-            window: (
-                surface.width / DEVICE_SCALE_FACTOR,
-                surface.height / DEVICE_SCALE_FACTOR,
-            ),
+            window: window_size(&display),
         })
     }
+}
+
+/// The window's CSS size. Inside a size class the display's surface is the
+/// framebuffer, larger than the window, so it is not the window's size.
+fn window_size(display: &DisplayClient) -> (u32, u32) {
+    let (width, height) = display.window();
+    (width / DEVICE_SCALE_FACTOR, height / DEVICE_SCALE_FACTOR)
 }
 
 /// Enter sign-in mode on the controller's `sign_in` input. The lease keeps
@@ -189,15 +192,7 @@ pub(super) fn hand_back(state: &mut DaemonState) -> BoxFuture<'_, ()> {
     async move {
         let deadline = Instant::now() + TRANSITION;
         if let Some(sign_in) = state.sign_in.take() {
-            let window = sign_in
-                .display()
-                .map(|display| display.surface())
-                .map(|surface| {
-                    (
-                        surface.width / DEVICE_SCALE_FACTOR,
-                        surface.height / DEVICE_SCALE_FACTOR,
-                    )
-                });
+            let window = sign_in.display().map(|display| window_size(&display));
             let automation = sign_in.chrome.relaunch_options();
             sign_in.stop().await;
             match (automation, window) {
@@ -292,4 +287,45 @@ async fn adopt(state: &mut DaemonState, browser: BrowserManager) -> Result<(), S
         apply_session_setup(state, &session).await?;
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use crate::native::stream::layout;
+    use serde_json::json;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    /// A cropping presenter's size-class layout leaves the framebuffer (the
+    /// surface) larger than the window: both relaunches keep the window's
+    /// size, not the framebuffer's.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_relaunch_keeps_the_window_size_not_the_size_class_framebuffer() {
+        let (display, helper, _frames) = DisplayClient::test_channel();
+        display.advertise(&["sizeClass"]);
+        let mut helper = BufReader::new(helper);
+        let owner = display.clone();
+        let laid_out = tokio::spawn(async move { layout::apply(&owner, 780, 600, true).await });
+        for answer in [
+            json!({"width":2560,"height":1440,"features":["sizeClass"],"windows":[{"id":7,"pid":1,"x":0,"y":0,"width":2560,"height":1440,"mapped":true,"focused":true,"overrideRedirect":false,"windowType":"normal"}]}),
+            json!({"width":1792,"height":1280,"windows":[]}),
+        ] {
+            let mut line = String::new();
+            tokio::time::timeout(Duration::from_secs(2), helper.read_line(&mut line))
+                .await
+                .expect("a helper request")
+                .unwrap();
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let reply = json!({"id":request["id"],"success":true,"data":answer});
+            helper
+                .get_mut()
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        laid_out.await.unwrap().unwrap();
+        let surface = display.surface();
+        assert_eq!((surface.width, surface.height), (1792, 1280));
+        assert_eq!(window_size(&display), (780, 600));
+    }
 }

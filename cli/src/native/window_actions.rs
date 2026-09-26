@@ -2,7 +2,9 @@
 
 use super::DaemonState;
 use crate::native::browser::ACTIVE_PAGE_AMBIGUOUS;
-use crate::native::display::{window_pixels, Surface, DEVICE_SCALE_FACTOR};
+use crate::native::display::{Surface, DEVICE_SCALE_FACTOR};
+use crate::native::stream::layout;
+
 use serde_json::{json, Value};
 use std::time::Instant;
 
@@ -120,6 +122,11 @@ pub(super) fn layout_made_stale(command: &Value) -> bool {
 pub(super) const OBSERVATION_REQUIRED: &str = "The browser changed outside your commands since your last observation (a person used it, or an earlier input's outcome is unknown), so focus, the pointer and any open dialog may have changed. This command can act on them without naming an element, so nothing was sent. Observe the page, then send it again, or address an element by selector or ref.";
 
 impl DaemonState {
+    /// The agent's own window layout (launch, sign-in, `set viewport`, or a
+    /// controller's legacy `viewport` input while no view presents): the
+    /// window is laid out exactly and, with DevTools, proven before this
+    /// returns. A presenting view's layouts run outside command custody
+    /// (`stream::layout`) and are proven by `prove_window_layout`.
     pub(crate) async fn apply_window_layout(
         &mut self,
         width: u32,
@@ -157,12 +164,10 @@ impl DaemonState {
             && window.y == 0
             && window.width == info.width
             && window.height == info.height
+            && !browser.layout_unproven(page_blocked)
             && self.viewport.is_none();
         if unchanged {
             return Ok(browser.display_client().unwrap().surface());
-        }
-        if let Some(server) = self.stream_server.as_ref() {
-            server.clear_frame();
         }
         // Refs and the selected frame stay: a layout changes no element's
         // identity. Each use of a ref measures its element again, and a ref
@@ -175,10 +180,7 @@ impl DaemonState {
             self.viewport = None;
         }
         self.window_page_error = page_blocked.then_some("browser_dialog_open");
-        if let Some(server) = self.stream_server.as_ref() {
-            server.set_viewport(width, height).await;
-            server.presentation.update_surface(&surface);
-        }
+        self.publish_window_layout(&surface).await;
         Ok(surface)
     }
 
@@ -186,68 +188,84 @@ impl DaemonState {
     /// display alone: the helper resizes it, with no page paint to confirm.
     async fn apply_display_layout(&mut self, width: u32, height: u32) -> Result<Surface, String> {
         let display = self.window_display().ok_or("Browser not launched")?;
-        let (display_width, display_height) = window_pixels(width, height)?;
-        let info = display.info().await.map_err(|error| error.to_string())?;
-        let window = info
-            .active_window()
-            .ok_or("The active browser window is ambiguous")?
-            .id;
-        display
-            .resize(display_width, display_height, Some(window))
-            .await
-            .map_err(|error| error.to_string())?;
-        display.finish_layout().await;
-        let surface = display.surface();
-        if let Some(server) = self.stream_server.as_ref() {
-            server.set_viewport(width, height).await;
-            server.presentation.update_surface(&surface);
-        }
-        Ok(surface)
+        let applied = layout::apply(&display, width, height, false).await?;
+        self.publish_window_layout(&applied.surface).await;
+        Ok(applied.surface)
     }
 
-    pub(crate) async fn apply_pending_window_layout(&mut self) {
-        let Some(server) = self.stream_server.clone() else {
+    /// A controller's `viewport` input (an older viewer resizing the window
+    /// it controls): the same layout a presenter gets, outside the agent's
+    /// page proof, which the agent's next command runs. The framebuffer may
+    /// stay at a size class only while every viewer crops to the window.
+    pub(crate) async fn apply_controller_layout(
+        &mut self,
+        width: u32,
+        height: u32,
+    ) -> Result<Surface, String> {
+        let display = self.window_display().ok_or("Browser not launched")?;
+        let size_class = self
+            .stream_server
+            .as_ref()
+            .is_some_and(|server| server.media.roster().crops_visible());
+        let applied = layout::apply(&display, width, height, size_class).await?;
+        self.publish_window_layout(&applied.surface).await;
+        Ok(applied.surface)
+    }
+
+    /// Tells the stream the window's applied layout. The window, not the
+    /// framebuffer, is the viewport its viewers see.
+    pub(crate) async fn publish_window_layout(&self, surface: &Surface) {
+        let (Some(server), Some(display)) = (self.stream_server.as_ref(), self.window_display())
+        else {
             return;
         };
-        server.presentation.expire();
-        if !server.presentation.configured() {
-            return;
+        let (width, height) = display.window();
+        server
+            .set_viewport(width / DEVICE_SCALE_FACTOR, height / DEVICE_SCALE_FACTOR)
+            .await;
+        server
+            .presentation
+            .update_surface(surface, display.window());
+    }
+
+    /// The agent's geometry gate: before the agent's next command acts on
+    /// the page, the page must follow the newest window layout. A viewer's
+    /// layout lands outside command custody; this proof runs once per layout
+    /// (page metrics at the window's size and one compositor readback per
+    /// visible page). Refs and the selected frame stay: a layout changes no
+    /// element's identity, and each use measures its element again
+    /// (`element::lookup_ref`, `scoped_frame`); points and the pointer are
+    /// fenced by `layout_made_stale`. A dialog that blocked the proof is
+    /// proven again once it is resolved.
+    async fn prove_window_layout(&mut self) -> Result<(), (&'static str, &'static str)> {
+        let page_blocked = self.pending_dialog.is_some();
+        let Some(browser) = self.browser.as_ref() else {
+            return Ok(());
+        };
+        if !browser.layout_unproven(page_blocked) {
+            return Ok(());
         }
-        let Some(display) = self.window_display() else {
-            if let Some(request) = server.presentation.pending("unavailable") {
-                server
-                    .presentation
-                    .complete(&request, "unavailable".into(), None);
+        let events = browser.client.subscribe();
+        self.window_page_error = Some("browser_layout_pending");
+        let proof = self
+            .browser
+            .as_mut()
+            .unwrap()
+            .prove_window_layout(page_blocked, events)
+            .await;
+        match proof {
+            Ok(page_blocked) => {
+                if !page_blocked {
+                    self.viewport = None;
+                }
+                self.window_page_error = page_blocked.then_some("browser_dialog_open");
+                Ok(())
             }
-            return;
-        };
-        let control = self.browser_control.clone();
-        let control = control.lock().await;
-        if control.agent_error().is_some() {
-            return;
+            Err(_) => Err((
+                "browser_layout_pending",
+                "The browser is applying its window layout.",
+            )),
         }
-        let Ok(info) = display.info().await else {
-            return;
-        };
-        let Some(window) = info.active_window() else {
-            return;
-        };
-        let target = format!("{}:{}", display.identity(), window.id);
-        let Some(request) = server.presentation.pending(&target) else {
-            return;
-        };
-        // A viewer's layout is not human input: it needs no fresh observation
-        // from the agent. Stale coordinates are already fenced by the rotated
-        // page generations and admission-time staleness (`layout_made_stale`).
-        // Daemon command custody already excludes controller mutations and
-        // native-window raw stream input is disabled. Release this gate so
-        // event reconciliation and normal dialog handling can proceed.
-        drop(control);
-        let surface = self
-            .apply_window_layout(request.config.width, request.config.height, None)
-            .await
-            .ok();
-        server.presentation.complete(&request, target, surface);
     }
 
     /// The response to a command `prepare_window_command` refused. When no
@@ -277,7 +295,6 @@ impl DaemonState {
         {
             return Ok(());
         }
-        self.apply_pending_window_layout().await;
         let Some(display) = self.window_display() else {
             self.window_page_error = None;
             return Ok(());
@@ -295,26 +312,7 @@ impl DaemonState {
             return Err(("browser_observation_stale", "The browser window changed after this command was sent, so a point or the pointer it uses may no longer be over what you chose. Nothing was sent. Observe its current page, then send it again."));
         }
         self.drain_cdp_events_background().await.map_err(|_| (ACTIVE_PAGE_AMBIGUOUS, "The active browser page is not observable. Inspect the browser or select an existing tab explicitly."))?;
-        if self.window_page_error == Some("browser_dialog_open")
-            && self.pending_dialog.is_none()
-            && self.viewport.is_some()
-        {
-            // A known modal prevented clearing an earlier page emulation.
-            // Complete that same layout boundary once its renderer resumes.
-            let surface = display.surface();
-            self.apply_window_layout(
-                surface.width / DEVICE_SCALE_FACTOR,
-                surface.height / DEVICE_SCALE_FACTOR,
-                None,
-            )
-            .await
-            .map_err(|_| {
-                (
-                    "browser_layout_pending",
-                    "The browser is applying its window layout.",
-                )
-            })?;
-        }
+        self.prove_window_layout().await?;
         let observation = self
             .browser
             .as_mut()

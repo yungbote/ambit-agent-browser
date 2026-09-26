@@ -130,31 +130,73 @@ impl BrowserManager {
         Ok(changed)
     }
 
+    /// Lays the window out at `width` × `height` CSS pixels, exactly, and
+    /// proves the page follows it before returning: the agent's own layouts
+    /// (launch, sign-in, `set viewport`). A viewer's layouts run outside
+    /// command custody (`stream::layout`) and are proven at the agent's next
+    /// command instead.
     pub(crate) async fn resize_window(
         &mut self,
         width: u32,
         height: u32,
         window_id: u32,
         page_blocked: bool,
-        mut events: tokio::sync::broadcast::Receiver<crate::native::cdp::types::CdpEvent>,
+        events: tokio::sync::broadcast::Receiver<crate::native::cdp::types::CdpEvent>,
     ) -> Result<(Surface, bool), String> {
         let (display_width, display_height) = window_pixels(width, height)?;
         let display = self
             .display_client()
             .ok_or("The browser has no owned window display")?;
-        self.client.rotate_all_page_generations();
-        display
-            .resize(display_width, display_height, Some(window_id))
-            .await
-            .map_err(|error| error.to_string())?;
+        {
+            let layout = display.layout().await;
+            self.client.rotate_all_page_generations();
+            display
+                .resize(
+                    &layout,
+                    display_width,
+                    display_height,
+                    Some(window_id),
+                    false,
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let page_blocked = self.prove_window_layout(page_blocked, events).await?;
+        Ok((display.surface(), page_blocked))
+    }
+
+    /// Proves the pages follow the window's newest layout: page metrics at
+    /// the window's size, then one compositor readback per visible page.
+    /// Returns whether a JavaScript dialog kept the proof from the page.
+    /// The proof is recorded on the display for that layout epoch, so it
+    /// runs once, and agent pointer input is sent only under a proven
+    /// layout (`DisplayClient::layout_proven`).
+    pub(crate) async fn prove_window_layout(
+        &mut self,
+        page_blocked: bool,
+        mut events: tokio::sync::broadcast::Receiver<crate::native::cdp::types::CdpEvent>,
+    ) -> Result<bool, String> {
+        let display = self
+            .display_client()
+            .ok_or("The browser has no owned window display")?;
+        // No layout lands while its proof runs, which it would never pass:
+        // a person's drag waits for this one proof, as for one agent input.
+        let _atomic = display.atomic_input().await;
+        let epoch = display.layout_epoch();
+        let (window_width, window_height) = display.window();
+        let (width, height) = (
+            window_width / crate::native::display::DEVICE_SCALE_FACTOR,
+            window_height / crate::native::display::DEVICE_SCALE_FACTOR,
+        );
         if page_blocked {
             // Chromium's native modal is the visible surface. Its renderer
             // cannot answer metrics or screenshots until the user resolves
-            // it. Publish only the acknowledged native surface; the daemon
-            // keeps page feedback unavailable and retains any emulation.
-            display.finish_layout().await;
-            return Ok((display.surface(), true));
+            // it. The daemon keeps page feedback unavailable and retains any
+            // emulation; the proof runs again once the dialog is gone.
+            display.record_proof(epoch, true);
+            return Ok(true);
         }
+
         // XConfigureWindow acknowledges native geometry before Chromium has
         // necessarily reflowed. Require its visible page metrics to agree
         // before publishing the applied surface or a host observation.
@@ -249,8 +291,21 @@ impl BrowserManager {
         })
         .await
         .map_err(|_| "The browser has not acknowledged the new page layout")??;
-        display.finish_layout().await;
-        Ok((display.surface(), page_blocked))
+        display.record_proof(epoch, page_blocked);
+        Ok(page_blocked)
+    }
+
+    /// Whether the newest layout still needs its page proof: it was never
+    /// proven, or a dialog that blocked its proof has since been resolved.
+    pub(crate) fn layout_unproven(&self, page_blocked: bool) -> bool {
+        let Some(display) = self.display_client() else {
+            return false;
+        };
+        match display.proof() {
+            Some((epoch, false)) => epoch != display.layout_epoch(),
+            Some((epoch, true)) => epoch != display.layout_epoch() || !page_blocked,
+            None => true,
+        }
     }
 }
 

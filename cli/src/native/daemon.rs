@@ -16,6 +16,7 @@ use super::actions::{
     auto_save_restore_state, close_all_browser_backends, close_current_browser,
     execute_command_received, maybe_autosave_restore_state, DaemonState,
 };
+use super::browser_control::{serve_window_input, BrowserControl};
 use super::cdp::client::CdpClient;
 use super::playwright::{InterruptReason, Operations};
 use super::state;
@@ -217,7 +218,13 @@ async fn run_socket_server(
             stream_server,
             idle_activity.clone(),
         )));
-    let playwright_operations = state.lock().await.playwright_operations.clone();
+    let (playwright_operations, browser_control) = {
+        let state = state.lock().await;
+        (
+            state.playwright_operations.clone(),
+            state.browser_control.clone(),
+        )
+    };
 
     // Notifier used by handle_connection to signal the daemon loop to exit
     // after a "close" command, instead of calling process::exit() which skips
@@ -242,8 +249,9 @@ async fn run_socket_server(
                         let sf = stream_file.clone();
                         let cn = close_notify.clone();
                         let operations = playwright_operations.clone();
+                        let control = browser_control.clone();
                         tasks.spawn(async move {
-                            handle_connection(stream, state, idle_activity, sf, cn, operations).await;
+                            handle_connection(stream, state, control, idle_activity, sf, cn, operations).await;
                         });
                     }
                     Err(e) => {
@@ -352,19 +360,14 @@ async fn run_socket_server(
 }
 
 /// Periodic CDP maintenance shares command custody and is cancelled on stop.
-/// A viewer's layout request also wakes it at once: the window follows the
-/// dock without waiting for the next tick or command.
+/// A viewer's layout never waits for it: the stream applies that layout
+/// itself (`stream::layout`).
 async fn maintain_browser(state: Arc<tokio::sync::Mutex<DaemonState>>, autosave_interval_ms: u64) {
     let mut interval = tokio::time::interval(Duration::from_millis(100));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-    let mut layout = LayoutWakeup::default();
     loop {
-        tokio::select! {
-            _ = interval.tick() => {}
-            _ = layout.changed() => {}
-        }
+        interval.tick().await;
         let mut state = state.lock().await;
-        layout.follow(state.stream_server.as_ref());
         if let Err(error) = state.expire_browser_control().await {
             let _ = writeln!(std::io::stderr(), "{}: {}", error.code, error.message);
         }
@@ -383,45 +386,8 @@ async fn maintain_browser(state: Arc<tokio::sync::Mutex<DaemonState>>, autosave_
                     error
                 );
             } else {
-                state.apply_pending_window_layout().await;
                 maybe_autosave_restore_state(&mut state, autosave_interval_ms).await;
             }
-        }
-    }
-}
-
-/// The presentation cell of the current stream server, re-subscribed whenever
-/// the server is replaced. Without a server there is nothing to wake for.
-#[derive(Default)]
-struct LayoutWakeup {
-    server: Option<std::sync::Weak<StreamServer>>,
-    changes: Option<tokio::sync::watch::Receiver<super::stream::presentation::PresentationState>>,
-}
-
-impl LayoutWakeup {
-    fn follow(&mut self, server: Option<&Arc<StreamServer>>) {
-        let same = match (self.server.as_ref(), server) {
-            (Some(current), Some(server)) => std::ptr::eq(current.as_ptr(), Arc::as_ptr(server)),
-            (None, None) => true,
-            _ => false,
-        };
-        if same {
-            return;
-        }
-        self.server = server.map(Arc::downgrade);
-        self.changes = server.map(|server| server.presentation.subscribe());
-    }
-
-    async fn changed(&mut self) {
-        match self.changes.as_mut() {
-            Some(changes) => {
-                if changes.changed().await.is_err() {
-                    // The server is gone; the next tick re-subscribes.
-                    self.changes = None;
-                    self.server = None;
-                }
-            }
-            None => std::future::pending().await,
         }
     }
 }
@@ -429,6 +395,7 @@ impl LayoutWakeup {
 async fn handle_connection<S>(
     stream: S,
     state: std::sync::Arc<tokio::sync::Mutex<DaemonState>>,
+    browser_control: Arc<tokio::sync::Mutex<BrowserControl>>,
     idle_activity: Arc<IdleActivity>,
     stream_file_cleanup: Option<PathBuf>,
     close_notify: Arc<Notify>,
@@ -495,6 +462,18 @@ async fn handle_connection<S>(
                     .unwrap_or_default()
                     .to_string();
 
+                // A person's window input never waits for command custody.
+                if let Some(response) =
+                    serve_window_input(&browser_control, &cmd, received_at).await
+                {
+                    let mut resp = serde_json::to_string(&response).unwrap_or_default();
+                    resp.push('\n');
+                    if writer.write_all(resp.as_bytes()).await.is_err() {
+                        break;
+                    }
+                    continue;
+                }
+
                 let mut disconnected = false;
                 let admitted = if action == "run_playwright" {
                     tokio::select! {
@@ -505,7 +484,8 @@ async fn handle_connection<S>(
                 } else {
                     command_state(&state, &cmd, &playwright_operations).await
                 };
-                let response = match admitted {
+                let admitted_at = std::time::Instant::now();
+                let mut response = match admitted {
                     Ok(mut s) => {
                         let response = if action == "run_playwright" {
                             let execution = execute_command_received(&cmd, &mut s, received_at);
@@ -531,6 +511,7 @@ async fn handle_connection<S>(
                 if disconnected {
                     break;
                 }
+                attach_input_timing(&cmd, &mut response, received_at, admitted_at);
 
                 let mut resp = serde_json::to_string(&response).unwrap_or_default();
                 resp.push('\n');
@@ -586,6 +567,28 @@ async fn read_until_disconnect<R: tokio::io::AsyncRead + Unpin>(
             }
         }
     }
+}
+
+/// A person's input acknowledgment says where its time went: waiting for
+/// command custody (`queueUs`) and applying it (`injectUs`). The window fast
+/// path reports the same fields for its own gate.
+fn attach_input_timing(
+    command: &Value,
+    response: &mut Value,
+    received_at: std::time::Instant,
+    admitted_at: std::time::Instant,
+) {
+    if command["action"] != super::browser_control::ACTION
+        || command["op"] != "input"
+        || response["success"] != true
+        || !response["data"].is_object()
+    {
+        return;
+    }
+    response["data"]["timing"] = serde_json::json!({
+        "queueUs": admitted_at.saturating_duration_since(received_at).as_micros() as u64,
+        "injectUs": admitted_at.elapsed().as_micros() as u64,
+    });
 }
 
 fn looks_like_http(line: &str) -> bool {
@@ -782,10 +785,12 @@ mod tests {
         let state = Arc::new(tokio::sync::Mutex::new(DaemonState::new()));
         let held = state.lock().await;
         let operations = held.playwright_operations.clone();
+        let control = held.browser_control.clone();
         let (mut client, server) = tokio::io::duplex(1024);
         let task = tokio::spawn(handle_connection(
             server,
             state.clone(),
+            control,
             Arc::new(IdleActivity::new()),
             None,
             Arc::new(Notify::new()),
@@ -808,6 +813,7 @@ mod tests {
     /// One daemon connection carrying one request, as a host helper would.
     async fn connect(
         state: Arc<tokio::sync::Mutex<DaemonState>>,
+        control: Arc<tokio::sync::Mutex<BrowserControl>>,
         operations: Operations,
         command: Value,
     ) -> (
@@ -819,6 +825,7 @@ mod tests {
         let task = tokio::spawn(handle_connection(
             server,
             state,
+            control,
             activity,
             None,
             Arc::new(Notify::new()),
@@ -888,11 +895,13 @@ mod tests {
         let client = browser.client.clone();
         let session = browser.active_session_id().unwrap().to_owned();
         let operations = initial.playwright_operations.clone();
+        let control = initial.browser_control.clone();
         let state = Arc::new(tokio::sync::Mutex::new(initial));
         let program = "await page.evaluate(() => document.title = 'Program ran');";
 
         let (mut late, task) = connect(
             state.clone(),
+            control.clone(),
             operations.clone(),
             json!({"action":"run_playwright","timeoutMs":1000,"code":program}),
         )
@@ -911,6 +920,7 @@ mod tests {
 
         let (mut waiting, program_task) = connect(
             state.clone(),
+            control.clone(),
             operations.clone(),
             json!({"action":"run_playwright","timeoutMs":30000,"code":program}),
         )
@@ -919,7 +929,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(800)).await;
         let controller = uuid::Uuid::new_v4().to_string();
         let expires = crate::native::stream::timestamp_ms() + 30_000;
-        let (mut human, human_task) = connect(state.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"acquire","controllerId":controller,"expiresAt":expires})).await;
+        let (mut human, human_task) = connect(state.clone(), control.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"acquire","controllerId":controller,"expiresAt":expires})).await;
         let acquired = reply(&mut human).await;
         assert_eq!(acquired["success"], true, "{acquired}");
         let stopped = reply(&mut waiting).await;
@@ -934,7 +944,7 @@ mod tests {
         human_task.await.unwrap();
         drop(waiting);
         program_task.await.unwrap();
-        let (mut release, task) = connect(state.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"release","controllerId":controller})).await;
+        let (mut release, task) = connect(state.clone(), control.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"release","controllerId":controller})).await;
         assert_eq!(reply(&mut release).await["success"], true);
         drop(release);
         task.await.unwrap();
@@ -961,8 +971,9 @@ mod tests {
         let session = browser.active_session_id().unwrap().to_owned();
         let target = browser.active_target_id().unwrap().to_owned();
         let operations = initial.playwright_operations.clone();
+        let control = initial.browser_control.clone();
         let state = Arc::new(tokio::sync::Mutex::new(initial));
-        let (mut program, program_task) = connect(state.clone(), operations.clone(), json!({"action":"run_playwright","timeoutMs":60000,"code":"await page.evaluate(() => {globalThis.holds={buttons:0,shift:false};addEventListener('pointerdown',e=>holds.buttons=e.buttons);addEventListener('pointerup',e=>holds.buttons=e.buttons);addEventListener('keydown',e=>holds.shift=e.shiftKey);addEventListener('keyup',e=>holds.shift=e.shiftKey)}); await page.mouse.move(40,40); await page.mouse.down(); await page.keyboard.down('Shift'); await page.evaluate(() => globalThis.programStarted = true); await page.waitForTimeout(60000);"})).await;
+        let (mut program, program_task) = connect(state.clone(), control.clone(), operations.clone(), json!({"action":"run_playwright","timeoutMs":60000,"code":"await page.evaluate(() => {globalThis.holds={buttons:0,shift:false};addEventListener('pointerdown',e=>holds.buttons=e.buttons);addEventListener('pointerup',e=>holds.buttons=e.buttons);addEventListener('keydown',e=>holds.shift=e.shiftKey);addEventListener('keyup',e=>holds.shift=e.shiftKey)}); await page.mouse.move(40,40); await page.mouse.down(); await page.keyboard.down('Shift'); await page.evaluate(() => globalThis.programStarted = true); await page.waitForTimeout(60000);"})).await;
         tokio::time::timeout(Duration::from_secs(10), async {
             while value(&client, &session, "globalThis.programStarted").await != true {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -976,7 +987,7 @@ mod tests {
             .unwrap()
             .as_millis() as u64
             + 30000;
-        let (mut human, human_task) = connect(state.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"acquire","controllerId":controller,"expiresAt":expires})).await;
+        let (mut human, human_task) = connect(state.clone(), control.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"acquire","controllerId":controller,"expiresAt":expires})).await;
         let acquired = reply(&mut human).await;
         assert_eq!(acquired["success"], true, "{acquired}");
         assert_eq!(
@@ -1002,7 +1013,7 @@ mod tests {
         human_task.await.unwrap();
         drop(program);
         program_task.await.unwrap();
-        let (mut release, task) = connect(state.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"release","controllerId":controller})).await;
+        let (mut release, task) = connect(state.clone(), control.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"release","controllerId":controller})).await;
         assert_eq!(reply(&mut release).await["success"], true);
         drop(release);
         task.await.unwrap();
@@ -1010,6 +1021,7 @@ mod tests {
         let code = "const {spawn} = await import('node:child_process'); const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {stdio:'ignore'}); await page.evaluate(pid => {globalThis.childPid=pid;globalThis.ticks=0}, child.pid); for (;;) { await page.evaluate(() => globalThis.ticks++); await page.waitForTimeout(20); }";
         let (mut observation, task) = connect(
             state.clone(),
+            control.clone(),
             operations.clone(),
             json!({"action":"snapshot"}),
         )
@@ -1019,6 +1031,7 @@ mod tests {
         task.await.unwrap();
         let (program, task) = connect(
             state.clone(),
+            control.clone(),
             operations.clone(),
             json!({"action":"run_playwright","timeoutMs":60000,"code":code}),
         )
@@ -1076,6 +1089,7 @@ mod tests {
         // before control is granted, and no program input lands afterwards.
         let (mut observation, task) = connect(
             state.clone(),
+            control.clone(),
             operations.clone(),
             json!({"action":"snapshot"}),
         )
@@ -1083,7 +1097,7 @@ mod tests {
         assert_eq!(reply(&mut observation).await["success"], true);
         drop(observation);
         task.await.unwrap();
-        let (mut program, program_task) = connect(state.clone(), operations.clone(), json!({"action":"run_playwright","timeoutMs":60000,"code":"await page.evaluate(() => {globalThis.ticks=0;globalThis.typed='';addEventListener('keydown',e=>typed+=e.key)}); for (;;) { await page.keyboard.press('x'); await page.evaluate(() => globalThis.ticks++); await page.waitForTimeout(20); }"})).await;
+        let (mut program, program_task) = connect(state.clone(), control.clone(), operations.clone(), json!({"action":"run_playwright","timeoutMs":60000,"code":"await page.evaluate(() => {globalThis.ticks=0;globalThis.typed='';addEventListener('keydown',e=>typed+=e.key)}); for (;;) { await page.keyboard.press('x'); await page.evaluate(() => globalThis.ticks++); await page.waitForTimeout(20); }"})).await;
         tokio::time::timeout(Duration::from_secs(10), async {
             while value(&client, &session, "globalThis.ticks").await.as_u64() < Some(3) {
                 tokio::time::sleep(Duration::from_millis(20)).await;
@@ -1092,7 +1106,7 @@ mod tests {
         .await
         .unwrap();
         let controller = uuid::Uuid::new_v4().to_string();
-        let (mut human, human_task) = connect(state.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"acquire","controllerId":controller,"expiresAt":expires})).await;
+        let (mut human, human_task) = connect(state.clone(), control.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"acquire","controllerId":controller,"expiresAt":expires})).await;
         let acquired = reply(&mut human).await;
         assert_eq!(acquired["success"], true, "{acquired}");
         let interrupted = reply(&mut program).await;
@@ -1113,7 +1127,7 @@ mod tests {
         human_task.await.unwrap();
         drop(program);
         program_task.await.unwrap();
-        let (mut release, task) = connect(state.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"release","controllerId":controller})).await;
+        let (mut release, task) = connect(state.clone(), control.clone(), operations.clone(), json!({"action":super::super::browser_control::ACTION,"op":"release","controllerId":controller})).await;
         assert_eq!(reply(&mut release).await["success"], true);
         drop(release);
         task.await.unwrap();
@@ -1131,6 +1145,180 @@ mod tests {
         close_current_browser(&mut *state.lock().await)
             .await
             .unwrap();
+    }
+
+    /// A display helper that acknowledges every control operation and
+    /// reports each one it received.
+    #[cfg(target_os = "linux")]
+    fn acknowledging_display() -> (
+        Arc<crate::native::display::DisplayClient>,
+        tokio::sync::mpsc::UnboundedReceiver<Value>,
+        tokio::net::UnixStream,
+    ) {
+        let (display, peer, frames) = crate::native::display::DisplayClient::test_channel();
+        let (seen, received) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut peer = BufReader::new(peer);
+            let mut line = String::new();
+            while peer.read_line(&mut line).await.is_ok_and(|read| read > 0) {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                line.clear();
+                let reply = serde_json::json!({ "id": request["id"], "success": true, "data": {} });
+                let _ = seen.send(request);
+                if peer
+                    .get_mut()
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        (display, received, frames)
+    }
+
+    /// A person's keystroke reaches the owned window while an agent command
+    /// or maintenance holds daemon state; navigation still waits for it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn window_input_never_waits_for_command_custody() {
+        use serde_json::json;
+        let owner = "aabbccdd-1111-4222-8333-123456789abc";
+        let state = Arc::new(tokio::sync::Mutex::new(DaemonState::new()));
+        let (control, operations) = {
+            let state = state.lock().await;
+            (
+                state.browser_control.clone(),
+                state.playwright_operations.clone(),
+            )
+        };
+        let (display, mut ops, _frames) = acknowledging_display();
+        control.lock().await.set_display(Some(display.clone()));
+        let expires = crate::native::stream::timestamp_ms() + 20_000;
+        let acquire = json!({"action":super::super::browser_control::ACTION,"op":"acquire","controllerId":owner,"expiresAt":expires});
+        control
+            .lock()
+            .await
+            .execute(
+                super::super::browser_control::ControlRequest::parse(&acquire).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ops.recv().await.unwrap()["op"], "reset");
+
+        let held = state.lock().await;
+        let generation = display.surface().generation;
+        let (mut typed, task) = connect(state.clone(), control.clone(), operations.clone(), json!({
+            "id":"k1","action":super::super::browser_control::ACTION,"op":"input","controllerId":owner,
+            "sequence":1,"expectedSurfaceGeneration":generation,
+            "events":[{"type":"input_keyboard","eventType":"keyDown","key":"a","text":"a"},
+                      {"type":"input_mouse","eventType":"mouseMoved","x":10,"y":20}]})).await;
+        let applied = reply(&mut typed).await;
+        assert_eq!(applied["success"], true, "{applied}");
+        assert_eq!(applied["id"], "k1");
+        assert_eq!(applied["data"]["status"], "applied");
+        assert_eq!(applied["data"]["lastSequence"], 1);
+        assert!(applied["data"]["timing"]["queueUs"].is_u64(), "{applied}");
+        assert!(applied["data"]["timing"]["injectUs"].is_u64(), "{applied}");
+        let sent = ops.recv().await.unwrap();
+        assert_eq!(sent["op"], "input");
+        assert_eq!(sent["events"].as_array().unwrap().len(), 2);
+        drop(typed);
+        task.await.unwrap();
+
+        // Navigation is a DevTools command: it keeps command custody.
+        let (mut navigated, task) = connect(state.clone(), control.clone(), operations, json!({
+            "id":"n2","action":super::super::browser_control::ACTION,"op":"input","controllerId":owner,
+            "sequence":2,"expectedSurfaceGeneration":generation,
+            "events":[{"type":"navigation","action":"reload"}]})).await;
+        let mut line = String::new();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), navigated.read_line(&mut line))
+                .await
+                .is_err(),
+            "navigation must wait for command custody: {line}"
+        );
+        drop(held);
+        let settled = reply(&mut navigated).await;
+        assert_eq!(settled["id"], "n2");
+        drop(navigated);
+        task.await.unwrap();
+    }
+
+    /// A files observation whose DevTools round trips stall never holds a
+    /// person's keystroke: its page work runs outside the control gate.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn stalled_files_observation_never_holds_window_input() {
+        use serde_json::json;
+        let owner = "aabbccdd-1111-4222-8333-123456789abc";
+        let mut initial = DaemonState::new();
+        // A browser whose DevTools never answers: every observation stalls.
+        initial.browser = Some(
+            crate::native::browser::tests::test_manager(vec![crate::native::browser::PageInfo {
+                tab_id: 1,
+                label: None,
+                target_id: "target".into(),
+                session_id: "session".into(),
+                url: "https://example.com/".into(),
+                title: String::new(),
+                target_type: "page".into(),
+            }])
+            .await,
+        );
+        let control = initial.browser_control.clone();
+        let operations = initial.playwright_operations.clone();
+        let state = Arc::new(tokio::sync::Mutex::new(initial));
+        let (display, mut ops, _frames) = acknowledging_display();
+        control.lock().await.set_display(Some(display.clone()));
+        let expires = crate::native::stream::timestamp_ms() + 20_000;
+        let acquire = json!({"action":super::super::browser_control::ACTION,"op":"acquire","controllerId":owner,"expiresAt":expires});
+        control
+            .lock()
+            .await
+            .execute(
+                super::super::browser_control::ControlRequest::parse(&acquire).unwrap(),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(ops.recv().await.unwrap()["op"], "reset");
+
+        let (mut observing, observation) = connect(
+            state.clone(),
+            control.clone(),
+            operations.clone(),
+            json!({"id":"f1","action":super::super::browser_control::ACTION,"op":"files","controllerId":owner}),
+        )
+        .await;
+        // Let the observation reach its stalled DevTools round trip.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let generation = display.surface().generation;
+        let (mut typed, task) = connect(state.clone(), control.clone(), operations, json!({
+            "id":"k1","action":super::super::browser_control::ACTION,"op":"input","controllerId":owner,
+            "sequence":1,"expectedSurfaceGeneration":generation,
+            "events":[{"type":"input_keyboard","eventType":"keyDown","key":"a"}]})).await;
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(1), typed.read_line(&mut line))
+            .await
+            .expect("window input waited for a files observation")
+            .unwrap();
+        let applied: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(applied["data"]["status"], "applied", "{applied}");
+        assert_eq!(ops.recv().await.unwrap()["op"], "input");
+        drop(typed);
+        task.await.unwrap();
+        // The observation itself still ends within its bound.
+        let observed = reply(&mut observing).await;
+        assert_eq!(observed["id"], "f1");
+        assert_eq!(
+            observed["code"], "browser_control_files_unavailable",
+            "{observed}"
+        );
+        drop(observing);
+        observation.await.unwrap();
     }
 
     #[tokio::test]
