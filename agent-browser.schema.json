@@ -157,6 +157,11 @@
       "enum": ["dark", "light", "no-preference"],
       "description": "Color scheme preference."
     },
+    "theme": {
+      "type": "string",
+      "enum": ["dark", "light"],
+      "description": "Browser theme: Chrome's own window UI and every page's prefers-color-scheme. An explicit colorScheme still decides the pages."
+    },
     "downloadPath": {
       "type": "string",
       "description": "Default directory for browser downloads."

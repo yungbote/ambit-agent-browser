@@ -19,7 +19,7 @@ use futures_util::future::{BoxFuture, FutureExt};
 use serde_json::Value;
 use tokio::time::Instant;
 
-use super::{adopt_launched_browser, apply_session_setup, close_current_browser, DaemonState};
+use super::{adopt_launched_browser, close_current_browser, DaemonState};
 use crate::native::browser::BrowserManager;
 use crate::native::browser_control::{ControlError, ControlRequest, SignInAdmission};
 use crate::native::cdp::chrome::{self, ChromeProcess, LaunchOptions};
@@ -74,7 +74,11 @@ impl Transition {
     async fn plan(state: &DaemonState) -> Result<Self, String> {
         let browser = state.browser.as_ref().ok_or(NOT_OWNED)?;
         let display = browser.display_client().ok_or(NOT_OWNED)?;
-        let automation = browser.relaunch_options().map_err(|_| NOT_OWNED)?;
+        // The session's theme now, never the one this browser launched with.
+        let automation = LaunchOptions {
+            theme: state.theme,
+            ..browser.relaunch_options().map_err(|_| NOT_OWNED)?
+        };
         if state.launch_configuration.is_none() {
             return Err(NOT_OWNED.to_string());
         }
@@ -199,6 +203,7 @@ pub(super) fn hand_back(state: &mut DaemonState) -> BoxFuture<'_, ()> {
                 (Ok(options), Some(window)) => {
                     let options = LaunchOptions {
                         remote_debugging: true,
+                        theme: state.theme,
                         ..options
                     };
                     relaunch_automation(state, options, window, deadline).await;
@@ -233,10 +238,10 @@ pub(super) async fn maintain(state: &mut DaemonState) {
 }
 
 /// Relaunch automation into the retained profile and display through the
-/// post-launch sequence every local launch shares, then replay the session's
-/// page setup onto the restored tabs. Storage state and auto-restore are not
-/// reloaded: the profile already holds the session. On failure nothing is
-/// left running.
+/// post-launch sequence every local launch shares, which replays the
+/// session's page setup onto the restored tabs. Storage state and
+/// auto-restore are not reloaded: the profile already holds the session. On
+/// failure nothing is left running.
 async fn relaunch_automation(
     state: &mut DaemonState,
     options: LaunchOptions,
@@ -271,22 +276,7 @@ async fn adopt(state: &mut DaemonState, browser: BrowserManager) -> Result<(), S
         retain_profile,
         has_proxy_auth,
     )
-    .await?;
-    let sessions: Vec<String> = state
-        .browser
-        .as_ref()
-        .map(|browser| {
-            browser
-                .pages_list()
-                .into_iter()
-                .map(|page| page.session_id)
-                .collect()
-        })
-        .unwrap_or_default();
-    for session in sessions {
-        apply_session_setup(state, &session).await?;
-    }
-    Ok(())
+    .await
 }
 
 #[cfg(all(test, target_os = "linux"))]

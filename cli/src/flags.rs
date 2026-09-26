@@ -90,6 +90,7 @@ pub struct Config {
     pub headers: Option<String>,
     pub annotate: Option<bool>,
     pub color_scheme: Option<String>,
+    pub theme: Option<String>,
     pub download_path: Option<String>,
     pub content_boundaries: Option<bool>,
     pub max_output: Option<usize>,
@@ -175,6 +176,7 @@ impl Config {
             headers: other.headers.or(self.headers),
             annotate: other.annotate.or(self.annotate),
             color_scheme: other.color_scheme.or(self.color_scheme),
+            theme: other.theme.or(self.theme),
             download_path: other.download_path.or(self.download_path),
             content_boundaries: other.content_boundaries.or(self.content_boundaries),
             max_output: other.max_output.or(self.max_output),
@@ -306,6 +308,7 @@ fn extract_config_path(args: &[String]) -> Option<Option<String>> {
         "--device",
         "--session-name",
         "--color-scheme",
+        "--theme",
         "--download-path",
         "--max-output",
         "--allowed-domains",
@@ -406,6 +409,10 @@ pub struct Flags {
     pub session_name: Option<String>,
     pub annotate: bool,
     pub color_scheme: Option<String>,
+    /// The browser theme (`dark` or `light`) a launch carries: Chrome's own
+    /// window UI and every page's `prefers-color-scheme`. Validated before
+    /// any daemon is contacted.
+    pub theme: Option<String>,
     pub download_path: Option<String>,
     pub content_boundaries: bool,
     pub max_output: Option<usize>,
@@ -616,6 +623,7 @@ pub(crate) fn parse_flags_from_config(args: &[String], config: Config) -> Flags 
         color_scheme: env::var("AGENT_BROWSER_COLOR_SCHEME")
             .ok()
             .or(config.color_scheme),
+        theme: env::var("AGENT_BROWSER_THEME").ok().or(config.theme),
         download_path: env::var("AGENT_BROWSER_DOWNLOAD_PATH")
             .ok()
             .or(config.download_path),
@@ -1010,6 +1018,12 @@ pub(crate) fn apply_cli_flags(args: &[String], flags: &mut Flags) {
                     i += 1;
                 }
             }
+            "--theme" => {
+                if let Some(s) = args.get(i + 1) {
+                    flags.theme = Some(s.clone());
+                    i += 1;
+                }
+            }
             "--download-path" => {
                 if let Some(s) = args.get(i + 1) {
                     flags.download_path = Some(s.clone());
@@ -1209,6 +1223,7 @@ pub fn clean_args(args: &[String]) -> Vec<String> {
         "--device",
         "--session-name",
         "--color-scheme",
+        "--theme",
         "--download-path",
         "--max-output",
         "--allowed-domains",
@@ -1653,6 +1668,48 @@ mod tests {
             vec!["--account".to_string(), "team".to_string()]
         );
         assert_eq!(plugin.capabilities, vec!["credential.read".to_string()]);
+    }
+
+    /// The theme comes from --theme, else AGENT_BROWSER_THEME, else config;
+    /// its value is validated before any daemon is contacted, not here.
+    #[test]
+    fn test_theme_flag_env_and_config_precedence() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_THEME"]);
+        guard.remove("AGENT_BROWSER_THEME");
+        let config = |theme: &str| Config {
+            theme: Some(theme.to_string()),
+            ..Config::default()
+        };
+        assert_eq!(
+            parse_flags_from_config(&args("open"), Config::default()).theme,
+            None
+        );
+        assert_eq!(
+            parse_flags_from_config(&args("open"), config("light"))
+                .theme
+                .as_deref(),
+            Some("light")
+        );
+        guard.set("AGENT_BROWSER_THEME", "dark");
+        assert_eq!(
+            parse_flags_from_config(&args("open"), config("light"))
+                .theme
+                .as_deref(),
+            Some("dark")
+        );
+        assert_eq!(
+            parse_flags_from_config(&args("--theme light open"), config("dark"))
+                .theme
+                .as_deref(),
+            Some("light")
+        );
+        // A value flag: its value is never mistaken for the command.
+        assert_eq!(
+            clean_args(&args("--theme dark open example.com")),
+            args("open example.com")
+        );
+        let config: Config = serde_json::from_str(r#"{"theme": "dark"}"#).unwrap();
+        assert_eq!(config.theme.as_deref(), Some("dark"));
     }
 
     #[test]

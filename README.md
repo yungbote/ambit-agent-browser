@@ -322,9 +322,14 @@ agent-browser set offline [on|off]    # Toggle offline mode
 agent-browser set headers <json>      # Extra HTTP headers
 agent-browser set credentials <u> <p> # HTTP basic auth for current and future tabs
 agent-browser set media [dark|light]  # Emulate color scheme
+agent-browser set theme <dark|light>  # Browser theme: window UI and pages
 ```
 
 `set credentials` applies HTTP Basic Authentication to the current tab and tabs opened later. `set offline off` and `set headers '{}'` restore the default setup for future tabs.
+
+The browser theme, `dark` or `light`, reaches Chrome's own window UI (tab strip, address bar, infobars) in a headed or window-mode browser and every page's `prefers-color-scheme`, so sites render their own dark or light design. Page content is never repainted, so a page without a dark design stays as it is. `--theme` (or `AGENT_BROWSER_THEME`, config `theme`) sets it when a browser launches and never relaunches a running browser; an invalid value is refused before anything starts. An explicit `dark` or `light` from `--color-scheme` or `set media` decides the pages until the next `set theme`, while the theme still decides the window UI. A `no-preference` scheme, or `set media` without a color, leaves pages on the theme, and a theme change keeps other media features such as reduced motion.
+
+`set theme` changes the theme of a running session. Every page of its automated browser switches now, including background tabs, tabs a person opened and popups, and tabs opened later get it too. The window UI follows at the next launch, since agent-browser can set it only when Chrome launches; every launch the daemon performs, including its relaunches for sign-in and hand-back, uses the session theme unless that launch names its own. The result data carries `theme`, `pages` (`live`, or `next_launch` when no automated browser runs, as during sign-in) and `ui` (`next_launch`, or `none` for a headless or attached browser). It never starts a daemon or launches a browser; with no running session it fails with `browser_runtime_unavailable` and changes nothing. It is not an agent action, so it is accepted while a person controls the browser or signs in, with a JavaScript dialog open or an ambiguous active tab, and it never counts as the fresh observation a handoff requires. The MCP tool is `agent_browser_set_theme` in the `mobile` profile, and `agent_browser_open` accepts an optional `theme`.
 
 ### Cookies & Storage
 
@@ -387,7 +392,7 @@ agent-browser click @e3              # click uses docs's refs
 agent-browser tab close docs         # close by label
 ```
 
-Tabs opened through `tab new` or `click --new-tab` inherit the session's user agent, headers, HTTP credentials, init scripts, routes, and emulation overrides before their first document loads.
+Tabs opened through `tab new`, `window new` or `click --new-tab` inherit the session's user agent, headers, HTTP credentials, init scripts, routes, emulation overrides, and browser theme before their first document loads. Tabs a person opens and popups get the same setup when the session discovers them.
 
 `tab list --json` also reports each tab's CDP `targetId`, and target ids are accepted anywhere a tab ref is accepted (`tab <targetId>`, `tab close <targetId>`). Unlike `t<N>` ids, which are per-daemon counters, target ids stay stable across daemon restarts, so they're the right handle for scripts coordinating multiple sessions on one browser. A tab ref that names no open tab fails with `"code": "tab_not_found"`, and `data.tabs` and `data.tabCount` list the open tabs as `browser_active_page_ambiguous` does.
 
@@ -617,7 +622,7 @@ For a viewer across a network, negotiate `pacing=ack&frameWindow=8` to allow up 
 
 Native capture samples at 60 frames per second under a human lease, 30 with a connected primary presentation and 15 otherwise; secondary viewers are capped at 15. Only damage is encoded, so an unchanged window costs no frames. Only the latest frame is retained while a viewer is busy; actual throughput depends on capture size and available CPU.
 
-Linux hosts can set `AGENT_BROWSER_WINDOW_STREAM=1` to stream the actual Chromium window, including its tabs, address bar, menus, dialogs and native cursor. This launches the same automated Chromium process on a private authenticated Xvfb display. It requires the `browser-display` helper beside the native executable, or an absolute `AGENT_BROWSER_DISPLAY_HELPER` path. The normal CLI and MCP page tools keep their existing commands. Window capture and human input use the existing stream and host control lease.
+Linux hosts can set `AGENT_BROWSER_WINDOW_STREAM=1` to stream the actual Chromium window, including its tabs, address bar, menus, dialogs and native cursor. This launches the same automated Chromium process on a private authenticated Xvfb display. It requires the `browser-display` helper beside the native executable, or an absolute `AGENT_BROWSER_DISPLAY_HELPER` path. The normal CLI and MCP page tools keep their existing commands. Window capture and human input use the existing stream and host control lease. The window's tab strip and address bar follow the [browser theme](#browser-settings) at each launch.
 
 Owned-window mouse commands move the captured native cursor and send buttons through the same display input owner as human control. The ordinary pre-hover supplies a measured page-to-window position, including page zoom and native browser chrome. A position lasts for one command or held gesture and is discarded on takeover. Native input is acknowledged by the display helper; no CDP button is replayed. Native motion can produce additional pointermove events, and Chromium may coalesce moves during a drag. A failed gesture or host timeout releases held native input through an acknowledged helper reset. If release is unconfirmed, new mouse input stays blocked. Cleanup never turns the original partial or unknown action into success; that classification and the fresh-observation requirement remain in the existing host response. Check and uncheck select one activation method before acting. Visible controls and associated labels use pointer input. A non-interactable associated input with no visible activation path uses the existing DOM control action, honors disabled state, and verifies the result. Responses report the actual method (`native`, `cdp`, `dom`, or `unchanged`); no action retries through another method.
 
@@ -647,6 +652,8 @@ Every host-bound operation returns its primary result in `structuredContent.resp
 
 After a host-authorized takeover ends, a host-bound MCP call that names what it acts on (a URL, tab, window, selector, ref or script) runs and returns fresh page/capture feedback. Only input addressed to the focused element or the pointer (key and text input without a selector, clipboard copy and paste, accepting or dismissing a pending dialog, mouse button presses and releases, and moves, wheel, swipe or touch at points no image fences), and a Playwright program, which can send any of these, is refused once with `browser_observation_required` and that feedback instead; nothing is sent. A successful capture or native-proven absence of an active page clears that handoff requirement. Acquisition rotates the native `pageGeneration`, so image coordinates from before takeover remain stale (`browser_observation_stale`) even if the URL and geometry are unchanged. Element refs and a `frame` selection last as long as the document they were taken from: a ref, or a command that would act inside the selected frame, used after its tab navigated or reloaded or while another tab is shown is refused with `browser_observation_stale` before anything is done, as is a ref no snapshot lists. Ordinary page-stream CLI use keeps its existing behavior; in owned-window mode the same handoff rule applies to CLI input.
 
+The configuration's optional `theme` (`dark` or `light`) is the browser theme for every launch it makes. `AGENT_BROWSER_THEME` does not apply here, and the model-facing `open` tool has no `theme`. The descriptor lists `agent_browser_set_theme` with `"_meta": {"io.ambit/browser": {"caller": "host"}}`, a host operation the host calls itself and never offers to the model. It reaches the running daemon directly, so it starts no daemon, sends no launch settings, captures no feedback, and is admitted while a person holds control. Exactly the driver generations whose descriptor lists `agent_browser_set_theme` accept a configuration with `theme`; earlier ones reject it as an unknown field.
+
 
 Starts a Model Context Protocol server over stdio. MCP clients launch this command as a subprocess and exchange newline-delimited JSON-RPC on stdin and stdout. The server defaults to MCP protocol 2025-11-25 and accepts older supported client protocol versions during initialization.
 
@@ -660,7 +667,7 @@ Profiles:
 - `debug` — Console/errors, tracing, profiling, recording, a11y audit, clipboard, plugins, doctor, dashboard, install, upgrade, chat, diff, batch, confirm/deny
 - `tabs` — Back/forward/reload, tabs, windows, frames, dialogs
 - `react` — React tree/inspect/renders/suspense, vitals, pushstate
-- `mobile` — Viewport/device/geolocation/media, touch, swipe, mouse, keyboard
+- `mobile` — Viewport/device/geolocation/media, browser theme, touch, swipe, mouse, keyboard
 - `all` — Every MCP tool, including the full typed CLI parity surface
 
 Common tools include:
@@ -1099,6 +1106,7 @@ This is useful for multimodal AI models that can reason about visual layout, unl
 | `--pin-tab` | Pin the session to its bound tab; fail with `tab_gone` instead of falling back to another tab (or `AGENT_BROWSER_PIN_TAB` env) |
 | `--no-pin-tab` | Disable a sticky pin previously enabled with `--pin-tab` |
 | `--color-scheme <scheme>` | Color scheme: `dark`, `light`, `no-preference` (or `AGENT_BROWSER_COLOR_SCHEME` env) |
+| `--theme <dark\|light>` | Browser theme at launch: Chrome's own window UI and every page's `prefers-color-scheme` (or `AGENT_BROWSER_THEME` env) |
 | `--download-path <path>` | Default download directory (or `AGENT_BROWSER_DOWNLOAD_PATH` env) |
 | `--content-boundaries` | Wrap page output in boundary markers for LLM safety (or `AGENT_BROWSER_CONTENT_BOUNDARIES` env) |
 | `--max-output <chars>` | Truncate page output to N characters (or `AGENT_BROWSER_MAX_OUTPUT` env) |

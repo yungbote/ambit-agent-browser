@@ -10,6 +10,7 @@ use std::time::Duration;
 
 use super::discovery::discover_cdp_url;
 use crate::ca_bundle::CaBundle;
+use crate::native::theme::Theme;
 
 pub struct ChromeProcess {
     child: Child,
@@ -99,7 +100,8 @@ impl ChromeProcess {
 
     /// Options that relaunch this browser exactly: its executable and flags,
     /// its own profile, CA trust and private display, reopening its last
-    /// session. Callers choose only whether DevTools is open.
+    /// session. Callers choose whether DevTools is open, and stamp the
+    /// session's current theme, which may have changed since this launch.
     pub(crate) fn relaunch_options(&self) -> Result<LaunchOptions, String> {
         let executable = self
             .executable
@@ -443,6 +445,10 @@ pub struct LaunchOptions {
     pub(crate) prepared_nss_home: Option<PreparedNssHome>,
     pub(crate) retained_profile: Option<RetainedChromeProfile>,
     pub color_scheme: Option<String>,
+    /// The session theme at this launch, which draws a headed window's own UI
+    /// (see `crate::native::theme`). Session state, not launch configuration:
+    /// a theme change never relaunches the browser.
+    pub theme: Option<Theme>,
     pub download_path: Option<String>,
     /// Hide native scrollbars in headless Chromium screenshots by launching
     /// Chrome with `--hide-scrollbars`.
@@ -527,6 +533,7 @@ impl Default for LaunchOptions {
             prepared_nss_home: None,
             retained_profile: None,
             color_scheme: None,
+            theme: None,
             download_path: None,
             hide_scrollbars: true,
             viewport_size: None,
@@ -743,6 +750,13 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
     }
 
     let effectively_headless = options.effectively_headless();
+
+    if let Some(switch) = options
+        .theme
+        .and_then(|theme| theme.chrome_switch(effectively_headless))
+    {
+        args.push(switch.to_string());
+    }
 
     // Extensions require headed mode in native Chrome (content scripts are not
     // injected in headless mode).  Skip --headless when extensions are loaded.
@@ -2860,6 +2874,64 @@ mod tests {
             .args
             .iter()
             .any(|arg| arg == "about:blank"));
+    }
+
+    /// The measured window-UI switch: only a dark theme in a browser with a
+    /// window of its own, never headless and never for light.
+    #[test]
+    fn theme_switch_is_derived_for_dark_headed_launches_only() {
+        let force_dark = |options: &LaunchOptions| {
+            let args = build_chrome_args(options).unwrap();
+            if let Some(dir) = args.temp_user_data_dir {
+                let _ = std::fs::remove_dir_all(dir);
+            }
+            args.args.iter().any(|arg| arg == "--force-dark-mode")
+        };
+        let dark = Some(Theme::Dark);
+        for (options, expected) in [
+            (
+                LaunchOptions {
+                    headless: false,
+                    theme: dark,
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                LaunchOptions {
+                    window_stream: true,
+                    theme: dark,
+                    ..Default::default()
+                },
+                true,
+            ),
+            (
+                LaunchOptions {
+                    headless: true,
+                    theme: dark,
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                LaunchOptions {
+                    headless: false,
+                    theme: Some(Theme::Light),
+                    ..Default::default()
+                },
+                false,
+            ),
+            (
+                LaunchOptions {
+                    headless: false,
+                    theme: None,
+                    ..Default::default()
+                },
+                false,
+            ),
+        ] {
+            assert_eq!(force_dark(&options), expected, "{:?}", options.theme);
+        }
     }
 
     #[test]

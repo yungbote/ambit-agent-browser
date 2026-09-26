@@ -55,6 +55,19 @@ impl Fixture {
         Process(Some(self.command(args).spawn().unwrap())).finish()
     }
 
+    fn run_with_stdin(&self, args: &[&str], stdin: &str) -> Output {
+        let mut command = self.command(args);
+        command.stdin(Stdio::piped());
+        let mut child = command.spawn().unwrap();
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(stdin.as_bytes())
+            .unwrap();
+        Process(Some(child)).finish()
+    }
+
     fn start(&self, args: &[&str]) -> Process {
         let mut command = self.command(args);
         command.arg("daemon");
@@ -87,6 +100,24 @@ impl Fixture {
     fn assert_clean(&self) {
         for extension in ["sock", "pid", "config", "version", "stream", "supervised"] {
             assert!(!self.path(extension).exists(), "leftover {extension}");
+        }
+    }
+}
+
+impl Drop for Fixture {
+    /// A daemon a failing test left running is stopped, and closes its
+    /// browser, rather than outliving the test.
+    fn drop(&mut self) {
+        let Some(pid) = fs::read_to_string(self.path("pid"))
+            .ok()
+            .and_then(|pid| pid.trim().parse::<i32>().ok())
+        else {
+            return;
+        };
+        let ours = fs::read(format!("/proc/{pid}/cmdline"))
+            .is_ok_and(|cmdline| cmdline.split(|byte| *byte == 0).next() == Some(BIN.as_bytes()));
+        if ours {
+            unsafe { libc::kill(pid, libc::SIGTERM) };
         }
     }
 }
@@ -253,6 +284,154 @@ fn absent_required_daemon_never_creates_session_files() {
         fixture.assert_clean();
         assert!(!fixture.path("lock").exists());
     }
+}
+
+/// A theme change reaches a session that is already running and nothing
+/// else: without one, no daemon starts; with one, the client sends exactly
+/// set_theme, never the launch its flags would otherwise send first.
+#[test]
+fn set_theme_never_starts_a_daemon_or_sends_a_launch() {
+    let fixture = Fixture::new();
+    // An invalid theme from any source is refused before anything is sent.
+    let invalid = fixture.run(&["--json", "--theme", "blue", "set", "theme", "light"]);
+    assert!(!invalid.status.success(), "{invalid:?}");
+    assert_eq!(response(&invalid)["type"], "invalid_value");
+    fixture.assert_clean();
+
+    let args = [
+        "--json", "--headed", "--theme", "dark", "set", "theme", "light",
+    ];
+    let output = fixture.run(&args);
+    assert!(!output.status.success(), "{output:?}");
+    let refused = response(&output);
+    assert_eq!(refused["code"], "browser_runtime_unavailable", "{refused}");
+    assert!(refused["error"]
+        .as_str()
+        .unwrap()
+        .contains("No browser session 'supervised' is running"));
+    fixture.assert_clean();
+    assert!(!fixture.path("lock").exists());
+
+    let listener = UnixListener::bind(fixture.path("sock")).unwrap();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut line = String::new();
+            // A liveness probe connects and sends nothing.
+            if BufReader::new(&stream).read_line(&mut line).unwrap_or(0) == 0 {
+                continue;
+            }
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let reply = serde_json::json!({ "id": request["id"], "success": true,
+                "data": { "theme": "light", "pages": "next_launch", "ui": "next_launch" } });
+            writeln!(stream, "{reply}").unwrap();
+            requests.push(request);
+            return requests;
+        }
+        requests
+    });
+    let output = fixture.run(&args);
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(response(&output)["data"]["theme"], "light");
+    let requests = server.join().unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["action"], "set_theme");
+    assert_eq!(requests[0]["theme"], "light");
+}
+
+/// A batch of theme changes starts nothing either, with its commands given
+/// as arguments or on stdin as the MCP batch tool sends them: without a
+/// running session no daemon starts, and a running one receives exactly the
+/// theme changes, never the launch the flags would otherwise send first.
+#[test]
+fn a_batch_of_theme_changes_never_starts_a_daemon_or_sends_a_launch() {
+    let fixture = Fixture::new();
+    let flags = ["--json", "--headed", "--theme", "dark"];
+    let batch = |fixture: &Fixture| {
+        [
+            fixture.run(&[&flags[..], &["batch", "set theme light"]].concat()),
+            fixture.run_with_stdin(
+                &[&flags[..], &["batch"]].concat(),
+                r#"[["set", "theme", "light"]]"#,
+            ),
+        ]
+    };
+    for output in batch(&fixture) {
+        assert!(!output.status.success(), "{output:?}");
+        let results = response(&output);
+        assert_eq!(
+            results[0]["code"], "browser_runtime_unavailable",
+            "{results}"
+        );
+        fixture.assert_clean();
+        assert!(!fixture.path("lock").exists());
+    }
+
+    let listener = UnixListener::bind(fixture.path("sock")).unwrap();
+    let server = thread::spawn(move || {
+        let mut requests = Vec::new();
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            let mut line = String::new();
+            // A liveness probe connects and sends nothing.
+            if BufReader::new(&stream).read_line(&mut line).unwrap_or(0) == 0 {
+                continue;
+            }
+            let request: Value = serde_json::from_str(&line).unwrap();
+            let reply = serde_json::json!({ "id": request["id"], "success": true,
+                "data": { "theme": "light", "pages": "live", "ui": "next_launch" } });
+            writeln!(stream, "{reply}").unwrap();
+            requests.push(request);
+            if requests.len() == 2 {
+                return requests;
+            }
+        }
+        requests
+    });
+    for output in batch(&fixture) {
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(response(&output)[0]["result"]["pages"], "live");
+    }
+    let requests = server.join().unwrap();
+    assert_eq!(
+        requests
+            .iter()
+            .map(|request| &request["action"])
+            .collect::<Vec<_>>(),
+        ["set_theme", "set_theme"]
+    );
+}
+
+/// A batch parses each of its commands once, so a command that reads stdin
+/// while it parses gets it in a batch as alone, also where it is the command
+/// that decides the batch needs a daemon. The daemon starts in the
+/// background, so a failure still stops it, and it closes its browser.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires isolated Chrome runtime; set AGENT_BROWSER_TEST_CHROME"]
+fn a_batch_command_that_reads_stdin_gets_it() {
+    let chrome = std::env::var("AGENT_BROWSER_TEST_CHROME")
+        .expect("set AGENT_BROWSER_TEST_CHROME inside an isolated runtime");
+    let fixture = Fixture::new();
+    fixture.config(
+        &serde_json::json!({
+            "executablePath": chrome,
+            "profile": fixture.0.path().join("profile"),
+        })
+        .to_string(),
+    );
+    let opened = fixture.run(&["--json", "open", "data:text/html,<title>Ready</title>"]);
+    assert!(opened.status.success(), "Chrome launch failed: {opened:?}");
+    let batch = fixture.run_with_stdin(&["--json", "batch", "eval --stdin"], "document.title");
+    assert!(batch.status.success(), "{batch:?}");
+    assert_eq!(
+        response(&batch)[0]["result"]["result"],
+        "Ready",
+        "{batch:?}"
+    );
+    let closed = fixture.run(&["--json", "close"]);
+    assert!(closed.status.success(), "{closed:?}");
 }
 
 #[test]

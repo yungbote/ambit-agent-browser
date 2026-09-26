@@ -309,7 +309,7 @@ agent-browser tab close t2             # close tab t2
 
 Stable `tabId`s mean `t2` points at the same tab across commands even when other tabs open or close. After switching, refs from a prior snapshot on a different tab no longer apply — re-snapshot. `tab list --json` also reports each tab's CDP `targetId`, accepted anywhere a tab ref is accepted; target ids stay stable across daemon restarts, unlike `t<N>` ids. A tab ref that names no open tab fails with `tab_not_found`, and its `data.tabs` lists the open tabs, so pick one from there instead of running `tab list`.
 
-Tabs opened through `tab new` or `click --new-tab` inherit the session's user agent, headers, HTTP credentials, init scripts, routes, and emulation overrides before their first document loads.
+Tabs opened through `tab new`, `window new` or `click --new-tab` inherit the session's user agent, headers, HTTP credentials, init scripts, routes, emulation overrides, and browser theme before their first document loads. Tabs a person opens and popups get the same setup when the session discovers them.
 
 Runtime init-script identifiers are session-wide. Removing one clears it from every open tab where it was registered and from the setup replayed into future tabs.
 
@@ -466,6 +466,7 @@ EOF
 --session <name>        # isolated browser session
 --json                  # JSON output (for machine parsing)
 --headed                # show the window (default is headless)
+--theme <dark|light>    # browser theme at launch: window UI and pages; set theme changes a running session
 --webgpu                # enable WebGPU (software Vulkan on Linux, no GPU needed)
 --auto-connect          # connect to an already-running Chrome
 --cdp <port|url>        # connect to a CDP port or WebSocket URL; root query slash is optional

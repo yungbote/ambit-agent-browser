@@ -4,9 +4,10 @@
 
 use super::*;
 use crate::commands::parse_command_with_input;
-use crate::connection::{ensure_daemon, send_command_detailed, Response};
+use crate::connection::{ensure_daemon, send_command_detailed, send_command_if_running, Response};
 use crate::flags::{apply_cli_flags, parse_flags_from_config, Config, Flags};
 use crate::native::feedback::{ObservationId, MAX_CALL_MS, REQUEST_FIELD};
+use crate::native::theme::Theme;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
@@ -29,6 +30,13 @@ const HOST_ARGUMENTS: &[&str] = &[
     "requireSandbox",
     "extraArgs",
 ];
+
+/// Host operations: tools the host calls itself and never offers to the
+/// model, marked `"caller": "host"` in the descriptor. Each acts on the
+/// running session as it is: it never starts a daemon or sends launch
+/// settings, and it is neither agent input nor an observation, so it
+/// captures no host feedback.
+const HOST_OPERATIONS: &[&str] = &[TOOL_SET_THEME];
 
 /// Process discovery, supervisor configuration, dependency installation and
 /// cross-session commands belong to the host. Browser auth and state stay in
@@ -78,7 +86,8 @@ pub(super) fn tools() -> Vec<Value> {
             properties.remove(*key);
         }
         if name == TOOL_OPEN {
-            for key in ["headed", "webgpu", "webmcp"] {
+            // The host decides these through its configuration.
+            for key in ["headed", "webgpu", "webmcp", "theme"] {
                 properties.remove(key);
             }
         }
@@ -91,6 +100,9 @@ pub(super) fn tools() -> Vec<Value> {
                 "coordinateSpace": "viewport-css",
                 "coordinateArguments": [{ "x": "/x", "y": "/y" }]
             }});
+        }
+        if HOST_OPERATIONS.contains(&name.as_str()) {
+            tool["_meta"] = json!({ "io.ambit/browser": { "caller": "host" } });
         }
     }
     tools.sort_by(|left, right| left["name"].as_str().cmp(&right["name"].as_str()));
@@ -123,6 +135,10 @@ struct HostConfig {
     semantic_judgement_config_path: Option<PathBuf>,
     semantic_judgement_client_module_path: Option<PathBuf>,
     node_network_bootstrap_path: Option<PathBuf>,
+    /// The person's theme for every launch this configuration makes. Admitted
+    /// exactly by the driver generations whose descriptor lists the theme
+    /// operation.
+    theme: Option<Theme>,
 }
 
 #[derive(Debug, Clone)]
@@ -168,6 +184,8 @@ impl HostBinding {
         flags.session = config.session.clone();
         flags.require_sandbox = true;
         flags.json = true;
+        // The configuration is the only theme source here, env included.
+        flags.theme = config.theme.map(|theme| theme.as_str().to_string());
         if flags.cdp.is_some() || flags.auto_connect || flags.provider.is_some() {
             return Err("Host-bound browser sessions require a locally owned browser.".into());
         }
@@ -207,6 +225,9 @@ impl HostBinding {
             invocation.stdin_body.as_deref(),
         )
         .map_err(|error| ProtocolError::invalid_params(error.format()))?;
+        if HOST_OPERATIONS.contains(&name) {
+            return Ok(result(send_command_if_running(command, &flags.session)));
+        }
         crate::attach_plugins_to_command(&mut command, &flags.plugins);
         crate::attach_pin_tab_to_command(&mut command, &flags);
         crate::attach_restore_config_to_command(&mut command, &flags);
@@ -231,23 +252,10 @@ impl HostBinding {
             "session": self.config.session, "captureDirectory": self.config.capture_directory,
             "timeoutMs": invocation.timeout_ms, "expectedObservation": self.config.expected_observation,
             "launch": launch });
-        Ok(result(send(command, &flags.session)))
+        Ok(result(
+            send_command_detailed(command, &flags.session).unwrap_or_else(Response::from),
+        ))
     }
-}
-
-fn send(command: Value, session: &str) -> Response {
-    send_command_detailed(command, session).unwrap_or_else(|error| Response {
-        error: Some(error.message),
-        code: Some(
-            if error.outcome_unknown {
-                "command_outcome_unknown"
-            } else {
-                "browser_runtime_unavailable"
-            }
-            .into(),
-        ),
-        ..Response::default()
-    })
 }
 
 fn result(mut response: Response) -> Value {
@@ -414,6 +422,83 @@ mod tests {
             "targetId": "T", "loaderId": "L", "pageGeneration": "G", "geometrySha256": "sha256:0",
         } });
         assert!(!held(&command), "{command}");
+    }
+
+    /// The theme belongs to the host: no model-visible schema carries it, the
+    /// theme operation is marked for the host alone, and the configuration
+    /// admits a theme exactly when the descriptor lists that operation.
+    #[test]
+    fn theme_is_a_host_operation_and_host_configuration() {
+        let tools = tools();
+        assert_eq!(tools.len(), 131);
+        let set_theme = tools
+            .iter()
+            .find(|tool| tool["name"] == TOOL_SET_THEME)
+            .unwrap();
+        assert_eq!(set_theme["title"], "Set theme");
+        assert_eq!(
+            set_theme["description"],
+            "Set the browser theme: Chrome's own window UI and every page's prefers-color-scheme. Pages switch now; the window UI follows at the next launch."
+        );
+        let schema = &set_theme["inputSchema"];
+        assert_eq!(
+            schema["properties"]["theme"],
+            json!({ "type": "string", "enum": ["dark", "light"] })
+        );
+        assert_eq!(schema["required"], json!(["theme"]));
+        assert_eq!(
+            schema["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            ["theme", "timeoutMs"]
+        );
+        for tool in &tools {
+            let host_only = tool["_meta"]["io.ambit/browser"]["caller"] == "host";
+            assert_eq!(
+                host_only,
+                HOST_OPERATIONS.contains(&tool["name"].as_str().unwrap()),
+                "{}",
+                tool["name"]
+            );
+            if !host_only {
+                assert!(
+                    tool["inputSchema"]["properties"].get("theme").is_none(),
+                    "{}",
+                    tool["name"]
+                );
+            }
+        }
+        assert_eq!(
+            set_theme["_meta"],
+            json!({ "io.ambit/browser": { "caller": "host" } })
+        );
+
+        let config = |extra: Value| {
+            let mut config = json!({ "version": 1, "namespace": "host", "session": "browser",
+                "requireSandbox": true, "captureDirectory": "/" });
+            config
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            serde_json::from_value::<HostConfig>(config)
+        };
+        assert_eq!(config(json!({})).unwrap().theme, None);
+        assert_eq!(
+            config(json!({ "theme": "dark" })).unwrap().theme,
+            Some(Theme::Dark)
+        );
+        assert_eq!(
+            config(json!({ "theme": "light" })).unwrap().theme,
+            Some(Theme::Light)
+        );
+        assert!(config(json!({ "theme": "system" })).is_err());
+        assert!(config(json!({ "colorScheme": "dark" })).is_err());
+        assert_eq!(
+            tools.iter().any(|tool| tool["name"] == TOOL_SET_THEME),
+            config(json!({ "theme": "dark" })).is_ok()
+        );
     }
 
     #[test]

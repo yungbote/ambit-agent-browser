@@ -1185,6 +1185,39 @@ pub(crate) struct CommandFailure {
     pub message: String,
 }
 
+impl From<CommandFailure> for Response {
+    /// A command that did not complete, coded for its caller: once sent its
+    /// outcome is unknown; otherwise the browser runtime was unavailable.
+    fn from(failure: CommandFailure) -> Self {
+        let code = if failure.outcome_unknown {
+            "command_outcome_unknown"
+        } else {
+            "browser_runtime_unavailable"
+        };
+        Response {
+            error: Some(failure.message),
+            code: Some(code.into()),
+            ..Response::default()
+        }
+    }
+}
+
+/// Deliver `cmd` to the session's daemon only if one is already running. It
+/// never starts, restarts or replaces a daemon, whatever its configuration;
+/// with none running, nothing is sent. A failure is the response's own code.
+pub(crate) fn send_command_if_running(cmd: Value, session: &str) -> Response {
+    if !daemon_ready(session) {
+        return Response::from(CommandFailure {
+            outcome_unknown: false,
+            message: format!(
+                "No browser session '{}' is running. Nothing was changed.",
+                session
+            ),
+        });
+    }
+    send_command_detailed(cmd, session).unwrap_or_else(Response::from)
+}
+
 pub(crate) fn send_command_detailed(cmd: Value, session: &str) -> Result<Response, CommandFailure> {
     const MAX_CONNECT_ATTEMPTS: u32 = 5;
     const RETRY_DELAY_MS: u64 = 200;

@@ -260,9 +260,7 @@ fn build_local_launch_command(flags: &Flags) -> serde_json::Value {
     // on daemons spawned before the change.
     launch_cmd["noXvfb"] = json!(flags.no_xvfb);
 
-    if let Some(ref cs) = flags.color_scheme {
-        launch_cmd["colorScheme"] = json!(cs);
-    }
+    attach_appearance_to_launch_command(&mut launch_cmd, flags);
 
     if let Some(ref dp) = flags.download_path {
         launch_cmd["downloadPath"] = json!(dp);
@@ -309,6 +307,81 @@ fn attach_webmcp_launch_option(launch_cmd: &mut serde_json::Value, flags: &Flags
     }
 }
 
+/// The appearance a launch carries: pages' `--color-scheme` and the browser
+/// theme. The daemon applies both only when a browser actually launches.
+fn attach_appearance_to_launch_command(launch_cmd: &mut serde_json::Value, flags: &Flags) {
+    if let Some(ref scheme) = flags.color_scheme {
+        launch_cmd["colorScheme"] = json!(scheme);
+    }
+    if let Some(ref theme) = flags.theme {
+        launch_cmd["theme"] = json!(theme);
+    }
+}
+
+/// A command for a session that is already running, such as a theme change:
+/// it never starts a daemon or sends the launch settings a first command
+/// would, in a batch too.
+fn addresses_running_session(cmd: &serde_json::Value) -> bool {
+    cmd["action"] == native::theme::ACTION
+}
+
+/// One command of a batch, parsed once: a command may read stdin while it
+/// parses (`eval --stdin`), so nothing parses it again.
+struct BatchCommand {
+    /// Its place among the batch's commands, counting from one.
+    number: usize,
+    words: Vec<String>,
+    parsed: Result<serde_json::Value, ParseError>,
+}
+
+/// A batch's commands, each parsed once, blank ones left out. The daemon runs
+/// as a standalone foreground process, never from a batch.
+fn parse_batch(commands: Vec<Vec<String>>, flags: &Flags) -> Vec<BatchCommand> {
+    commands
+        .into_iter()
+        .enumerate()
+        .filter(|(_, words)| !words.is_empty())
+        .map(|(index, words)| {
+            let parsed = parse_command(&words, flags).and_then(|command| {
+                if command["action"] == "daemon" {
+                    Err(ParseError::InvalidValue {
+                        message: "daemon must run as a standalone foreground process".to_string(),
+                        usage: "[options] daemon",
+                    })
+                } else {
+                    Ok(command)
+                }
+            });
+            BatchCommand {
+                number: index + 1,
+                words,
+                parsed,
+            }
+        })
+        .collect()
+}
+
+/// Whether a batch needs a daemon: one of its commands does. A command for a
+/// running session never starts one, and a command that does not parse sends
+/// nothing, so a batch of theme changes starts nothing, as each alone would.
+fn batch_needs_daemon(batch: &[BatchCommand]) -> bool {
+    batch.iter().any(|command| {
+        command
+            .parsed
+            .as_ref()
+            .is_ok_and(|command| !addresses_running_session(command))
+    })
+}
+
+/// A theme from the flag, environment or config that is not dark or light.
+fn invalid_theme_error(flags: &Flags) -> Option<String> {
+    flags
+        .theme
+        .as_deref()
+        .filter(|theme| native::theme::Theme::parse(theme).is_none())
+        .map(|theme| format!("Invalid theme '{}'. Use dark or light.", theme))
+}
+
 fn attach_allowed_domains_to_launch_command(launch_cmd: &mut serde_json::Value, flags: &Flags) {
     if let Some(ref domains) = flags.allowed_domains {
         launch_cmd["allowedDomains"] = json!(domains);
@@ -351,9 +424,7 @@ fn build_provider_launch_command(provider: &str, flags: &Flags) -> serde_json::V
     attach_restore_config_to_command(&mut launch_cmd, flags);
     attach_ca_cert_to_launch_command(&mut launch_cmd, flags);
 
-    if let Some(ref cs) = flags.color_scheme {
-        launch_cmd["colorScheme"] = json!(cs);
-    }
+    attach_appearance_to_launch_command(&mut launch_cmd, flags);
 
     launch_cmd
 }
@@ -483,6 +554,7 @@ fn should_send_local_launch_config(flags: &Flags, command: &serde_json::Value) -
         || flags.no_webmcp
         || flags.cli_no_webmcp
         || flags.color_scheme.is_some()
+        || flags.theme.is_some()
         || flags.download_path.is_some()
         || flags.engine.is_some()
         || flags.allowed_domains.is_some()
@@ -1892,6 +1964,40 @@ fn main() {
         return;
     }
 
+    if let Some(msg) = invalid_theme_error(&flags) {
+        if flags.json {
+            print_json_error_with_type(msg, "invalid_value");
+        } else {
+            eprintln!("{} {}", color::error_indicator(), msg);
+        }
+        exit(1);
+    }
+
+    if addresses_running_session(&cmd) {
+        let action = cmd["action"].as_str().map(str::to_string);
+        let resp = connection::send_command_if_running(cmd, &flags.session);
+        print_response_with_opts(&resp, action.as_deref(), &OutputOptions::from_flags(&flags));
+        if !resp.success {
+            exit(1);
+        }
+        return;
+    }
+
+    // A batch's commands are read and parsed once, before anything starts, so
+    // a batch that needs no daemon starts none and sends no launch settings.
+    let batch =
+        (cmd["action"] == "batch").then(|| parse_batch(batch_commands(&cmd, &flags), &flags));
+    let bail = cmd["bail"].as_bool().unwrap_or(false);
+    let batch = match batch {
+        Some(batch) if !batch_needs_daemon(&batch) => {
+            run_batch(&flags, bail, batch, |command| {
+                Ok(connection::send_command_if_running(command, &flags.session))
+            });
+            return;
+        }
+        batch => batch,
+    };
+
     if let Some(msg) = incompatible_launch_mode_error(&flags) {
         if flags.json {
             print_json_error(msg);
@@ -1968,9 +2074,7 @@ fn main() {
 
         attach_ca_cert_to_launch_command(&mut launch_cmd, &flags);
 
-        if let Some(ref cs) = flags.color_scheme {
-            launch_cmd["colorScheme"] = json!(cs);
-        }
+        attach_appearance_to_launch_command(&mut launch_cmd, &flags);
 
         if let Some(ref dp) = flags.download_path {
             launch_cmd["downloadPath"] = json!(dp);
@@ -2059,9 +2163,7 @@ fn main() {
 
         attach_ca_cert_to_launch_command(&mut launch_cmd, &flags);
 
-        if let Some(ref cs) = flags.color_scheme {
-            launch_cmd["colorScheme"] = json!(cs);
-        }
+        attach_appearance_to_launch_command(&mut launch_cmd, &flags);
 
         if let Some(ref dp) = flags.download_path {
             launch_cmd["downloadPath"] = json!(dp);
@@ -2102,16 +2204,14 @@ fn main() {
         }
     }
 
-    // Handle batch command: from args or stdin
-    if cmd.get("action").and_then(|v| v.as_str()) == Some("batch") {
-        let bail = cmd.get("bail").and_then(|v| v.as_bool()).unwrap_or(false);
-        let arg_commands = cmd.get("commands").and_then(|v| v.as_array()).map(|arr| {
-            arr.iter()
-                .filter_map(|v| v.as_str())
-                .map(commands::shell_words_split)
-                .collect::<Vec<Vec<String>>>()
+    if let Some(batch) = batch {
+        run_batch(&flags, bail, batch, |command| {
+            if addresses_running_session(&command) {
+                Ok(connection::send_command_if_running(command, &flags.session))
+            } else {
+                send_command_with_respawn(command, &flags.session, &daemon_opts)
+            }
         });
-        run_batch(&flags, &daemon_opts, bail, arg_commands);
         return;
     }
 
@@ -2173,48 +2273,56 @@ fn send_command_with_respawn(
     }
 }
 
-fn run_batch(
-    flags: &Flags,
-    daemon_opts: &DaemonOptions,
-    bail: bool,
-    arg_commands: Option<Vec<Vec<String>>>,
-) {
-    let commands: Vec<Vec<String>> = if let Some(cmds) = arg_commands {
-        cmds
-    } else {
-        use std::io::Read as _;
+/// A batch's commands: its arguments, or else a JSON array of string arrays
+/// on stdin. Unreadable input ends the process with its error.
+fn batch_commands(cmd: &serde_json::Value, flags: &Flags) -> Vec<Vec<String>> {
+    use std::io::Read as _;
 
-        let mut input = String::new();
-        if let Err(e) = std::io::stdin().read_to_string(&mut input) {
+    if let Some(commands) = cmd["commands"].as_array() {
+        return commands
+            .iter()
+            .filter_map(|command| command.as_str())
+            .map(commands::shell_words_split)
+            .collect();
+    }
+    let mut input = String::new();
+    if let Err(e) = std::io::stdin().read_to_string(&mut input) {
+        if flags.json {
+            print_json_error(format!("Failed to read stdin: {}", e));
+        } else {
+            eprintln!("{} Failed to read stdin: {}", color::error_indicator(), e);
+        }
+        exit(1);
+    }
+    match serde_json::from_str(&input) {
+        Ok(commands) => commands,
+        Err(e) => {
             if flags.json {
-                print_json_error(format!("Failed to read stdin: {}", e));
+                print_json_error(format!(
+                    "Invalid JSON input: {}. Expected an array of string arrays, e.g. [[\"open\", \"https://example.com\"], [\"snapshot\"]]",
+                    e
+                ));
             } else {
-                eprintln!("{} Failed to read stdin: {}", color::error_indicator(), e);
+                eprintln!(
+                    "{} Invalid JSON input: {}. Expected an array of string arrays.",
+                    color::error_indicator(),
+                    e
+                );
             }
             exit(1);
         }
+    }
+}
 
-        match serde_json::from_str(&input) {
-            Ok(c) => c,
-            Err(e) => {
-                if flags.json {
-                    print_json_error(format!(
-                        "Invalid JSON input: {}. Expected an array of string arrays, e.g. [[\"open\", \"https://example.com\"], [\"snapshot\"]]",
-                        e
-                    ));
-                } else {
-                    eprintln!(
-                        "{} Invalid JSON input: {}. Expected an array of string arrays.",
-                        color::error_indicator(),
-                        e
-                    );
-                }
-                exit(1);
-            }
-        }
-    };
-
-    if commands.is_empty() {
+/// Runs a batch's parsed commands in order, each delivered by `deliver`, and
+/// prints their results.
+fn run_batch(
+    flags: &Flags,
+    bail: bool,
+    batch: Vec<BatchCommand>,
+    mut deliver: impl FnMut(serde_json::Value) -> Result<Response, String>,
+) {
+    if batch.is_empty() {
         if flags.json {
             println!("[]");
         }
@@ -2226,27 +2334,19 @@ fn run_batch(
     let mut results: Vec<serde_json::Value> = Vec::new();
     let mut had_error = false;
 
-    for (i, cmd_args) in commands.iter().enumerate() {
-        if cmd_args.is_empty() {
-            continue;
-        }
-
-        let mut parsed = match parse_command(cmd_args, flags).and_then(|command| {
-            if command.get("action").and_then(serde_json::Value::as_str) == Some("daemon") {
-                Err(ParseError::InvalidValue {
-                    message: "daemon must run as a standalone foreground process".to_string(),
-                    usage: "[options] daemon",
-                })
-            } else {
-                Ok(command)
-            }
-        }) {
+    for BatchCommand {
+        number,
+        words,
+        parsed,
+    } in batch
+    {
+        let mut parsed = match parsed {
             Ok(c) => c,
             Err(e) => {
                 had_error = true;
                 if flags.json {
                     results.push(json!({
-                        "command": cmd_args,
+                        "command": words,
                         "success": false,
                         "error": e.format(),
                     }));
@@ -2257,7 +2357,7 @@ fn run_batch(
                     eprintln!(
                         "{} Command {}: {}",
                         color::error_indicator(),
-                        i + 1,
+                        number,
                         e.format()
                     );
                     if bail {
@@ -2277,11 +2377,11 @@ fn run_batch(
 
         attach_pin_tab_to_command(&mut parsed, flags);
 
-        match send_command_with_respawn(parsed, &flags.session, daemon_opts) {
+        match deliver(parsed) {
             Ok(resp) => {
                 if flags.json {
                     let mut result = json!({
-                        "command": cmd_args,
+                        "command": words,
                         "success": resp.success,
                         "result": resp.data,
                         "error": resp.error,
@@ -2300,7 +2400,7 @@ fn run_batch(
                     }
                     results.push(result);
                 } else {
-                    if i > 0 {
+                    if number > 1 {
                         println!();
                     }
                     print_response_with_opts(&resp, action.as_deref(), &output_opts);
@@ -2319,7 +2419,7 @@ fn run_batch(
                 had_error = true;
                 if flags.json {
                     results.push(json!({
-                        "command": cmd_args,
+                        "command": words,
                         "success": false,
                         "error": e.to_string(),
                     }));
@@ -2327,7 +2427,7 @@ fn run_batch(
                         break;
                     }
                 } else {
-                    eprintln!("{} Command {}: {}", color::error_indicator(), i + 1, e);
+                    eprintln!("{} Command {}: {}", color::error_indicator(), number, e);
                     if bail {
                         exit(1);
                     }
@@ -2531,6 +2631,7 @@ mod tests {
         flags.no_webmcp = false;
         flags.cli_no_webmcp = false;
         flags.color_scheme = None;
+        flags.theme = None;
         flags.download_path = None;
         flags.engine = None;
         flags.allowed_domains = None;
@@ -2727,6 +2828,46 @@ mod tests {
         let mut launch = json!({ "action": "launch" });
         attach_webmcp_launch_option(&mut launch, &flags);
         assert_eq!(launch["webmcp"], false);
+    }
+
+    #[test]
+    fn test_theme_rides_every_launch_command_and_requests_a_local_launch() {
+        let mut flags = neutral_launch_config_flags();
+        let command = json!({ "action": "snapshot" });
+        assert!(!should_send_local_launch_config(&flags, &command));
+        assert!(build_local_launch_command(&flags).get("theme").is_none());
+        flags.theme = Some("dark".into());
+        assert!(should_send_local_launch_config(&flags, &command));
+        assert_eq!(build_local_launch_command(&flags)["theme"], "dark");
+        assert_eq!(
+            build_provider_launch_command("browserbase", &flags)["theme"],
+            "dark"
+        );
+        assert_eq!(invalid_theme_error(&flags), None);
+        flags.theme = Some("system".into());
+        assert_eq!(
+            invalid_theme_error(&flags).as_deref(),
+            Some("Invalid theme 'system'. Use dark or light.")
+        );
+    }
+
+    #[test]
+    fn test_published_schemas_define_matching_theme() {
+        let repo_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("cli should have a repository parent");
+        let schema = |path: &str| -> serde_json::Value {
+            serde_json::from_str(&std::fs::read_to_string(repo_root.join(path)).unwrap()).unwrap()
+        };
+        let root = schema("agent-browser.schema.json");
+        assert_eq!(
+            root["properties"]["theme"]["enum"],
+            json!(["dark", "light"])
+        );
+        assert_eq!(
+            root["properties"]["theme"],
+            schema("docs/public/schema.json")["properties"]["theme"]
+        );
     }
 
     #[test]

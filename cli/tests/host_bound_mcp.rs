@@ -193,6 +193,7 @@ fn host_overrides_are_rejected_before_daemon_start() {
         json!({ "session": "outside" }),
         json!({ "extraArgs": ["--no-sandbox"] }),
         json!({ "headed": true }),
+        json!({ "theme": "dark" }),
         json!({ "timeoutMs": 120001 }),
     ] {
         let response = host.request(
@@ -202,6 +203,28 @@ fn host_overrides_are_rejected_before_daemon_start() {
         assert_eq!(response["error"]["code"], -32602, "{response}");
     }
     assert_eq!(fs::read_dir(host.path("sockets")).unwrap().count(), 0);
+}
+
+/// The theme operation acts on a running session only: with none it starts
+/// no daemon and captures nothing. The configuration's theme is validated
+/// when the host binding loads.
+#[test]
+fn host_theme_operation_starts_nothing_and_its_configuration_is_validated() {
+    let host = Host::new();
+    host.configure_with(json!({ "theme": "dark" }));
+    let result = host.call("agent_browser_set_theme", json!({ "theme": "light" }));
+    assert_eq!(result["isError"], true, "{result}");
+    assert_eq!(
+        result["structuredContent"]["response"]["code"],
+        "browser_runtime_unavailable"
+    );
+    assert!(result["structuredContent"]["browser"].is_null());
+    assert_eq!(fs::read_dir(host.path("sockets")).unwrap().count(), 0);
+
+    host.configure_with(json!({ "theme": "system" }));
+    let output = host.command().output().unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("Invalid host browser configuration"));
 }
 
 #[test]
@@ -475,6 +498,66 @@ fn host_playwright_program_uses_only_its_own_semantic_binding() {
         title["structuredContent"]["response"]["data"]["title"], "Escalated",
         "{title}"
     );
+    assert_eq!(
+        host.call("agent_browser_close", json!({}))["isError"],
+        false
+    );
+}
+
+/// The configured theme reaches pages at launch; while the person holds the
+/// browser the theme operation is admitted where agent operations are
+/// refused, switches pages at once, and leaves the observation the agent
+/// owes after the handoff pending.
+#[test]
+#[cfg(unix)]
+#[ignore = "requires AMBIT_TEST_CHROME_EXECUTABLE with working Chrome sandbox"]
+fn host_theme_launches_from_configuration_and_switches_under_person_control() {
+    let host = Host::new();
+    host.configure_with(json!({ "theme": "dark" }));
+    let scheme = |host: &Host| {
+        let result = host.call(
+            "agent_browser_eval",
+            json!({ "script": "matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light'" }),
+        );
+        assert_eq!(result["isError"], false, "{result}");
+        result["structuredContent"]["response"]["data"]["result"].clone()
+    };
+    let opened = host.call(
+        "agent_browser_open",
+        json!({ "url": "data:text/html,<button>Count</button>" }),
+    );
+    assert_eq!(opened["isError"], false, "{opened}");
+    assert_eq!(scheme(&host), "dark");
+
+    let owner = uuid::Uuid::new_v4().to_string();
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 25000;
+    host.control(json!({ "op": "acquire", "controllerId": owner, "expiresAt": expires }));
+    let blocked = host.call("agent_browser_click", json!({ "selector": "button" }));
+    assert_eq!(
+        blocked["structuredContent"]["response"]["code"],
+        "browser_controlled_by_user"
+    );
+    let switched = host.call("agent_browser_set_theme", json!({ "theme": "light" }));
+    assert_eq!(switched["isError"], false, "{switched}");
+    assert_eq!(
+        switched["structuredContent"]["response"]["data"],
+        json!({ "theme": "light", "pages": "live", "ui": "none" })
+    );
+    assert!(switched["structuredContent"]["browser"].is_null());
+    host.control(json!({ "op": "release", "controllerId": owner }));
+
+    let again = host.call("agent_browser_set_theme", json!({ "theme": "light" }));
+    assert_eq!(again["isError"], false, "{again}");
+    let owed = host.call("agent_browser_click", json!({ "selector": "button" }));
+    assert_eq!(
+        owed["structuredContent"]["response"]["code"],
+        "browser_observation_required"
+    );
+    assert_eq!(scheme(&host), "light");
     assert_eq!(
         host.call("agent_browser_close", json!({}))["isError"],
         false

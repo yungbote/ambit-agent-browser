@@ -4,6 +4,7 @@ use std::io::{self, BufRead, Read};
 
 use crate::color;
 use crate::flags::Flags;
+use crate::native::theme::{self, Theme};
 use crate::validation::{is_valid_session_name, session_name_error};
 
 /// Error type for command parsing with contextual information
@@ -3227,6 +3228,7 @@ fn parse_set(rest: &[&str], id: &str) -> Result<Value, ParseError> {
         "credentials",
         "auth",
         "media",
+        "theme",
     ];
 
     match rest.first().copied() {
@@ -3341,13 +3343,27 @@ fn parse_set(rest: &[&str], id: &str) -> Result<Value, ParseError> {
                 json!({ "id": id, "action": "emulatemedia", "colorScheme": color, "reducedMotion": reduced }),
             )
         }
+        Some("theme") => {
+            const USAGE: &str = "set theme <dark|light>";
+            let theme = rest.get(1).ok_or_else(|| ParseError::MissingArguments {
+                context: "set theme".to_string(),
+                usage: USAGE,
+            })?;
+            if Theme::parse(theme).is_none() {
+                return Err(ParseError::InvalidValue {
+                    message: format!("Invalid theme '{}'. Use dark or light.", theme),
+                    usage: USAGE,
+                });
+            }
+            Ok(json!({ "id": id, "action": theme::ACTION, "theme": theme }))
+        }
         Some(sub) => Err(ParseError::UnknownSubcommand {
             subcommand: sub.to_string(),
             valid_options: VALID,
         }),
         None => Err(ParseError::MissingArguments {
             context: "set".to_string(),
-            usage: "set <viewport|device|geo|offline|headers|credentials|media> [args...]",
+            usage: "set <viewport|device|geo|offline|headers|credentials|media|theme> [args...]",
         }),
     }
 }
@@ -3616,6 +3632,7 @@ mod tests {
             cli_pin_tab: false,
             annotate: false,
             color_scheme: None,
+            theme: None,
             download_path: None,
             content_boundaries: false,
             max_output: None,
@@ -5489,6 +5506,32 @@ mod tests {
         assert_eq!(cmd["action"], "emulatemedia");
         assert_eq!(cmd["colorScheme"], "dark");
         assert_eq!(cmd["reducedMotion"], "no-preference");
+    }
+
+    #[test]
+    fn test_set_theme() {
+        for theme in ["dark", "light"] {
+            let cmd =
+                parse_command(&args(&format!("set theme {theme}")), &default_flags()).unwrap();
+            assert_eq!(cmd["action"], "set_theme");
+            assert_eq!(cmd["theme"], theme);
+        }
+        for invalid in [
+            "set theme system",
+            "set theme no-preference",
+            "set theme Dark",
+        ] {
+            let error = parse_command(&args(invalid), &default_flags()).unwrap_err();
+            assert!(
+                matches!(error, ParseError::InvalidValue { .. }),
+                "{invalid}"
+            );
+            assert!(error.format().contains("set theme <dark|light>"));
+        }
+        assert!(matches!(
+            parse_command(&args("set theme"), &default_flags()).unwrap_err(),
+            ParseError::MissingArguments { .. }
+        ));
     }
 
     #[test]

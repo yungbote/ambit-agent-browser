@@ -45,6 +45,7 @@ use super::state;
 use super::storage;
 use super::stream::{self, IdleActivity, StreamServer};
 use super::tab_binding;
+use super::theme::{self, Theme};
 use super::tracing::{self as native_tracing, TracingState};
 use super::webdriver::appium::AppiumManager;
 use super::webdriver::backend::{BrowserBackend, WebDriverBackend, WEBDRIVER_UNSUPPORTED_ACTIONS};
@@ -476,11 +477,31 @@ fn apply_effective_ca_cert(
 
 /// Arguments of the last `Emulation.setEmulatedMedia` call, kept so the same
 /// emulation can be replayed onto a new page session.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct EmulatedMedia {
     pub media: Option<String>,
     /// `(name, value)` media features, e.g. `("prefers-color-scheme", "dark")`.
     pub features: Vec<(String, String)>,
+}
+
+impl EmulatedMedia {
+    /// The `Emulation.setEmulatedMedia` parameters for this emulation. Each
+    /// call replaces a page's whole emulated feature set.
+    pub(crate) fn params(&self) -> Value {
+        let mut params = json!({});
+        if let Some(ref media) = self.media {
+            params["media"] = Value::String(media.clone());
+        }
+        if !self.features.is_empty() {
+            params["features"] = Value::Array(
+                self.features
+                    .iter()
+                    .map(|(name, value)| json!({ "name": name, "value": value }))
+                    .collect(),
+            );
+        }
+        params
+    }
 }
 
 /// An init script tracked across target sessions.
@@ -691,6 +712,10 @@ pub struct DaemonState {
     /// Session-scoped setup applied to the active page, re-applied to tabs the
     /// daemon creates. See [`SessionSetup`].
     pub session_setup: SessionSetup,
+    /// The session theme: the last `set_theme`, or the theme the last launch
+    /// carried. It outlives browsers and is never launch configuration; pages
+    /// get it with the session setup (see [`theme`]).
+    pub(crate) theme: Option<Theme>,
     /// Init script sources returned by launch mutator plugins for this launch.
     pub plugin_init_scripts: Vec<String>,
     /// Provider cleanup metadata for the active external browser session.
@@ -847,6 +872,7 @@ impl DaemonState {
             viewport: None,
             window_page_error: None,
             session_setup: SessionSetup::default(),
+            theme: None,
             plugin_init_scripts: Vec::new(),
             active_provider_session: None,
             active_provider_connection: false,
@@ -1303,6 +1329,71 @@ impl DaemonState {
                 .unwrap_or_default();
     }
 
+    /// Adopt a page attachment the session did not ask for: a tab the person
+    /// opened, a popup, a page a navigation promoted, or a second session
+    /// Chrome attached to a page the daemon already holds. Containment comes
+    /// first, then the session setup a page new to the session gets (so a
+    /// paused page starts under it), then registration, and only then does
+    /// the page run. A page the daemon opened itself (`tab new`, `window new`,
+    /// `click --new-tab`, a launch, the page that replaces the last one) was
+    /// registered and given the session setup by the command that opened it;
+    /// its own attachment reaches this
+    /// drain too and must not get the setup again, or every init script
+    /// would run twice in it. `register_discovered_page` alone decides
+    /// activation: a pinned session never activates a discovered target
+    /// (that would steal the active tab and overwrite its binding); a legacy
+    /// session follows it.
+    ///
+    /// A containment failure is returned; a session setup failure is not,
+    /// since the page must not stay paused over emulation or scripts.
+    async fn adopt_discovered_page(
+        &mut self,
+        target: &TargetInfo,
+        session_id: &str,
+        filter: Option<&DomainFilter>,
+        has_proxy_creds: bool,
+    ) -> Result<(), String> {
+        let Some(mgr) = self.browser.as_ref() else {
+            return Ok(());
+        };
+        let new_to_session = !mgr.has_target(&target.target_id);
+        mgr.prepare_domains_pub(session_id).await?;
+        if filter.is_some() || has_proxy_creds {
+            install_network_controls_for_session(&mgr.client, session_id, filter, has_proxy_creds)
+                .await?;
+        }
+        let mut page_url = target.url.clone();
+        if filter.is_some_and(|filter| should_blank_existing_url(&page_url, filter)) {
+            let _ = mgr
+                .client
+                .send_command(
+                    "Page.navigate",
+                    Some(json!({ "url": "about:blank" })),
+                    Some(session_id),
+                )
+                .await;
+            page_url = "about:blank".to_string();
+        }
+        if new_to_session {
+            if let Err(error) = apply_session_setup(self, session_id).await {
+                eprintln!(
+                    "Warning: failed to apply the session setup to a discovered page: {error}"
+                );
+            }
+        }
+        let Some(mgr) = self.browser.as_mut() else {
+            return Ok(());
+        };
+        mgr.register_discovered_page(
+            &target.target_id,
+            session_id,
+            page_url,
+            target.title.clone(),
+            target.target_type.clone(),
+        );
+        mgr.resume_if_waiting_pub(session_id).await
+    }
+
     async fn apply_drained_events(&mut self, drained: DrainedEvents) -> Result<(), String> {
         // Popups and externally closed pages can change the active top-level
         // target without changing iframe topology. Refresh after either kind
@@ -1378,70 +1469,17 @@ impl DaemonState {
             }
         }
 
-        // Register top-level pages that browser-level auto-attach paused before
-        // their first request. Controls must be installed before resuming.
+        // Top-level pages that browser-level auto-attach paused before their
+        // first request (e.g. a tab the person opened, or a JS-opened popup):
+        // they run only once adopted.
         for (target_info, page_sid) in &drained.attached_page_sessions {
             let filter = self.domain_filter.read().await.clone();
             let has_proxy_creds = self.proxy_credentials.read().await.is_some();
-            let controls_active = filter.is_some() || has_proxy_creds;
-            let setup_result = if let Some(ref mut mgr) = self.browser {
-                async {
-                    mgr.prepare_domains_pub(page_sid).await?;
-                    if controls_active {
-                        install_network_controls_for_session(
-                            &mgr.client,
-                            page_sid,
-                            filter.as_ref(),
-                            has_proxy_creds,
-                        )
-                        .await?;
-                    }
-
-                    let mut page_url = target_info.url.clone();
-                    if let Some(ref filter) = filter {
-                        if should_blank_existing_url(&page_url, filter) {
-                            let _ = mgr
-                                .client
-                                .send_command(
-                                    "Page.navigate",
-                                    Some(json!({ "url": "about:blank" })),
-                                    Some(page_sid),
-                                )
-                                .await;
-                            page_url = "about:blank".to_string();
-                        }
-                    }
-
-                    // This handler drains `Target.attachedToTarget` for a
-                    // page that browser-level auto-attach discovered before
-                    // its own `Target.targetCreated` was drained (e.g. a
-                    // human-opened tab, or a JS-opened popup in the shared
-                    // Chrome). Explicit agent commands (`tab new`, `window
-                    // new`, `click --new-tab`) already register their own
-                    // page via `add_page` on their own path before this
-                    // event is ever drained, so this branch never runs for
-                    // agent-initiated tabs. `register_discovered_page` is the
-                    // single decision point shared with the
-                    // `Target.targetCreated` handler below: a pinned session
-                    // never activates a discovered target (that would steal
-                    // the active tab and overwrite its binding); a legacy
-                    // session follows it.
-                    mgr.register_discovered_page(
-                        &target_info.target_id,
-                        page_sid,
-                        page_url,
-                        target_info.title.clone(),
-                        target_info.target_type.clone(),
-                    );
-
-                    mgr.resume_if_waiting_pub(page_sid).await
-                }
-                .await
-            } else {
-                Ok(())
-            };
-            if let Err(error) = setup_result {
-                if controls_active {
+            let adopted = self
+                .adopt_discovered_page(target_info, page_sid, filter.as_ref(), has_proxy_creds)
+                .await;
+            if let Err(error) = adopted {
+                if filter.is_some() || has_proxy_creds {
                     return close_after_network_control_failure(self, error).await;
                 }
                 eprintln!(
@@ -1505,73 +1543,37 @@ impl DaemonState {
             self.active_iframe_sessions.remove(sid);
         }
 
-        // Attach and register new targets
+        // Pages created outside the daemon's own commands, which Chrome did
+        // not pause: attach and adopt them.
         for te in &drained.new_targets {
             let filter = self.domain_filter.read().await.clone();
             let has_proxy_creds = self.proxy_credentials.read().await.is_some();
-            let controls_active = filter.is_some() || has_proxy_creds;
-            let setup_result = if let Some(ref mut mgr) = self.browser {
-                async {
-                    let attach: AttachToTargetResult = mgr
-                        .client
-                        .send_command_typed(
-                            "Target.attachToTarget",
-                            &AttachToTargetParams {
-                                target_id: te.target_info.target_id.clone(),
-                                flatten: true,
-                            },
-                            None,
-                        )
-                        .await?;
-                    mgr.prepare_domains_pub(&attach.session_id).await?;
-                    if controls_active {
-                        install_network_controls_for_session(
-                            &mgr.client,
-                            &attach.session_id,
-                            filter.as_ref(),
-                            has_proxy_creds,
-                        )
-                        .await?;
-                    }
-
-                    let mut page_url = te.target_info.url.clone();
-                    if let Some(ref filter) = filter {
-                        if should_blank_existing_url(&page_url, filter) {
-                            let _ = mgr
-                                .client
-                                .send_command(
-                                    "Page.navigate",
-                                    Some(json!({ "url": "about:blank" })),
-                                    Some(&attach.session_id),
-                                )
-                                .await;
-                            page_url = "about:blank".to_string();
-                        }
-                    }
-
-                    // Event-discovered target (e.g. a tab the human opened in the
-                    // shared Chrome, or a JS-opened popup): register it via the
-                    // same `register_discovered_page` decision point used by the
-                    // `Target.attachedToTarget` handler above, which activates it
-                    // only for legacy sessions; a pinned session never adopts a
-                    // discovered tab (that steal would also overwrite its
-                    // binding). Explicit commands (`tab new`, `window new`,
-                    // `click --new-tab`) activate via their own paths.
-                    mgr.register_discovered_page(
-                        &te.target_info.target_id,
-                        &attach.session_id,
-                        page_url,
-                        te.target_info.title.clone(),
-                        te.target_info.target_type.clone(),
-                    );
-                    mgr.resume_if_waiting_pub(&attach.session_id).await
-                }
+            let adopted = async {
+                let Some(mgr) = self.browser.as_ref() else {
+                    return Ok(());
+                };
+                let attach: AttachToTargetResult = mgr
+                    .client
+                    .send_command_typed(
+                        "Target.attachToTarget",
+                        &AttachToTargetParams {
+                            target_id: te.target_info.target_id.clone(),
+                            flatten: true,
+                        },
+                        None,
+                    )
+                    .await?;
+                self.adopt_discovered_page(
+                    &te.target_info,
+                    &attach.session_id,
+                    filter.as_ref(),
+                    has_proxy_creds,
+                )
                 .await
-            } else {
-                Ok(())
-            };
-            if let Err(error) = setup_result {
-                if controls_active {
+            }
+            .await;
+            if let Err(error) = adopted {
+                if filter.is_some() || has_proxy_creds {
                     return close_after_network_control_failure(self, error).await;
                 }
                 eprintln!("Warning: failed to prepare new page session: {}", error);
@@ -2687,6 +2689,12 @@ pub(crate) async fn execute_command_received(
     state: &mut DaemonState,
     received_at: std::time::Instant,
 ) -> Value {
+    // The theme is session state, not agent activity: it passes no window,
+    // custody, observation or action-policy gate and captures no host
+    // feedback.
+    if cmd["action"] == theme::ACTION {
+        return theme::set(cmd, state).await;
+    }
     if let Err((code, message)) = state.prepare_window_command(cmd, received_at).await {
         let mut response = state.window_refusal(&cmd["id"], code, message);
         if let Some(value) = cmd.get(super::feedback::REQUEST_FIELD) {
@@ -3148,12 +3156,21 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
             lifecycle_reused = true;
         }
 
-        if let Some(ref mut mgr) = state.browser {
-            if mgr.page_count() == 0 {
+        let replacement = match state.browser.as_mut() {
+            Some(mgr) if mgr.page_count() == 0 => {
                 // ensure_page itself skips creation for a pinned tab_gone
                 // session, so a closed sole tab stays tab_gone instead of
                 // silently recovering onto a fresh blank page.
                 let _ = mgr.ensure_page().await;
+                mgr.active_session_id().ok().map(str::to_string)
+            }
+            _ => None,
+        };
+        // The page that replaces the last one is the daemon's own: it gets
+        // the session setup, as every page a command opens does.
+        if let Some(session) = replacement {
+            if let Err(error) = apply_session_setup(state, &session).await {
+                eprintln!("Warning: failed to apply the session setup to a new page: {error}");
             }
         }
     }
@@ -4123,6 +4140,7 @@ async fn install_network_controls_or_resume_prepared_session(
 /// True when [`apply_session_setup`] has anything to replay onto a new tab.
 async fn session_setup_pending(state: &DaemonState) -> bool {
     !state.session_setup.is_empty()
+        || state.theme.is_some()
         || !state.routes.read().await.is_empty()
         || !state.origin_headers.read().await.is_empty()
 }
@@ -4155,22 +4173,13 @@ async fn apply_session_setup(state: &mut DaemonState, session_id: &str) -> Resul
             .await;
     }
 
-    if let Some(ref emulated) = setup.emulated_media {
-        let mut params = json!({});
-        if let Some(ref m) = emulated.media {
-            params["media"] = Value::String(m.clone());
-        }
-        if !emulated.features.is_empty() {
-            params["features"] = Value::Array(
-                emulated
-                    .features
-                    .iter()
-                    .map(|(name, value)| json!({ "name": name, "value": value }))
-                    .collect(),
-            );
-        }
+    if let Some(media) = theme::page_media(setup.emulated_media.as_ref(), state.theme) {
         let _ = client
-            .send_command("Emulation.setEmulatedMedia", Some(params), Some(session_id))
+            .send_command(
+                "Emulation.setEmulatedMedia",
+                Some(media.params()),
+                Some(session_id),
+            )
             .await;
     }
 
@@ -4258,8 +4267,10 @@ async fn apply_session_setup(state: &mut DaemonState, session_id: &str) -> Resul
 /// The post-launch sequence every locally launched browser shares, a
 /// sign-in relaunch included: the daemon owns it, follows its events and
 /// dialogs, shows it, then installs network containment before any state
-/// loads or user script runs. Failure closes the browser, so a requested
-/// allowlist never degrades to an unrestricted session.
+/// loads or user script runs, and gives every page it opened with the
+/// session setup, as every page the session adopts later gets it. Failure to
+/// install containment closes the browser, so a requested allowlist never
+/// degrades to an unrestricted session.
 async fn adopt_launched_browser(
     state: &mut DaemonState,
     browser: BrowserManager,
@@ -4275,7 +4286,22 @@ async fn adopt_launched_browser(
     state.start_fetch_handler();
     state.start_dialog_handler();
     state.update_stream_client().await;
-    install_network_controls_or_close(state, has_proxy_auth).await
+    install_network_controls_or_close(state, has_proxy_auth).await?;
+    let sessions: Vec<String> = state
+        .browser
+        .as_ref()
+        .map(|browser| {
+            browser
+                .pages_list()
+                .into_iter()
+                .map(|page| page.session_id)
+                .collect()
+        })
+        .unwrap_or_default();
+    for session in sessions {
+        apply_session_setup(state, &session).await?;
+    }
+    Ok(())
 }
 
 async fn auto_launch(
@@ -4283,6 +4309,7 @@ async fn auto_launch(
     plugins: Vec<crate::plugins::PluginConfig>,
 ) -> Result<(), String> {
     let mut options = launch_options_from_env();
+    options.theme = state.theme;
     let effective_ca_cert = state.effective_ca_cert.clone();
     apply_effective_ca_cert(&mut options, &effective_ca_cert);
     state.plugin_init_scripts.clear();
@@ -4739,6 +4766,7 @@ fn launch_options_from_env() -> LaunchOptions {
         prepared_nss_home: None,
         retained_profile: None,
         color_scheme: env::var("AGENT_BROWSER_COLOR_SCHEME").ok(),
+        theme: None,
         download_path: env::var("AGENT_BROWSER_DOWNLOAD_PATH").ok(),
         hide_scrollbars: hide_scrollbars_from_env(),
         viewport_size: None,
@@ -5083,6 +5111,16 @@ async fn try_load_storage_state(state: &mut DaemonState, path: &Option<String>) 
 // ---------------------------------------------------------------------------
 
 async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    // The launch's own theme wins; otherwise the session keeps its theme.
+    let theme = match cmd.get("theme").filter(|value| !value.is_null()) {
+        Some(value) => Some(
+            value
+                .as_str()
+                .and_then(Theme::parse)
+                .ok_or("Invalid theme: use dark or light")?,
+        ),
+        None => state.theme,
+    };
     let effective_ca_cert = resolve_effective_ca_cert(cmd, state)?;
     // Absent field falls back to the daemon's spawn-time env (mirrors
     // hideScrollbars/webgpu), keeping the launch configuration stable when follow-up
@@ -5213,6 +5251,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .get("colorScheme")
             .and_then(|v| v.as_str())
             .map(String::from),
+        theme,
         download_path: cmd
             .get("downloadPath")
             .and_then(|v| v.as_str())
@@ -5333,6 +5372,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     }
     state.ref_map.clear();
     state.session_setup = SessionSetup::default();
+    state.theme = theme;
 
     let has_cdp = cdp_url.is_some() || cdp_port.is_some();
     super::browser::validate_launch_options(
@@ -7979,17 +8019,20 @@ async fn handle_set_media(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         }
     }
 
-    let features = if feat_list.is_empty() {
-        None
-    } else {
-        Some(feat_list.clone())
-    };
-
-    mgr.set_emulated_media(media, features).await?;
-    state.session_setup.emulated_media = Some(EmulatedMedia {
+    let requested = EmulatedMedia {
         media: media.map(String::from),
         features: feat_list,
-    });
+    };
+    // With a session theme, only an explicit dark or light scheme overrides it.
+    let applied = theme::page_media(Some(&requested), state.theme).unwrap_or_default();
+    mgr.client
+        .send_command(
+            "Emulation.setEmulatedMedia",
+            Some(applied.params()),
+            Some(mgr.active_session_id()?),
+        )
+        .await?;
+    state.session_setup.emulated_media = Some(requested);
     Ok(json!({ "set": true }))
 }
 
@@ -11185,6 +11228,7 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
         }
     };
 
+    apply_session_setup(state, &session_id).await?;
     let has_proxy_creds = state.proxy_credentials.read().await.is_some();
     install_network_controls_or_resume_prepared_session(state, has_proxy_creds, &session_id)
         .await?;
@@ -15733,6 +15777,46 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             .to_string()
             .contains("private-profile-test-value"));
         assert!(!information.to_string().contains("proxyPassword"));
+    }
+
+    /// The theme is session state: a theme-only difference never relaunches
+    /// the browser and never changes whether its private profile is reused.
+    #[test]
+    fn test_launch_configuration_excludes_the_theme() {
+        let dark = LaunchOptions {
+            window_stream: true,
+            theme: Some(Theme::Dark),
+            color_scheme: Some("dark".into()),
+            ..Default::default()
+        };
+        for theme in [Some(Theme::Light), None] {
+            let other = LaunchOptions {
+                theme,
+                ..dark.clone()
+            };
+            assert_eq!(
+                launch_configuration(&dark, &[], &[], &[], &[], Some("chrome"), "local", None),
+                launch_configuration(&other, &[], &[], &[], &[], Some("chrome"), "local", None),
+            );
+            assert_eq!(
+                private_profile_eligible(&dark, Some("chrome"), "local", &[], None),
+                private_profile_eligible(&other, Some("chrome"), "local", &[], None),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_launch_refuses_an_invalid_theme_before_anything_starts() {
+        let mut state = DaemonState::new();
+        state.theme = Some(Theme::Dark);
+        for theme in [json!("blue"), json!(1)] {
+            let error = handle_launch(&json!({ "action": "launch", "theme": theme }), &mut state)
+                .await
+                .unwrap_err();
+            assert!(error.contains("Invalid theme"), "{error}");
+        }
+        assert!(state.browser.is_none());
+        assert_eq!(state.theme, Some(Theme::Dark));
     }
 
     #[test]
