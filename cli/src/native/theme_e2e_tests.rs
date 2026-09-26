@@ -478,9 +478,8 @@ async fn open_windows(state: &mut DaemonState, site: &SchemeSite, suffix: &str) 
 }
 
 /// A window the agent opens, isolated or sharing the browser's cookies,
-/// starts in the session theme and switches with it. Chrome's own preference
-/// does not decide it: an isolated window's context does not even follow the
-/// launch's dark window UI.
+/// starts in the session theme and switches with it, also after a live change
+/// has left Chrome's own preference at the launch's theme.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn e2e_theme_reaches_every_window_the_agent_opens() {
@@ -583,7 +582,15 @@ async fn e2e_theme_every_page_gets_the_session_setup_once() {
 
     let remove = json!({ "action": "removeinitscript", "identifier": identifier });
     assert_success(&command(&remove, &mut state).await);
-    for tab in ["t2", "t3"] {
+    let open_tabs = command(&json!({ "action": "tab_list" }), &mut state).await;
+    let open_tabs: Vec<Value> = assert_success(&open_tabs)["tabs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|tab| tab["tabId"].clone())
+        .collect();
+    assert_eq!(open_tabs.len(), 4, "{open_tabs:?}");
+    for tab in open_tabs {
         let switch = json!({ "action": "tab_switch", "tabId": tab });
         assert_success(&command(&switch, &mut state).await);
         assert_success(&command(&navigate(site.page("reloaded")), &mut state).await);

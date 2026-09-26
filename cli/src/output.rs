@@ -2627,9 +2627,11 @@ refs; unlike `t<N>` ids they stay stable across daemon restarts. A ref that
 names no open tab fails with code=tab_not_found; data.tabs and data.tabCount
 list the open tabs.
 
-Tabs opened with `tab new` or `click --new-tab` inherit the session's user
-agent, headers, HTTP credentials, init scripts, routes, and emulation
-overrides before their first document loads.
+Tabs opened with `tab new`, `window new` or `click --new-tab` inherit the
+session's user agent, headers, HTTP credentials, init scripts, routes,
+emulation overrides and browser theme before their first document loads.
+Tabs a person opens and popups get the same setup when the session
+discovers them.
 
 Each session remembers its active tab (bound by CDP target id) and returns
 to it after a daemon restart. With --pin-tab, a command addressed to the

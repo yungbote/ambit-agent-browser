@@ -1333,8 +1333,9 @@ impl DaemonState {
     /// first, then the session setup a page new to the session gets (so a
     /// paused page starts under it), then registration, and only then does
     /// the page run. A page the daemon opened itself (`tab new`, `window new`,
-    /// `click --new-tab`, a launch) was registered and given the session
-    /// setup by the command that opened it; its own attachment reaches this
+    /// `click --new-tab`, a launch, the page that replaces the last one) was
+    /// registered and given the session setup by the command that opened it;
+    /// its own attachment reaches this
     /// drain too and must not get the setup again, or every init script
     /// would run twice in it. `register_discovered_page` alone decides
     /// activation: a pinned session never activates a discovered target

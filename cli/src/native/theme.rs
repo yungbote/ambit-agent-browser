@@ -9,10 +9,11 @@
 //! `--force-dark-mode` draws a headed window's UI dark and makes pages prefer
 //! dark without repainting them, for the life of the process. The image has
 //! no GTK and no settings portal, so nothing outside Chrome can switch a
-//! running window's UI. Chrome's own Mode setting can, in about 20 ms, but
-//! only from a chrome://settings tab the person would see in the tab strip
-//! (a hidden one crashes Chrome), through internal WebUI interfaces, and it
-//! writes a profile preference; the driver does not use it. So pages switch
+//! running window's UI. Chrome's own Mode setting can (the window repaints
+//! about 20 ms after it changes), but only from a chrome://settings tab the
+//! person would see in the tab strip for most of a second (a hidden one
+//! crashes Chrome), through internal WebUI interfaces, and it writes a
+//! profile preference; the driver does not use it. So pages switch
 //! live through `Emulation.setEmulatedMedia`, and the window UI follows at
 //! the next launch.
 //!
