@@ -131,6 +131,10 @@ struct Mapping {
 }
 
 impl Mapping {
+    /// The display point for page point `(x, y)`: on the screen and inside
+    /// the browser window this mapping measured. A size-class framebuffer
+    /// is larger than the window, and a press outside the window reaches
+    /// no page.
     fn point(&self, x: f64, y: f64, surface: &Surface) -> Result<(f64, f64), String> {
         let scale = self.pointer.geometry["scale"]
             .as_f64()
@@ -138,12 +142,14 @@ impl Mapping {
         let factor = f64::from(surface.device_scale_factor);
         let x = (self.pointer.screen_x * factor + (x - self.pointer.client_x) * scale).round();
         let y = (self.pointer.screen_y * factor + (y - self.pointer.client_y) * scale).round();
+        let (_, left, top, width, height) = self.window;
+        let (left, top) = (f64::from(left), f64::from(top));
         if !x.is_finite()
             || !y.is_finite()
-            || x < 0.0
-            || y < 0.0
-            || x >= f64::from(surface.width)
-            || y >= f64::from(surface.height)
+            || x < left.max(0.0)
+            || y < top.max(0.0)
+            || x >= (left + f64::from(width)).min(f64::from(surface.width))
+            || y >= (top + f64::from(height)).min(f64::from(surface.height))
         {
             return Err("The mouse position is outside the current browser window.".into());
         }
@@ -594,6 +600,23 @@ mod tests {
             assert_eq!(
                 mapping.point(260.0, 175.0, &surface).unwrap(),
                 (572.0, expected_y)
+            );
+        }
+    }
+
+    /// Inside a size class the framebuffer is larger than the window: a
+    /// point past the window's edge is refused, not pressed on the root.
+    #[test]
+    fn pointer_mapping_refuses_points_past_the_window_inside_a_larger_framebuffer() {
+        let surface = Surface::new(1792, 1280);
+        let mut mapping = mapping(2.0, 262.0);
+        mapping.window = (1, 0, 0, 1560, 1200);
+        // Page x 210 is display x 462; 1 CSS px is 2 display px.
+        assert_eq!(mapping.point(758.5, 175.0, &surface).unwrap().0, 1559.0);
+        for (x, y) in [(759.0, 175.0), (850.0, 300.0), (210.0, 644.0)] {
+            assert_eq!(
+                mapping.point(x, y, &surface).unwrap_err(),
+                "The mouse position is outside the current browser window."
             );
         }
     }

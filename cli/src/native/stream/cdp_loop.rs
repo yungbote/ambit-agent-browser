@@ -377,11 +377,14 @@ pub(super) async fn cdp_event_loop(
                                             display.as_ref(), activity["screenX"].as_f64(), activity["screenY"].as_f64(), evt.session_id.as_deref()
                                         ) {
                                             let surface = display.surface();
+                                            // The window is the framebuffer's
+                                            // top-left part: what viewers see.
+                                            let (width, height) = display.window();
                                             let x = screen_x * f64::from(surface.device_scale_factor);
                                             let y = screen_y * f64::from(surface.device_scale_factor);
                                             if activity["source"] == "agent"
                                                 && activity["pageGeneration"] == client_arc.page_generation(page)
-                                                && x >= 0.0 && y >= 0.0 && x < f64::from(surface.width) && y < f64::from(surface.height) {
+                                                && x >= 0.0 && y >= 0.0 && x < f64::from(width) && y < f64::from(height) {
                                                 activity["coordinateSpace"] = json!("display-pixels");
                                                 activity["surfaceGeneration"] = json!(surface.generation);
                                                 activity["x"] = json!(x);
