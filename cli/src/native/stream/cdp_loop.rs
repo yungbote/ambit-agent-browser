@@ -96,7 +96,7 @@ async fn revision_changed(revision: &mut Option<watch::Receiver<u64>>) {
 
 /// A file picker opened or ended, or a download settled: the controller
 /// asks for the current `files` once instead of polling. It names nothing.
-fn files_doorbell() -> String {
+pub(super) fn files_doorbell() -> String {
     json!({ "type": "files", "ts": super::monotonic_us() }).to_string()
 }
 

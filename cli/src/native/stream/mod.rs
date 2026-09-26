@@ -1396,6 +1396,52 @@ mod tests {
         }
     }
 
+    /// A viewer whose writer falls behind skips records. The pointer's
+    /// identity is sent only when it changes, so a skipped one would stay
+    /// wrong until the next change: the lagging viewer is sent the current
+    /// state again (and the files doorbell it may have missed).
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_lagging_viewer_is_sent_the_current_state_again() {
+        let (server, _slot) = StreamServer::start_without_client(
+            0,
+            "lagging-viewer".into(),
+            true,
+            Arc::new(IdleActivity::new()),
+        )
+        .await
+        .unwrap();
+        let mut client = connect_client_to(server.port(), "/").await;
+        async fn next(client: &mut WsClient) -> Option<Value> {
+            match tokio::time::timeout(std::time::Duration::from_secs(1), client.next()).await {
+                Ok(Some(Ok(Message::Text(text)))) => serde_json::from_str(&text).ok(),
+                _ => None,
+            }
+        }
+        // The viewer's writer is running: it has sent the joining state.
+        assert_eq!(next(&mut client).await.unwrap()["type"], "status");
+        // Nothing else runs while these are published, so the writer falls
+        // more than the channel's capacity behind: the identity is skipped.
+        let cursor = json!({"type":"cursor","ts":1,"serial":5,"css":"text"}).to_string();
+        server.media.set_cursor(Some(cursor.clone()));
+        let _ = server.frame_tx.send(cursor);
+        for sample in 0..100 {
+            let _ = server
+                .frame_tx
+                .send(json!({"type":"activity","sample":sample}).to_string());
+        }
+        let mut seen = Vec::new();
+        while let Some(message) = next(&mut client).await {
+            seen.push(message["type"].as_str().unwrap_or_default().to_string());
+            if message["type"] == "cursor" {
+                assert_eq!(message["css"], "text");
+            }
+        }
+        assert!(seen.iter().any(|kind| kind == "cursor"), "{seen:?}");
+        assert!(seen.iter().any(|kind| kind == "files"), "{seen:?}");
+        assert!(seen.iter().filter(|kind| *kind == "activity").count() < 100);
+        server.shutdown().await;
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn frame_window_stops_at_its_bound_until_a_cumulative_ack() {
         let (server, _) = StreamServer::start_without_client(

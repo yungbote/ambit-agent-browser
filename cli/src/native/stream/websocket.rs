@@ -521,6 +521,45 @@ async fn handle_connection(
     }
 }
 
+/// The records a viewer is sent only when they change: the stream's status,
+/// its tabs (with the active tab's URL) and the pointer's identity. A viewer
+/// is sent them when it joins, and again when its writer fell behind and
+/// skipped records, since a skipped change is never repeated.
+struct StreamState<'a> {
+    client_slot: &'a RwLock<Option<Arc<CdpClient>>>,
+    display_slot: &'a RwLock<Option<Arc<DisplayClient>>>,
+    screencasting: &'a Mutex<bool>,
+    viewport_width: &'a Mutex<u32>,
+    viewport_height: &'a Mutex<u32>,
+    last_engine: &'a RwLock<String>,
+    recording: &'a Mutex<bool>,
+    last_tabs: &'a RwLock<Vec<Value>>,
+    media: &'a StreamMedia,
+}
+
+impl StreamState<'_> {
+    async fn messages(&self) -> Vec<String> {
+        let status = json!({
+            "type": "status",
+            "connected": super::source_connected(self.client_slot, self.display_slot).await,
+            "screencasting": *self.screencasting.lock().await,
+            "viewportWidth": *self.viewport_width.lock().await,
+            "viewportHeight": *self.viewport_height.lock().await,
+            "engine": self.last_engine.read().await.clone(),
+            "recording": *self.recording.lock().await,
+        });
+        let mut messages = vec![status.to_string()];
+        let tabs = self.last_tabs.read().await;
+        if !tabs.is_empty() {
+            messages.push(
+                json!({ "type": "tabs", "tabs": *tabs, "timestamp": timestamp_ms() }).to_string(),
+            );
+        }
+        messages.extend(self.media.cursor());
+        messages
+    }
+}
+
 /// One WebSocket client, split in two halves: a reader task dispatching input
 /// to CDP, and a writer loop delivering frames latest-first under an optional
 /// per-client cap. Invariant: the halves never wait on each other, which is
@@ -626,37 +665,19 @@ async fn handle_ws_client(
         presentation_rx.borrow_and_update();
     }
 
-    {
-        let connected = super::source_connected(&client_slot, &display_slot).await;
-        let sc = *screencasting.lock().await;
-        let vw = *viewport_width.lock().await;
-        let vh = *viewport_height.lock().await;
-        let eng = last_engine.read().await.clone();
-        let rec = *recording.lock().await;
-        let status = json!({
-            "type": "status",
-            "connected": connected,
-            "screencasting": sc,
-            "viewportWidth": vw,
-            "viewportHeight": vh,
-            "engine": eng,
-            "recording": rec,
-        });
-        let _ = ws_tx.send(Message::Text(status.to_string())).await;
-
-        let tabs = last_tabs.read().await;
-        if !tabs.is_empty() {
-            let tabs_msg = json!({
-                "type": "tabs",
-                "tabs": *tabs,
-                "timestamp": timestamp_ms(),
-            });
-            let _ = ws_tx.send(Message::Text(tabs_msg.to_string())).await;
-        }
-        // The pointer's current state: identities are sent only on change.
-        if let Some(cursor) = media.cursor() {
-            let _ = ws_tx.send(Message::Text(cursor)).await;
-        }
+    let state = StreamState {
+        client_slot: &client_slot,
+        display_slot: &display_slot,
+        screencasting: &screencasting,
+        viewport_width: &viewport_width,
+        viewport_height: &viewport_height,
+        last_engine: &last_engine,
+        recording: &recording,
+        last_tabs: &last_tabs,
+        media: &media,
+    };
+    for message in state.messages().await {
+        let _ = ws_tx.send(Message::Text(message)).await;
     }
 
     // Invariant: only a successful send writes `last_sent`. `None` means
@@ -736,7 +757,21 @@ async fn handle_ws_client(
                         }
                     }
                     Err(broadcast::error::RecvError::Lagged(_)) => {
-                        continue;
+                        // Skipped records are never repeated: send what they
+                        // changed again, and ring the files doorbell in case
+                        // it was one of them.
+                        let mut messages = state.messages().await;
+                        messages.push(super::cdp_loop::files_doorbell());
+                        let mut open = true;
+                        for message in messages {
+                            if ws_tx.send(Message::Text(message)).await.is_err() {
+                                open = false;
+                                break;
+                            }
+                        }
+                        if !open {
+                            break;
+                        }
                     }
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
