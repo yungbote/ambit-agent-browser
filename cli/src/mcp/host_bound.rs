@@ -349,9 +349,10 @@ mod tests {
     }
 
     /// Every tool in the host catalog, as the daemon receives it: only input
-    /// that goes to the focused element, the pointer or a point no image
-    /// fences waits for a fresh observation after a person used the browser.
-    /// Every other tool names what it acts on and runs.
+    /// that goes to the focused element (a dialog answer included), the
+    /// pointer or a point no image fences, and a program, which can send any
+    /// of these, waits for a fresh observation after a person used the
+    /// browser. Every other tool names what it acts on and runs.
     #[test]
     fn only_input_without_a_named_target_waits_after_a_handback() {
         use crate::native::actions::observation_required_after_handback_for_test as held;
@@ -369,6 +370,9 @@ mod tests {
             TOOL_MOUSE_MOVE,
             TOOL_MOUSE_WHEEL,
             TOOL_SWIPE,
+            TOOL_DIALOG_ACCEPT,
+            TOOL_DIALOG_DISMISS,
+            TOOL_RUN_PLAYWRIGHT,
         ];
         // `cookies set --curl` reads its file while parsing.
         let curl = tempfile::NamedTempFile::new().unwrap();
