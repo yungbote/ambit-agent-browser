@@ -2743,6 +2743,17 @@ pub(crate) async fn execute_command_received(
                 if response["success"] != true {
                     return response;
                 }
+                // The window preparation above ran before this browser
+                // existed. The command meets it now, against the browser it
+                // will act on: which of its pages is active, and whether a
+                // point it carries was chosen for this window.
+                if response["data"]["reused"] != true {
+                    if let Err((code, message)) =
+                        state.prepare_window_command(cmd, received_at).await
+                    {
+                        return state.window_refusal(&command["id"], code, message);
+                    }
+                }
             }
             Box::pin(execute_command_inner(&command, state)).await
         };

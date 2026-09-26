@@ -13247,6 +13247,127 @@ async fn e2e_native_refs_from_another_tab_are_refused_as_stale() {
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
 
+/// What a launch does once it has discovered the pages of its owned window:
+/// activate the page the window shows, and only when it can tell which one
+/// that is. Here the person selected the first tab natively, so the daemon
+/// still starts from the second (as discovery may start from any tab that
+/// answers first), and the first tab's renderer is busy, so observation
+/// cannot tell. Before, the launch activated the page it started from: the
+/// window switched away from the person's tab. Now nothing is activated,
+/// and the next command acts on the tab the window shows once it can tell.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_native_a_launch_that_cannot_tell_the_shown_tab_activates_none() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"navigate","url":"data:text/html,<title>First</title><p>First</p>"}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"tab_new","url":"data:text/html,<title>Second</title><p>Second</p>"}),
+            &mut state,
+        )
+        .await,
+    );
+    let browser = state.browser.as_mut().unwrap();
+    let first = browser.pages_list()[0].clone();
+    // The person selects the first tab; the daemon has not observed it yet.
+    browser
+        .client
+        .send_command(
+            "Target.activateTarget",
+            Some(json!({ "targetId": first.target_id })),
+            None,
+        )
+        .await
+        .unwrap();
+    // Its renderer is busy past the page observation's bound (2 s).
+    let client = browser.client.clone();
+    let session = first.session_id.clone();
+    let busy = tokio::spawn(async move {
+        let _ = client
+            .send_command(
+                "Runtime.evaluate",
+                Some(json!({ "expression": "{const until=Date.now()+3500;while(Date.now()<until){}}" })),
+                Some(&session),
+            )
+            .await;
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    browser.activate_shown_page().await.unwrap();
+    busy.await.unwrap();
+
+    let title = control_test_command(&json!({"action":"title"}), &mut state).await;
+    assert_success(&title);
+    assert_eq!(get_data(&title)["title"], "First");
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+/// The window preparation every command meets runs before the command's
+/// launch step, when there is no browser yet. A command that launched the
+/// browser meets it after the launch, against the browser it will act on:
+/// which page is active (a launch that cannot tell leaves it unchosen), and
+/// whether a point it carries was chosen for this window. A point sent
+/// before the window existed is refused, nothing sent; a command that names
+/// its target runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_native_a_command_that_launches_the_browser_meets_the_window_gate() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let captures = tempfile::tempdir().unwrap();
+    let with_launch = |mut command: Value, state: &DaemonState| {
+        command["ambitFeedback"] = json!({
+            "namespace": std::env::var("AGENT_BROWSER_NAMESPACE").unwrap_or_default(),
+            "session": state.session_id, "captureDirectory": captures.path(),
+            "timeoutMs": 60_000, "launch": { "action": "launch" },
+        });
+        command
+    };
+
+    let mut state = DaemonState::new();
+    let moved = control_test_command(
+        &with_launch(json!({"action":"mousemove","x":40,"y":40}), &state),
+        &mut state,
+    )
+    .await;
+    assert_error_code(&moved, "browser_observation_stale");
+    assert!(state.browser.is_some(), "the launch step ran");
+    assert!(moved["error"]
+        .as_str()
+        .unwrap()
+        .contains("Nothing was sent"));
+    // The browser is reused now, and the next point is admitted as usual.
+    assert_success(
+        &control_test_command(
+            &with_launch(json!({"action":"mousemove","x":40,"y":40}), &state),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+
+    let mut state = DaemonState::new();
+    let url = "data:text/html,<title>Launched</title><p>Launched</p>";
+    let opened = control_test_command(
+        &with_launch(json!({"action":"navigate","url":url}), &state),
+        &mut state,
+    )
+    .await;
+    assert_success(&opened);
+    let title = control_test_command(&json!({"action":"title"}), &mut state).await;
+    assert_eq!(get_data(&title)["title"], "Launched");
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
 // Production 2026-09-23: a native mouse move over a Cloudflare challenge
 // iframe and a click whose element was off-screen both failed with "The
 // browser did not report the native mouse position".

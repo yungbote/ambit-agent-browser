@@ -728,17 +728,7 @@ impl BrowserManager {
 
         if let Some(display) = manager.display_client() {
             let layout_events = manager.client.subscribe();
-            // The owned headed browser may start on its native New Tab page,
-            // or restore several tabs, without a window manager to activate
-            // any of them. Keep the page the window shows when observation
-            // can tell which one it is; when it cannot (no focus yet, a
-            // restored renderer still busy loading), keep the live page
-            // discovery chose. Either way activate it once. Choosing a page
-            // never fails a launch: a later command that cannot tell which
-            // page is active is refused alone, with the open tabs listed
-            // (`prepare_window_command`).
-            let _ = manager.synchronize_visible_page().await;
-            manager.bring_to_front().await?;
+            manager.activate_shown_page().await?;
             let info = display.info().await.map_err(|error| error.to_string())?;
             let window = info
                 .active_window()
@@ -1140,9 +1130,10 @@ impl BrowserManager {
     /// times out) and does not reload or focus the tab.
     ///
     /// An owned window selects its page by observation right after discovery
-    /// (`launch_window`); discovery only needs a live page to start from. It
-    /// takes the first page to answer, so restored tabs whose renderers are
-    /// still busy loading cost nothing instead of a probe timeout each.
+    /// (`activate_shown_page`); discovery only needs a live page to start
+    /// from, and never activates it. It takes the first page to answer, so
+    /// restored tabs whose renderers are still busy loading cost nothing
+    /// instead of a probe timeout each.
     async fn find_live_page_index(&self, session_ids: &[String]) -> Option<usize> {
         if self.display_client().is_some() {
             let mut probes: futures_util::stream::FuturesUnordered<_> = session_ids
@@ -2240,6 +2231,25 @@ impl BrowserManager {
         self.client
             .send_command("Emulation.setEmulatedMedia", Some(params), Some(session_id))
             .await?;
+        Ok(())
+    }
+
+    /// Activates, once, the page an owned window shows after a launch. The
+    /// headed browser may start on its native New Tab page, or restore
+    /// several tabs, without a window manager to activate any of them. When
+    /// observation tells which page the window shows, it becomes the active
+    /// page and is activated. When it cannot (no focus yet, a restored
+    /// renderer still busy), nothing is activated: the window keeps showing
+    /// the tab the person left in front, and the active page stays the one
+    /// discovery started from (the first renderer to answer, not necessarily
+    /// that tab). Every command, the one a launch was made for included,
+    /// tells which page is active again first, and is refused alone, with the
+    /// open tabs listed, while it cannot (`prepare_window_command`). Choosing
+    /// a page never fails a launch.
+    pub(crate) async fn activate_shown_page(&mut self) -> Result<(), String> {
+        if self.synchronize_visible_page().await.is_ok() {
+            self.bring_to_front().await?;
+        }
         Ok(())
     }
 
