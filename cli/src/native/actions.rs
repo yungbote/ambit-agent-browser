@@ -754,6 +754,15 @@ impl DaemonState {
         }
     }
 
+    /// The same privately owned output source across automation/sign-in custody.
+    pub(crate) fn window_audio(&self) -> Option<super::audio::AudioSource> {
+        match (&self.browser, &self.sign_in) {
+            (Some(browser), _) => browser.audio_source(),
+            (None, Some(sign_in)) => sign_in.audio_source(),
+            (None, None) => None,
+        }
+    }
+
     /// The page session a pending JavaScript dialog pauses: its renderer
     /// answers nothing until the dialog is resolved.
     pub(crate) fn dialog_session(&self) -> Option<String> {

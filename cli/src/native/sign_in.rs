@@ -41,6 +41,9 @@ pub(crate) struct SignInBrowser {
 }
 
 impl SignInBrowser {
+    pub(crate) fn audio_source(&self) -> Option<crate::native::audio::AudioSource> {
+        self.chrome.audio_source()
+    }
     pub(crate) fn display(&self) -> Option<Arc<DisplayClient>> {
         #[cfg(target_os = "linux")]
         return self.chrome.display_client();

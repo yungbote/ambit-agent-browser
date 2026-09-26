@@ -1,0 +1,38 @@
+<!doctype html>
+<meta name="viewport" content="width=device-width">
+<title>Audio qualification</title>
+<style>
+body { margin: 0; background: #223 }
+button { position: absolute; inset: 0; width: 100%; height: 100%; font: 28px sans-serif; background: #223; color: #fff }
+</style>
+<button id="play" type="button">Loading audio fixture</button>
+<script>
+const frequency = __FREQUENCY__;
+const play = document.getElementById('play');
+let audio;
+const report = kind => fetch(`/report/${kind}/${frequency}`).catch(error => {
+  play.textContent = `Report failed: ${error.message}`;
+});
+window.addEventListener('error', event => { play.textContent = event.message; });
+play.textContent = `Play ${frequency} Hz`;
+report('loaded');
+play.addEventListener('click', async () => {
+  if (audio) return;
+  try {
+    audio = new AudioContext({ sampleRate: 48000 });
+    await audio.resume();
+    const oscillator = audio.createOscillator();
+    oscillator.frequency.value = frequency;
+    const gain = audio.createGain();
+    gain.gain.value = .25;
+    oscillator.connect(gain).connect(audio.destination);
+    requestAnimationFrame(() => {
+      oscillator.start();
+      play.style.background = '#fff';
+      play.style.color = '#223';
+      play.textContent = `Playing ${frequency} Hz`;
+      report('playing');
+    });
+  } catch (error) { play.textContent = `Playback failed: ${error.message}`; }
+});
+</script>

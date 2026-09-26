@@ -1701,6 +1701,13 @@ impl BrowserManager {
         &self.ws_url
     }
 
+    pub(crate) fn audio_source(&self) -> Option<super::audio::AudioSource> {
+        if let Some(BrowserProcess::Chrome(process)) = self.browser_process.as_ref() {
+            return process.audio_source();
+        }
+        None
+    }
+
     pub(crate) fn display_client(&self) -> Option<Arc<super::display::DisplayClient>> {
         #[cfg(target_os = "linux")]
         if let Some(BrowserProcess::Chrome(process)) = self.browser_process.as_ref() {

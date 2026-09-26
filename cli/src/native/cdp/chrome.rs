@@ -94,6 +94,8 @@ pub(crate) struct RetainedChromeProfile {
 /// keeps the same display. The server stops with its last owner.
 #[derive(Clone)]
 pub(crate) struct RetainedDisplay {
+    #[cfg(all(target_os = "linux", feature = "browser-audio"))]
+    audio: Option<crate::native::audio::RetainedAudio>,
     #[cfg(target_os = "linux")]
     server: Arc<XvfbServer>,
 }
@@ -177,7 +179,20 @@ impl ChromeProcess {
             .map(|display| display.client.clone())
     }
 
+    /// Output is available only for a locally owned, qualified native window.
+    pub(crate) fn audio_source(&self) -> Option<crate::native::audio::AudioSource> {
+        #[cfg(all(target_os = "linux", feature = "browser-audio"))]
+        return self
+            .xvfb
+            .as_ref()
+            .and_then(|display| display.audio.as_ref())
+            .map(|audio| audio.source());
+        #[cfg(not(all(target_os = "linux", feature = "browser-audio")))]
+        None
+    }
+
     pub fn kill(&mut self) {
+        self.discontinue_audio();
         let _ = self.child.kill();
         // On Unix, kill the entire process group to ensure Chrome helper
         // processes (GPU, renderer, utility, crashpad) are also terminated.
@@ -207,6 +222,7 @@ impl ChromeProcess {
     /// falling back to kill() if it doesn't exit within the timeout.
     /// This allows Chrome to flush cookies and other state to the user-data-dir.
     pub fn wait_or_kill(&mut self, timeout: Duration) {
+        self.discontinue_audio();
         let start = std::time::Instant::now();
         let poll_interval = Duration::from_millis(50);
 
@@ -219,6 +235,17 @@ impl ChromeProcess {
         }
 
         self.kill();
+    }
+
+    fn discontinue_audio(&self) {
+        #[cfg(all(target_os = "linux", feature = "browser-audio"))]
+        if let Some(audio) = self
+            .xvfb
+            .as_ref()
+            .and_then(|display| display.audio.as_ref())
+        {
+            audio.discontinue();
+        }
     }
 
     /// Close Chrome without DevTools, as a person closing it would: SIGTERM
@@ -472,6 +499,8 @@ fn maybe_start_xvfb(options: &LaunchOptions) -> Option<RetainedDisplay> {
                     match String::from_utf8_lossy(&buf[..pos]).trim().parse::<u32>() {
                         Ok(num) => {
                             return Some(RetainedDisplay {
+                                #[cfg(all(target_os = "linux", feature = "browser-audio"))]
+                                audio: None,
                                 server: Arc::new(XvfbServer {
                                     child,
                                     display: format!(":{}", num),
@@ -1290,8 +1319,28 @@ fn try_launch_chrome(
     #[cfg(not(target_os = "linux"))]
     let temp_nss_home: Option<PreparedNssHome> = None;
 
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", not(feature = "browser-audio")))]
     let xvfb = maybe_start_xvfb(options);
+    #[cfg(all(target_os = "linux", feature = "browser-audio"))]
+    let xvfb = std::thread::scope(|scope| {
+        // Parallel with display startup; output capture itself remains subscriber-driven.
+        let pending_audio = scope.spawn(|| {
+            if !options.window_stream {
+                return None;
+            }
+            options
+                .retained_display
+                .as_ref()
+                .and_then(|display| display.audio.clone())
+                .or_else(|| crate::native::audio::RetainedAudio::start(canceled).ok())
+        });
+        let mut display = maybe_start_xvfb(options);
+        let audio = pending_audio.join().unwrap_or(None);
+        if let Some(display) = &mut display {
+            display.audio = audio;
+        }
+        display
+    });
 
     #[cfg(target_os = "linux")]
     if options.window_stream && xvfb.is_none() {
@@ -1344,6 +1393,19 @@ fn try_launch_chrome(
     if let Some(ref home) = temp_nss_home {
         cmd.env("HOME", home.path());
         cmd.env("XDG_DATA_HOME", home.path().join(".local/share"));
+    }
+
+    #[cfg(all(target_os = "linux", feature = "browser-audio"))]
+    if options.window_stream {
+        // Failed private startup must never select an inherited host/session device.
+        cmd.env_remove("PULSE_COOKIE")
+            .env_remove("PULSE_SOURCE")
+            .env_remove("PULSE_SINK")
+            .env_remove("PULSE_CLIENTCONFIG")
+            .env("PULSE_SERVER", "unix:/dev/null");
+        if let Some(output) = xvfb.as_ref().and_then(|display| display.audio.as_ref()) {
+            output.apply_environment(&mut cmd);
+        }
     }
 
     // Place Chrome in its own process group so we can kill the entire tree
@@ -2540,6 +2602,8 @@ mod tests {
         ));
         std::fs::write(&auth_file, b"cookie").unwrap();
         let display = RetainedDisplay {
+            #[cfg(all(target_os = "linux", feature = "browser-audio"))]
+            audio: None,
             server: Arc::new(XvfbServer {
                 child: spawn_noop_child(),
                 display: ":97".into(),
