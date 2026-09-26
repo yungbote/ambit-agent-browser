@@ -215,7 +215,7 @@ pub(crate) async fn scoped_frame<'a>(
     Ok(Some(scope.frame_id.as_str()))
 }
 
-pub(crate) const FRAME_SCOPE_ENDED: &str = "browser_observation_stale: The frame selected with `frame` is on a page this tab no longer shows (it navigated or reloaded, or another tab is active). Nothing was done. Select the main frame or a frame of this page, then send this again.";
+const FRAME_SCOPE_ENDED: &str = "browser_observation_stale: The frame selected with `frame` is on a page this tab no longer shows (it navigated or reloaded, or another tab is active). Nothing was done. Select the main frame or a frame of this page, then send this again.";
 
 pub fn parse_ref(input: &str) -> Option<String> {
     let trimmed = input.trim();
