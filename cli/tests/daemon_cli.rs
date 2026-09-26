@@ -115,7 +115,7 @@ impl Drop for Fixture {
             return;
         };
         let ours = fs::read(format!("/proc/{pid}/cmdline"))
-            .is_ok_and(|cmdline| cmdline.starts_with(BIN.as_bytes()));
+            .is_ok_and(|cmdline| cmdline.split(|byte| *byte == 0).next() == Some(BIN.as_bytes()));
         if ours {
             unsafe { libc::kill(pid, libc::SIGTERM) };
         }
@@ -401,6 +401,37 @@ fn a_batch_of_theme_changes_never_starts_a_daemon_or_sends_a_launch() {
             .collect::<Vec<_>>(),
         ["set_theme", "set_theme"]
     );
+}
+
+/// A batch parses each of its commands once, so a command that reads stdin
+/// while it parses gets it in a batch as alone, also where it is the command
+/// that decides the batch needs a daemon. The daemon starts in the
+/// background, so a failure still stops it, and it closes its browser.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires isolated Chrome runtime; set AGENT_BROWSER_TEST_CHROME"]
+fn a_batch_command_that_reads_stdin_gets_it() {
+    let chrome = std::env::var("AGENT_BROWSER_TEST_CHROME")
+        .expect("set AGENT_BROWSER_TEST_CHROME inside an isolated runtime");
+    let fixture = Fixture::new();
+    fixture.config(
+        &serde_json::json!({
+            "executablePath": chrome,
+            "profile": fixture.0.path().join("profile"),
+        })
+        .to_string(),
+    );
+    let opened = fixture.run(&["--json", "open", "data:text/html,<title>Ready</title>"]);
+    assert!(opened.status.success(), "Chrome launch failed: {opened:?}");
+    let batch = fixture.run_with_stdin(&["--json", "batch", "eval --stdin"], "document.title");
+    assert!(batch.status.success(), "{batch:?}");
+    assert_eq!(
+        response(&batch)[0]["result"]["result"],
+        "Ready",
+        "{batch:?}"
+    );
+    let closed = fixture.run(&["--json", "close"]);
+    assert!(closed.status.success(), "{closed:?}");
 }
 
 #[test]
