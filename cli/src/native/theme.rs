@@ -130,11 +130,25 @@ pub(crate) async fn set(command: &Value, state: &mut DaemonState) -> Value {
         return json!({ "id": id, "success": false,
             "error": "set_theme requires theme dark or light." });
     };
+    let (pages, ui) = apply(theme, state).await;
+    json!({ "id": id, "success": true,
+        "data": { "theme": theme, "pages": pages, "ui": ui } })
+}
+
+/// Reconcile a current host launch preference without restarting a live browser.
+/// Unchanged preferences leave explicit page emulation and the CDP path alone.
+pub(crate) async fn reconcile_launch(theme: Option<Theme>, state: &mut DaemonState) {
+    if let Some(theme) = theme.filter(|theme| Some(*theme) != state.theme) {
+        apply(theme, state).await;
+    }
+}
+
+async fn apply(theme: Theme, state: &mut DaemonState) -> (&'static str, &'static str) {
     state.theme = Some(theme);
     if let Some(requested) = state.session_setup.emulated_media.as_mut() {
         requested.features.retain(|(name, _)| name != COLOR_SCHEME);
     }
-    let (pages, ui) = match state.browser.as_ref() {
+    match state.browser.as_ref() {
         Some(browser) => {
             if let Some(media) =
                 page_media(state.session_setup.emulated_media.as_ref(), state.theme)
@@ -149,9 +163,7 @@ pub(crate) async fn set(command: &Value, state: &mut DaemonState) -> Value {
             ("live", ui)
         }
         None => ("next_launch", "next_launch"),
-    };
-    json!({ "id": id, "success": true,
-        "data": { "theme": theme, "pages": pages, "ui": ui } })
+    }
 }
 
 /// Sends the media emulation to every page at once. Failures are ignored as
@@ -272,6 +284,34 @@ mod tests {
             request.features
         );
         assert!(page_media(None, None).is_none());
+    }
+
+    #[tokio::test]
+    async fn launch_reconciliation_only_changes_a_new_explicit_preference() {
+        let mut state = DaemonState::new();
+        state.theme = Some(Theme::Dark);
+        state.session_setup.emulated_media = Some(media(&[(COLOR_SCHEME, "light")]));
+        reconcile_launch(None, &mut state).await;
+        reconcile_launch(Some(Theme::Dark), &mut state).await;
+        assert_eq!(state.theme, Some(Theme::Dark));
+        assert_eq!(
+            state
+                .session_setup
+                .emulated_media
+                .as_ref()
+                .unwrap()
+                .features,
+            media(&[(COLOR_SCHEME, "light")]).features
+        );
+        reconcile_launch(Some(Theme::Light), &mut state).await;
+        assert_eq!(state.theme, Some(Theme::Light));
+        assert!(state
+            .session_setup
+            .emulated_media
+            .as_ref()
+            .unwrap()
+            .features
+            .is_empty());
     }
 
     #[tokio::test]

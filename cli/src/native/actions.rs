@@ -5368,6 +5368,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     } else {
         load_storage_state(state, &storage_state_owned).await?;
         state.effective_ca_cert = effective_ca_cert;
+        super::theme::reconcile_launch(theme, state).await;
         return Ok(json!({ "launched": true, "reused": true, "relaunchedBrowser": false }));
     }
     state.ref_map.clear();

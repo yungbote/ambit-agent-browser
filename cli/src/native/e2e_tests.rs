@@ -13858,3 +13858,53 @@ async fn e2e_native_mouse_reaches_a_cross_site_iframe() {
     );
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
+
+/// A missed settings push heals on the next host launch envelope without
+/// replacing the page, its JavaScript state, or the private Chrome profile.
+#[tokio::test]
+#[ignore]
+async fn e2e_reused_launch_reconciles_theme_without_replacing_the_page() {
+    let mut state = DaemonState::new();
+    let launch = json!({"action":"launch", "theme":"dark", "headless":true});
+    assert_success(&control_test_command(&launch, &mut state).await);
+    assert_success(
+        &control_test_command(
+            &json!({"action":"navigate",
+        "url":"data:text/html,<title>Theme continuity</title><input id=entry>"}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(&control_test_command(&json!({"action":"evaluate",
+        "script":"window.themeContinuity = 'retained'; document.querySelector('input').value = 'draft'; true"}), &mut state).await);
+    let original_session = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .active_session_id()
+        .unwrap()
+        .to_owned();
+    for theme in ["light", "dark", "dark"] {
+        let response = control_test_command(
+            &json!({"action":"launch", "theme":theme,
+            "headless":true}),
+            &mut state,
+        )
+        .await;
+        assert_success(&response);
+        assert_eq!(response["data"]["reused"], true, "{response}");
+        assert_eq!(response["data"]["relaunchedBrowser"], false);
+        assert_eq!(
+            state.browser.as_ref().unwrap().active_session_id().unwrap(),
+            original_session.as_str()
+        );
+        let observed = control_test_command(&json!({"action":"evaluate", "script":
+            "({dark: matchMedia('(prefers-color-scheme: dark)').matches, marker: window.themeContinuity, input: document.querySelector('input').value})"}), &mut state).await;
+        assert_success(&observed);
+        assert_eq!(
+            observed["data"]["result"],
+            json!({"dark":theme == "dark", "marker":"retained", "input":"draft"})
+        );
+    }
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
