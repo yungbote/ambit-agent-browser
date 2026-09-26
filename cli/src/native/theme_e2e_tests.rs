@@ -253,16 +253,19 @@ const TAB_STRIP_DIP: u32 = 42;
 /// qualification runtime. Each frame is saved for the evidence.
 async fn window_ui_now(state: &DaemonState, name: &str) -> Result<Scheme, String> {
     let display = state.window_display().ok_or("no owned browser window")?;
+    // A whole frame now: no wait for damage and no cursor identity.
     let request = CaptureRequest {
         cursor: false,
         budget_bytes: 0,
         force: true,
         patches: false,
+        ..Default::default()
     };
     let (capture, surface) = display
         .capture(request)
         .await
         .map_err(|error| error.message)?
+        .frame
         .ok_or("a forced capture returned no frame")?;
     let bytes = base64::engine::general_purpose::STANDARD
         .decode(capture.data.ok_or("the capture is not a whole frame")?)
