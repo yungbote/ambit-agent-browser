@@ -63,6 +63,82 @@ async fn screenshot(state: &DaemonState, name: &str) {
     .unwrap();
 }
 
+async fn wait_for_paint(state: &DaemonState, point: (f64, f64), rgb: [u8; 3]) {
+    use crate::native::display::CaptureRequest;
+    use base64::Engine;
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let (capture, _) = state
+                .window_display()
+                .unwrap()
+                .capture(CaptureRequest {
+                    force: true,
+                    budget_bytes: 3_000_000,
+                    ..Default::default()
+                })
+                .await
+                .unwrap()
+                .frame
+                .unwrap();
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(capture.data.unwrap())
+                .unwrap();
+            let frame = image::load_from_memory(&bytes).unwrap().to_rgb8();
+            let pixel = frame.get_pixel(point.0 as u32, point.1 as u32);
+            if pixel
+                .0
+                .iter()
+                .zip(rgb)
+                .all(|(observed, expected)| observed.abs_diff(expected) < 5)
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the person sees the painted button before clicking it");
+}
+
+fn save_wave(name: &str, pcm: &[i16]) {
+    let Some(directory) = std::env::var_os("AUDIO_EVIDENCE_DIR") else {
+        return;
+    };
+    let data_bytes = (pcm.len() * 2) as u32;
+    let mut wave = Vec::with_capacity(44 + data_bytes as usize);
+    wave.extend(b"RIFF");
+    wave.extend((36 + data_bytes).to_le_bytes());
+    wave.extend(b"WAVEfmt ");
+    wave.extend(16u32.to_le_bytes());
+    wave.extend(1u16.to_le_bytes());
+    wave.extend(2u16.to_le_bytes());
+    wave.extend(SAMPLE_RATE.to_le_bytes());
+    wave.extend((SAMPLE_RATE * 4).to_le_bytes());
+    wave.extend(4u16.to_le_bytes());
+    wave.extend(16u16.to_le_bytes());
+    wave.extend(b"data");
+    wave.extend(data_bytes.to_le_bytes());
+    wave.extend(pcm.iter().flat_map(|sample| sample.to_le_bytes()));
+    std::fs::write(
+        std::path::Path::new(&directory).join(format!("{name}.wav")),
+        wave,
+    )
+    .unwrap();
+}
+
+fn process_cpu_us() -> u64 {
+    // CPU of this source/test process, including the test's reference decoder; not Chrome CPU.
+    let mut usage = std::mem::MaybeUninit::<libc::rusage>::uninit();
+    assert_eq!(
+        unsafe { libc::getrusage(libc::RUSAGE_SELF, usage.as_mut_ptr()) },
+        0
+    );
+    let usage = unsafe { usage.assume_init() };
+    ((usage.ru_utime.tv_sec + usage.ru_stime.tv_sec) * 1_000_000
+        + usage.ru_utime.tv_usec
+        + usage.ru_stime.tv_usec) as u64
+}
+
 fn power(samples: &[i16], frequency: f64) -> f64 {
     let n = samples.len() / 2;
     let (mut real, mut imaginary) = (0.0, 0.0);
@@ -141,7 +217,7 @@ async fn e2e_audio_two_sessions_page_output_and_sign_in() {
                 recorded.lock().unwrap().push(path.to_string());
                 if path.starts_with("/report/") {
                     let _ = socket
-                        .write_all(b"HTTP/1.1 204 No Content\r\nConnection: close\r\n\r\n")
+                        .write_all(b"HTTP/1.1 204 No Content\r\nCache-Control: no-store\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
                         .await;
                     return;
                 }
@@ -184,10 +260,17 @@ async fn e2e_audio_two_sessions_page_output_and_sign_in() {
     command(&mut b, json!({"action":"click","selector":"#play"})).await;
     assert!(wait_for_report(&reports, "/report/playing/440", 1).await);
     assert!(wait_for_report(&reports, "/report/playing/880", 1).await);
+    let (x, y, _) = crate::native::e2e_tests::window_point(&a, 320.0, 240.0).await;
     screenshot(&a, "automation-playing").await;
     let mut sub_a = source_a.subscribe(AudioCodec::Opus).unwrap();
     let mut sub_b = source_b.subscribe(AudioCodec::PcmS16le).unwrap();
+    let capture_started = Instant::now();
+    let capture_cpu = process_cpu_us();
     let (a_pcm, b_pcm) = tokio::join!(collect(&mut sub_a, 1200), collect(&mut sub_b, 1200));
+    let capture_cpu = process_cpu_us() - capture_cpu;
+    let capture_wall = capture_started.elapsed().as_micros();
+    save_wave("automation-a-opus-decoded", &a_pcm.0);
+    save_wave("automation-b-pcm", &b_pcm.0);
     let (a_own, a_other, b_own, b_other) = (
         power(&a_pcm.0, 440.0),
         power(&a_pcm.0, 880.0),
@@ -224,21 +307,28 @@ async fn e2e_audio_two_sessions_page_output_and_sign_in() {
         "restored page did not load: {:?}",
         reports.lock().unwrap()
     );
+    wait_for_paint(&a, (x, y), [34, 34, 51]).await;
     let signing_in = a.window_audio().unwrap();
     assert_eq!(
         signing_in.observe().startup_us,
         source_a.observe().startup_us
     );
-    // The page fills the content area; native input works with no DevTools.
-    a.window_display().unwrap().input(&[
-        json!({"type":"input_mouse","eventType":"mouseMoved","x":300,"y":400,"button":"none","buttons":0}),
-        json!({"type":"input_mouse","eventType":"mousePressed","x":300,"y":400,"button":"left","buttons":1,"clickCount":1}),
-        json!({"type":"input_mouse","eventType":"mouseReleased","x":300,"y":400,"button":"left","buttons":0,"clickCount":1})
-    ]).await.unwrap();
-    screenshot(&a, "sign-in-after-gesture").await;
+    // Calibrated before handover; this actual person's input has no DevTools channel.
+    let mut click = control("input", &controller);
+    click["sequence"] = json!(2);
+    click["expectedSurfaceGeneration"] = response["data"]["surface"]["generation"].clone();
+    click["events"] = json!([
+        {"type":"input_mouse","eventType":"mouseMoved","x":x,"y":y,"button":"none","buttons":0},
+        {"type":"input_mouse","eventType":"mousePressed","x":x,"y":y,"button":"left","buttons":1,"clickCount":1},
+        {"type":"input_mouse","eventType":"mouseReleased","x":x,"y":y,"button":"left","buttons":0,"clickCount":1}
+    ]);
+    command(&mut a, click).await;
     assert!(wait_for_report(&reports, "/report/playing/440", 2).await);
+    wait_for_paint(&a, (x, y), [255, 255, 255]).await;
+    screenshot(&a, "sign-in-after-gesture").await;
     let mut signed = signing_in.subscribe(AudioCodec::Opus).unwrap();
     let signed_pcm = collect(&mut signed, 1000).await;
+    save_wave("sign-in-opus-decoded", &signed_pcm.0);
     assert!(
         power(&signed_pcm.0, 440.0) > 1000.0,
         "sign-in output must reach the retained sink: power={}",
@@ -262,6 +352,6 @@ async fn e2e_audio_two_sessions_page_output_and_sign_in() {
     server.abort();
     println!(
         "AUDIO_PROOF {}",
-        json!({"status":"passed","pulse":observation,"launchAMs":launch_a_ms,"signInMs":transition.as_millis(),"aTone":a_own,"aForeignTone":a_other,"bTone":b_own,"bForeignTone":b_other,"opusPrimingSamples":a_pcm.2,"packets":a_pcm.1.len(),"maxOpusBytes":a_pcm.1.iter().map(|p|p.2).max(),"slowSubscriber":"overrun_closed","lateSubscriber":"fresh_sequence","signIn":"retained_output","shutdown":"retired"})
+        json!({"status":"passed","pulse":observation,"launchAMs":launch_a_ms,"signInMs":transition.as_millis(),"aTone":a_own,"aForeignTone":a_other,"bTone":b_own,"bForeignTone":b_other,"opusPrimingSamples":a_pcm.2,"packets":a_pcm.1.len(),"maxOpusBytes":a_pcm.1.iter().map(|p|p.2).max(),"captureAndReferenceDecoderCpuUs":capture_cpu,"captureWallUs":capture_wall,"slowSubscriber":"overrun_closed","lateSubscriber":"fresh_sequence","signIn":"retained_output","shutdown":"retired"})
     );
 }
