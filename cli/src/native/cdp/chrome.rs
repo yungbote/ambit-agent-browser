@@ -751,6 +751,23 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
 
     let effectively_headless = options.effectively_headless();
 
+    // BrowserManager creates the initial page when no target exists. Chrome's
+    // independent startup new-tab target can arrive after that page and race
+    // its first compositor capture. Headless sessions need only the managed
+    // page; a headed window or an explicitly restored session keeps Chrome's
+    // normal startup behavior.
+    if effectively_headless
+        && !options.restore_last_session
+        && !options.args.iter().any(|arg| {
+            matches!(
+                switch_name(arg).as_deref(),
+                Some("restore-last-session" | "no-startup-window")
+            )
+        })
+    {
+        args.push("--no-startup-window".to_string());
+    }
+
     if let Some(switch) = options
         .theme
         .and_then(|theme| theme.chrome_switch(effectively_headless))
@@ -2775,6 +2792,7 @@ mod tests {
         };
         let result = build_chrome_args(&opts).unwrap();
         assert!(result.args.iter().any(|a| a == "--headless=new"));
+        assert!(result.args.iter().any(|a| a == "--no-startup-window"));
         assert!(result.args.iter().any(|a| a == "--hide-scrollbars"));
         assert!(result
             .args
@@ -2786,6 +2804,57 @@ mod tests {
         let dir = result.temp_user_data_dir.unwrap();
         assert!(dir.exists());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn headless_startup_page_owner_preserves_windows_restore_and_custom_switches() {
+        for options in [
+            LaunchOptions {
+                headless: false,
+                ..Default::default()
+            },
+            LaunchOptions {
+                window_stream: true,
+                ..Default::default()
+            },
+            LaunchOptions {
+                extensions: Some(vec!["/tmp/extension".into()]),
+                ..Default::default()
+            },
+            LaunchOptions {
+                restore_last_session: true,
+                ..Default::default()
+            },
+            LaunchOptions {
+                args: vec!["--restore-last-session".into()],
+                ..Default::default()
+            },
+        ] {
+            let built = build_chrome_args(&options).unwrap();
+            assert!(!built.args.iter().any(|arg| arg == "--no-startup-window"));
+            if let Some(directory) = built.temp_user_data_dir {
+                let _ = std::fs::remove_dir_all(directory);
+            }
+        }
+        for supplied in ["--no-startup-window", "--no-startup-window=false"] {
+            let built = build_chrome_args(&LaunchOptions {
+                args: vec![supplied.into()],
+                ..Default::default()
+            })
+            .unwrap();
+            assert_eq!(
+                built
+                    .args
+                    .iter()
+                    .filter(|arg| switch_name(arg).as_deref() == Some("no-startup-window"))
+                    .count(),
+                1
+            );
+            assert!(built.args.iter().any(|arg| arg == supplied));
+            if let Some(directory) = built.temp_user_data_dir {
+                let _ = std::fs::remove_dir_all(directory);
+            }
+        }
     }
 
     #[test]
