@@ -3630,8 +3630,11 @@ Operations include a native viewport JPEG reference when capture succeeds;
 capture failure never replaces the primary outcome. The host owns admission
 of the file bytes. --describe-host-bound prints the full catalog without
 starting a browser. Host-bound calls are limited to 120000 milliseconds.
-After human control, browser_observation_required returns fresh feedback
-before another host-bound action. Earlier image pageGeneration values are stale.
+After human control, a call that names its target runs; input to focus or the
+pointer, a dialog answer and a Playwright program are refused once as
+browser_observation_required with fresh feedback. Earlier image pageGeneration
+values are stale, and so are refs and a frame selection from a document the tab
+no longer shows (browser_observation_stale).
 A page action without a single visible tab is refused as
 browser_active_page_ambiguous. data.tabs lists the open tabs (at most 20: tabId,
 label, title, URL origin, active), data.tabCount counts them, and no tab is

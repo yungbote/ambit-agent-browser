@@ -80,7 +80,7 @@ agent-browser click @e12
 
 ## Ref Lifecycle
 
-**IMPORTANT**: Refs are invalidated when the page changes! A ref used after its page navigated or reloaded is refused with `browser_observation_stale` and nothing is done. Resizing the window keeps refs.
+**IMPORTANT**: Refs are invalidated when the page changes! A ref used after its page navigated or reloaded, or while another tab is shown, is refused with `browser_observation_stale` and nothing is done, as is a ref no snapshot lists. Resizing the window keeps refs.
 
 ```bash
 # Get initial snapshot
