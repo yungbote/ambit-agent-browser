@@ -4,13 +4,16 @@
 //! (XFixes), mapped to a CSS keyword. The workspace image has no cursor
 //! theme, so Chrome draws its cursors from the X core font and several
 //! keywords share one image: for those the helper can name only the class
-//! (`default` also stands for `help`, `not-allowed`, `copy` and eight more).
-//! The hovered element's computed `cursor` in the visible page picks the
-//! member of that class, so a person under control sees the cursor the page
-//! asked for. Without DevTools (sign-in), past a cross-origin frame or past
-//! the deadline, the class keyword stands. Identities reach viewers in the
-//! order the helper reported them, and a refinement never outlives a newer
-//! identity.
+//! keyword, and with `members` the keywords that image stands for (the
+//! arrow stands for `default` alone; the X that shows when Chrome sets no
+//! cursor stands for `help`, `not-allowed`, `copy` and eight more, and is
+//! reported as `default` too). The hovered element's computed `cursor` in
+//! the visible page picks the member of that image's class, so a person
+//! under control sees the cursor the page asked for, and never one the
+//! window does not show. Without DevTools (sign-in), past a cross-origin
+//! frame or past the deadline, the class keyword stands. Identities reach
+//! viewers in the order the helper reported them, and a refinement never
+//! outlives a newer identity.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -29,10 +32,13 @@ const MAX_CURSOR_RECORD: usize = 96 * 1024;
 /// then leaves the class keyword, which is what the window shows.
 const REFINE_DEADLINE: Duration = Duration::from_millis(50);
 
-/// The keywords the helper reports for a class of cursors that share one
-/// image on the workspace image (CfT 152 under Xvfb, no Xcursor theme, as
-/// the helper's qualification measured them), with every keyword each
-/// stands for. A keyword outside this table names its cursor exactly.
+/// For a helper that does not send `members`: the keywords it reports for a
+/// class of cursors that share one image on the workspace image (CfT 152
+/// under Xvfb, no Xcursor theme, as the helper's qualification measured
+/// them), with every keyword each stands for. A keyword outside this table
+/// names its cursor exactly. Such a helper reports the arrow and the X both
+/// as `default`, so `default` here is their union; it is deleted with the
+/// last helper that does not classify its images.
 const CURSOR_CLASSES: &[(&str, &[&str])] = &[
     (
         "default",
@@ -113,21 +119,24 @@ impl CursorIdentities {
     /// is refined off the capture path; any other identity is published at
     /// once.
     pub(super) fn observe(&self, identity: Value, ts: u64) {
-        let Some(record) = cursor_record(identity, ts) else {
+        let Some((record, members)) = cursor_record(identity, ts) else {
             return;
         };
         let order = self.next_order();
-        let Some(members) = record["css"].as_str().and_then(class_members) else {
+        if members
+            .iter()
+            .all(|member| record["css"] == member.as_str())
+        {
             self.publish(order, record);
             return;
-        };
+        }
         let identities = self.clone();
         tokio::spawn(async move {
             let mut record = record;
             if let Some(keyword) = identities
                 .hovered_cursor()
                 .await
-                .and_then(|computed| member(members, &computed))
+                .and_then(|computed| member(&members, &computed))
             {
                 record["css"] = json!(keyword);
             }
@@ -179,28 +188,51 @@ impl CursorIdentities {
     }
 }
 
-/// The viewer record for one helper cursor identity: `serial`, a CSS keyword
-/// or null, and for a page's own cursor its `image`. A record of another
-/// shape or size is not forwarded.
-fn cursor_record(identity: Value, ts: u64) -> Option<Value> {
+/// The most keywords one cursor image can stand for (CSS names 36).
+const MAX_MEMBERS: usize = 64;
+
+/// The viewer record for one helper cursor identity (`serial`, a CSS keyword
+/// or null, and for a page's own cursor its `image`), with the keywords its
+/// image stands for: the helper's `members`, or for a helper that sends none
+/// this driver's table. A record of another shape or size is not forwarded.
+fn cursor_record(identity: Value, ts: u64) -> Option<(Value, Vec<String>)> {
     let serial = identity["serial"]
         .as_u64()
         .filter(|serial| *serial <= u64::from(u32::MAX))?;
     let css = &identity["css"];
     let image = identity.get("image");
-    let shaped = match (css, image) {
-        (Value::String(keyword), None) => !keyword.is_empty(),
-        (Value::Null, Some(image)) => image.is_object(),
-        _ => false,
+    let members = match (css, image, identity.get("members")) {
+        (Value::String(keyword), None, None) if !keyword.is_empty() => class_members(keyword)
+            .unwrap_or_default()
+            .iter()
+            .map(|member| member.to_string())
+            .collect(),
+        (Value::String(keyword), None, Some(Value::Array(members)))
+            if !keyword.is_empty() && (1..=MAX_MEMBERS).contains(&members.len()) =>
+        {
+            members
+                .iter()
+                .map(|member| {
+                    member
+                        .as_str()
+                        .filter(|member| {
+                            (1..=32).contains(&member.len())
+                                && member
+                                    .bytes()
+                                    .all(|byte| byte.is_ascii_lowercase() || byte == b'-')
+                        })
+                        .map(str::to_owned)
+                })
+                .collect::<Option<Vec<_>>>()?
+        }
+        (Value::Null, Some(image), None) if image.is_object() => Vec::new(),
+        _ => return None,
     };
-    if !shaped {
-        return None;
-    }
     let mut record = json!({ "type": "cursor", "ts": ts, "serial": serial, "css": css });
     if let Some(image) = image {
         record["image"] = image.clone();
     }
-    Some(record).filter(|record| record.to_string().len() <= MAX_CURSOR_RECORD)
+    Some((record, members)).filter(|(record, _)| record.to_string().len() <= MAX_CURSOR_RECORD)
 }
 
 /// The keywords a class keyword stands for, when it names a class.
@@ -215,14 +247,14 @@ fn class_members(keyword: &str) -> Option<&'static [&'static str]> {
 /// entry of a list whose images did not load; `auto` shows the arrow. None
 /// when the page asks for a cursor outside the class, so the window shows
 /// something else and the class keyword stands.
-fn member(members: &'static [&'static str], computed: &str) -> Option<&'static str> {
+fn member(members: &[String], computed: &str) -> Option<String> {
     let keyword = computed.rsplit(',').next()?.trim().to_ascii_lowercase();
     let keyword = if keyword == "auto" {
         "default"
     } else {
         keyword.as_str()
     };
-    members.iter().copied().find(|member| *member == keyword)
+    members.iter().find(|member| *member == keyword).cloned()
 }
 
 #[cfg(test)]
@@ -244,6 +276,12 @@ mod tests {
             json!({"serial": u64::from(u32::MAX) + 1, "css": "text"}),
             json!({"css": "text"}),
             json!("text"),
+            json!({"serial": 1, "css": "default", "members": []}),
+            json!({"serial": 1, "css": "default", "members": "default"}),
+            json!({"serial": 1, "css": "default", "members": [1]}),
+            json!({"serial": 1, "css": "default", "members": ["Not-Allowed"]}),
+            json!({"serial": 1, "css": "default", "members": [""]}),
+            json!({"serial": 1, "css": null, "image": {}, "members": ["default"]}),
         ] {
             assert!(cursor_record(identity.clone(), 7).is_none(), "{identity}");
         }
@@ -258,7 +296,12 @@ mod tests {
     /// not.
     #[test]
     fn a_computed_cursor_picks_only_a_member_of_the_reported_class() {
-        let refine = |class: &str, computed: &str| member(class_members(class)?, computed);
+        let refine = |class: &str, computed: &str| {
+            let members = class_members(class)?;
+            let owned: Vec<String> = members.iter().map(|member| member.to_string()).collect();
+            let chosen = member(&owned, computed)?;
+            members.iter().copied().find(|member| *member == chosen)
+        };
         assert_eq!(refine("default", "not-allowed"), Some("not-allowed"));
         assert_eq!(refine("default", "help"), Some("help"));
         assert_eq!(refine("default", "auto"), Some("default"));
@@ -382,6 +425,54 @@ mod tests {
             requests.try_recv().is_err(),
             "an exact keyword asks nothing"
         );
+    }
+
+    /// The helper names the keywords each image stands for. The arrow is
+    /// `default` alone, so it is never refined into the X's keywords (a
+    /// scrollbar of a `not-allowed` element shows the arrow); the X, also
+    /// reported as `default`, is refined within its own keywords only.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_default_is_refined_only_within_the_image_the_helper_names() {
+        let (client, mut requests) =
+            devtools(vec![(0, Some("not-allowed")), (0, Some("pointer"))]).await;
+        let (identities, mut messages, _media) = identities(Some(client));
+        let x_cursor = json!([
+            "context-menu",
+            "help",
+            "vertical-text",
+            "alias",
+            "copy",
+            "no-drop",
+            "not-allowed",
+            "nesw-resize",
+            "nwse-resize",
+            "zoom-in",
+            "zoom-out"
+        ]);
+        // The arrow over a `not-allowed` element's scrollbar.
+        identities.observe(
+            json!({"serial": 4, "css": "default", "members": ["default"]}),
+            1,
+        );
+        assert_eq!(next(&mut messages).await["css"], "default");
+        assert!(requests.try_recv().is_err(), "the arrow asks nothing");
+        // The X over the element itself.
+        identities.observe(
+            json!({"serial": 5, "css": "default", "members": x_cursor}),
+            2,
+        );
+        let refined = next(&mut messages).await;
+        assert_eq!(
+            (refined["serial"].as_u64(), refined["css"].as_str()),
+            (Some(5), Some("not-allowed"))
+        );
+        assert!(refined.get("members").is_none(), "{refined}");
+        // A page cursor outside the X's keywords leaves the class keyword.
+        identities.observe(
+            json!({"serial": 6, "css": "default", "members": x_cursor}),
+            3,
+        );
+        assert_eq!(next(&mut messages).await["css"], "default");
     }
 
     /// A refinement never lands after a newer identity, and one the page
