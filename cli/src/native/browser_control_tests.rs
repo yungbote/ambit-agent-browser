@@ -1017,7 +1017,9 @@ fn lease_for(controller_id: &str, deadline: Instant, last_sequence: u64) -> Leas
 }
 
 /// A display helper that acknowledges every control operation and reports
-/// each operation it received.
+/// each operation it received. The helper's test channel exists only on
+/// Linux.
+#[cfg(target_os = "linux")]
 fn acknowledging_display() -> (
     std::sync::Arc<crate::native::display::DisplayClient>,
     mpsc::UnboundedReceiver<Value>,
@@ -1094,6 +1096,7 @@ fn sign_in_event_shape_is_exact_and_judged_after_the_sequence() {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn sign_in_admission_follows_the_contract_order_without_effect() {
     let (display, _ops, _frames) = acknowledging_display();
@@ -1186,6 +1189,7 @@ async fn sign_in_admission_follows_the_contract_order_without_effect() {
     ));
 }
 
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn sign_in_custody_outlasts_the_lease_deadline_until_the_browser_is_handed_back() {
     let (display, _ops, _frames) = acknowledging_display();
@@ -1258,6 +1262,7 @@ async fn sign_in_custody_outlasts_the_lease_deadline_until_the_browser_is_handed
 /// The idle clock follows the person, not the dock: renewing keeps it,
 /// applied input restarts it, and a window without DevTools takes native
 /// input with no page session at all.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn sign_in_idle_clock_restarts_on_applied_input_only() {
     let (display, mut ops, _frames) = acknowledging_display();
@@ -1339,6 +1344,7 @@ async fn sign_in_idle_clock_restarts_on_applied_input_only() {
 /// Only a person's native mouse and keyboard input to an owned window skips
 /// command custody. Everything else, and a sign-in the watchdog must end
 /// first, is left to the command path unapplied.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn window_input_fast_path_serves_only_native_window_input() {
     let (display, mut ops, _frames) = acknowledging_display();
@@ -1435,6 +1441,7 @@ async fn window_input_fast_path_serves_only_native_window_input() {
 /// Frames name the input they include by its sequence: the watermark moves
 /// only after the display acknowledged a batch, never on a refused one, and
 /// clears when the lease ends.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn applied_input_watermark_follows_acknowledged_input_only() {
     let (display, mut ops, _frames) = acknowledging_display();
@@ -1481,6 +1488,7 @@ async fn applied_input_watermark_follows_acknowledged_input_only() {
 /// Taking control releases whatever the agent held at the helper, so the
 /// agent's held button no longer holds layouts back: the person's first
 /// resize lands at once, not after the gesture bound.
+#[cfg(target_os = "linux")]
 #[tokio::test]
 async fn taking_control_ends_the_agents_held_gesture_for_layouts() {
     let (display, mut ops, _frames) = acknowledging_display();
