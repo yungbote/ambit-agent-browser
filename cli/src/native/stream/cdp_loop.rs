@@ -109,6 +109,22 @@ pub(super) fn replaced<T>(current: &Option<Arc<T>>, next: &Option<Arc<T>>) -> bo
     }
 }
 
+/// Chrome can commit a frame while its history is temporarily unavailable.
+/// Keep only that page's outstanding sample; its ordinary readiness events
+/// finish the observation, even when loading exceeds the sample deadline.
+struct PendingHistory {
+    url: String,
+    session: String,
+    generation: String,
+}
+
+impl PendingHistory {
+    fn matches(&self, client: &CdpClient, session: Option<&str>) -> bool {
+        self.session == session.unwrap_or_default()
+            && self.generation == client.page_generation(&self.session)
+    }
+}
+
 async fn publish_url(
     client: &CdpClient,
     frame_tx: &broadcast::Sender<String>,
@@ -116,14 +132,21 @@ async fn publish_url(
     cdp_session_id: &RwLock<Option<String>>,
     event_session_id: Option<&str>,
     url: &str,
-) {
+) -> Option<PendingHistory> {
+    let session = event_session_id.unwrap_or_default();
+    let generation = client.page_generation(session);
     let history = super::history_availability(client, event_session_id).await;
     let active_session = cdp_session_id.read().await;
     if !session_matches(active_session.as_deref(), event_session_id) {
-        return;
+        return None;
     }
     {
         let mut tabs = last_tabs.write().await;
+        // Acquiring the publication lock can wait through a page change.
+        // Check after that final await, immediately before updating metadata.
+        if generation != client.page_generation(session) {
+            return None;
+        }
         for tab in tabs.iter_mut() {
             if tab.get("active").and_then(Value::as_bool).unwrap_or(false) {
                 if let Some(tab) = tab.as_object_mut() {
@@ -148,6 +171,11 @@ async fn publish_url(
         message["canGoForward"] = json!(forward);
     }
     let _ = frame_tx.send(message.to_string());
+    history.is_none().then(|| PendingHistory {
+        url: url.to_string(),
+        session: session.to_string(),
+        generation,
+    })
 }
 
 /// Streams the current source to its viewers: the owned window's display,
@@ -202,6 +230,9 @@ pub(super) async fn cdp_event_loop(
     // an identity only when it changes, so the identity outlives a capture
     // loop restarted for the same display and ends with the display.
     let mut identity_source: Option<String> = None;
+    // A viewport-only loop restart must not forget an outstanding history
+    // sample. Its page generation and session fence it across replacements.
+    let mut pending_history: Option<PendingHistory> = None;
     loop {
         tokio::select! {
             changed = shutdown_rx.changed() => {
@@ -256,6 +287,22 @@ pub(super) async fn cdp_event_loop(
                 .map(|client| client.downloads.subscribe_settled());
 
             let session_id = cdp_session_id.read().await.clone();
+            if let Some(pending) = pending_history.take() {
+                if let Some(client) = client
+                    .as_ref()
+                    .filter(|client| pending.matches(client, session_id.as_deref()))
+                {
+                    pending_history = publish_url(
+                        client,
+                        &frame_tx,
+                        &last_tabs,
+                        &cdp_session_id,
+                        session_id.as_deref(),
+                        &pending.url,
+                    )
+                    .await;
+                }
+            }
 
             let vw = *viewport_width.lock().await;
             let vh = *viewport_height.lock().await;
@@ -328,7 +375,7 @@ pub(super) async fn cdp_event_loop(
                                 pending_same_document.drain(..)
                             {
                                 if frame_id == main_frame_id {
-                                    publish_url(
+                                    pending_history = publish_url(
                                         &client_arc,
                                         &frame_tx,
                                         &last_tabs,
@@ -416,7 +463,7 @@ pub(super) async fn cdp_event_loop(
                                                     .map(String::from);
                                             }
                                             if let Some(url) = frame.get("url").and_then(|v| v.as_str()) {
-                                                publish_url(
+                                                pending_history = publish_url(
                                                     &client_arc,
                                                     &frame_tx,
                                                     &last_tabs,
@@ -463,7 +510,7 @@ pub(super) async fn cdp_event_loop(
                                             } else if Some(frame_id)
                                                 == active_main_frame_id.as_deref()
                                             {
-                                                publish_url(
+                                                pending_history = publish_url(
                                                     &client_arc,
                                                     &frame_tx,
                                                     &last_tabs,
@@ -473,6 +520,22 @@ pub(super) async fn cdp_event_loop(
                                                 )
                                                 .await;
                                             }
+                                        }
+                                    }
+                                } else if matches!(evt.method.as_str(), "Page.domContentEventFired" | "Page.loadEventFired")
+                                    && session_matches(session_id.as_deref(), evt.session_id.as_deref())
+                                {
+                                    if let Some(pending) = pending_history.take() {
+                                        if pending.matches(&client_arc, evt.session_id.as_deref()) {
+                                            pending_history = publish_url(
+                                                &client_arc,
+                                                &frame_tx,
+                                                &last_tabs,
+                                                &cdp_session_id,
+                                                evt.session_id.as_deref(),
+                                                &pending.url,
+                                            )
+                                            .await;
                                         }
                                     }
                                 } else if evt.method == "Page.screencastFrame" {
@@ -684,6 +747,23 @@ mod tests {
         mpsc::UnboundedSender<Value>,
         Arc<Mutex<Vec<String>>>,
     ) {
+        mock_cdp_with_history(
+            main_frame_id,
+            seed_delay,
+            Arc::new(Mutex::new(json!({ "result": {} }))),
+        )
+        .await
+    }
+
+    async fn mock_cdp_with_history(
+        main_frame_id: &str,
+        seed_delay: std::time::Duration,
+        history: Arc<Mutex<Value>>,
+    ) -> (
+        Arc<CdpClient>,
+        mpsc::UnboundedSender<Value>,
+        Arc<Mutex<Vec<String>>>,
+    ) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!(
             "ws://127.0.0.1:{}/devtools/browser/mock",
@@ -727,7 +807,13 @@ mod tests {
                         } else {
                             json!({})
                         };
-                        tx.send(Message::Text(json!({ "id": id, "result": result }).to_string()))
+                        let mut response = if method == "Page.getNavigationHistory" {
+                            history.lock().await.clone()
+                        } else {
+                            json!({ "result": result })
+                        };
+                        response["id"] = json!(id);
+                        tx.send(Message::Text(response.to_string()))
                             .await
                             .unwrap();
                     }
@@ -977,6 +1063,200 @@ mod tests {
         })
         .await
         .expect("timed out waiting for CDP method");
+    }
+
+    #[tokio::test]
+    async fn unavailable_history_is_refreshed_when_the_same_page_finishes_loading() {
+        let history = Arc::new(Mutex::new(json!({ "error": {
+            "code": -32000, "message": "Not attached to an active page"
+        } })));
+        let (client, events, methods) =
+            mock_cdp_with_history("F-MAIN", std::time::Duration::ZERO, history.clone()).await;
+        let mut harness = start_loop_with_client(Some("S-ACTIVE"), client, events, methods).await;
+        next_message_of_type(&mut harness.messages, "status").await;
+        harness
+            .events
+            .send(
+                json!({"method":"Page.frameNavigated","sessionId":"S-ACTIVE",
+            "params":{"frame":{"id":"F-MAIN","url":"https://active.test/next"}}}),
+            )
+            .unwrap();
+        let first = next_message_of_type(&mut harness.messages, "url").await;
+        assert_eq!(first["url"], "https://active.test/next");
+        assert!(
+            first.get("canGoBack").is_none(),
+            "unknown is not false: {first}"
+        );
+        // Readiness can arrive after the bounded sample has expired. There
+        // is no timer that polls history while the page continues loading.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            harness
+                .methods
+                .lock()
+                .await
+                .iter()
+                .filter(|method| *method == "Page.getNavigationHistory")
+                .count(),
+            1
+        );
+        *history.lock().await = json!({"result":{"currentIndex":1,"entries":[{},{}]}});
+        harness
+            .events
+            .send(json!({"method":"Page.domContentEventFired","sessionId":"S-OTHER","params":{}}))
+            .unwrap();
+        expect_no_url(&mut harness.messages).await;
+        harness
+            .events
+            .send(json!({"method":"Page.domContentEventFired","sessionId":"S-ACTIVE","params":{}}))
+            .unwrap();
+        let ready = next_message_of_type(&mut harness.messages, "url").await;
+        assert_eq!(ready["url"], first["url"]);
+        assert_eq!(ready["canGoBack"], true);
+        assert_eq!(ready["canGoForward"], false);
+        assert_eq!(harness.last_tabs.read().await[0]["canGoBack"], true);
+        harness
+            .events
+            .send(json!({"method":"Page.loadEventFired","sessionId":"S-ACTIVE","params":{}}))
+            .unwrap();
+        expect_no_url(&mut harness.messages).await;
+        assert_eq!(
+            harness
+                .methods
+                .lock()
+                .await
+                .iter()
+                .filter(|method| *method == "Page.getNavigationHistory")
+                .count(),
+            2
+        );
+        stop_loop(harness).await;
+    }
+
+    #[tokio::test]
+    async fn pending_history_does_not_follow_a_replaced_page_or_active_session() {
+        let history = Arc::new(Mutex::new(
+            json!({"error":{"code":-32000,"message":"Not attached to an active page"}}),
+        ));
+        let (client, events, methods) =
+            mock_cdp_with_history("F-MAIN", std::time::Duration::ZERO, history.clone()).await;
+        let mut harness =
+            start_loop_with_client(Some("S-ACTIVE"), client.clone(), events, methods).await;
+        next_message_of_type(&mut harness.messages, "status").await;
+        harness
+            .events
+            .send(
+                json!({"method":"Page.frameNavigated","sessionId":"S-ACTIVE",
+            "params":{"frame":{"id":"F-MAIN","url":"https://active.test/old"}}}),
+            )
+            .unwrap();
+        next_message_of_type(&mut harness.messages, "url").await;
+        client.rotate_page_generation("S-ACTIVE");
+        harness
+            .events
+            .send(json!({"method":"Page.loadEventFired","sessionId":"S-ACTIVE","params":{}}))
+            .unwrap();
+        expect_no_url(&mut harness.messages).await;
+        assert_eq!(
+            harness
+                .methods
+                .lock()
+                .await
+                .iter()
+                .filter(|method| *method == "Page.getNavigationHistory")
+                .count(),
+            1
+        );
+
+        harness
+            .events
+            .send(
+                json!({"method":"Page.frameNavigated","sessionId":"S-ACTIVE",
+            "params":{"frame":{"id":"F-MAIN","url":"https://active.test/current"}}}),
+            )
+            .unwrap();
+        next_message_of_type(&mut harness.messages, "url").await;
+        *harness.cdp_session_id.write().await = Some("S-OTHER".to_string());
+        *history.lock().await = json!({"result":{"currentIndex":1,"entries":[{},{}]}});
+        harness
+            .events
+            .send(json!({"method":"Page.loadEventFired","sessionId":"S-ACTIVE","params":{}}))
+            .unwrap();
+        expect_no_url(&mut harness.messages).await;
+        stop_loop(harness).await;
+    }
+
+    #[tokio::test]
+    async fn an_in_flight_history_sample_cannot_publish_after_its_page_changes() {
+        let history = Arc::new(Mutex::new(
+            json!({"result":{"currentIndex":1,"entries":[{},{}]}}),
+        ));
+        let (client, events, methods) =
+            mock_cdp_with_history("F-MAIN", std::time::Duration::ZERO, history.clone()).await;
+        let mut harness =
+            start_loop_with_client(Some("S-ACTIVE"), client.clone(), events, methods).await;
+        next_message_of_type(&mut harness.messages, "status").await;
+        let held = history.lock().await;
+        harness
+            .events
+            .send(
+                json!({"method":"Page.frameNavigated","sessionId":"S-ACTIVE",
+            "params":{"frame":{"id":"F-MAIN","url":"https://active.test/old"}}}),
+            )
+            .unwrap();
+        wait_for_method(&harness.methods, "Page.getNavigationHistory").await;
+        client.rotate_page_generation("S-ACTIVE");
+        drop(held);
+        expect_no_url(&mut harness.messages).await;
+        assert_eq!(
+            harness.last_tabs.read().await[0]["url"],
+            "https://active.test/"
+        );
+        stop_loop(harness).await;
+    }
+
+    #[tokio::test]
+    async fn history_blocked_on_publication_cannot_follow_a_page_change() {
+        let history = Arc::new(Mutex::new(
+            json!({"result":{"currentIndex":1,"entries":[{},{}]}}),
+        ));
+        let (client, _events, _methods) =
+            mock_cdp_with_history("F-MAIN", std::time::Duration::ZERO, history).await;
+        let tabs = RwLock::new(vec![json!({"active":true,"url":"https://active.test/"})]);
+        let active = RwLock::new(Some("S-ACTIVE".to_string()));
+        let (messages, mut received) = broadcast::channel(4);
+        let mut replies = client.subscribe_raw();
+        let held = tabs.write().await;
+        let publication = publish_url(
+            &client,
+            &messages,
+            &tabs,
+            &active,
+            Some("S-ACTIVE"),
+            "https://active.test/old",
+        );
+        tokio::pin!(publication);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                tokio::select! {
+                    _ = &mut publication => panic!("publication passed the held tabs lock"),
+                    reply = replies.recv() => {
+                        let value: Value = serde_json::from_str(&reply.unwrap().text).unwrap();
+                        if value["result"]["currentIndex"] == 1 { break; }
+                    }
+                }
+            }
+        })
+        .await
+        .unwrap();
+        // The CDP reply is complete. Poll through it to the held publication
+        // lock before changing the page; a pre-lock check would now be stale.
+        assert!(futures_util::poll!(&mut publication).is_pending());
+        client.rotate_page_generation("S-ACTIVE");
+        drop(held);
+        assert!(publication.await.is_none());
+        assert!(received.try_recv().is_err());
+        assert_eq!(tabs.read().await[0]["url"], "https://active.test/");
     }
 
     /// A presentation change (a viewer's new layout, or its applied surface)
