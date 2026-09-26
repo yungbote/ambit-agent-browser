@@ -325,8 +325,9 @@ impl DaemonState {
             Ok(changed) => {
                 self.window_page_error = None;
                 if changed {
-                    self.ref_map.clear();
-                    self.active_frame_id = None;
+                    // Refs and the selected frame stay: each is bound to the
+                    // document it was taken from, which the page shown now
+                    // does not have (`element::lookup_ref`, `scoped_frame`).
                     self.refresh_active_iframe_sessions().await;
                     self.update_stream_client().await;
                 }

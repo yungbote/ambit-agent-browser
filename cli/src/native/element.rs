@@ -147,11 +147,28 @@ pub(crate) async fn page_document(client: &CdpClient, session_id: &str) -> Optio
         .map(str::to_string)
 }
 
+/// Whether the page no longer shows `document`, the document something the
+/// agent holds (a ref, a frame selection) was taken from. Nothing taken from
+/// a document outlives it: its nodes and frames belong to a page that is
+/// gone, however it went (a navigation or reload by anyone, a relaunch,
+/// another tab shown). A page that cannot tell its document now keeps what
+/// was taken from it, as does anything taken without a document.
+async fn document_gone(client: &CdpClient, session_id: &str, document: Option<&str>) -> bool {
+    let Some(document) = document else {
+        return false;
+    };
+    page_document(client, session_id)
+        .await
+        .is_some_and(|current| current != document)
+}
+
 /// The entry `ref_id` names, while the page still shows the document the
 /// snapshot that listed it read. A ref from another document is refused
 /// before anything is done: its node, and the role and name it would be
-/// found again by, belong to a page that is gone. A page that cannot tell
-/// its document now resolves the ref as before.
+/// found again by, belong to a page that is gone. So is a ref no snapshot
+/// of this session lists (any longer): both are refused as
+/// `browser_observation_stale`, the refusal a ref from an old observation
+/// gets, whatever ended it.
 pub(crate) async fn lookup_ref<'a>(
     client: &CdpClient,
     session_id: &str,
@@ -159,20 +176,46 @@ pub(crate) async fn lookup_ref<'a>(
     ref_id: &str,
 ) -> Result<&'a RefEntry, String> {
     let entry = ref_map.get(ref_id).ok_or_else(|| {
-        format!("Unknown ref: {ref_id}. Refs come from the latest snapshot: take one and use a ref it lists.")
+        format!("browser_observation_stale: Unknown ref: {ref_id}. The latest snapshot does not list it. Nothing was done. Take a snapshot and use a ref it lists.")
     })?;
-    if let Some(document) = entry.document.as_deref() {
-        if page_document(client, session_id)
-            .await
-            .is_some_and(|current| current != document)
-        {
-            return Err(format!(
-                "browser_observation_stale: Ref {ref_id} is from a snapshot of a page this tab no longer shows (it navigated or reloaded, or another tab is active). Nothing was done. Take a snapshot and use a ref it lists."
-            ));
-        }
+    if document_gone(client, session_id, entry.document.as_deref()).await {
+        return Err(format!(
+            "browser_observation_stale: Ref {ref_id} is from a snapshot of a page this tab no longer shows (it navigated or reloaded, or another tab is active). Nothing was done. Take a snapshot and use a ref it lists."
+        ));
     }
     Ok(entry)
 }
+
+/// The frame a `frame` command selected, and the document (the page's
+/// main-frame loader) it was selected in. Selector and snapshot commands
+/// act inside it until the main frame or another frame is selected, or the
+/// agent's own navigation or tab change resets it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FrameScope {
+    pub frame_id: String,
+    pub document: Option<String>,
+}
+
+/// The frame `scope` selects, while the page still shows the document it
+/// was selected in. Like a ref, a frame selection ends with its document:
+/// that frame is gone, so a command that would act inside it is refused
+/// before anything is done, and keeps being refused until a frame (the main
+/// frame included) is selected again.
+pub(crate) async fn scoped_frame<'a>(
+    client: &CdpClient,
+    session_id: &str,
+    scope: Option<&'a FrameScope>,
+) -> Result<Option<&'a str>, String> {
+    let Some(scope) = scope else {
+        return Ok(None);
+    };
+    if document_gone(client, session_id, scope.document.as_deref()).await {
+        return Err(FRAME_SCOPE_ENDED.to_string());
+    }
+    Ok(Some(scope.frame_id.as_str()))
+}
+
+pub(crate) const FRAME_SCOPE_ENDED: &str = "browser_observation_stale: The frame selected with `frame` is on a page this tab no longer shows (it navigated or reloaded, or another tab is active). Nothing was done. Select the main frame or a frame of this page, then send this again.";
 
 pub fn parse_ref(input: &str) -> Option<String> {
     let trimmed = input.trim();
@@ -199,23 +242,28 @@ pub fn parse_ref(input: &str) -> Option<String> {
     None
 }
 
-/// Mirror of DaemonState.active_frame_id, refreshed before every command
+/// Mirror of DaemonState.active_frame, refreshed before every command
 /// (commands are serialized by the daemon's state lock, so this cannot
 /// race). It lets CSS-selector resolution honor `frame <sel>` without
 /// threading a parameter through every interaction signature; snapshot refs
 /// already carry their frame through the ref map.
-static ACTIVE_FRAME: std::sync::OnceLock<std::sync::Mutex<Option<String>>> =
+static ACTIVE_FRAME: std::sync::OnceLock<std::sync::Mutex<Option<FrameScope>>> =
     std::sync::OnceLock::new();
 
-pub fn set_active_frame(frame_id: Option<&str>) {
+pub fn set_active_frame(scope: Option<&FrameScope>) {
     *ACTIVE_FRAME
         .get_or_init(|| std::sync::Mutex::new(None))
         .lock()
-        .unwrap() = frame_id.map(String::from);
+        .unwrap() = scope.cloned();
 }
 
-fn active_frame() -> Option<String> {
-    ACTIVE_FRAME.get().and_then(|m| m.lock().unwrap().clone())
+/// The selected frame CSS-selector resolution acts inside, while its
+/// document lasts (`scoped_frame`).
+async fn active_frame(client: &CdpClient, session_id: &str) -> Result<Option<String>, String> {
+    let scope = ACTIVE_FRAME.get().and_then(|m| m.lock().unwrap().clone());
+    Ok(scoped_frame(client, session_id, scope.as_ref())
+        .await?
+        .map(str::to_string))
 }
 
 /// Object handle for the <iframe> element that owns a frame, resolved on the
@@ -430,7 +478,7 @@ pub async fn resolve_element_center(
     }
 
     // CSS selector: honor an active `frame <sel>` selection.
-    if let Some(frame_id) = active_frame() {
+    if let Some(frame_id) = active_frame(client, session_id).await? {
         // Cross-process iframe: its dedicated session's main frame IS the
         // iframe, so plain document-rooted resolution works there.
         if let Some(frame_session) = iframe_sessions.get(&frame_id) {
@@ -634,7 +682,7 @@ pub async fn resolve_element_object_id(
     }
 
     // Selector fallback (CSS or XPath): honor an active `frame <sel>` selection.
-    if let Some(frame_id) = active_frame() {
+    if let Some(frame_id) = active_frame(client, session_id).await? {
         if let Some(frame_session) = iframe_sessions.get(&frame_id) {
             let js = build_find_element_js(selector_or_ref);
             let result: EvaluateResult = client
