@@ -1483,6 +1483,9 @@ impl DisplayClient {
     pub(crate) fn proof(&self) -> Option<(u64, bool)> {
         match *self {}
     }
+    pub(crate) fn layout_proven(&self) -> bool {
+        match *self {}
+    }
     pub(crate) fn has(&self, _: &str) -> bool {
         match *self {}
     }
