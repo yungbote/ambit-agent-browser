@@ -5,17 +5,11 @@
 //! repainted: Chrome's auto dark mode (`Emulation.setAutoDarkModeOverride`)
 //! is not used, and a page with no dark design stays as it is.
 //!
-//! Measured on Chrome for Testing 152 in the workspace image:
-//! `--force-dark-mode` draws a headed window's UI dark and makes pages prefer
-//! dark without repainting them, for the life of the process. The image has
-//! no GTK and no settings portal, so nothing outside Chrome can switch a
-//! running window's UI. Chrome's own Mode setting can (the window repaints
-//! about 20 ms after it changes), but only from a chrome://settings tab the
-//! person would see in the tab strip for most of a second (a hidden one
-//! crashes Chrome), through internal WebUI interfaces, and it writes a
-//! profile preference; the driver does not use it. So pages switch
-//! live through `Emulation.setEmulatedMedia`, and the window UI follows at
-//! the next launch.
+//! Qualified managed Linux images provide GTK3 and a private XSettings
+//! service owned by the browser's retained Xvfb display. Standard system
+//! theme changes repaint Chrome's window without a new tab, profile change
+//! or browser relaunch. Old images and unsupported/custom UI paths retain
+//! the launch-time force-dark fallback; attached browsers remain untouched.
 //!
 //! A page's emulation reaches its cross-site frames; while its tab is hidden
 //! Chrome may defer a frame until the tab is shown. A page Chrome does not
@@ -122,8 +116,10 @@ pub(crate) fn page_media(
 /// dialog closes) and `next_launch` when no automated browser runs (none, or
 /// a window a person is signing in to, which has no DevTools); `ui` is
 /// `none` for a browser without a window UI the daemon drew (headless or
-/// attached) and otherwise `next_launch`, as the driver does not switch a
-/// running window's UI (see the module note).
+/// attached), `live` when its owned system settings acknowledged the update,
+/// `pinned` for explicit custom UI settings, and otherwise `next_launch`.
+/// Sign-in needs no automation channel to update
+/// its existing private display.
 pub(crate) async fn set(command: &Value, state: &mut DaemonState) -> Value {
     let id = &command["id"];
     let Some(theme) = command["theme"].as_str().and_then(Theme::parse) else {
@@ -150,19 +146,29 @@ async fn apply(theme: Theme, state: &mut DaemonState) -> (&'static str, &'static
     }
     match state.browser.as_ref() {
         Some(browser) => {
-            if let Some(media) =
-                page_media(state.session_setup.emulated_media.as_ref(), state.theme)
-            {
-                switch_pages(browser, &media).await;
-            }
-            let ui = if browser.draws_window_ui() {
-                "next_launch"
-            } else {
-                "none"
+            // A paused page must not hold the native window's repaint behind
+            // its media acknowledgement. Both projections share this Theme.
+            let page_update = async {
+                if let Some(media) =
+                    page_media(state.session_setup.emulated_media.as_ref(), state.theme)
+                {
+                    switch_pages(browser, &media).await;
+                }
             };
+            let ui_update = async {
+                if !browser.draws_window_ui() {
+                    "none"
+                } else {
+                    browser.apply_window_theme(theme).await
+                }
+            };
+            let (_, ui) = tokio::join!(page_update, ui_update);
             ("live", ui)
         }
-        None => ("next_launch", "next_launch"),
+        None => {
+            let ui = state.apply_sign_in_window_theme(theme).await;
+            ("next_launch", ui)
+        }
     }
 }
 

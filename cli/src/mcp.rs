@@ -1271,7 +1271,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_SET_THEME,
             "Set theme",
-            "Set the browser theme: Chrome's own window UI and every page's prefers-color-scheme. Pages switch now; the window UI follows at the next launch.",
+            "Set the browser theme: Chrome's own window UI and every page's prefers-color-scheme. Pages switch now; supported private windows switch live; other managed windows follow at the next launch unless custom UI settings are pinned.",
             json!({ "theme": theme_schema() }),
             &["theme"],
         ),

@@ -438,7 +438,7 @@ mod tests {
         assert_eq!(set_theme["title"], "Set theme");
         assert_eq!(
             set_theme["description"],
-            "Set the browser theme: Chrome's own window UI and every page's prefers-color-scheme. Pages switch now; the window UI follows at the next launch."
+            "Set the browser theme: Chrome's own window UI and every page's prefers-color-scheme. Pages switch now; supported private windows switch live; other managed windows follow at the next launch unless custom UI settings are pinned."
         );
         let schema = &set_theme["inputSchema"];
         assert_eq!(

@@ -5,10 +5,14 @@ use std::path::{Path, PathBuf};
 #[cfg(not(windows))]
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(target_os = "linux")]
+use std::sync::Mutex;
 use std::sync::{mpsc, Arc};
 use std::time::Duration;
 
 use super::discovery::discover_cdp_url;
+#[cfg(target_os = "linux")]
+use super::system_theme::SystemTheme;
 use crate::ca_bundle::CaBundle;
 use crate::native::theme::Theme;
 
@@ -31,8 +35,17 @@ pub struct ChromeProcess {
     /// torn down; a relaunch into the same display shares it.
     #[cfg(target_os = "linux")]
     xvfb: Option<RetainedDisplay>,
+    window_theme: WindowTheme,
     #[cfg(target_os = "linux")]
     display_process: Option<crate::native::display::DisplayProcess>,
+}
+
+#[derive(Clone, Copy)]
+enum WindowTheme {
+    NextLaunch,
+    Pinned,
+    #[cfg(target_os = "linux")]
+    System,
 }
 
 struct TemporaryBrowserDirectory {
@@ -86,6 +99,28 @@ pub(crate) struct RetainedDisplay {
 }
 
 impl ChromeProcess {
+    pub(crate) async fn apply_window_theme(&self, theme: Theme) -> &'static str {
+        if matches!(self.window_theme, WindowTheme::Pinned) {
+            return "pinned";
+        }
+        #[cfg(target_os = "linux")]
+        if matches!(self.window_theme, WindowTheme::System) {
+            if let Some(display) = self.xvfb.clone() {
+                let canceled = Arc::new(AtomicBool::new(false));
+                let _cancel_on_drop = CancelLaunchOnDrop(canceled.clone());
+                let applied = tokio::task::spawn_blocking(move || {
+                    display.apply_system_theme(theme, &canceled)
+                })
+                .await
+                .unwrap_or(false);
+                return if applied { "live" } else { "next_launch" };
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = theme;
+        "next_launch"
+    }
+
     pub(crate) fn retained_profile(&self) -> Option<RetainedChromeProfile> {
         Some(RetainedChromeProfile {
             directory: self.temp_user_data_dir.clone()?,
@@ -233,11 +268,54 @@ struct XvfbServer {
     child: Child,
     display: String,
     auth_file: PathBuf,
+    system_theme: Mutex<Option<SystemTheme>>,
+}
+
+#[cfg(target_os = "linux")]
+impl RetainedDisplay {
+    fn initialize_system_theme(&self, theme: Theme, canceled: &AtomicBool) -> bool {
+        let Ok(mut settings) = self.server.system_theme.lock() else {
+            return false;
+        };
+        if settings
+            .as_mut()
+            .is_some_and(|owner| owner.apply(theme, canceled))
+        {
+            return true;
+        }
+        // A relaunch may replace its own failed service; live theme commands
+        // only update the existing service and never start another desktop.
+        *settings = None;
+        *settings = SystemTheme::start(
+            &self.server.display,
+            &self.server.auth_file,
+            theme,
+            canceled,
+        )
+        .ok();
+        settings.is_some()
+    }
+
+    fn apply_system_theme(&self, theme: Theme, canceled: &AtomicBool) -> bool {
+        self.server
+            .system_theme
+            .lock()
+            .ok()
+            .is_some_and(|mut settings| {
+                settings
+                    .as_mut()
+                    .is_some_and(|owner| owner.apply(theme, canceled))
+            })
+    }
 }
 
 #[cfg(target_os = "linux")]
 impl Drop for XvfbServer {
     fn drop(&mut self) {
+        *self
+            .system_theme
+            .get_mut()
+            .unwrap_or_else(|error| error.into_inner()) = None;
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = std::fs::remove_file(&self.auth_file);
@@ -398,6 +476,7 @@ fn maybe_start_xvfb(options: &LaunchOptions) -> Option<RetainedDisplay> {
                                     child,
                                     display: format!(":{}", num),
                                     auth_file,
+                                    system_theme: Mutex::new(None),
                                 }),
                             });
                         }
@@ -630,6 +709,43 @@ fn automation_switch(arg: &str) -> bool {
     })
 }
 
+/// Resolve the driver's default only after the private display proves whether
+/// it can apply system themes. Explicit Chrome arguments remain untouched.
+fn resolve_ui_theme_arguments(
+    mut args: Vec<String>,
+    options: &LaunchOptions,
+    live: bool,
+) -> Vec<String> {
+    if live {
+        if !options
+            .args
+            .iter()
+            .any(|arg| switch_name(arg).as_deref() == Some("gtk-version"))
+        {
+            args.insert(0, "--gtk-version=3".into());
+        }
+    } else if let Some(switch) = options
+        .theme
+        .and_then(|theme| theme.chrome_switch(options.effectively_headless()))
+    {
+        args.insert(0, switch.into());
+    }
+    args
+}
+
+#[cfg(target_os = "linux")]
+fn private_system_theme_eligible(options: &LaunchOptions) -> bool {
+    SystemTheme::enabled() && !options.effectively_headless() && !custom_window_theme(options)
+}
+
+fn custom_window_theme(options: &LaunchOptions) -> bool {
+    (cfg!(target_os = "linux") && std::env::var_os("GTK_THEME").is_some())
+        || options.args.iter().any(|arg| {
+            switch_name(arg).as_deref() == Some("force-dark-mode")
+                || (switch_name(arg).as_deref() == Some("gtk-version") && arg != "--gtk-version=3")
+        })
+}
+
 fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
     validate_sandbox_options(options, Some("chrome"), false)?;
     // Without DevTools nothing can observe or drive the browser but its own
@@ -766,13 +882,6 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         })
     {
         args.push("--no-startup-window".to_string());
-    }
-
-    if let Some(switch) = options
-        .theme
-        .and_then(|theme| theme.chrome_switch(effectively_headless))
-    {
-        args.push(switch.to_string());
     }
 
     // Extensions require headed mode in native Chrome (content scripts are not
@@ -1189,6 +1298,27 @@ fn try_launch_chrome(
         return Err("Window streaming requires a private Xvfb display; clear inherited DISPLAY and ensure Xvfb is available".into());
     }
 
+    #[cfg(target_os = "linux")]
+    let live_system_theme = private_system_theme_eligible(options)
+        && xvfb.as_ref().is_some_and(|display| {
+            display.initialize_system_theme(options.theme.unwrap_or(Theme::Light), canceled)
+        });
+    #[cfg(not(target_os = "linux"))]
+    let live_system_theme = false;
+    let args = resolve_ui_theme_arguments(args, options, live_system_theme);
+    let window_theme = if custom_window_theme(options) {
+        WindowTheme::Pinned
+    } else {
+        #[cfg(target_os = "linux")]
+        if live_system_theme {
+            WindowTheme::System
+        } else {
+            WindowTheme::NextLaunch
+        }
+        #[cfg(not(target_os = "linux"))]
+        WindowTheme::NextLaunch
+    };
+
     #[cfg(not(windows))]
     let mut cmd = Command::new(chrome_path);
     #[cfg(not(windows))]
@@ -1263,6 +1393,7 @@ fn try_launch_chrome(
         pgid,
         #[cfg(target_os = "linux")]
         xvfb,
+        window_theme,
         #[cfg(target_os = "linux")]
         display_process: None,
     };
@@ -2272,6 +2403,7 @@ mod tests {
             pgid: None,
             #[cfg(target_os = "linux")]
             xvfb: None,
+            window_theme: WindowTheme::NextLaunch,
             #[cfg(target_os = "linux")]
             display_process: None,
         }
@@ -2412,6 +2544,7 @@ mod tests {
                 child: spawn_noop_child(),
                 display: ":97".into(),
                 auth_file: auth_file.clone(),
+                system_theme: Mutex::new(None),
             }),
         };
         let mut process = test_process(
@@ -2945,6 +3078,75 @@ mod tests {
             .any(|arg| arg == "about:blank"));
     }
 
+    #[test]
+    fn live_system_theme_replaces_only_the_driver_default_switch() {
+        let options = LaunchOptions {
+            headless: false,
+            theme: Some(Theme::Dark),
+            ..Default::default()
+        };
+        let explicit = vec!["--lang=fr".into(), "--force-dark-mode=false".into()];
+        let live = resolve_ui_theme_arguments(explicit.clone(), &options, true);
+        assert_eq!(
+            live,
+            vec!["--gtk-version=3", "--lang=fr", "--force-dark-mode=false"]
+        );
+        let fallback = resolve_ui_theme_arguments(explicit, &options, false);
+        assert_eq!(
+            fallback,
+            vec!["--force-dark-mode", "--lang=fr", "--force-dark-mode=false"]
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn system_theme_requires_image_opt_in_and_preserves_explicit_theme_environment() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SYSTEM_THEME", "GTK_THEME"]);
+        guard.remove("AGENT_BROWSER_SYSTEM_THEME");
+        guard.remove("GTK_THEME");
+        let options = LaunchOptions {
+            headless: false,
+            ..Default::default()
+        };
+        assert!(!private_system_theme_eligible(&options));
+        guard.set("AGENT_BROWSER_SYSTEM_THEME", "xsettingsd");
+        assert!(private_system_theme_eligible(&options));
+        assert!(!private_system_theme_eligible(&LaunchOptions::default()));
+        for argument in [
+            "--force-dark-mode",
+            "--force-dark-mode=false",
+            "--gtk-version=4",
+        ] {
+            assert!(!private_system_theme_eligible(&LaunchOptions {
+                args: vec![argument.into()],
+                ..options.clone()
+            }));
+        }
+        assert!(private_system_theme_eligible(&LaunchOptions {
+            args: vec!["--gtk-version=3".into()],
+            ..options.clone()
+        }));
+        guard.set("GTK_THEME", "CustomTheme");
+        assert!(!private_system_theme_eligible(&options));
+        assert!(custom_window_theme(&options));
+        guard.set("GTK_THEME", "");
+        assert!(!private_system_theme_eligible(&options));
+        assert!(
+            custom_window_theme(&options),
+            "set-but-empty GTK_THEME is still a caller pin"
+        );
+    }
+
+    #[tokio::test]
+    async fn pinned_window_theme_reports_the_limit_without_starting_a_settings_worker() {
+        let mut process = test_process(spawn_noop_child(), LaunchOptions::default());
+        process.window_theme = WindowTheme::Pinned;
+        assert_eq!(process.apply_window_theme(Theme::Light).await, "pinned");
+        assert_eq!(process.apply_window_theme(Theme::Dark).await, "pinned");
+        process.window_theme = WindowTheme::NextLaunch;
+        assert_eq!(process.apply_window_theme(Theme::Dark).await, "next_launch");
+    }
+
     /// The measured window-UI switch: only a dark theme in a browser with a
     /// window of its own, never headless and never for light.
     #[test]
@@ -2954,7 +3156,9 @@ mod tests {
             if let Some(dir) = args.temp_user_data_dir {
                 let _ = std::fs::remove_dir_all(dir);
             }
-            args.args.iter().any(|arg| arg == "--force-dark-mode")
+            resolve_ui_theme_arguments(args.args, options, false)
+                .iter()
+                .any(|arg| arg == "--force-dark-mode")
         };
         let dark = Some(Theme::Dark);
         for (options, expected) in [
@@ -3427,6 +3631,7 @@ mod tests {
                 pgid: None,
                 #[cfg(target_os = "linux")]
                 xvfb: None,
+                window_theme: WindowTheme::NextLaunch,
                 #[cfg(target_os = "linux")]
                 display_process: None,
             };
@@ -3454,6 +3659,7 @@ mod tests {
             pgid: None,
             #[cfg(target_os = "linux")]
             xvfb: None,
+            window_theme: WindowTheme::NextLaunch,
             #[cfg(target_os = "linux")]
             display_process: None,
         };

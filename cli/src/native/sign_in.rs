@@ -48,6 +48,13 @@ impl SignInBrowser {
         None
     }
 
+    pub(crate) async fn apply_window_theme(
+        &self,
+        theme: crate::native::theme::Theme,
+    ) -> &'static str {
+        self.chrome.apply_window_theme(theme).await
+    }
+
     pub(crate) fn has_exited(&mut self) -> bool {
         self.chrome.has_exited()
     }
@@ -57,6 +64,20 @@ impl SignInBrowser {
     pub(crate) async fn stop(self) {
         let mut chrome = self.chrome;
         let _ = tokio::task::spawn_blocking(move || chrome.terminate(STOP)).await;
+    }
+}
+
+impl DaemonState {
+    /// Theme projects onto the existing private sign-in display without an
+    /// automation channel or changes to its human-control ownership.
+    pub(crate) async fn apply_sign_in_window_theme(
+        &self,
+        theme: crate::native::theme::Theme,
+    ) -> &'static str {
+        match self.sign_in.as_ref() {
+            Some(browser) => browser.apply_window_theme(theme).await,
+            None => "next_launch",
+        }
     }
 }
 

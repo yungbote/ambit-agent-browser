@@ -481,6 +481,16 @@ pub enum BrowserProcess {
 }
 
 impl BrowserProcess {
+    pub(crate) async fn apply_window_theme(
+        &self,
+        theme: crate::native::theme::Theme,
+    ) -> &'static str {
+        match self {
+            BrowserProcess::Chrome(process) => process.apply_window_theme(theme).await,
+            BrowserProcess::Lightpanda(_) => "none",
+        }
+    }
+
     pub fn kill(&mut self) {
         match self {
             BrowserProcess::Chrome(p) => p.kill(),
@@ -626,6 +636,16 @@ impl BrowserManager {
     /// a headed browser it launched. Attached browsers draw their own.
     pub(crate) fn draws_window_ui(&self) -> bool {
         self.browser_process.is_some() && !self.headless
+    }
+
+    pub(crate) async fn apply_window_theme(
+        &self,
+        theme: crate::native::theme::Theme,
+    ) -> &'static str {
+        match self.browser_process.as_ref() {
+            Some(process) if !self.headless => process.apply_window_theme(theme).await,
+            _ => "none",
+        }
     }
 
     /// Options that relaunch this locally launched Chrome exactly, into its

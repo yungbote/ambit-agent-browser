@@ -340,7 +340,7 @@ fn format_vitals_text(data: &serde_json::Value) -> String {
 }
 
 /// Where a theme change took effect: pages now or at the next launch, and the
-/// window UI at the next launch (a browser without a UI of its own has none).
+/// the window UI live, at the next launch, or pinned by explicit custom settings.
 fn format_theme_text(data: &serde_json::Value) -> String {
     let pages = if data["pages"] == "live" {
         "pages switched"
@@ -350,6 +350,7 @@ fn format_theme_text(data: &serde_json::Value) -> String {
     let ui = match data["ui"].as_str() {
         Some("live") => ", window UI switched",
         Some("next_launch") => ", window UI at the next launch",
+        Some("pinned") => ", window UI pinned by custom settings",
         _ => "",
     };
     format!(
@@ -2461,7 +2462,7 @@ Settings:
         [reduced-motion]     Enable reduced motion
   theme <dark|light>         Set the browser theme: Chrome's own window UI and
                              every page's prefers-color-scheme. Pages switch
-                             now; the window UI follows at the next launch.
+                             now; supported private windows switch live, with next-launch fallback.
                              Acts on a running session; never launches one
 
 Global Options:
@@ -4394,6 +4395,14 @@ mod tests {
             (
                 json!({ "theme": "light", "pages": "live", "ui": "none" }),
                 "Theme light: pages switched",
+            ),
+            (
+                json!({ "theme": "light", "pages": "live", "ui": "pinned" }),
+                "Theme light: pages switched, window UI pinned by custom settings",
+            ),
+            (
+                json!({ "theme": "dark", "pages": "live", "ui": "live" }),
+                "Theme dark: pages switched, window UI switched",
             ),
             (
                 json!({ "theme": "light", "pages": "next_launch", "ui": "next_launch" }),
