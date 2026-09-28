@@ -532,6 +532,33 @@ impl NativeMouse {
         self.keys.values().fold(0, |held, bit| held | bit)
     }
 
+    /// `events` with each one's modifier mask: the modifiers it asks for and
+    /// those held once it has applied. The helper sets the modifier keys to
+    /// each event's mask, so a modifier's own key going down carries its bit
+    /// (without it the helper would lift the key at once), and its release
+    /// does not (with it the helper would press the key again).
+    pub(super) fn with_held_modifiers(&self, events: &[Value]) -> Vec<Value> {
+        let mut held = self.held_modifiers();
+        events
+            .iter()
+            .map(|event| {
+                let bit = modifier_bit(event);
+                let mut requested = event["modifiers"].as_i64().unwrap_or(0);
+                match event["eventType"].as_str() {
+                    Some("keyDown" | "rawKeyDown") => held |= bit,
+                    Some("keyUp") => {
+                        held &= !bit;
+                        requested &= !bit;
+                    }
+                    _ => {}
+                }
+                let mut event = event.clone();
+                event["modifiers"] = json!(requested | held);
+                event
+            })
+            .collect()
+    }
+
     /// A native event's modifier mask: the one it asks for, and those held.
     fn holding(&self, requested: i64) -> i64 {
         requested | self.held_modifiers()

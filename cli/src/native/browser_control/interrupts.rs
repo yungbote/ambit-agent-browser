@@ -6,6 +6,7 @@
 //! Playwright program stops at once, and neither starts while one is pending.
 //! Raising or reading one never waits for the gate paced input holds.
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;
@@ -25,6 +26,10 @@ struct Pending {
     reasons: Mutex<Vec<InterruptReason>>,
     /// Counts raises, so a sleeper wakes the moment one arrives.
     raised: watch::Sender<u64>,
+    /// Counts a person's takeovers. A takeover leaves the pending list once
+    /// its request holds command custody, so work that waits without custody
+    /// learns of one from this count instead.
+    takeovers: AtomicU64,
 }
 
 impl Default for Interrupts {
@@ -32,6 +37,7 @@ impl Default for Interrupts {
         Self(Arc::new(Pending {
             reasons: Mutex::new(Vec::new()),
             raised: watch::channel(0).0,
+            takeovers: AtomicU64::new(0),
         }))
     }
 }
@@ -61,6 +67,9 @@ impl Interrupts {
 
     pub(crate) fn raise(&self, reason: InterruptReason) -> Interruption {
         self.reasons().push(reason);
+        if reason == InterruptReason::HumanControl {
+            self.0.takeovers.fetch_add(1, Ordering::SeqCst);
+        }
         self.0
             .raised
             .send_modify(|count| *count = count.wrapping_add(1));
@@ -90,6 +99,12 @@ impl Interrupts {
     /// Wakes whoever waits on it when an interruption is raised.
     pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
         self.0.raised.subscribe()
+    }
+
+    /// How many takeovers were ever raised. Work that waits without command
+    /// custody compares it with the count it began with.
+    pub(crate) fn takeovers(&self) -> u64 {
+        self.0.takeovers.load(Ordering::SeqCst)
     }
 }
 
@@ -127,5 +142,18 @@ mod tests {
         assert!(interrupts.takeover());
         drop(second);
         assert!(!interrupts.takeover());
+    }
+
+    /// A takeover's request leaves the pending list once it holds command
+    /// custody; the count still says it happened.
+    #[test]
+    fn a_takeover_is_counted_after_its_guard_drops() {
+        let interrupts = Interrupts::default();
+        let before = interrupts.takeovers();
+        drop(interrupts.raise(InterruptReason::Shutdown));
+        assert_eq!(interrupts.takeovers(), before);
+        drop(interrupts.raise(InterruptReason::HumanControl));
+        assert!(!interrupts.takeover());
+        assert_eq!(interrupts.takeovers(), before + 1);
     }
 }
