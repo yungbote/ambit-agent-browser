@@ -85,6 +85,10 @@ A delta's `baseSeq` must equal the last painted frame with matching surface gene
 
 For a viewer across a network, negotiate `pacing=ack&frameWindow=8` to allow up to eight delivered frames and at most 12 MiB awaiting acknowledgment. The default window is one for compatibility. A cumulative ACK names the newest frame actually painted; it also retires the preceding delivered frames whose pixels that composed frame includes. A slow viewer stops at the count or byte bound, and skipped delta dependencies still require a whole frame.
 
+### Video track
+
+A binary viewer that draws its own pointer (`frames=binary&cursor=viewer`) can declare `video=av1-444,av1`. The driver answers `{"type":"video","state":"available","codec":"av1-444"}` when it can encode one of them (the owned Linux window, a display helper serving pictures, and `libaom.so.3`), otherwise `unavailable`. After `{"type":"video","enabled":true,"generation":1}` it answers `started` with a `streamId` and `codecString`, then sends binary AV1 units instead of frames: a four-byte header length, a JSON header (`track: "video"`, `streamId`, `seq`, `ts`, `key`, `codecString` on key units, `coded`, `visible`, `surface`, `quality`, `byteLength`), and one temporal unit. Acknowledge painted units with `{"type":"ack","track":"video","streamId":"<uuid>","seq":n}`; ask for a key unit with `{"type":"video","keyframe":true,"generation":n}`. A new `started` under the same generation begins a new stream at `seq` 1 with a key unit. `enabled:false` is answered `stopped`, and frames resume with a whole one.
+
 ### Frame messages
 
 The server sends frame messages with base64-encoded images:
