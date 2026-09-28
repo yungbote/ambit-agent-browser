@@ -1,15 +1,27 @@
 //! Agent mouse transport for the browser's existing owned display.
 //!
-//! CDP performs the ordinary pre-hover used to resolve a page point. Its
-//! trusted renderer event measures the native position, including Chrome's
-//! chrome and page zoom. Only the display helper sends buttons. A mapping
-//! lives for one command or an explicitly held gesture, never across takeover.
+//! The pointer travels. An event that lands more than
+//! `motion::REACHED_CSS_PX` from the real X pointer is preceded by a glide
+//! there (`motion::Glide`): one helper sample per presenter frame, each
+//! published to viewers once the helper acknowledged it, so a person watching
+//! sees the input the driver really sends. A pending interruption (a person
+//! taking control) stops the glide at its next sample.
+//!
+//! The page-to-display mapping is measured natively, from the renderer's
+//! trusted event for a one-pixel move where the pointer already is, and kept
+//! per page session while its page generation, window and page geometry
+//! stand. It is proven when a gesture starts and again before a press, and a
+//! hit test at the end of travel refuses a press the aimed element no longer
+//! receives. Only the display helper sends buttons.
 
 use std::collections::HashMap;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
+use super::interrupts::{InterruptReason, Interrupts};
+use super::motion::{self, Glide};
+use crate::native::actions::CommandError;
 use crate::native::activity::{InputSource, NativePointer};
 use crate::native::cdp::client::CdpClient;
 use crate::native::display::{AtomicInput, DisplayClient, Surface};
@@ -33,8 +45,16 @@ const UNMEASURED: &str =
 /// moved, so its pointer input is refused until the next command proves it.
 const RESIZED: &str = "The browser window was resized after this page was last observed, so this mouse input was not sent. Observe the page before choosing the next action.";
 
+/// How long a probe of the pointer waits for the renderer to report it.
+const PROBE_WAIT: Duration = Duration::from_millis(100);
+
+/// The smaller side, in CSS pixels, of a travel's target when nothing under
+/// it is aimed at: a wheel turned somewhere else, or a held drag.
+const UNAIMED_WIDTH_CSS: f64 = 40.0;
+
 /// A CDP move whose trusted renderer event, when this page's own document
 /// receives it, measures where page coordinates are on the native display.
+/// Used only when the pointer cannot be measured where it is.
 async fn pre_hover(
     client: &CdpClient,
     session: &str,
@@ -61,55 +81,41 @@ async fn pre_hover(
     Ok(command.native_pointer())
 }
 
-/// Chooses the visible point of this page's own document nearest `(x, y)`.
-/// A point over an iframe, object or embed delivers its events to that
-/// document instead, so it cannot measure this page.
-fn calibration_probe(x: f64, y: f64) -> String {
-    format!(
-        r#"((x, y) => {{
-            const width = innerWidth, height = innerHeight;
-            if (!(x >= 0 && y >= 0 && x < width && y < height)) return {{ width, height, inside: false }};
-            const own = (px, py) => {{
-                const element = document.elementFromPoint(px, py);
-                return !!element && !/^(IFRAME|FRAME|OBJECT|EMBED)$/.test(element.tagName);
-            }};
-            let best = null;
-            for (let i = 0; i < 9; i++) for (let j = 0; j < 9; j++) {{
-                const px = Math.min(width - 1, Math.round((i + 0.5) * width / 9));
-                const py = Math.min(height - 1, Math.round((j + 0.5) * height / 9));
-                const distance = (px - x) ** 2 + (py - y) ** 2;
-                if ((!best || distance < best.distance) && own(px, py)) best = {{ x: px, y: py, distance }};
-            }}
-            return {{ width, height, inside: true, calibration: best && {{ x: best.x, y: best.y }} }};
-        }})({x}, {y})"#
-    )
-}
+/// Chooses the visible point of this page's own document nearest the
+/// viewport's centre. A point over an iframe, object or embed delivers its
+/// events to that document instead, so it cannot measure this page.
+const CALIBRATION_PROBE: &str = r#"(() => {
+    const width = innerWidth, height = innerHeight, x = width / 2, y = height / 2;
+    const own = (px, py) => {
+        const element = document.elementFromPoint(px, py);
+        return !!element && !/^(IFRAME|FRAME|OBJECT|EMBED)$/.test(element.tagName);
+    };
+    let best = null;
+    for (let i = 0; i < 9; i++) for (let j = 0; j < 9; j++) {
+        const px = Math.min(width - 1, Math.round((i + 0.5) * width / 9));
+        const py = Math.min(height - 1, Math.round((j + 0.5) * height / 9));
+        const distance = (px - x) ** 2 + (py - y) ** 2;
+        if ((!best || distance < best.distance) && own(px, py)) best = { x: px, y: py, distance };
+    }
+    return { calibration: best && { x: best.x, y: best.y } };
+})()"#;
 
-/// The page-to-native mapping is one affine relation for the whole page, so a
-/// point whose events reach a child frame is measured at another visible
-/// point of the page. A point outside the page is refused before any input.
-async fn calibrate(
-    client: &CdpClient,
-    session: &str,
-    x: f64,
-    y: f64,
-) -> Result<NativePointer, String> {
+/// The page-to-native mapping is one affine relation for the whole page, so
+/// a page the pointer cannot be measured over is measured at its own visible
+/// point nearest the viewport's centre, where a pointer with no known place
+/// starts its travel. A CDP hover shows there until the first sample moves
+/// the real pointer.
+async fn calibrate(client: &CdpClient, session: &str) -> Result<NativePointer, String> {
     let read = client
         .send_command(
             "Runtime.evaluate",
-            Some(json!({ "expression": calibration_probe(x, y), "returnByValue": true })),
+            Some(json!({ "expression": CALIBRATION_PROBE, "returnByValue": true })),
             Some(session),
         )
         .await?;
     let view = &read["result"]["value"];
     if read.get("exceptionDetails").is_some() || !view.is_object() {
         return Err(UNMEASURED.into());
-    }
-    if view["inside"] != true {
-        return Err(format!(
-            "The point ({x}, {y}) is outside the visible page ({}x{} CSS pixels). No native input was sent; scroll it into view or choose a visible point.",
-            view["width"], view["height"]
-        ));
     }
     let (Some(calibration_x), Some(calibration_y)) = (
         view["calibration"]["x"].as_f64(),
@@ -122,6 +128,42 @@ async fn calibrate(
         .ok_or_else(|| UNMEASURED.into())
 }
 
+/// Where the element a press aims at is recorded, in the page's pointer
+/// realm, and how narrow it is (its smaller side in CSS pixels).
+fn aim_script(x: f64, y: f64) -> String {
+    format!(
+        r#"((x, y) => {{
+            let doc = document, lx = x, ly = y, hit = doc.elementFromPoint(lx, ly);
+            while (hit && (hit.tagName === 'IFRAME' || hit.tagName === 'FRAME') && hit.contentDocument) {{
+                const frame = hit.getBoundingClientRect();
+                lx -= frame.x + hit.clientLeft;
+                ly -= frame.y + hit.clientTop;
+                doc = hit.contentDocument;
+                const inner = doc.elementFromPoint(lx, ly);
+                if (!inner) break;
+                hit = inner;
+            }}
+            globalThis.__ambitAim = hit;
+            if (!hit) return null;
+            const box = hit.getBoundingClientRect();
+            return Math.min(box.width, box.height);
+        }})({x}, {y})"#
+    )
+}
+
+/// Whether the aimed element still receives a press at the point: null when
+/// it does, otherwise what receives it instead ('' when it left the page).
+fn hit_test_script(x: f64, y: f64) -> String {
+    format!(
+        r#"((x, y) => {{
+            const el = globalThis.__ambitAim;
+            const blocker = !el || !el.isConnected ? '' : ({blocker})(document, el, x, y);
+            return blocker === null ? null : {{ blocker, scrollX, scrollY }};
+        }})({x}, {y})"#,
+        blocker = crate::native::element::BLOCKER_AT_JS,
+    )
+}
+
 #[derive(Clone)]
 struct Mapping {
     session: String,
@@ -131,14 +173,33 @@ struct Mapping {
 }
 
 impl Mapping {
-    /// The display point for page point `(x, y)`: on the screen and inside
-    /// the browser window this mapping measured. A size-class framebuffer
-    /// is larger than the window, and a press outside the window reaches
-    /// no page.
-    fn point(&self, x: f64, y: f64, surface: &Surface) -> Result<(f64, f64), String> {
-        let scale = self.pointer.geometry["scale"]
+    /// Display pixels per CSS pixel of the page.
+    fn scale(&self) -> Result<f64, String> {
+        self.pointer.geometry["scale"]
             .as_f64()
-            .ok_or("Missing native pointer scale")?;
+            .filter(|scale| scale.is_finite() && *scale > 0.0)
+            .ok_or_else(|| "Missing native pointer scale".into())
+    }
+
+    /// The page's viewport in CSS pixels, when the measurement reported it.
+    fn viewport(&self) -> Option<(f64, f64)> {
+        let geometry = &self.pointer.geometry;
+        geometry["width"].as_f64().zip(geometry["height"].as_f64())
+    }
+
+    /// The display point for page point `(x, y)`: inside the page's viewport,
+    /// on the screen and inside the browser window this mapping measured. A
+    /// size-class framebuffer is larger than the window, and a press outside
+    /// the window reaches no page.
+    fn point(&self, x: f64, y: f64, surface: &Surface) -> Result<(f64, f64), String> {
+        if let Some((width, height)) = self.viewport() {
+            if !(x >= 0.0 && y >= 0.0 && x < width && y < height) {
+                return Err(format!(
+                    "The point ({x}, {y}) is outside the visible page ({width}x{height} CSS pixels), so no input was sent to it; scroll it into view or choose a visible point."
+                ));
+            }
+        }
+        let scale = self.scale()?;
         let factor = f64::from(surface.device_scale_factor);
         let x = (self.pointer.screen_x * factor + (x - self.pointer.client_x) * scale).round();
         let y = (self.pointer.screen_y * factor + (y - self.pointer.client_y) * scale).round();
@@ -155,11 +216,85 @@ impl Mapping {
         }
         Ok((x, y))
     }
+
+    /// The page point shown at display point `point`.
+    fn page(&self, point: (f64, f64), surface: &Surface) -> Result<(f64, f64), String> {
+        let scale = self.scale()?;
+        let factor = f64::from(surface.device_scale_factor);
+        Ok((
+            self.pointer.client_x + (point.0 - self.pointer.screen_x * factor) / scale,
+            self.pointer.client_y + (point.1 - self.pointer.screen_y * factor) / scale,
+        ))
+    }
+
+    /// The display point at the centre of the page's viewport: where a
+    /// pointer with no known place starts its travel.
+    fn center(&self, surface: &Surface) -> Result<(f64, f64), String> {
+        let (width, height) = self.viewport().ok_or(UNMEASURED)?;
+        self.point((width / 2.0).floor(), (height / 2.0).floor(), surface)
+    }
+}
+
+/// What a press at `point` must still reach: the element under it when the
+/// travel there began, held in the page's pointer realm.
+struct Aim {
+    session: String,
+    generation: String,
+    context: i64,
+    point: (f64, f64),
+    /// The aimed element's smaller side in CSS pixels.
+    width: Option<f64>,
+}
+
+impl Aim {
+    fn holds(&self, mapping: &Mapping, point: (f64, f64)) -> bool {
+        self.session == mapping.session
+            && self.generation == mapping.pointer.page_generation
+            && (self.point.0 - point.0).hypot(self.point.1 - point.1) <= motion::REACHED_CSS_PX
+    }
+}
+
+/// What a pending interruption makes of input that has not finished: a
+/// travel stopped before its press pressed nothing; one stopped with a
+/// button held is interrupted, and the held button is released.
+fn stopped(reason: InterruptReason, held: bool) -> CommandError {
+    match (reason, held) {
+        (InterruptReason::HumanControl, false) => "browser_controlled_by_user: The user took control of this browser before this pointer action reached its target, so nothing was pressed. Wait until they release control before continuing.".into(),
+        (InterruptReason::HumanControl, true) => CommandError::with_data(
+            "browser_operation_interrupted: The user took control of this browser during this held pointer gesture; its button was released. Inspect the page after they release control and do not replay the gesture.",
+            json!({"interruptedBy":"human","executionStopped":true,"effectsMayHaveOccurred":true}),
+        ),
+        (_, held) => CommandError::with_data(
+            "browser_operation_interrupted: The browser owner stopped this pointer action before it finished. Inspect the page before continuing; do not replay it.",
+            json!({"executionStopped":true,"effectsMayHaveOccurred":held}),
+        ),
+    }
+}
+
+/// Page coordinates of a mouse event: both finite, or both absent where the
+/// event may land wherever the pointer is (a wheel).
+fn coordinates(params: &Value, event_type: &str) -> Result<Option<(f64, f64)>, String> {
+    let absent = |key: &str| params.get(key).is_none_or(Value::is_null);
+    if event_type == "mouseWheel" && absent("x") && absent("y") {
+        return Ok(None);
+    }
+    let x = params["x"]
+        .as_f64()
+        .filter(|x| x.is_finite())
+        .ok_or("Invalid mouse x")?;
+    let y = params["y"]
+        .as_f64()
+        .filter(|y| y.is_finite())
+        .ok_or("Invalid mouse y")?;
+    Ok(Some((x, y)))
 }
 
 #[derive(Default)]
 pub(super) struct NativeMouse {
+    /// Measured page-to-display mappings by page session, kept while each
+    /// page generation, window and page geometry stand (`current`).
     mappings: HashMap<String, Mapping>,
+    aim: Option<Aim>,
     buttons: i64,
     modifiers: i64,
     /// Set before the helper can perform input. Cancellation cannot clear it.
@@ -167,12 +302,6 @@ pub(super) struct NativeMouse {
 }
 
 impl NativeMouse {
-    pub(super) fn begin_command(&mut self) {
-        if self.buttons == 0 {
-            self.mappings.clear();
-        }
-    }
-
     /// Layouts land between atomic inputs, not between commands, and a
     /// layout is proven only by the agent's next command. Checked under
     /// atomic input custody, so no layout lands between this check and the
@@ -211,22 +340,26 @@ impl NativeMouse {
         Ok(())
     }
 
+    /// A failure that may have left input held releases it. Only a stop the
+    /// driver chose knows what it sent; any other failure after input may
+    /// have acted, so its outcome is unknown.
     async fn finish(
         &mut self,
-        result: Result<bool, String>,
+        result: Result<bool, CommandError>,
         display: &DisplayClient,
-    ) -> Result<bool, String> {
-        if let Err(original) = result {
-            if self.needs_release() {
-                let original = outcome_unknown(original);
-                if let Err(cleanup) = self.release(display).await {
-                    return Err(format!("{original} {cleanup}"));
-                }
-                return Err(original);
+    ) -> Result<bool, CommandError> {
+        let Err(mut failure) = result else {
+            return result;
+        };
+        if self.needs_release() {
+            if !failure.error.starts_with("browser_operation_interrupted: ") {
+                failure.error = outcome_unknown(&failure.error);
             }
-            return Err(original);
+            if let Err(cleanup) = self.release(display).await {
+                failure.error = format!("{} {cleanup}", outcome_unknown(&failure.error));
+            }
         }
-        result
+        Err(failure)
     }
 
     async fn current(
@@ -274,39 +407,43 @@ impl NativeMouse {
         Ok(())
     }
 
+    /// The mapping of `session`, proven current: the kept one while its page,
+    /// window and geometry stand, or a new measurement. A held gesture keeps
+    /// the mapping it started with or fails.
     async fn prepare(
         &mut self,
         client: &CdpClient,
         session: &str,
         display: &DisplayClient,
-        x: f64,
-        y: f64,
     ) -> Result<Mapping, String> {
-        self.require_known()?;
-        if let Some(mapping) = self.mappings.get(session) {
-            self.current(mapping, client, display).await?;
-            return Ok(mapping.clone());
+        if !display.ready() {
+            return Err("The browser window is applying its layout.".into());
+        }
+        if let Some(mapping) = self.mappings.get(session).cloned() {
+            match self.current(&mapping, client, display).await {
+                Ok(()) => return Ok(mapping),
+                Err(error) if self.buttons != 0 => return Err(error),
+                Err(_) => {
+                    self.mappings.remove(session);
+                }
+            }
         }
         if self.buttons != 0 {
             return Err("The held mouse gesture has no observed position in this page. Release the mouse before starting a new gesture.".into());
-        }
-        let surface = display.surface();
-        if !display.ready() {
-            return Err("The browser window is applying its layout.".into());
         }
         let info = display.info().await.map_err(|error| error.to_string())?;
         let window = info
             .active_window()
             .ok_or("The active browser window is unavailable")?;
         let window = (window.id, window.x, window.y, window.width, window.height);
-        let pointer = match pre_hover(client, session, x, y).await? {
+        let pointer = match self.probe(client, session, display, window).await? {
             Some(pointer) => pointer,
-            None => calibrate(client, session, x, y).await?,
+            None => calibrate(client, session).await?,
         };
         let mapping = Mapping {
             session: session.into(),
             pointer,
-            surface: surface.generation,
+            surface: display.surface().generation,
             window,
         };
         self.current(&mapping, client, display).await?;
@@ -314,6 +451,287 @@ impl NativeMouse {
         Ok(mapping)
     }
 
+    /// Measures the page where the pointer already is: a one-pixel move there,
+    /// too small to see, which the renderer under it reports as a trusted
+    /// event. `None` when the pointer's place is unknown or outside the
+    /// window, or when this page's own document does not receive the move
+    /// (the pointer is over the browser's controls, a child frame or another
+    /// window).
+    async fn probe(
+        &mut self,
+        client: &CdpClient,
+        session: &str,
+        display: &DisplayClient,
+        window: (u32, i32, i32, u32, u32),
+    ) -> Result<Option<NativePointer>, String> {
+        let (_, left, top, width, height) = window;
+        let (left, top) = (f64::from(left), f64::from(top));
+        let (right, bottom) = (left + f64::from(width), top + f64::from(height));
+        let Some(pointer) = display
+            .pointer()
+            .filter(|(x, y)| *x >= left + 1.0 && *y >= top && *x < right - 1.0 && *y < bottom)
+        else {
+            return Ok(None);
+        };
+        let Ok(probe) = client.arm_pointer_probe(session).await else {
+            return Ok(None);
+        };
+        let toward_center = if pointer.0 < (left + right) / 2.0 {
+            1.0
+        } else {
+            -1.0
+        };
+        let atomic = display.atomic_input().await;
+        self.same_layout(display)?;
+        self.send_move(
+            (pointer.0 + toward_center, pointer.1),
+            self.modifiers,
+            display,
+        )
+        .await?;
+        drop(atomic);
+        Ok(probe.measured(PROBE_WAIT).await)
+    }
+
+    /// Records what a press at `point` must reach, unless an aim there
+    /// stands and this event does not travel: a press after its own move, or
+    /// a second click in place, keeps the aim its travel began with. Returns
+    /// the aimed element's smaller side in CSS pixels.
+    async fn aim(
+        &mut self,
+        mapping: &Mapping,
+        point: (f64, f64),
+        travels: bool,
+        client: &CdpClient,
+    ) -> Result<Option<f64>, String> {
+        if let Some(aim) = self
+            .aim
+            .as_ref()
+            .filter(|aim| !travels && aim.holds(mapping, point))
+        {
+            return Ok(aim.width);
+        }
+        self.aim = None;
+        let read = client
+            .send_command(
+                "Runtime.evaluate",
+                Some(json!({
+                    "expression": aim_script(point.0, point.1),
+                    "contextId": mapping.pointer.context, "returnByValue": true,
+                })),
+                Some(&mapping.session),
+            )
+            .await?;
+        if read.get("exceptionDetails").is_some() {
+            return Err("The page could not be read at the pointer's target.".into());
+        }
+        let width = read["result"]["value"]
+            .as_f64()
+            .filter(|width| width.is_finite());
+        self.aim = Some(Aim {
+            session: mapping.session.clone(),
+            generation: mapping.pointer.page_generation.clone(),
+            context: mapping.pointer.context,
+            point,
+            width,
+        });
+        Ok(width)
+    }
+
+    /// The hit test at the end of travel: a press is sent only where the
+    /// element its travel aimed at still receives it. A layer that opened
+    /// during the travel (a hover menu, a banner) or a target that moved
+    /// refuses the press; nothing is pressed.
+    async fn hit_test(
+        &self,
+        mapping: &Mapping,
+        point: (f64, f64),
+        client: &CdpClient,
+    ) -> Result<(), CommandError> {
+        let Some(aim) = self.aim.as_ref().filter(|aim| aim.holds(mapping, point)) else {
+            return Ok(());
+        };
+        let read = client
+            .send_command(
+                "Runtime.evaluate",
+                Some(json!({
+                    "expression": hit_test_script(point.0, point.1),
+                    "contextId": aim.context, "returnByValue": true,
+                })),
+                Some(&aim.session),
+            )
+            .await?;
+        let found = &read["result"]["value"];
+        if read.get("exceptionDetails").is_none() && found.is_null() {
+            return Ok(());
+        }
+        // The topmost node for the refusal's record. Hit testing takes the
+        // document coordinates of the session's local root.
+        let observed = match (found["scrollX"].as_f64(), found["scrollY"].as_f64()) {
+            (Some(scroll_x), Some(scroll_y)) => client
+                .send_command(
+                    "DOM.getNodeForLocation",
+                    Some(json!({
+                        "x": (point.0 + scroll_x).round() as i64,
+                        "y": (point.1 + scroll_y).round() as i64,
+                        "includeUserAgentShadowDOM": true,
+                    })),
+                    Some(&aim.session),
+                )
+                .await
+                .ok()
+                .and_then(|node| node["backendNodeId"].as_i64()),
+            _ => None,
+        };
+        let message = match found["blocker"].as_str() {
+            Some("") | None => "browser_observation_stale: The target left the page while the pointer travelled to it, so no button was pressed. Observe the page before choosing the next action.".to_string(),
+            Some(blocker) => format!("browser_observation_stale: Another element (<{blocker}>) now covers the target at the press point, so no button was pressed. Observe the page before choosing the next action."),
+        };
+        Err(CommandError::with_data(
+            message,
+            json!({ "precondition": "hitTest", "observed": observed }),
+        ))
+    }
+
+    /// One pointer move to `point` (display pixels) with the buttons this
+    /// gesture holds and `modifiers`, which the helper holds from then on.
+    /// Its outcome is unknown until the helper acknowledges it.
+    async fn send_move(
+        &mut self,
+        point: (f64, f64),
+        modifiers: i64,
+        display: &DisplayClient,
+    ) -> Result<(), String> {
+        let event = json!({
+            "type": "input_mouse", "eventType": "mouseMoved", "x": point.0, "y": point.1,
+            "buttons": self.buttons, "modifiers": modifiers,
+        });
+        self.unknown = true;
+        if let Err(error) = display.input(&[event]).await {
+            if error.operation_performed == Some(json!(false)) {
+                self.unknown = false;
+                return Err(error.to_string());
+            }
+            return Err(format!("browser_control_outcome_unknown: Native input may have executed ({error}). Do not replay the original action."));
+        }
+        self.modifiers = modifiers;
+        self.unknown = false;
+        Ok(())
+    }
+
+    /// One sample of a travel: sent under atomic input custody at a proven
+    /// layout, then published to viewers as the agent's pointer.
+    async fn sample(
+        &mut self,
+        point: (f64, f64),
+        modifiers: i64,
+        mapping: &Mapping,
+        client: &CdpClient,
+        display: &DisplayClient,
+    ) -> Result<(), String> {
+        let atomic = display.atomic_input().await;
+        self.same_layout(display)?;
+        self.send_move(point, modifiers, display).await?;
+        drop(atomic);
+        let surface = display.surface();
+        let (x, y) = mapping.page(point, &surface)?;
+        let factor = f64::from(surface.device_scale_factor);
+        client
+            .observe_activity(
+                json!({
+                    "type": "pointer", "eventType": "move", "x": x, "y": y,
+                    "buttons": self.buttons, "modifiers": self.modifiers,
+                    "screenX": point.0 / factor, "screenY": point.1 / factor,
+                }),
+                &mapping.session,
+                mapping.pointer.page_generation.clone(),
+                InputSource::Agent,
+            )
+            .acknowledged();
+        Ok(())
+    }
+
+    /// Travels along `glide`, one sample per frame on the travel's clock,
+    /// the last on its destination. Stops at the first sample a pending
+    /// interruption finds, and when a JavaScript dialog opens for this page
+    /// (returns true). Intermediate samples prove nothing but the layout.
+    #[allow(clippy::too_many_arguments)]
+    async fn travel(
+        &mut self,
+        glide: Glide,
+        modifiers: i64,
+        mapping: &Mapping,
+        client: &CdpClient,
+        display: &DisplayClient,
+        dialog_sessions: &[&str],
+        interrupts: &Interrupts,
+    ) -> Result<bool, CommandError> {
+        let mut raised = interrupts.subscribe();
+        let mut events = client.subscribe();
+        let now = Instant::now();
+        let clock = now.checked_sub(motion::FRAME).unwrap_or(now);
+        let mut last = None;
+        loop {
+            if let Some(reason) = interrupts.pending() {
+                return Err(stopped(reason, self.buttons != 0));
+            }
+            loop {
+                match events.try_recv() {
+                    Ok(event)
+                        if event.method == "Page.javascriptDialogOpening"
+                            && event
+                                .session_id
+                                .as_deref()
+                                .is_none_or(|id| dialog_sessions.contains(&id)) =>
+                    {
+                        return Ok(true)
+                    }
+                    Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                        return Err(outcome_unknown(
+                            "The browser disconnected while the pointer travelled. Do not replay the action.",
+                        )
+                        .into())
+                    }
+                }
+            }
+            let sample = glide.sample(clock.elapsed());
+            let point = (sample.point.0.round(), sample.point.1.round());
+            if last != Some(point) {
+                self.sample(point, modifiers, mapping, client, display)
+                    .await?;
+                last = Some(point);
+            }
+            let Some(next) = sample.next else {
+                return Ok(false);
+            };
+            tokio::select! {
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(clock + next)) => {}
+                _ = raised.changed() => {}
+            }
+        }
+    }
+
+    /// Where a wheel without coordinates turns: the page point under the X
+    /// pointer, or the viewport's centre while the pointer's place is
+    /// unknown or off the page.
+    fn pointer_point(
+        &self,
+        mapping: &Mapping,
+        display: &DisplayClient,
+        surface: &Surface,
+    ) -> Result<(f64, f64), String> {
+        let (width, height) = mapping.viewport().ok_or(UNMEASURED)?;
+        let under = display
+            .pointer()
+            .map(|pointer| mapping.page(pointer, surface))
+            .transpose()?
+            .filter(|(x, y)| *x >= 0.0 && *y >= 0.0 && *x < width && *y < height);
+        Ok(under.unwrap_or(((width / 2.0).floor(), (height / 2.0).floor())))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn dispatch(
         &mut self,
         params: Value,
@@ -322,58 +740,131 @@ impl NativeMouse {
         display: &DisplayClient,
         dialog_sessions: &[&str],
         allow_release_cleanup: bool,
-    ) -> Result<bool, String> {
+        interrupts: &Interrupts,
+    ) -> Result<bool, CommandError> {
         // Do not turn another command into a retry of an unconfirmed reset.
         self.require_known()?;
-        let coordinates = (|| {
-            let x = params["x"]
-                .as_f64()
-                .filter(|x| x.is_finite())
-                .ok_or("Invalid mouse x")?;
-            let y = params["y"]
-                .as_f64()
-                .filter(|y| y.is_finite())
-                .ok_or("Invalid mouse y")?;
-            Ok::<_, String>((x, y))
-        })();
-        let (x, y) = match coordinates {
-            Ok(point) => point,
-            Err(error) => return self.finish(Err(error), display).await,
-        };
-        let atomic = display.atomic_input().await;
-        if let Err(error) = self.same_layout(display) {
-            drop(atomic);
-            return self.finish(Err(error), display).await;
+        let result = self
+            .gesture(
+                params,
+                client,
+                session,
+                display,
+                dialog_sessions,
+                allow_release_cleanup,
+                interrupts,
+            )
+            .await;
+        self.finish(result, display).await
+    }
+
+    /// One mouse event and the travel that brings the pointer to it: proven
+    /// before it starts, stopped by a pending interruption, and for a press
+    /// proven again and hit tested at the end of travel.
+    #[allow(clippy::too_many_arguments)]
+    async fn gesture(
+        &mut self,
+        mut params: Value,
+        client: &CdpClient,
+        session: &str,
+        display: &DisplayClient,
+        dialog_sessions: &[&str],
+        allow_release_cleanup: bool,
+        interrupts: &Interrupts,
+    ) -> Result<bool, CommandError> {
+        let event_type = params["type"]
+            .as_str()
+            .filter(|kind| {
+                matches!(
+                    *kind,
+                    "mouseMoved" | "mousePressed" | "mouseReleased" | "mouseWheel"
+                )
+            })
+            .ok_or("Unsupported mouse event type")?
+            .to_owned();
+        let point = coordinates(&params, &event_type)?;
+        // A resize since the page was proven refuses before anything is sent.
+        self.same_layout(display)?;
+        if let Some(reason) = interrupts.pending() {
+            return Err(stopped(reason, self.buttons != 0));
         }
-        let mapping = match self.prepare(client, session, display, x, y).await {
+        let mapping = match self.prepare(client, session, display).await {
             Ok(mapping) => mapping,
             Err(error) => {
-                // An explicit release needs no stale page coordinates. This
-                // branch precedes any new native dispatch; a failed attempted
-                // input below must retain its original failure instead.
-                drop(atomic);
-                if allow_release_cleanup && params["type"] == "mouseReleased" && self.buttons != 0 {
+                // An explicit release needs no stale page coordinates.
+                // Nothing was sent for this event yet.
+                if allow_release_cleanup && event_type == "mouseReleased" && self.buttons != 0 {
                     self.release(display).await?;
                     return Ok(false);
                 }
-                return self.finish(Err(error), display).await;
+                return Err(error.into());
             }
         };
-        let result = async {
-            let point = mapping.point(x, y, &display.surface())?;
-            self.dispatch_at(
+        let surface = display.surface();
+        let (x, y) = match point {
+            Some(point) => point,
+            None => self.pointer_point(&mapping, display, &surface)?,
+        };
+        params["x"] = json!(x);
+        params["y"] = json!(y);
+        let to = mapping.point(x, y, &surface)?;
+        let scale = mapping.scale()?;
+        let from = display
+            .pointer()
+            .filter(|(px, py)| {
+                *px >= 0.0
+                    && *py >= 0.0
+                    && *px < f64::from(surface.width)
+                    && *py < f64::from(surface.height)
+            })
+            .map_or_else(|| mapping.center(&surface), Ok)?;
+        let reach = motion::REACHED_CSS_PX * scale;
+        let travels = (to.0 - from.0).hypot(to.1 - from.1) > reach;
+        let presses = event_type == "mousePressed" && self.buttons == 0;
+        let width = if self.buttons == 0 && (presses || event_type == "mouseMoved") {
+            self.aim(&mapping, (x, y), travels, client).await?
+        } else {
+            None
+        };
+        // The travel's samples carry the modifiers of the event they lead to.
+        let modifiers = params["modifiers"].as_i64().unwrap_or(0);
+        if let Some(glide) = Glide::new(from, to, width.unwrap_or(UNAIMED_WIDTH_CSS) * scale, reach)
+        {
+            if self
+                .travel(
+                    glide,
+                    modifiers,
+                    &mapping,
+                    client,
+                    display,
+                    dialog_sessions,
+                    interrupts,
+                )
+                .await?
+            {
+                return Ok(true);
+            }
+        }
+        if presses {
+            self.current(&mapping, client, display).await?;
+            self.hit_test(&mapping, (x, y), client).await?;
+            if let Some(reason) = interrupts.pending() {
+                return Err(stopped(reason, false));
+            }
+        }
+        let atomic = display.atomic_input().await;
+        self.same_layout(display)?;
+        Ok(self
+            .dispatch_at(
                 params,
-                point,
+                to,
                 &mapping,
                 client,
                 display,
                 dialog_sessions,
                 atomic,
             )
-            .await
-        }
-        .await;
-        self.finish(result, display).await
+            .await?)
     }
 
     /// Sends one native mouse event. `atomic` is the input custody its
@@ -481,6 +972,11 @@ impl NativeMouse {
         }
     }
 
+    /// A drag is a press at the source after a travel there, a travel with
+    /// the button held to the target, and the release there. Both pages are
+    /// measured before the button goes down: a held gesture keeps the
+    /// mapping it started with.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn drag(
         &mut self,
         client: &CdpClient,
@@ -488,10 +984,11 @@ impl NativeMouse {
         page_session: &str,
         source: (&str, f64, f64),
         target: (&str, f64, f64),
-    ) -> Result<bool, String> {
+        interrupts: &Interrupts,
+    ) -> Result<bool, CommandError> {
         self.require_known()?;
         let result = self
-            .drag_inner(client, display, page_session, source, target)
+            .drag_inner(client, display, page_session, source, target, interrupts)
             .await;
         self.finish(result, display).await
     }
@@ -503,405 +1000,48 @@ impl NativeMouse {
         page_session: &str,
         source: (&str, f64, f64),
         target: (&str, f64, f64),
-    ) -> Result<bool, String> {
-        let atomic = display.atomic_input().await;
+        interrupts: &Interrupts,
+    ) -> Result<bool, CommandError> {
         self.same_layout(display)?;
-        let end_mapping = self
-            .prepare(client, target.0, display, target.1, target.2)
-            .await?;
-        let start_mapping = self
-            .prepare(client, source.0, display, source.1, source.2)
-            .await?;
-        let start = start_mapping.point(source.1, source.2, &display.surface())?;
-        let end = end_mapping.point(target.1, target.2, &display.surface())?;
-        let params = |kind: &str, x: f64, y: f64, buttons: i64| json!({"type":kind,"x":x,"y":y,"button":"left","buttons":buttons,"clickCount":1});
-        if self
-            .dispatch_at(
-                params("mousePressed", source.1, source.2, 1),
-                start,
-                &start_mapping,
-                client,
-                display,
-                &[source.0, page_session],
-                atomic,
-            )
-            .await?
-        {
-            return Ok(true);
+        if let Some(reason) = interrupts.pending() {
+            return Err(stopped(reason, false));
         }
-        for step in 1..=10 {
-            let atomic = display.atomic_input().await;
-            self.same_layout(display)?;
-            self.current(&start_mapping, client, display).await?;
-            let fraction = f64::from(step) / 10.0;
-            let point = (
-                (start.0 + (end.0 - start.0) * fraction).round(),
-                (start.1 + (end.1 - start.1) * fraction).round(),
-            );
-            self.dispatch_at(
-                params("mouseMoved", source.1, source.2, 1),
-                point,
-                &start_mapping,
-                client,
-                display,
-                &[source.0, page_session],
-                atomic,
-            )
-            .await?;
-            tokio::time::sleep(Duration::from_millis(10)).await;
+        self.prepare(client, target.0, display).await?;
+        let steps = [
+            (
+                source.0,
+                json!({"type":"mousePressed","x":source.1,"y":source.2,"button":"left","buttons":1,"clickCount":1}),
+            ),
+            (
+                target.0,
+                json!({"type":"mouseMoved","x":target.1,"y":target.2,"button":"left","buttons":1}),
+            ),
+            (
+                target.0,
+                json!({"type":"mouseReleased","x":target.1,"y":target.2,"button":"left","buttons":0,"clickCount":1}),
+            ),
+        ];
+        for (session, params) in steps {
+            let dialog_sessions = [session, page_session];
+            if self
+                .gesture(
+                    params,
+                    client,
+                    session,
+                    display,
+                    &dialog_sessions,
+                    false,
+                    interrupts,
+                )
+                .await?
+            {
+                return Ok(true);
+            }
         }
-        let atomic = display.atomic_input().await;
-        self.same_layout(display)?;
-        self.current(&end_mapping, client, display).await?;
-        self.dispatch_at(
-            params("mouseReleased", target.1, target.2, 0),
-            end,
-            &end_mapping,
-            client,
-            display,
-            &[target.0, page_session],
-            atomic,
-        )
-        .await
+        Ok(false)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn mapping(scale: f64, screen_y: f64) -> Mapping {
-        Mapping {
-            session: "page".into(),
-            pointer: NativePointer {
-                source_page: None,
-                context: 7,
-                page_generation: "page".into(),
-                client_x: 210.0,
-                client_y: 175.0,
-                screen_x: 231.0,
-                screen_y,
-                geometry: json!({"scale":scale}),
-            },
-            surface: "surface".into(),
-            window: (1, 0, 0, 2560, 1440),
-        }
-    }
-
-    #[test]
-    fn measured_native_origin_covers_zoom_fullscreen_and_devtools_without_chrome_height() {
-        let surface = Surface::new(2560, 1440);
-        for (screen_y, expected_y) in [(279.5, 559.0), (192.5, 385.0)] {
-            let mapping = mapping(2.2, screen_y);
-            assert_eq!(
-                mapping.point(210.0, 175.0, &surface).unwrap(),
-                (462.0, expected_y)
-            );
-            assert_eq!(
-                mapping.point(260.0, 175.0, &surface).unwrap(),
-                (572.0, expected_y)
-            );
-        }
-    }
-
-    /// Inside a size class the framebuffer is larger than the window: a
-    /// point past the window's edge is refused, not pressed on the root.
-    #[test]
-    fn pointer_mapping_refuses_points_past_the_window_inside_a_larger_framebuffer() {
-        let surface = Surface::new(1792, 1280);
-        let mut mapping = mapping(2.0, 262.0);
-        mapping.window = (1, 0, 0, 1560, 1200);
-        // Page x 210 is display x 462; 1 CSS px is 2 display px.
-        assert_eq!(mapping.point(758.5, 175.0, &surface).unwrap().0, 1559.0);
-        for (x, y) in [(759.0, 175.0), (850.0, 300.0), (210.0, 644.0)] {
-            assert_eq!(
-                mapping.point(x, y, &surface).unwrap_err(),
-                "The mouse position is outside the current browser window."
-            );
-        }
-    }
-
-    #[test]
-    fn pointer_mapping_rejects_outside_and_nonfinite_coordinates() {
-        let surface = Surface::new(2560, 1440);
-        let mapping = mapping(2.2, 279.5);
-        for (x, y) in [
-            (f64::NAN, 1.0),
-            (f64::INFINITY, 1.0),
-            (-1000.0, 0.0),
-            (10000.0, 0.0),
-            (0.0, 10000.0),
-        ] {
-            assert!(mapping.point(x, y, &surface).is_err());
-        }
-    }
-
-    #[test]
-    fn mappings_survive_only_a_held_gesture_and_unknown_input_requires_explicit_reset() {
-        let mut mouse = NativeMouse::default();
-        mouse.mappings.insert("page".into(), mapping(2.0, 262.0));
-        mouse.begin_command();
-        assert!(mouse.mappings.is_empty());
-        mouse.mappings.insert("page".into(), mapping(2.0, 262.0));
-        mouse.buttons = 1;
-        mouse.unknown = true;
-        mouse.begin_command();
-        assert_eq!(mouse.mappings.len(), 1);
-        assert!(mouse.unknown);
-        mouse.reset();
-        assert!(mouse.mappings.is_empty());
-        assert!(!mouse.unknown);
-        assert_eq!(mouse.buttons, 0);
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn failed_readback_releases_held_input_but_preserves_the_original_failure() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let (display, peer, _frames) = DisplayClient::test_channel();
-        let server = tokio::spawn(async move {
-            let mut peer = BufReader::new(peer);
-            let mut line = String::new();
-            peer.read_line(&mut line).await.unwrap();
-            let command: Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(command["op"], "reset");
-            let reply = format!("{}\n", json!({"id":command["id"],"success":true,"data":{}}));
-            peer.get_mut().write_all(reply.as_bytes()).await.unwrap();
-        });
-        let mut mouse = NativeMouse {
-            buttons: 1,
-            modifiers: 2,
-            ..Default::default()
-        };
-        mouse.mappings.insert("page".into(), mapping(2.0, 262.0));
-        let original = "browser_control_outcome_unknown: Renderer readback failed after the press";
-        assert_eq!(
-            mouse
-                .finish(Err(original.into()), &display)
-                .await
-                .unwrap_err(),
-            original
-        );
-        assert!(!mouse.needs_release());
-        assert!(mouse.mappings.is_empty());
-        server.await.unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn lost_reset_receipt_retains_unknown_hold_and_fences_new_input() {
-        use tokio::io::{AsyncBufReadExt, BufReader};
-        let (display, peer, _frames) = DisplayClient::test_channel();
-        let server = tokio::spawn(async move {
-            let mut peer = BufReader::new(peer);
-            let mut line = String::new();
-            peer.read_line(&mut line).await.unwrap();
-            let command: Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(command["op"], "reset");
-            // The helper closes without acknowledging this cleanup.
-        });
-        let mut mouse = NativeMouse {
-            buttons: 1,
-            ..Default::default()
-        };
-        mouse.mappings.insert("page".into(), mapping(2.0, 262.0));
-        let error = mouse
-            .finish(Err("Original mouse action failed".into()), &display)
-            .await
-            .unwrap_err();
-        assert!(error.starts_with("browser_control_outcome_unknown:"));
-        assert!(error.contains("Original mouse action failed"));
-        assert!(error.contains("release is unconfirmed"));
-        assert!(mouse.unknown);
-        assert_eq!(mouse.buttons, 1);
-        mouse.begin_command();
-        assert_eq!(mouse.mappings.len(), 1);
-        assert!(mouse
-            .require_known()
-            .unwrap_err()
-            .starts_with("browser_control_outcome_unknown:"));
-        assert!(!display.available());
-        server.await.unwrap();
-    }
-
-    #[cfg(target_os = "linux")]
-    #[tokio::test]
-    async fn acknowledged_press_and_failed_page_readback_stay_unknown_through_mcp() {
-        use futures_util::{SinkExt, StreamExt};
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio_tungstenite::tungstenite::Message;
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let cdp_server = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
-            for readback in [false, true] {
-                let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
-                    panic!("expected CDP command")
-                };
-                let command: Value = serde_json::from_str(&text).unwrap();
-                assert_eq!(command["method"], "Runtime.evaluate");
-                let response = if readback {
-                    assert_eq!(command["params"]["expression"], "true");
-                    json!({"id":command["id"],"error":{"code":-32000,"message":"Renderer readback timeout after native press"}})
-                } else {
-                    assert_eq!(command["params"]["expression"], GEOMETRY);
-                    json!({"id":command["id"],"result":{"result":{"value":{"scale":2.0}}}})
-                };
-                socket
-                    .send(Message::Text(response.to_string()))
-                    .await
-                    .unwrap();
-            }
-        });
-        let client = CdpClient::connect(&format!("ws://{address}"))
-            .await
-            .unwrap();
-        let (display, peer, _frames) = DisplayClient::test_channel();
-        let helper = tokio::spawn(async move {
-            let mut peer = BufReader::new(peer);
-            let mut operations = Vec::new();
-            for expected in ["info", "input", "reset"] {
-                let mut line = String::new();
-                peer.read_line(&mut line).await.unwrap();
-                let command: Value = serde_json::from_str(&line).unwrap();
-                assert_eq!(command["op"], expected);
-                operations.push(expected);
-                if expected == "input" {
-                    assert_eq!(command["events"].as_array().unwrap().len(), 1);
-                    assert_eq!(command["events"][0]["eventType"], "mousePressed");
-                }
-                let data = if expected == "info" {
-                    json!({"width":2560,"height":1440,"windows":[{"id":1,"pid":1,"x":0,"y":0,"width":2560,"height":1440,"mapped":true,"focused":true,"overrideRedirect":false,"windowType":"normal"}]})
-                } else {
-                    json!({})
-                };
-                let response = format!(
-                    "{}\n",
-                    json!({"id":command["id"],"success":true,"data":data})
-                );
-                peer.get_mut().write_all(response.as_bytes()).await.unwrap();
-            }
-            operations
-        });
-        let mut mouse = NativeMouse::default();
-        let mut measured = mapping(2.0, 262.0);
-        measured.surface = display.surface().generation;
-        measured.pointer.page_generation = client.page_generation("page");
-        mouse.mappings.insert("page".into(), measured);
-        let mut control = super::super::BrowserControl::default();
-        control.set_display(Some(display.clone()));
-        control.native_mouse = mouse;
-        display.record_proof(display.layout_epoch(), false);
-        let error = control
-            .agent_native_mouse(
-                json!({"type":"mousePressed","x":210,"y":175,"button":"left","buttons":1}),
-                &client,
-                "page",
-                &["page"],
-            )
-            .await
-            .unwrap_err();
-        assert!(error.starts_with("browser_control_outcome_unknown:"));
-        assert!(error.contains("Renderer readback timeout"));
-        assert!(!control.native_mouse.needs_release());
-        assert!(control.needs_observation());
-        assert_eq!(helper.await.unwrap(), ["info", "input", "reset"]);
-        cdp_server.await.unwrap();
-        let result = crate::mcp::native_error_result_for_test(&error);
-        assert_eq!(result["isError"], true);
-        assert_eq!(result["structuredContent"]["response"]["success"], false);
-        assert_eq!(
-            result["structuredContent"]["response"]["code"],
-            "browser_control_outcome_unknown"
-        );
-        assert!(result["structuredContent"]["response"]
-            .get("operationPerformed")
-            .is_none());
-        if let Ok(path) = std::env::var("AMBIT_TEST_NATIVE_MOUSE_MCP_RESULT") {
-            std::fs::write(path, serde_json::to_vec_pretty(&result).unwrap()).unwrap();
-        }
-    }
-
-    /// Layouts no longer wait for a whole command: pointer input is refused
-    /// before anything is sent when a person's view resized the window after
-    /// the command's page proof, whether the layout landed while the command
-    /// ran or between its proof and its start. A new command alone does not
-    /// make the old proof current; the next proof does.
-    #[cfg(target_os = "linux")]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn pointer_input_after_a_newer_layout_is_refused_before_it_is_sent() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let cdp_server = tokio::spawn(async move {
-            let (socket, _) = listener.accept().await.unwrap();
-            let _socket = tokio_tungstenite::accept_async(socket).await.unwrap();
-            tokio::time::sleep(Duration::from_secs(5)).await;
-        });
-        let client = CdpClient::connect(&format!("ws://{address}"))
-            .await
-            .unwrap();
-        for layout_before_command in [false, true] {
-            let (display, peer, _frames) = DisplayClient::test_channel();
-            let mut control = super::super::BrowserControl::default();
-            control.set_display(Some(display.clone()));
-            // The command's preparation proved the page at the current layout.
-            display.record_proof(display.layout_epoch(), false);
-            if !layout_before_command {
-                control.begin_agent_command();
-            }
-            let owner = display.clone();
-            let resized = tokio::spawn(async move {
-                let layout = owner.layout().await;
-                owner
-                    .resize(&layout, 1560, 1200, Some(7), false)
-                    .await
-                    .map(|_| ())
-            });
-            let mut peer = BufReader::new(peer);
-            let mut line = String::new();
-            peer.read_line(&mut line).await.unwrap();
-            let request: Value = serde_json::from_str(&line).unwrap();
-            assert_eq!(request["op"], "resize");
-            let response = json!({"id":request["id"],"success":true,"data":{"width":1560,"height":1200,"windows":[]}});
-            peer.get_mut()
-                .write_all(format!("{response}\n").as_bytes())
-                .await
-                .unwrap();
-            resized.await.unwrap().unwrap();
-            if layout_before_command {
-                control.begin_agent_command();
-            }
-            let error = control
-                .agent_native_mouse(
-                    json!({"type":"mousePressed","x":210,"y":175,"button":"left","buttons":1}),
-                    &client,
-                    "page",
-                    &["page"],
-                )
-                .await
-                .unwrap_err();
-            assert_eq!(
-                error, RESIZED,
-                "layout before the command: {layout_before_command}"
-            );
-            line.clear();
-            let quiet =
-                tokio::time::timeout(Duration::from_millis(100), peer.read_line(&mut line)).await;
-            assert!(quiet.is_err(), "nothing was sent: {line}");
-            control.begin_agent_command();
-            assert_eq!(
-                control.native_mouse.same_layout(&display).unwrap_err(),
-                RESIZED
-            );
-            display.record_proof(display.layout_epoch(), false);
-            assert!(control.native_mouse.same_layout(&display).is_ok());
-            // A proof a dialog blocked does not let pointer input through.
-            display.record_proof(display.layout_epoch(), true);
-            assert!(control.native_mouse.same_layout(&display).is_err());
-        }
-        cdp_server.abort();
-    }
-}
+#[path = "mouse_tests.rs"]
+mod tests;

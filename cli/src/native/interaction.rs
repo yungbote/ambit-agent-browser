@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
+use super::actions::CommandError;
 use super::browser_control::BrowserControl;
 use super::cdp::client::CdpClient;
 use super::cdp::types::*;
@@ -37,7 +38,7 @@ pub async fn click(
     button: &str,
     click_count: i32,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<ClickResult, String> {
+) -> Result<ClickResult, CommandError> {
     let (x, y, effective_session_id) = resolve_element_center(
         client,
         session_id,
@@ -88,7 +89,7 @@ pub async fn dblclick(
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<ClickResult, String> {
+) -> Result<ClickResult, CommandError> {
     click(
         client,
         control,
@@ -109,7 +110,7 @@ pub async fn hover(
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let (x, y, effective_session_id) = resolve_element_center(
         client,
         session_id,
@@ -585,7 +586,7 @@ pub async fn check(
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<CheckResult, String> {
+) -> Result<CheckResult, CommandError> {
     set_checked(
         client,
         control,
@@ -605,7 +606,7 @@ pub async fn uncheck(
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<CheckResult, String> {
+) -> Result<CheckResult, CommandError> {
     set_checked(
         client,
         control,
@@ -629,7 +630,7 @@ async fn set_checked(
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
     desired: bool,
-) -> Result<CheckResult, String> {
+) -> Result<CheckResult, CommandError> {
     let (object_id, effective_session_id) = resolve_element_object_id(
         client,
         session_id,
@@ -1030,7 +1031,7 @@ async fn dispatch_mouse_or_dialog(
     session_id: &str,
     accept_sessions: &[&str],
     params: &DispatchMouseEventParams,
-) -> Result<bool, String> {
+) -> Result<bool, CommandError> {
     use tokio::sync::broadcast::error::RecvError;
 
     if control.lock().await.has_native_display() {
@@ -1094,7 +1095,7 @@ async fn dispatch_click(
     y: f64,
     button: &str,
     click_count: i32,
-) -> Result<ClickResult, String> {
+) -> Result<ClickResult, CommandError> {
     // Move
     if dispatch_mouse_or_dialog(
         client,

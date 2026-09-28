@@ -355,6 +355,12 @@ mod platform {
         /// A hold that outlived the bound once: layouts no longer wait for
         /// it. Its next input finds the window changed and releases.
         overridden_gesture: AtomicU64,
+        /// Where the X pointer is, in display pixels: the last acknowledged
+        /// pointer event from any source (the agent's or a person's),
+        /// confined to the window after a layout as the X server confines
+        /// it. `None` before the first, and after one whose outcome is
+        /// unknown. The helper reports no pointer; this is what it was told.
+        pointer: std::sync::Mutex<Option<(f64, f64)>>,
     }
 
     /// Exclusive custody of the window geometry for one layout.
@@ -439,7 +445,19 @@ mod platform {
                 gesture: tokio::sync::watch::channel(0).0,
                 next_gesture: AtomicU64::new(1),
                 overridden_gesture: AtomicU64::new(0),
+                pointer: std::sync::Mutex::new(None),
             }))
+        }
+
+        fn pointer_slot(&self) -> std::sync::MutexGuard<'_, Option<(f64, f64)>> {
+            self.pointer
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+        }
+
+        /// Where the X pointer is, in display pixels, if known.
+        pub(crate) fn pointer(&self) -> Option<(f64, f64)> {
+            *self.pointer_slot()
         }
 
         /// As if the helper's `info` had listed these protocol extensions.
@@ -693,6 +711,9 @@ mod platform {
                     if self.available() {
                         answered(&mut self.surface.write().unwrap());
                     }
+                    if error.operation_performed != Some(json!(false)) {
+                        *self.pointer_slot() = None;
+                    }
                     return Err(error);
                 }
             };
@@ -714,6 +735,15 @@ mod platform {
             surface.value.height = info.height;
             surface.window = (width, height);
             answered(&mut surface);
+            // The output shows the window at the origin, and the X server
+            // keeps the pointer on an output across a layout.
+            let mut pointer = self.pointer_slot();
+            *pointer = pointer.map(|(x, y)| {
+                (
+                    x.clamp(0.0, f64::from(width.saturating_sub(1))),
+                    y.clamp(0.0, f64::from(height.saturating_sub(1))),
+                )
+            });
             Ok(info)
         }
 
@@ -809,9 +839,25 @@ mod platform {
         }
 
         pub(crate) async fn input(&self, events: &[Value]) -> Result<(), DisplayError> {
-            self.request(json!({ "op": "input", "events": events }))
-                .await?;
-            Ok(())
+            // Every pointer event warps the X pointer to its point; the last
+            // one is where the batch leaves it.
+            let moved = events
+                .iter()
+                .rev()
+                .find(|event| event["type"] == "input_mouse")
+                .map(|event| event["x"].as_f64().zip(event["y"].as_f64()));
+            let result = self
+                .request(json!({ "op": "input", "events": events }))
+                .await;
+            if let Some(moved) = moved {
+                match &result {
+                    Ok(_) => *self.pointer_slot() = moved,
+                    // The helper validates a batch before its first effect.
+                    Err(error) if error.operation_performed == Some(json!(false)) => {}
+                    Err(_) => *self.pointer_slot() = None,
+                }
+            }
+            result.map(|_| ())
         }
 
         /// Releases every button and key the helper holds. A confirmed
@@ -1124,6 +1170,93 @@ mod platform {
                 reply(&mut peer, json!({"id":request["id"],"success":true,"data":{"width":1560,"height":1200,"windows":[]}})).await;
                 resized.await.unwrap().unwrap();
             }
+        }
+
+        /// The helper reports no pointer, so the client keeps where it put
+        /// it: every acknowledged pointer event moves it, whoever sent it; a
+        /// refused batch does not; an unknown outcome forgets it; and a
+        /// layout keeps it on the window, as the X server does.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn the_pointer_is_where_the_last_acknowledged_pointer_event_put_it() {
+            let (display, peer, _frames) = DisplayClient::test_channel();
+            let mut peer = BufReader::new(peer);
+            async fn send(
+                display: &Arc<DisplayClient>,
+                peer: &mut BufReader<tokio::net::UnixStream>,
+                events: Value,
+                answer: Value,
+            ) -> Result<(), DisplayError> {
+                let owner = display.clone();
+                let sent =
+                    tokio::spawn(async move { owner.input(events.as_array().unwrap()).await });
+                let request = read_request(peer).await;
+                assert_eq!(request["op"], "input");
+                let mut answer = answer;
+                answer["id"] = request["id"].clone();
+                reply(peer, answer).await;
+                sent.await.unwrap()
+            }
+            let acknowledged = json!({"success":true,"data":{}});
+            let moved =
+                |x: f64, y: f64| json!({"type":"input_mouse","eventType":"mouseMoved","x":x,"y":y});
+            assert_eq!(display.pointer(), None);
+            let press = json!({"type":"input_mouse","eventType":"mousePressed","x":30.0,"y":40.0,"button":"left"});
+            let key = json!({"type":"input_keyboard","eventType":"keyDown","key":"a"});
+            send(
+                &display,
+                &mut peer,
+                json!([moved(10.0, 20.0), press, key.clone()]),
+                acknowledged.clone(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(display.pointer(), Some((30.0, 40.0)));
+            send(&display, &mut peer, json!([key]), acknowledged.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                display.pointer(),
+                Some((30.0, 40.0)),
+                "keys move no pointer"
+            );
+            let refused = json!({"success":false,"error":{"code":"display_invalid","message":"invalid","operationPerformed":false}});
+            assert!(
+                send(&display, &mut peer, json!([moved(99.0, 99.0)]), refused)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(
+                display.pointer(),
+                Some((30.0, 40.0)),
+                "a refused batch did nothing"
+            );
+            let unknown = json!({"success":false,"error":{"code":"display_outcome_unknown","message":"unknown","operationPerformed":"unknown"}});
+            assert!(
+                send(&display, &mut peer, json!([moved(99.0, 99.0)]), unknown)
+                    .await
+                    .is_err()
+            );
+            assert_eq!(display.pointer(), None, "it may or may not have moved");
+
+            send(
+                &display,
+                &mut peer,
+                json!([moved(1500.0, 900.0)]),
+                acknowledged,
+            )
+            .await
+            .unwrap();
+            let owner = display.clone();
+            let resized = tokio::spawn(async move {
+                let layout = owner.layout().await;
+                owner
+                    .resize(&layout, 1200, 800, Some(7), false)
+                    .await
+                    .map(|_| ())
+            });
+            answer_resize(&mut peer, (1200, 800)).await;
+            resized.await.unwrap().unwrap();
+            assert_eq!(display.pointer(), Some((1199.0, 799.0)));
         }
 
         #[tokio::test]
@@ -1472,6 +1605,9 @@ impl DisplayClient {
         match *self {}
     }
     pub(crate) fn window(&self) -> (u32, u32) {
+        match *self {}
+    }
+    pub(crate) fn pointer(&self) -> Option<(f64, f64)> {
         match *self {}
     }
     pub(crate) fn layout_epoch(&self) -> u64 {

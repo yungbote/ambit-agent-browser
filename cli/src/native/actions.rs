@@ -2947,8 +2947,6 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
-    state.browser_control.lock().await.begin_agent_command();
-
     if let Err(err) = validate_restore_config_from_command(cmd) {
         return error_response(&id, &err);
     }
@@ -13373,6 +13371,14 @@ impl From<String> for CommandError {
 impl From<&str> for CommandError {
     fn from(error: &str) -> Self {
         error.to_string().into()
+    }
+}
+
+/// A caller that reports only a message keeps the failure's coded message;
+/// the facts stated with it are not carried.
+impl From<CommandError> for String {
+    fn from(error: CommandError) -> Self {
+        error.error
     }
 }
 

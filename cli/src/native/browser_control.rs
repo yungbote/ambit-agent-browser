@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::actions::CommandError;
 use super::activity::InputSource;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -17,6 +18,7 @@ use super::input::{input_command, stream_event, HeldInputs};
 use tokio::sync::watch;
 
 mod interrupts;
+pub(crate) mod motion;
 mod mouse;
 
 pub(crate) use interrupts::{InterruptReason, Interruption, Interrupts};
@@ -478,14 +480,6 @@ impl BrowserControl {
         self.display = display;
     }
 
-    /// An agent command, or one Playwright mouse event, starts a new unheld
-    /// gesture's page/window measurement. Its pointer input is sent only
-    /// under a layout the agent's page was proven at, which a person's
-    /// resize during the command or program ends.
-    pub(crate) fn begin_agent_command(&mut self) {
-        self.native_mouse.begin_command();
-    }
-
     /// Observe lease deadlines without holding this gate. Frame pacing and
     /// pointer compositing follow it; input custody never does.
     pub(crate) fn custody(&self) -> watch::Receiver<Option<Instant>> {
@@ -593,26 +587,29 @@ impl BrowserControl {
         self.finish_native_dialog().await
     }
 
-    fn observe_native_result(&mut self, result: &Result<bool, String>) {
-        if result
-            .as_ref()
-            .is_err_and(|error| error.starts_with("browser_control_outcome_unknown: "))
-        {
+    fn observe_native_result<T>(&mut self, result: &Result<T, CommandError>) {
+        if result.as_ref().is_err_and(|failure| {
+            failure
+                .error
+                .starts_with("browser_control_outcome_unknown: ")
+        }) {
             self.needs_observation = true;
         }
     }
 
-    /// Returns a dialog observation separately from the real helper receipt.
-    /// Callers must never retry through CDP after entering this transport.
+    /// The agent's pointer input through the owned display, with the travel
+    /// that brings the pointer there (`mouse::NativeMouse`). Returns a dialog
+    /// observation separately from the real helper receipt. Callers must
+    /// never retry through CDP after entering this transport.
     pub(crate) async fn agent_native_mouse(
         &mut self,
         params: Value,
         client: &CdpClient,
         session: &str,
         dialog_sessions: &[&str],
-    ) -> Result<bool, String> {
+    ) -> Result<bool, CommandError> {
         if let Some(error) = self.agent_error() {
-            return Err(format!("{}: {}", error.code, error.message));
+            return Err(format!("{}: {}", error.code, error.message).into());
         }
         let result = self
             .native_mouse
@@ -623,6 +620,7 @@ impl BrowserControl {
                 self.display.as_ref().ok_or("No owned browser display")?,
                 dialog_sessions,
                 false,
+                &self.interrupts,
             )
             .await;
         self.observe_native_result(&result);
@@ -635,9 +633,9 @@ impl BrowserControl {
         page_session: &str,
         source: (&str, f64, f64),
         target: (&str, f64, f64),
-    ) -> Result<bool, String> {
+    ) -> Result<bool, CommandError> {
         if let Some(error) = self.agent_error() {
-            return Err(format!("{}: {}", error.code, error.message));
+            return Err(format!("{}: {}", error.code, error.message).into());
         }
         let result = self
             .native_mouse
@@ -647,6 +645,7 @@ impl BrowserControl {
                 page_session,
                 source,
                 target,
+                &self.interrupts,
             )
             .await;
         self.observe_native_result(&result);
@@ -668,17 +667,25 @@ impl BrowserControl {
         params: Value,
         client: &CdpClient,
         session_id: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), CommandError> {
         self.drain_stream()
             .await
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
         if let Some(error) = self.agent_error() {
-            return Err(format!("{}: {}", error.code, error.message));
+            return Err(format!("{}: {}", error.code, error.message).into());
         }
         if let ("input_mouse", Some(display)) = (kind, self.display.as_ref()) {
             let result = self
                 .native_mouse
-                .dispatch(params, client, session_id, display, &[session_id], true)
+                .dispatch(
+                    params,
+                    client,
+                    session_id,
+                    display,
+                    &[session_id],
+                    true,
+                    &self.interrupts,
+                )
                 .await;
             self.observe_native_result(&result);
             return result.map(|_| ());
@@ -688,7 +695,7 @@ impl BrowserControl {
             .stream_held
             .accepts(std::iter::once((session_id, &event)))
         {
-            return Err("At most 256 inputs may be held at once.".to_string());
+            return Err("At most 256 inputs may be held at once.".into());
         }
         let (method, params) = self
             .stream_held
@@ -704,7 +711,7 @@ impl BrowserControl {
             .map_err(|_| format!("CDP command timed out: {}", method))??;
         self.stream_outcome_unknown = false;
         if let Some(error) = response.error {
-            return Err(format!("CDP error ({}): {}", method, error));
+            return Err(format!("CDP error ({}): {}", method, error).into());
         }
         self.stream_held.acknowledged(session_id, &event);
         Ok(())

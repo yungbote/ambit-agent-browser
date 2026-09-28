@@ -867,7 +867,7 @@ fn build_count_elements_js(selector: &str) -> String {
 /// on el": shadow-including ancestors/descendants in either direction, and
 /// label/control association (custom checkboxes hide the input under a styled
 /// sibling inside the same label).
-const BLOCKER_AT_JS: &str = r#"(doc, el, x, y) => {
+pub(crate) const BLOCKER_AT_JS: &str = r#"(doc, el, x, y) => {
     // Descend from the given document through same-origin iframes so a point
     // over a frame resolves to the element inside it, in that frame's space.
     let d = doc, lx = x, ly = y;

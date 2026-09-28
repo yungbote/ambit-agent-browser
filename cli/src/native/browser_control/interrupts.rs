@@ -8,6 +8,8 @@
 
 use std::sync::{Arc, Mutex};
 
+use tokio::sync::watch;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum InterruptReason {
     HumanControl,
@@ -21,12 +23,15 @@ pub(crate) struct Interrupts(Arc<Pending>);
 
 struct Pending {
     reasons: Mutex<Vec<InterruptReason>>,
+    /// Counts raises, so a sleeper wakes the moment one arrives.
+    raised: watch::Sender<u64>,
 }
 
 impl Default for Interrupts {
     fn default() -> Self {
         Self(Arc::new(Pending {
             reasons: Mutex::new(Vec::new()),
+            raised: watch::channel(0).0,
         }))
     }
 }
@@ -56,6 +61,9 @@ impl Interrupts {
 
     pub(crate) fn raise(&self, reason: InterruptReason) -> Interruption {
         self.reasons().push(reason);
+        self.0
+            .raised
+            .send_modify(|count| *count = count.wrapping_add(1));
         Interruption {
             interrupts: self.clone(),
             reason,
@@ -78,20 +86,28 @@ impl Interrupts {
     pub(crate) fn takeover(&self) -> bool {
         self.pending() == Some(InterruptReason::HumanControl)
     }
+
+    /// Wakes whoever waits on it when an interruption is raised.
+    pub(crate) fn subscribe(&self) -> watch::Receiver<u64> {
+        self.0.raised.subscribe()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_takeover_outranks_other_interruptions_until_its_guard_drops() {
+    #[tokio::test]
+    async fn a_takeover_outranks_other_interruptions_until_its_guard_drops() {
         let interrupts = Interrupts::default();
+        let mut raised = interrupts.subscribe();
         assert_eq!(interrupts.pending(), None);
         let shutdown = interrupts.raise(InterruptReason::Shutdown);
+        raised.changed().await.unwrap();
         assert_eq!(interrupts.pending(), Some(InterruptReason::Shutdown));
         assert!(!interrupts.takeover());
         let takeover = interrupts.clone().raise(InterruptReason::HumanControl);
+        raised.changed().await.unwrap();
         assert_eq!(interrupts.pending(), Some(InterruptReason::HumanControl));
         assert!(interrupts.takeover());
         drop(takeover);
