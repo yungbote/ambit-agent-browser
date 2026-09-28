@@ -4,8 +4,10 @@
 //! `motion::REACHED_CSS_PX` from the real X pointer is preceded by a glide
 //! there (`motion::Glide`): one helper sample per presenter frame, each
 //! published to viewers once the helper acknowledged it, so a person watching
-//! sees the input the driver really sends. A pending interruption (a person
-//! taking control) stops the glide at its next sample.
+//! sees the input the driver really sends. A wheel turns one notch per frame
+//! the same way (`motion::notches`; the `scroll` command's closed loop is in
+//! `mouse_scroll.rs`). A pending interruption (a person taking control) stops
+//! either at its next frame.
 //!
 //! The page-to-display mapping is measured natively, from the renderer's
 //! trusted event for a one-pixel move where the pointer already is, and kept
@@ -24,6 +26,7 @@ use super::motion::{self, Glide};
 use crate::native::actions::CommandError;
 use crate::native::activity::{InputSource, NativePointer};
 use crate::native::cdp::client::CdpClient;
+use crate::native::cdp::types::CdpEvent;
 use crate::native::display::{AtomicInput, DisplayClient, Surface};
 
 const GEOMETRY: &str = "({scale:devicePixelRatio*(visualViewport?.scale??1),width:innerWidth,height:innerHeight,offsetX:visualViewport?.offsetLeft??0,offsetY:visualViewport?.offsetTop??0})";
@@ -260,28 +263,171 @@ impl Aim {
     }
 }
 
+/// What an unfinished pointer action has done at its target when it stops.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Acted {
+    /// Nothing: at most its travel moved the pointer.
+    Nothing,
+    /// A button is held; stopping releases it.
+    Held,
+    /// The wheel turned, so the page may have scrolled part of the way.
+    Turned,
+}
+
+impl Acted {
+    fn of(held: bool) -> Self {
+        if held {
+            Self::Held
+        } else {
+            Self::Nothing
+        }
+    }
+}
+
 /// What a pending interruption makes of input that has not finished: a
-/// travel stopped before its press pressed nothing; one stopped with a
-/// button held is interrupted, and the held button is released.
-fn stopped(reason: InterruptReason, held: bool) -> CommandError {
-    match (reason, held) {
-        (InterruptReason::HumanControl, false) => "browser_controlled_by_user: The user took control of this browser before this pointer action reached its target, so nothing was pressed. Wait until they release control before continuing.".into(),
-        (InterruptReason::HumanControl, true) => CommandError::with_data(
+/// travel stopped before its target did nothing there; one stopped with a
+/// button held or a wheel turning is interrupted, and a held button is
+/// released.
+fn stopped(reason: InterruptReason, acted: Acted) -> CommandError {
+    let human =
+        json!({"interruptedBy":"human","executionStopped":true,"effectsMayHaveOccurred":true});
+    match (reason, acted) {
+        (InterruptReason::HumanControl, Acted::Nothing) => "browser_controlled_by_user: The user took control of this browser before this pointer action reached its target, so nothing was pressed or scrolled. Wait until they release control before continuing.".into(),
+        (InterruptReason::HumanControl, Acted::Held) => CommandError::with_data(
             "browser_operation_interrupted: The user took control of this browser during this held pointer gesture; its button was released. Inspect the page after they release control and do not replay the gesture.",
-            json!({"interruptedBy":"human","executionStopped":true,"effectsMayHaveOccurred":true}),
+            human,
         ),
-        (_, held) => CommandError::with_data(
+        (InterruptReason::HumanControl, Acted::Turned) => CommandError::with_data(
+            "browser_operation_interrupted: The user took control of this browser while the wheel was turning, so the page scrolled only part of the way. Inspect the page after they release control and do not replay the scroll.",
+            human,
+        ),
+        (_, acted) => CommandError::with_data(
             "browser_operation_interrupted: The browser owner stopped this pointer action before it finished. Inspect the page before continuing; do not replay it.",
-            json!({"executionStopped":true,"effectsMayHaveOccurred":held}),
+            json!({"executionStopped":true,"effectsMayHaveOccurred":acted != Acted::Nothing}),
         ),
     }
 }
 
+/// A layout that lands while the wheel turns stops it: the notches before
+/// it were sent, and the rest would land on content that moved.
+const RESIZED_TURNING: &str = "browser_operation_interrupted: The browser window was resized while the wheel was turning, so the page scrolled only part of the way. Observe the page before choosing the next action; do not replay the scroll.";
+
+/// Whether a CDP event is a JavaScript dialog opening for one of the pages
+/// an action watches: it blocks their scripts until someone answers it.
+fn opens_dialog(event: &CdpEvent, sessions: &[&str]) -> bool {
+    event.method == "Page.javascriptDialogOpening"
+        && event
+            .session_id
+            .as_deref()
+            .is_none_or(|id| sessions.contains(&id))
+}
+
+/// The clock paced input runs on: one helper event per presenter frame, on
+/// absolute deadlines from a clock started one frame before the first event,
+/// so the first goes at once and a late one never delays the rest. Between
+/// events it stops for a pending interruption and for a JavaScript dialog
+/// opening for the page.
+struct Pacing<'a> {
+    clock: Instant,
+    ticks: u32,
+    raised: tokio::sync::watch::Receiver<u64>,
+    events: tokio::sync::broadcast::Receiver<CdpEvent>,
+    interrupts: &'a Interrupts,
+    dialog_sessions: &'a [&'a str],
+}
+
+impl<'a> Pacing<'a> {
+    fn start(
+        client: &CdpClient,
+        interrupts: &'a Interrupts,
+        dialog_sessions: &'a [&'a str],
+    ) -> Self {
+        let now = Instant::now();
+        Self {
+            clock: now.checked_sub(motion::FRAME).unwrap_or(now),
+            ticks: 0,
+            raised: interrupts.subscribe(),
+            events: client.subscribe(),
+            interrupts,
+            dialog_sessions,
+        }
+    }
+
+    fn elapsed(&self) -> Duration {
+        self.clock.elapsed()
+    }
+
+    /// Whether the next event may go: a pending interruption stops the
+    /// action (what that means depends on what it has `acted`), and a
+    /// dialog that opened ends it (true).
+    fn check(&mut self, acted: Acted) -> Result<bool, CommandError> {
+        if let Some(reason) = self.interrupts.pending() {
+            return Err(stopped(reason, acted));
+        }
+        loop {
+            match self.events.try_recv() {
+                Ok(event) if opens_dialog(&event, self.dialog_sessions) => return Ok(true),
+                Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => return Ok(false),
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
+                    return Err(outcome_unknown(
+                        "The browser disconnected during this pointer action. Do not replay it.",
+                    )
+                    .into())
+                }
+            }
+        }
+    }
+
+    /// Waits until `next` on the clock, or less when an interruption is
+    /// raised meanwhile.
+    async fn until(&mut self, next: Duration) {
+        tokio::select! {
+            _ = tokio::time::sleep_until(tokio::time::Instant::from_std(self.clock + next)) => {}
+            _ = self.raised.changed() => {}
+        }
+    }
+
+    /// Waits for the next frame of the clock that has not passed: the first
+    /// at once, then one per frame. A late tick (after a pause, or a slow
+    /// read) skips the frames it missed rather than bunching the events that
+    /// follow it.
+    async fn tick(&mut self) {
+        let passed = self.elapsed().as_nanos() / motion::FRAME.as_nanos();
+        self.ticks = (self.ticks + 1).max(u32::try_from(passed).unwrap_or(u32::MAX));
+        self.until(motion::FRAME * self.ticks).await;
+    }
+
+    /// A page read, unless a dialog opens for the page first (`None`): the
+    /// dialog blocks the page's scripts, so the read would wait for it.
+    async fn observe<T>(
+        &mut self,
+        read: impl std::future::Future<Output = Result<T, String>>,
+    ) -> Result<Option<T>, CommandError> {
+        tokio::pin!(read);
+        loop {
+            tokio::select! {
+                result = &mut read => return Ok(Some(result?)),
+                event = self.events.recv() => match event {
+                    Ok(event) if opens_dialog(&event, self.dialog_sessions) => return Ok(None),
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return Err(outcome_unknown(
+                            "The browser disconnected during this pointer action. Do not replay it.",
+                        )
+                        .into())
+                    }
+                    _ => {}
+                },
+            }
+        }
+    }
+}
+
 /// Page coordinates of a mouse event: both finite, or both absent where the
-/// event may land wherever the pointer is (a wheel).
-fn coordinates(params: &Value, event_type: &str) -> Result<Option<(f64, f64)>, String> {
+/// event lands wherever the pointer is (a button pressed in place, a wheel).
+fn coordinates(params: &Value) -> Result<Option<(f64, f64)>, String> {
     let absent = |key: &str| params.get(key).is_none_or(Value::is_null);
-    if event_type == "mouseWheel" && absent("x") && absent("y") {
+    if absent("x") && absent("y") {
         return Ok(None);
     }
     let x = params["x"]
@@ -666,37 +812,13 @@ impl NativeMouse {
         dialog_sessions: &[&str],
         interrupts: &Interrupts,
     ) -> Result<bool, CommandError> {
-        let mut raised = interrupts.subscribe();
-        let mut events = client.subscribe();
-        let now = Instant::now();
-        let clock = now.checked_sub(motion::FRAME).unwrap_or(now);
+        let mut pacing = Pacing::start(client, interrupts, dialog_sessions);
         let mut last = None;
         loop {
-            if let Some(reason) = interrupts.pending() {
-                return Err(stopped(reason, self.buttons != 0));
+            if pacing.check(Acted::of(self.buttons != 0))? {
+                return Ok(true);
             }
-            loop {
-                match events.try_recv() {
-                    Ok(event)
-                        if event.method == "Page.javascriptDialogOpening"
-                            && event
-                                .session_id
-                                .as_deref()
-                                .is_none_or(|id| dialog_sessions.contains(&id)) =>
-                    {
-                        return Ok(true)
-                    }
-                    Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
-                    Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
-                    Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {
-                        return Err(outcome_unknown(
-                            "The browser disconnected while the pointer travelled. Do not replay the action.",
-                        )
-                        .into())
-                    }
-                }
-            }
-            let sample = glide.sample(clock.elapsed());
+            let sample = glide.sample(pacing.elapsed());
             let point = (sample.point.0.round(), sample.point.1.round());
             if last != Some(point) {
                 self.sample(point, modifiers, mapping, client, display)
@@ -706,18 +828,102 @@ impl NativeMouse {
             let Some(next) = sample.next else {
                 return Ok(false);
             };
-            tokio::select! {
-                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(clock + next)) => {}
-                _ = raised.changed() => {}
-            }
+            pacing.until(next).await;
         }
     }
 
-    /// Where a wheel without coordinates turns: the page point under the X
-    /// pointer, or the viewport's centre while the pointer's place is
-    /// unknown or off the page.
+    /// Turns the wheel at `point` (display pixels; the page point is in
+    /// `params`) one of `notches` per frame. The last goes through
+    /// `dispatch_at`, so the page has taken the wheel when this returns;
+    /// the others read nothing back. Returns true when a dialog opened.
+    #[allow(clippy::too_many_arguments)]
+    async fn turn(
+        &mut self,
+        params: Value,
+        notches: Vec<(f64, f64)>,
+        point: (f64, f64),
+        mapping: &Mapping,
+        client: &CdpClient,
+        display: &DisplayClient,
+        dialog_sessions: &[&str],
+        interrupts: &Interrupts,
+    ) -> Result<bool, CommandError> {
+        let mut pacing = Pacing::start(client, interrupts, dialog_sessions);
+        let last = notches.len().saturating_sub(1);
+        for (index, (delta_x, delta_y)) in notches.into_iter().enumerate() {
+            pacing.tick().await;
+            let acted = if index == 0 {
+                Acted::of(self.buttons != 0)
+            } else {
+                Acted::Turned
+            };
+            if pacing.check(acted)? {
+                return Ok(true);
+            }
+            let mut notch = params.clone();
+            notch["deltaX"] = json!(delta_x);
+            notch["deltaY"] = json!(delta_y);
+            let atomic = display.atomic_input().await;
+            self.turning_layout(display, acted)?;
+            if index == last {
+                return Ok(self
+                    .dispatch_at(
+                        notch,
+                        point,
+                        mapping,
+                        client,
+                        display,
+                        dialog_sessions,
+                        atomic,
+                    )
+                    .await?);
+            }
+            self.send(&notch, point, mapping, client, display, atomic)
+                .await?;
+        }
+        Ok(false)
+    }
+
+    /// `same_layout` for a wheel's next notch: once the wheel has turned, a
+    /// layout that landed stops it part of the way.
+    fn turning_layout(&self, display: &DisplayClient, acted: Acted) -> Result<(), CommandError> {
+        self.same_layout(display).map_err(|refusal| {
+            if acted == Acted::Turned {
+                CommandError::with_data(
+                    RESIZED_TURNING,
+                    json!({"executionStopped":true,"effectsMayHaveOccurred":true}),
+                )
+            } else {
+                refusal.into()
+            }
+        })
+    }
+
+    /// Where the pointer's travel starts: the real X pointer, or the page's
+    /// centre while the pointer is off the screen or has no known place.
+    fn origin(
+        &self,
+        mapping: &Mapping,
+        display: &DisplayClient,
+        surface: &Surface,
+    ) -> Result<(f64, f64), String> {
+        display
+            .pointer()
+            .filter(|(x, y)| {
+                *x >= 0.0
+                    && *y >= 0.0
+                    && *x < f64::from(surface.width)
+                    && *y < f64::from(surface.height)
+            })
+            .map_or_else(|| mapping.center(surface), Ok)
+    }
+
+    /// Where an event without coordinates lands: the page point under the X
+    /// pointer. A wheel turns at the viewport's centre while the pointer's
+    /// place is unknown or off the page; a button is pressed only in place.
     fn pointer_point(
         &self,
+        event_type: &str,
         mapping: &Mapping,
         display: &DisplayClient,
         surface: &Surface,
@@ -728,7 +934,11 @@ impl NativeMouse {
             .map(|pointer| mapping.page(pointer, surface))
             .transpose()?
             .filter(|(x, y)| *x >= 0.0 && *y >= 0.0 && *x < width && *y < height);
-        Ok(under.unwrap_or(((width / 2.0).floor(), (height / 2.0).floor())))
+        match (under, event_type) {
+            (Some(point), _) => Ok(point),
+            (None, "mouseWheel") => Ok(((width / 2.0).floor(), (height / 2.0).floor())),
+            (None, _) => Err("The pointer is not over the page, so no mouse input was sent. Move the mouse onto the page first.".into()),
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -782,11 +992,21 @@ impl NativeMouse {
             })
             .ok_or("Unsupported mouse event type")?
             .to_owned();
-        let point = coordinates(&params, &event_type)?;
+        let point = coordinates(&params)?;
+        let notches = match event_type.as_str() {
+            "mouseWheel" => Some(
+                motion::notches((
+                    params["deltaX"].as_f64().unwrap_or(0.0),
+                    params["deltaY"].as_f64().unwrap_or(0.0),
+                ))
+                .ok_or("Invalid wheel delta: each axis must be finite and at most 32768")?,
+            ),
+            _ => None,
+        };
         // A resize since the page was proven refuses before anything is sent.
         self.same_layout(display)?;
         if let Some(reason) = interrupts.pending() {
-            return Err(stopped(reason, self.buttons != 0));
+            return Err(stopped(reason, Acted::of(self.buttons != 0)));
         }
         let mapping = match self.prepare(client, session, display).await {
             Ok(mapping) => mapping,
@@ -803,21 +1023,13 @@ impl NativeMouse {
         let surface = display.surface();
         let (x, y) = match point {
             Some(point) => point,
-            None => self.pointer_point(&mapping, display, &surface)?,
+            None => self.pointer_point(&event_type, &mapping, display, &surface)?,
         };
         params["x"] = json!(x);
         params["y"] = json!(y);
         let to = mapping.point(x, y, &surface)?;
         let scale = mapping.scale()?;
-        let from = display
-            .pointer()
-            .filter(|(px, py)| {
-                *px >= 0.0
-                    && *py >= 0.0
-                    && *px < f64::from(surface.width)
-                    && *py < f64::from(surface.height)
-            })
-            .map_or_else(|| mapping.center(&surface), Ok)?;
+        let from = self.origin(&mapping, display, &surface)?;
         let reach = motion::REACHED_CSS_PX * scale;
         let travels = (to.0 - from.0).hypot(to.1 - from.1) > reach;
         let presses = event_type == "mousePressed" && self.buttons == 0;
@@ -849,8 +1061,22 @@ impl NativeMouse {
             self.current(&mapping, client, display).await?;
             self.hit_test(&mapping, (x, y), client).await?;
             if let Some(reason) = interrupts.pending() {
-                return Err(stopped(reason, false));
+                return Err(stopped(reason, Acted::Nothing));
             }
+        }
+        if let Some(notches) = notches {
+            return self
+                .turn(
+                    params,
+                    notches,
+                    to,
+                    &mapping,
+                    client,
+                    display,
+                    dialog_sessions,
+                    interrupts,
+                )
+                .await;
         }
         let atomic = display.atomic_input().await;
         self.same_layout(display)?;
@@ -867,9 +1093,69 @@ impl NativeMouse {
             .await?)
     }
 
-    /// Sends one native mouse event. `atomic` is the input custody its
-    /// geometry proof ran under: it ends at the helper's receipt, before the
-    /// page readback, so a slow renderer never holds a layout back.
+    /// Sends one native mouse event at `point` (display pixels; the page
+    /// point is in `params`) and publishes it to viewers once the helper
+    /// acknowledged it. `atomic` is the input custody its geometry proof ran
+    /// under: it ends at the helper's receipt.
+    async fn send(
+        &mut self,
+        params: &Value,
+        point: (f64, f64),
+        mapping: &Mapping,
+        client: &CdpClient,
+        display: &DisplayClient,
+        atomic: AtomicInput<'_>,
+    ) -> Result<(), String> {
+        let event_type = params["type"].as_str().unwrap_or_default();
+        // The helper changes one physical button per press/release. A caller's
+        // claimed bitmask cannot clear the owner's actual acknowledged hold.
+        let button = i64::from(crate::native::input::mouse_button_mask(
+            params["button"].as_str().unwrap_or("left"),
+        ));
+        let buttons = match event_type {
+            "mousePressed" => self.buttons | button,
+            "mouseReleased" => self.buttons & !button,
+            _ => self.buttons,
+        };
+        let modifiers = params["modifiers"].as_i64().unwrap_or(0);
+        let surface = display.surface();
+        let mut event = crate::native::input::stream_event("input_mouse", params);
+        event["x"] = json!(point.0);
+        event["y"] = json!(point.1);
+        event["buttons"] = json!(buttons);
+        let mut activity =
+            crate::native::activity::from_command("Input.dispatchMouseEvent", params)
+                .ok_or("Invalid mouse activity")?;
+        activity["buttons"] = json!(buttons);
+        activity["screenX"] = json!(point.0 / f64::from(surface.device_scale_factor));
+        activity["screenY"] = json!(point.1 / f64::from(surface.device_scale_factor));
+        let observation = client.observe_activity(
+            activity,
+            &mapping.session,
+            mapping.pointer.page_generation.clone(),
+            InputSource::Agent,
+        );
+        self.unknown = true;
+        if let Err(error) = display.input(&[event]).await {
+            if error.operation_performed == Some(json!(false)) {
+                self.unknown = false;
+                return Err(error.to_string());
+            }
+            return Err(format!("browser_control_outcome_unknown: Native input may have executed ({error}). Do not replay the original action."));
+        }
+        self.buttons = buttons;
+        self.modifiers = modifiers;
+        self.unknown = false;
+        // A held button keeps layouts back until it is released.
+        display.set_gesture(buttons != 0);
+        drop(atomic);
+        observation.acknowledged();
+        Ok(())
+    }
+
+    /// Sends one native mouse event (`send`), then joins the page: the
+    /// helper's receipt proves native dispatch, and the readback joins
+    /// dialog observation. Returns true when a dialog opened.
     #[allow(clippy::too_many_arguments)]
     async fn dispatch_at(
         &mut self,
@@ -889,20 +1175,6 @@ impl NativeMouse {
         ) {
             return Err("Unsupported mouse event type".into());
         }
-        // The helper changes one physical button per press/release. A caller's
-        // claimed bitmask cannot clear the owner's actual acknowledged hold.
-        let button = i64::from(crate::native::input::mouse_button_mask(
-            params["button"].as_str().unwrap_or("left"),
-        ));
-        let buttons = match event_type {
-            "mousePressed" => self.buttons | button,
-            "mouseReleased" => self.buttons & !button,
-            _ => self.buttons,
-        };
-        let modifiers = params["modifiers"].as_i64().unwrap_or(0);
-        let surface = display.surface();
-        let screen_x = point.0 / f64::from(surface.device_scale_factor);
-        let screen_y = point.1 / f64::from(surface.device_scale_factor);
         // Held moves may cross an iframe. Their real helper acknowledgement
         // proves movement; only button boundaries need a renderer/dialog join.
         let observe = !matches!(
@@ -910,37 +1182,8 @@ impl NativeMouse {
             ("mouseMoved", 1..) | ("mouseReleased", 0)
         );
         let mut events = client.subscribe();
-        let mut event = crate::native::input::stream_event("input_mouse", &params);
-        event["x"] = json!(point.0);
-        event["y"] = json!(point.1);
-        event["buttons"] = json!(buttons);
-        let mut activity =
-            crate::native::activity::from_command("Input.dispatchMouseEvent", &params)
-                .ok_or("Invalid mouse activity")?;
-        activity["buttons"] = json!(buttons);
-        activity["screenX"] = json!(screen_x);
-        activity["screenY"] = json!(screen_y);
-        let observation = client.observe_activity(
-            activity,
-            session,
-            mapping.pointer.page_generation.clone(),
-            InputSource::Agent,
-        );
-        self.unknown = true;
-        if let Err(error) = display.input(&[event]).await {
-            if error.operation_performed == Some(json!(false)) {
-                self.unknown = false;
-                return Err(error.to_string());
-            }
-            return Err(format!("browser_control_outcome_unknown: Native input may have executed ({error}). Do not replay the original action."));
-        }
-        self.buttons = buttons;
-        self.modifiers = modifiers;
-        self.unknown = false;
-        // A held button keeps layouts back until it is released.
-        display.set_gesture(buttons != 0);
-        drop(atomic);
-        observation.acknowledged();
+        self.send(&params, point, mapping, client, display, atomic)
+            .await?;
         if !observe {
             return Ok(false);
         }
@@ -971,7 +1214,7 @@ impl NativeMouse {
                     return Ok(false);
                 }
                 event = events.recv() => match event {
-                    Ok(event) if event.method == "Page.javascriptDialogOpening" && event.session_id.as_deref().is_none_or(|id| dialog_sessions.contains(&id)) => return Ok(true),
+                    Ok(event) if opens_dialog(&event, dialog_sessions) => return Ok(true),
                     Err(tokio::sync::broadcast::error::RecvError::Closed) => return Err(outcome_unknown("The browser disconnected after native input. Do not replay the action.")),
                     _ => {},
                 },
@@ -1011,7 +1254,7 @@ impl NativeMouse {
     ) -> Result<bool, CommandError> {
         self.same_layout(display)?;
         if let Some(reason) = interrupts.pending() {
-            return Err(stopped(reason, false));
+            return Err(stopped(reason, Acted::Nothing));
         }
         self.prepare(client, target.0, display).await?;
         let steps = [
@@ -1048,6 +1291,9 @@ impl NativeMouse {
         Ok(false)
     }
 }
+
+#[path = "mouse_scroll.rs"]
+mod scroll;
 
 #[cfg(test)]
 #[path = "mouse_tests.rs"]

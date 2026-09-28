@@ -75,6 +75,8 @@ pub(super) fn target(command: &Value) -> Target {
             _ => Target::Named,
         },
         "mousedown" | "mouseup" => Target::Pointer,
+        // A wheel without coordinates turns where the pointer is.
+        "wheel" if command.get("x").is_none_or(Value::is_null) => Target::Pointer,
         "mousemove" | "mouse" | "wheel" | "input_mouse" | "input_touch" | "swipe" => Target::Point,
         _ => Target::Named,
     }
@@ -448,6 +450,13 @@ mod tests {
             &fenced(json!({ "action": "mousedown" })),
             true
         ));
+        // Nor has a wheel without coordinates; one with them is a point.
+        let wheel = json!({ "action": "wheel", "deltaX": 0, "deltaY": 100 });
+        assert_eq!(target(&wheel), Target::Pointer);
+        assert!(observation_required(&fenced(wheel), true));
+        let wheel_at = json!({ "action": "wheel", "x": 10, "y": 20, "deltaY": 100 });
+        assert_eq!(target(&wheel_at), Target::Point);
+        assert!(!observation_required(&fenced(wheel_at), true));
         // Nor has a program: whatever image it came with, it can press keys.
         assert!(observation_required(
             &fenced(json!({ "action": "run_playwright", "code": "return 1" })),

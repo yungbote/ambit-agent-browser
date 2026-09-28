@@ -732,6 +732,10 @@ pub async fn press_key_with_modifiers(
     Ok(())
 }
 
+/// Scrolls by script, published on the tab's page as `scrolling`: the view
+/// moves with no pointer path. Headless and DevTools-only browsers scroll
+/// this way; the owned window's wheel (`BrowserControl::agent_native_scroll`)
+/// falls back to it where no wheel moves the scroller.
 pub async fn scroll(
     client: &CdpClient,
     session_id: &str,
@@ -741,52 +745,78 @@ pub async fn scroll(
     delta_y: f64,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<(), String> {
+    if let Some(sel) = selector_or_ref {
+        let (object_id, effective_session_id) =
+            resolve_element_object_id(client, session_id, ref_map, sel, iframe_sessions).await?;
+        return scroll_by(
+            client,
+            session_id,
+            &effective_session_id,
+            &object_id,
+            delta_x,
+            delta_y,
+        )
+        .await;
+    }
     let observation = client.observe_activity(
         serde_json::json!({ "type": "activity", "kind": "scrolling" }),
         session_id,
         client.page_generation(session_id),
         super::activity::InputSource::Agent,
     );
-    if let Some(sel) = selector_or_ref {
-        let (object_id, effective_session_id) =
-            resolve_element_object_id(client, session_id, ref_map, sel, iframe_sessions).await?;
-        let js = "function(dx, dy) { this.scrollBy(dx, dy); }".to_string();
-        client
-            .send_command_typed::<_, Value>(
-                "Runtime.callFunctionOn",
-                &CallFunctionOnParams {
-                    function_declaration: js,
-                    object_id: Some(object_id),
-                    arguments: Some(vec![
-                        CallArgument {
-                            value: Some(serde_json::json!(delta_x)),
-                            object_id: None,
-                        },
-                        CallArgument {
-                            value: Some(serde_json::json!(delta_y)),
-                            object_id: None,
-                        },
-                    ]),
-                    return_by_value: Some(true),
-                    await_promise: Some(false),
-                },
-                Some(&effective_session_id),
-            )
-            .await?;
-    } else {
-        let js = format!("window.scrollBy({}, {})", delta_x, delta_y);
-        client
-            .send_command_typed::<_, Value>(
-                "Runtime.evaluate",
-                &EvaluateParams {
-                    expression: js,
-                    return_by_value: Some(true),
-                    await_promise: Some(false),
-                },
-                Some(session_id),
-            )
-            .await?;
-    }
+    client
+        .send_command_typed::<_, Value>(
+            "Runtime.evaluate",
+            &EvaluateParams {
+                expression: format!("window.scrollBy({}, {})", delta_x, delta_y),
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(session_id),
+        )
+        .await?;
+    observation.acknowledged();
+    Ok(())
+}
+
+/// Scrolls `object_id` (a scroller in `session_id`) by script, published on
+/// the tab's page (`page_session`) as `scrolling`.
+pub(crate) async fn scroll_by(
+    client: &CdpClient,
+    page_session: &str,
+    session_id: &str,
+    object_id: &str,
+    delta_x: f64,
+    delta_y: f64,
+) -> Result<(), String> {
+    let observation = client.observe_activity(
+        serde_json::json!({ "type": "activity", "kind": "scrolling" }),
+        page_session,
+        client.page_generation(page_session),
+        super::activity::InputSource::Agent,
+    );
+    client
+        .send_command_typed::<_, Value>(
+            "Runtime.callFunctionOn",
+            &CallFunctionOnParams {
+                function_declaration: "function(dx, dy) { this.scrollBy(dx, dy); }".into(),
+                object_id: Some(object_id.into()),
+                arguments: Some(vec![
+                    CallArgument {
+                        value: Some(serde_json::json!(delta_x)),
+                        object_id: None,
+                    },
+                    CallArgument {
+                        value: Some(serde_json::json!(delta_y)),
+                        object_id: None,
+                    },
+                ]),
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(session_id),
+        )
+        .await?;
     observation.acknowledged();
     Ok(())
 }

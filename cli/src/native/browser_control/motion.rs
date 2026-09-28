@@ -1,10 +1,11 @@
 //! The shape of the agent's visible input: where the pointer is at each
-//! moment of a travel, and when each key goes.
+//! moment of a travel, when each key goes, and how a wheel turns.
 //!
 //! A person watching the browser sees the input the driver really sends, so
 //! this is a schedule, never an animation: the native input owner executes it
 //! one helper request at a time, under its usual custody, layout proof and
-//! interruption rules (`mouse.rs`, `BrowserControl::agent_native_keys`).
+//! interruption rules (`mouse.rs`, `mouse_scroll.rs`,
+//! `BrowserControl::agent_native_keys`).
 
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -25,6 +26,17 @@ pub(crate) const KEY_INTERVAL: Duration = Duration::from_millis(25);
 /// A fill value longer than this many characters arrives as one visible
 /// paste, the way a person enters it, instead of key by key.
 pub(crate) const PASTE_ABOVE_CHARS: usize = 64;
+
+/// One wheel notch in the helper's unit: it turns the X wheel one click per
+/// 100 of delta and keeps any remainder for the wheel's next event.
+pub(crate) const NOTCH_DELTA: f64 = 100.0;
+
+/// The most delta one wheel may carry on an axis: the helper's own bound.
+const MOST_WHEEL_DELTA: f64 = 32768.0;
+
+/// How long a scroll's wheel may leave its scroller unmoved before the
+/// scroll goes by script instead.
+pub(crate) const WHEEL_STALL: Duration = Duration::from_millis(400);
 
 // Fitts's law (Shannon form) with a fast person's constants, at 2.5 times
 // their speed, clamped so no travel is instant or dawdles.
@@ -157,6 +169,51 @@ fn entered(event: &Value) -> usize {
     }
 }
 
+/// A wheel of `delta` per axis as the helper events that turn it, one per
+/// frame: each carries at most one notch per axis, and together they carry
+/// exactly `delta`. A wheel with no delta is one event. `None` when a delta
+/// is not finite or is beyond the helper's bound.
+pub(crate) fn notches(delta: (f64, f64)) -> Option<Vec<(f64, f64)>> {
+    let axis = |delta: f64| {
+        (delta.is_finite() && delta.abs() <= MOST_WHEEL_DELTA).then(|| {
+            let notch = NOTCH_DELTA.copysign(delta);
+            let whole = (delta.abs() / NOTCH_DELTA).floor() as usize;
+            let mut events = vec![notch; whole];
+            let rest = delta - notch * whole as f64;
+            if rest != 0.0 {
+                events.push(rest);
+            }
+            events
+        })
+    };
+    let (x, y) = (axis(delta.0)?, axis(delta.1)?);
+    let count = x.len().max(y.len()).max(1);
+    Some(
+        (0..count)
+            .map(|index| {
+                (
+                    x.get(index).copied().unwrap_or(0.0),
+                    y.get(index).copied().unwrap_or(0.0),
+                )
+            })
+            .collect(),
+    )
+}
+
+/// How many notches move a scroller on toward its goal, `remaining` CSS
+/// pixels away, when a scroll asked it to go `toward` (+1 or -1; 0 on an
+/// axis it was not asked to move) and a notch moves it `per_notch`: the
+/// nearest whole count, none once it is within half a notch, and none that
+/// would take it back.
+pub(crate) fn notches_toward(remaining: f64, toward: f64, per_notch: f64) -> u32 {
+    let ahead = remaining * toward;
+    if !(per_notch.is_finite() && per_notch > 0.0 && ahead.is_finite()) || ahead <= per_notch / 2.0
+    {
+        return 0;
+    }
+    (ahead / per_notch).round().min(f64::from(u32::MAX)) as u32
+}
+
 /// Splits helper keyboard events into strokes, in order and without gaps.
 /// Events before the first press form one unpaced stroke.
 pub(crate) fn strokes(events: &[Value]) -> Vec<Stroke> {
@@ -282,6 +339,49 @@ mod tests {
                 next: None
             }
         );
+    }
+
+    /// A wheel turns one notch per event, never a burst: every event carries
+    /// at most one notch per axis, in order, and all of them carry exactly
+    /// the delta asked for, remainder included.
+    #[test]
+    fn a_wheel_turns_at_most_one_notch_per_axis_per_event() {
+        assert_eq!(
+            notches((250.0, -120.0)),
+            Some(vec![(100.0, -100.0), (100.0, -20.0), (50.0, 0.0)])
+        );
+        assert_eq!(notches((0.0, 300.0)), Some(vec![(0.0, 100.0); 3]));
+        assert_eq!(notches((0.0, 40.0)), Some(vec![(0.0, 40.0)]));
+        // A wheel with no delta still goes, as one event.
+        assert_eq!(notches((0.0, 0.0)), Some(vec![(0.0, 0.0)]));
+        assert_eq!(notches((-0.0, 0.0)), Some(vec![(0.0, 0.0)]));
+        let longest = notches((0.0, -32768.0)).unwrap();
+        assert_eq!(longest.len(), 328);
+        assert!(longest.iter().all(|(x, y)| *x == 0.0 && y.abs() <= 100.0));
+        assert_eq!(longest.iter().map(|(_, y)| y).sum::<f64>(), -32768.0);
+        // The helper's bound and non-finite deltas refuse the wheel.
+        assert_eq!(notches((0.0, 32768.5)), None);
+        assert_eq!(notches((f64::NAN, 100.0)), None);
+        assert_eq!(notches((0.0, f64::INFINITY)), None);
+    }
+
+    /// A scroll's notches: the nearest whole count toward its goal, none
+    /// within half a notch of it, none backward, none without an estimate.
+    #[test]
+    fn a_scroll_needs_the_nearest_whole_number_of_notches_toward_its_goal() {
+        assert_eq!(notches_toward(300.0, 1.0, 120.0), 3);
+        assert_eq!(notches_toward(500.0, 1.0, 120.0), 4);
+        assert_eq!(notches_toward(-500.0, -1.0, 120.0), 4);
+        assert_eq!(notches_toward(61.0, 1.0, 120.0), 1);
+        assert_eq!(notches_toward(60.0, 1.0, 120.0), 0);
+        // An overshoot is never scrolled back, and an axis the scroll was
+        // not asked to move is left alone.
+        assert_eq!(notches_toward(-300.0, 1.0, 120.0), 0);
+        assert_eq!(notches_toward(300.0, 0.0, 120.0), 0);
+        for per_notch in [0.0, -120.0, f64::NAN, f64::INFINITY] {
+            assert_eq!(notches_toward(300.0, 1.0, per_notch), 0);
+        }
+        assert_eq!(notches_toward(f64::INFINITY, 1.0, 120.0), 0);
     }
 
     #[test]

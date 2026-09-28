@@ -721,6 +721,40 @@ impl BrowserControl {
         result
     }
 
+    /// The agent's scroll through the owned display: the wheel turned where
+    /// it reaches the scroller, until the scroller moved by `delta` CSS
+    /// pixels as far as it can go (`mouse_scroll.rs`). `scroller` is an
+    /// element's object id and its session; `None` scrolls the page itself.
+    pub(crate) async fn agent_native_scroll(
+        &mut self,
+        client: &CdpClient,
+        page_session: &str,
+        scroller: Option<(&str, &str)>,
+        delta: (f64, f64),
+    ) -> Result<(), CommandError> {
+        if let Some(error) = self.agent_error() {
+            return Err(format!("{}: {}", error.code, error.message).into());
+        }
+        let (object, session) = match scroller {
+            Some((object, session)) => (Some(object), session),
+            None => (None, page_session),
+        };
+        let result = self
+            .native_mouse
+            .scroll(
+                client,
+                self.display.as_ref().ok_or("No owned browser display")?,
+                page_session,
+                session,
+                object,
+                delta,
+                &self.interrupts,
+            )
+            .await;
+        self.observe_native_result(&result);
+        result
+    }
+
     pub(crate) fn needs_observation(&self) -> bool {
         self.needs_observation
     }

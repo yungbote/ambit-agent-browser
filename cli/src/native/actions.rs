@@ -3296,7 +3296,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         "type" => stating(handle_type(cmd, state).await, &mut failure_data),
         "press" => stating(handle_press(cmd, state).await, &mut failure_data),
         "hover" => stating(handle_hover(cmd, state).await, &mut failure_data),
-        "scroll" => handle_scroll(cmd, state).await,
+        "scroll" => stating(handle_scroll(cmd, state).await, &mut failure_data),
         "select" => handle_select(cmd, state).await,
         "check" => stating(handle_check(cmd, state).await, &mut failure_data),
         "uncheck" => stating(handle_uncheck(cmd, state).await, &mut failure_data),
@@ -6521,7 +6521,7 @@ async fn handle_hover(cmd: &Value, state: &mut DaemonState) -> Result<Value, Com
     Ok(json!({ "hovered": selector }))
 }
 
-async fn handle_scroll(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_scroll(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd.get("selector").and_then(|v| v.as_str());
@@ -6542,6 +6542,35 @@ async fn handle_scroll(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         }
     }
 
+    if state.browser_control.lock().await.has_native_display() {
+        let scroller = match selector {
+            Some(selector) => Some(
+                super::element::resolve_element_object_id(
+                    &mgr.client,
+                    &session_id,
+                    &state.ref_map,
+                    selector,
+                    &state.iframe_sessions,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        state
+            .browser_control
+            .lock()
+            .await
+            .agent_native_scroll(
+                &mgr.client,
+                &session_id,
+                scroller
+                    .as_ref()
+                    .map(|(object, session)| (object.as_str(), session.as_str())),
+                (dx, dy),
+            )
+            .await?;
+        return Ok(json!({ "scrolled": true }));
+    }
     interaction::scroll(
         &mgr.client,
         &session_id,
@@ -9323,30 +9352,36 @@ async fn handle_clipboard(cmd: &Value, state: &DaemonState) -> Result<Value, Str
     }
 }
 
+/// A wheel turns at its coordinates, or where the pointer is when it has
+/// none: the owned window's real pointer, or the last point the agent's
+/// DevTools mouse input went to.
 async fn handle_wheel(cmd: &Value, state: &DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
-    let x = cmd.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let y = cmd.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let delta_x = cmd.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let delta_y = cmd.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-    state
-        .browser_control
-        .lock()
-        .await
-        .agent_input(
-            "input_mouse",
-            json!({
-                "type": "mouseWheel",
-                "x": x,
-                "y": y,
-                "deltaX": delta_x,
-                "deltaY": delta_y,
-            }),
-            &mgr.client,
-            &session_id,
-        )
+    let point = match (
+        cmd.get("x").and_then(Value::as_f64),
+        cmd.get("y").and_then(Value::as_f64),
+    ) {
+        (Some(x), Some(y)) => Some((x, y)),
+        (None, None) => None,
+        _ => {
+            return Err(
+                "A wheel takes both x and y, or neither to turn where the pointer is.".into(),
+            )
+        }
+    };
+    let mut control = state.browser_control.lock().await;
+    let mut params = json!({ "type": "mouseWheel", "deltaX": delta_x, "deltaY": delta_y });
+    if let Some((x, y)) = point.or_else(|| {
+        (!control.has_native_display()).then_some((state.mouse_state.x, state.mouse_state.y))
+    }) {
+        params["x"] = json!(x);
+        params["y"] = json!(y);
+    }
+    control
+        .agent_input("input_mouse", params, &mgr.client, &session_id)
         .await?;
 
     Ok(json!({ "scrolled": true, "deltaX": delta_x, "deltaY": delta_y }))
@@ -13171,43 +13206,30 @@ async fn handle_mousemove(cmd: &Value, state: &mut DaemonState) -> Result<Value,
 }
 
 async fn handle_mousedown(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
     let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
-    let params = build_mouse_event_params(
-        &mut state.mouse_state,
-        "mousePressed",
-        None,
-        None,
-        Some(button),
-        None,
-        Some(1),
-        None,
-        None,
-        None,
-    );
-
-    state
-        .browser_control
-        .lock()
-        .await
-        .agent_input(
-            "input_mouse",
-            serde_json::to_value(&params).map_err(|error| error.to_string())?,
-            &mgr.client,
-            &session_id,
-        )
-        .await?;
+    button_in_place(state, "mousePressed", button).await?;
     Ok(json!({ "pressed": true }))
 }
 
 async fn handle_mouseup(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
+    let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
+    button_in_place(state, "mouseReleased", button).await?;
+    Ok(json!({ "released": true }))
+}
+
+/// A button pressed or released in place: in the owned window where its
+/// real pointer is (the event carries no coordinates), otherwise at the last
+/// point the agent's DevTools mouse input went to.
+async fn button_in_place(
+    state: &mut DaemonState,
+    event_type: &str,
+    button: &str,
+) -> Result<(), CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
-    let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
     let params = build_mouse_event_params(
         &mut state.mouse_state,
-        "mouseReleased",
+        event_type,
         None,
         None,
         Some(button),
@@ -13217,19 +13239,17 @@ async fn handle_mouseup(cmd: &Value, state: &mut DaemonState) -> Result<Value, C
         None,
         None,
     );
-
-    state
-        .browser_control
-        .lock()
+    let mut params = serde_json::to_value(&params).map_err(|error| error.to_string())?;
+    let mut control = state.browser_control.lock().await;
+    if control.has_native_display() {
+        if let Some(fields) = params.as_object_mut() {
+            fields.remove("x");
+            fields.remove("y");
+        }
+    }
+    control
+        .agent_input("input_mouse", params, &mgr.client, &session_id)
         .await
-        .agent_input(
-            "input_mouse",
-            serde_json::to_value(&params).map_err(|error| error.to_string())?,
-            &mgr.client,
-            &session_id,
-        )
-        .await?;
-    Ok(json!({ "released": true }))
 }
 
 // ---------------------------------------------------------------------------

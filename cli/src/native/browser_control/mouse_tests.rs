@@ -143,7 +143,10 @@ async fn an_interrupted_held_gesture_releases_and_stays_interrupted() {
         ..Default::default()
     };
     let failure = mouse
-        .finish(Err(stopped(InterruptReason::HumanControl, true)), &display)
+        .finish(
+            Err(stopped(InterruptReason::HumanControl, Acted::Held)),
+            &display,
+        )
         .await
         .unwrap_err();
     assert!(
@@ -228,6 +231,35 @@ struct Page {
     blocker: Option<String>,
     fail_readback: bool,
     token: Option<String>,
+    scroller: Scroller,
+}
+
+/// The page's vertical scroller as Chrome drives it: each wheel notch moves
+/// its target 120 CSS px, and each read finds it at most 40 px nearer the
+/// target, the way smooth scrolling animates frame by frame.
+#[cfg(target_os = "linux")]
+struct Scroller {
+    at: f64,
+    target: f64,
+    most: f64,
+    /// Whether the wheel reaches it (a canvas that takes the wheel does not).
+    wheel: bool,
+    /// What the wheel-point probe answers.
+    point: Value,
+}
+
+#[cfg(target_os = "linux")]
+impl Scroller {
+    fn turned(&mut self, notches: f64) {
+        if self.wheel {
+            self.target = (self.target + 120.0 * notches).clamp(0.0, self.most);
+        }
+    }
+
+    fn read(&mut self) -> Value {
+        self.at += (self.target - self.at).clamp(-40.0, 40.0);
+        json!([0.0, self.at, 0.0, self.most])
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -287,6 +319,27 @@ fn answer(page: &mut Page, command: &Value) -> Value {
         "Runtime.evaluate" if expression == "true" || expression == NEXT_FRAME => {
             json!({"result":{"value":true}})
         }
+        "Runtime.evaluate" if expression.contains("document.scrollingElement") => {
+            json!({"result":{"objectId":"scroller"}})
+        }
+        "Runtime.callFunctionOn" => {
+            let function = command["params"]["functionDeclaration"]
+                .as_str()
+                .unwrap_or_default();
+            let scroller = &mut page.scroller;
+            if function == super::scroll::OFFSETS {
+                json!({"result":{"value":scroller.read()}})
+            } else if function == super::scroll::WHEEL_POINT {
+                json!({"result":{"value":scroller.point}})
+            } else if function.contains("scrollBy") {
+                let by = command["params"]["arguments"][1]["value"].as_f64().unwrap();
+                scroller.at = (scroller.at + by).clamp(0.0, scroller.most);
+                scroller.target = scroller.at;
+                json!({"result":{}})
+            } else {
+                json!({})
+            }
+        }
         _ => json!({}),
     };
     json!({"id":command["id"],"result":result})
@@ -303,6 +356,13 @@ impl Fake {
             blocker: None,
             fail_readback: false,
             token: None,
+            scroller: Scroller {
+                at: 0.0,
+                target: 0.0,
+                most: 5000.0,
+                wheel: true,
+                point: json!([640.0, 320.0, 640.0]),
+            },
         }));
         let (pointer_to, mut pointer) = mpsc::unbounded_channel::<(f64, f64)>();
         let browser_page = page.clone();
@@ -347,6 +407,7 @@ impl Fake {
         let window = Arc::new(StdMutex::new(self::window(0)));
         let helper_log = helper.clone();
         let helper_window = window.clone();
+        let helper_page = page.clone();
         let helper_task = tokio::spawn(async move {
             let _frames = _frames;
             let mut peer = BufReader::new(peer);
@@ -368,6 +429,10 @@ impl Fake {
                                     event["x"].as_f64().unwrap(),
                                     event["y"].as_f64().unwrap(),
                                 ));
+                            }
+                            if event["eventType"] == "mouseWheel" {
+                                let notches = event["deltaY"].as_f64().unwrap_or(0.0) / 100.0;
+                                helper_page.lock().unwrap().scroller.turned(notches);
                             }
                         }
                         json!({})
@@ -809,6 +874,229 @@ async fn a_wheel_without_coordinates_turns_where_the_pointer_is() {
             <= 1,
         "no travel: {inputs:?}"
     );
+}
+
+#[cfg(target_os = "linux")]
+fn wheels(inputs: &[(Instant, Value)]) -> Vec<&(Instant, Value)> {
+    inputs
+        .iter()
+        .filter(|(_, event)| event["eventType"] == "mouseWheel")
+        .collect()
+}
+
+#[cfg(target_os = "linux")]
+fn agent_activity(
+    activity: &mut tokio::sync::broadcast::Receiver<crate::native::cdp::types::CdpEvent>,
+) -> Vec<Value> {
+    let mut published = Vec::new();
+    while let Ok(event) = activity.try_recv() {
+        if event.method == crate::native::activity::EVENT && event.params["source"] == "agent" {
+            published.push(event.params);
+        }
+    }
+    published
+}
+
+/// A wheel is never a burst: each notch goes one frame after the last, at
+/// the same point, and each reaches viewers as it is acknowledged.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wheel_turns_one_notch_per_frame() {
+    let fake = Fake::new().await;
+    let mut control = fake.control();
+    let mut activity = fake.client.subscribe();
+    fake.place_pointer(shown(400.0, 300.0)).await;
+    control
+        .agent_input(
+            "input_mouse",
+            json!({"type":"mouseWheel","x":400.0,"y":300.0,"deltaX":0,"deltaY":250}),
+            &fake.client,
+            "page",
+        )
+        .await
+        .unwrap();
+    let inputs = fake.helper_inputs();
+    let wheels = wheels(&inputs);
+    let deltas: Vec<_> = wheels
+        .iter()
+        .map(|(_, event)| event["deltaY"].as_f64().unwrap())
+        .collect();
+    assert_eq!(deltas, [100.0, 100.0, 50.0]);
+    assert!(wheels.iter().all(|(_, event)| {
+        (event["x"].as_f64().unwrap(), event["y"].as_f64().unwrap()) == shown(400.0, 300.0)
+    }));
+    for pair in wheels.windows(2) {
+        let gap = pair[1].0 - pair[0].0;
+        assert!(gap >= motion::FRAME - Duration::from_millis(2), "{gap:?}");
+    }
+    let scrolls = agent_activity(&mut activity)
+        .into_iter()
+        .filter(|event| event["eventType"] == "scroll")
+        .count();
+    assert_eq!(scrolls, 3);
+}
+
+/// `scroll` travels to where the wheel reaches the scroller, then turns it
+/// one notch per frame: the nearest whole number of notches, read back from
+/// the scroller, with no script scroll and nothing invented.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scroll_turns_the_wheel_where_it_reaches_the_scroller_until_it_is_there() {
+    let fake = Fake::new().await;
+    let mut control = fake.control();
+    let mut activity = fake.client.subscribe();
+    fake.place_pointer((100.0, 1200.0)).await;
+    control
+        .agent_native_scroll(&fake.client, "page", None, (0.0, 300.0))
+        .await
+        .unwrap();
+    let inputs = fake.helper_inputs();
+    let wheels = wheels(&inputs);
+    // 300 CSS px at 120 a notch is 2.5 notches: three.
+    assert_eq!(wheels.len(), 3, "{inputs:?}");
+    assert!(wheels
+        .iter()
+        .all(|(_, event)| event["deltaY"] == 100.0 && event["deltaX"] == 0.0));
+    let point = shown(640.0, 320.0);
+    assert!(wheels.iter().all(|(_, event)| {
+        (event["x"].as_f64().unwrap(), event["y"].as_f64().unwrap()) == point
+    }));
+    let first = inputs
+        .iter()
+        .position(|(_, event)| event["eventType"] == "mouseWheel")
+        .unwrap();
+    assert!(first > 2, "the pointer travelled first: {inputs:?}");
+    let arrived = &inputs[first - 1].1;
+    assert_eq!(
+        (
+            arrived["x"].as_f64().unwrap(),
+            arrived["y"].as_f64().unwrap()
+        ),
+        point
+    );
+    for pair in wheels.windows(2) {
+        let gap = pair[1].0 - pair[0].0;
+        assert!(gap >= motion::FRAME - Duration::from_millis(2), "{gap:?}");
+    }
+    assert_eq!(fake.page.lock().unwrap().scroller.at, 360.0);
+    assert_eq!(fake.page_commands("scrollBy"), 0);
+    let published = agent_activity(&mut activity);
+    assert_eq!(
+        published
+            .iter()
+            .filter(|event| event["eventType"] == "scroll")
+            .count(),
+        3
+    );
+    assert!(!published.iter().any(|event| event["kind"] == "scrolling"));
+}
+
+/// A scroller the wheel does not move (a canvas takes it, overflow a person
+/// cannot scroll) is scrolled by script once the stall passes: one notch
+/// went, then the script, published as `scrolling` with no path.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scroll_the_wheel_cannot_move_goes_by_script_after_the_stall() {
+    let fake = Fake::new().await;
+    let mut control = fake.control();
+    let mut activity = fake.client.subscribe();
+    fake.place_pointer(shown(640.0, 320.0)).await;
+    fake.page.lock().unwrap().scroller.wheel = false;
+    let started = Instant::now();
+    control
+        .agent_native_scroll(&fake.client, "page", None, (0.0, 300.0))
+        .await
+        .unwrap();
+    let spent = started.elapsed();
+    assert!(
+        spent >= motion::WHEEL_STALL && spent < motion::WHEEL_STALL + Duration::from_millis(300),
+        "{spent:?}"
+    );
+    assert_eq!(wheels(&fake.helper_inputs()).len(), 1);
+    assert_eq!(fake.page_commands("scrollBy"), 1);
+    assert_eq!(fake.page.lock().unwrap().scroller.at, 300.0);
+    assert!(agent_activity(&mut activity)
+        .iter()
+        .any(|event| event["kind"] == "scrolling"));
+}
+
+/// No wheel where no visible point reaches the scroller, and none for less
+/// than half a notch: those go by script at once.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scroll_no_wheel_can_do_goes_by_script_at_once() {
+    let fake = Fake::new().await;
+    let mut control = fake.control();
+    fake.place_pointer(shown(640.0, 320.0)).await;
+    control
+        .agent_native_scroll(&fake.client, "page", None, (0.0, 50.0))
+        .await
+        .unwrap();
+    assert_eq!(fake.page.lock().unwrap().scroller.at, 50.0);
+    fake.page.lock().unwrap().scroller.point = Value::Null;
+    let started = Instant::now();
+    control
+        .agent_native_scroll(&fake.client, "page", None, (0.0, 600.0))
+        .await
+        .unwrap();
+    assert!(started.elapsed() < Duration::from_millis(200));
+    assert_eq!(fake.page.lock().unwrap().scroller.at, 650.0);
+    assert_eq!(fake.page_commands("scrollBy"), 2);
+    assert!(wheels(&fake.helper_inputs()).is_empty());
+}
+
+/// A takeover stops a turning wheel within a frame. The notches before it
+/// went, so the scroll is interrupted part of the way, never unknown, and
+/// nothing is held to release.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_takeover_stops_a_scroll_within_a_frame_part_of_the_way() {
+    let fake = Fake::new().await;
+    let mut control = fake.control();
+    let interrupts = control.interrupts();
+    fake.place_pointer(shown(640.0, 320.0)).await;
+    let scroll = async {
+        let result = control
+            .agent_native_scroll(&fake.client, "page", None, (0.0, 3000.0))
+            .await;
+        (result, Instant::now())
+    };
+    let takeover = async {
+        while wheels(&fake.helper_inputs()).len() < 3 {
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        (
+            interrupts.raise(InterruptReason::HumanControl),
+            Instant::now(),
+        )
+    };
+    let ((result, stopped_at), (takeover, raised_at)) =
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::join!(scroll, takeover)
+        })
+        .await
+        .unwrap();
+    drop(takeover);
+    let failure = result.unwrap_err();
+    assert!(
+        stopped_at - raised_at <= motion::FRAME + Duration::from_millis(15),
+        "stopped {:?} after the takeover",
+        stopped_at - raised_at
+    );
+    assert!(
+        failure.error.starts_with("browser_operation_interrupted: "),
+        "{}",
+        failure.error
+    );
+    assert_eq!(
+        failure.data,
+        Some(
+            json!({"interruptedBy":"human","executionStopped":true,"effectsMayHaveOccurred":true})
+        )
+    );
+    assert!(wheels(&fake.helper_inputs()).len() < 25);
+    assert!(!fake.helper_ops().contains(&"reset".to_string()));
+    assert!(!control.needs_observation());
 }
 
 #[cfg(target_os = "linux")]
