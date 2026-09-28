@@ -2187,13 +2187,14 @@ Examples:
 
         "run-playwright" => {
             r##"
-agent-browser run-playwright - Run Playwright in the existing browser
+agent-browser run-playwright - Run Playwright in the managed browser
 
 Usage: agent-browser run-playwright [--target <id>] [--timeout-ms <ms>] <code|--stdin>
 
 Run an async JavaScript body with page, context and browser. Return a JSON value.
 The body runs in Node; document and window exist only inside page.evaluate().
-The default page is the native driver's current tab. Open the browser first.
+The default page is the native driver's current tab; a fresh session starts its
+managed browser automatically. An explicit target requires an existing tab.
 Requires Node and installed playwright-core 1.62.1 or a qualified newer version.
 
 Options:

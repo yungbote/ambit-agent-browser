@@ -1180,6 +1180,38 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
+    async fn e2e_playwright_first_command_launches_one_owned_browser() {
+        use crate::native::actions::execute_command;
+        let mut state = DaemonState::new();
+        let response = Box::pin(execute_command(&json!({"action":"run_playwright","timeoutMs":15000,"code":"await page.goto('data:text/html,<title>First program</title><input id=name>'); await page.locator('#name').fill('Ada'); return {title: await page.title(), value: await page.locator('#name').inputValue(), contexts: browser.contexts().length};"}), &mut state)).await;
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(
+            response["data"]["result"],
+            json!({"title":"First program","value":"Ada","contexts":1})
+        );
+        let target = state
+            .browser
+            .as_ref()
+            .unwrap()
+            .active_target_id()
+            .unwrap()
+            .to_owned();
+        let native = execute_command(&json!({"action":"title"}), &mut state).await;
+        assert_eq!(native["success"], true, "{native}");
+        assert_eq!(native["data"]["title"], "First program");
+        assert_eq!(
+            state.browser.as_ref().unwrap().active_target_id().unwrap(),
+            target
+        );
+        let repeated = Box::pin(execute_command(&json!({"action":"run_playwright","timeoutMs":15000,"code":"return {value: await page.locator('#name').inputValue(), pages: context.pages().length};"}), &mut state)).await;
+        assert_eq!(repeated["success"], true, "{repeated}");
+        assert_eq!(repeated["data"]["result"], json!({"value":"Ada","pages":1}));
+        let closed = execute_command(&json!({"action":"close"}), &mut state).await;
+        assert_eq!(closed["success"], true, "{closed}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[ignore = "requires local Chromium and installed playwright-core 1.62.1"]
     async fn e2e_playwright_uses_existing_target_and_retains_browser_after_timeout() {
         use crate::native::actions::execute_command;
         let mut state = DaemonState::new();

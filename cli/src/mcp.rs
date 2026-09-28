@@ -1031,7 +1031,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_RUN_PLAYWRIGHT,
             "Run Playwright",
-            "Run an async JavaScript body with the existing page, context and browser. Return a JSON-serializable result; the tool result reports completion, the returned value and captured console output. Uses the current tab unless targetId selects another existing tab. Human takeover cancels the program; interrupted or failed code may already have changed the page and is never replayed.",
+            "Run an async JavaScript body with the existing page, context and browser. Return a JSON-serializable result; the tool result reports completion, the returned value and captured console output. Uses the current tab, starting the managed browser when needed. An explicit targetId selects only an existing tab and never starts a replacement. Human takeover cancels the program; interrupted or failed code may already have changed the page and is never replayed.",
             json!({
                 "code": { "type": "string", "minLength": 1, "maxLength": 1048576 },
                 "targetId": { "type": "string", "minLength": 1 }

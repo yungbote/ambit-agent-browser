@@ -614,3 +614,43 @@ fn host_playwright_program_that_fails_before_any_call_is_a_program_error() {
         false
     );
 }
+
+/// The first program receives the ordinary host-managed page and feedback;
+/// an explicit missing target cannot manufacture a different browser.
+#[test]
+#[cfg(unix)]
+#[ignore = "requires AMBIT_TEST_CHROME_EXECUTABLE, AMBIT_TEST_NODE and AMBIT_TEST_PLAYWRIGHT_MODULE"]
+fn host_playwright_first_call_uses_host_launch_and_capture() {
+    let host = Host::new();
+    host.configure_with(json!({"theme":"dark"}));
+    let missing = host.call(
+        "agent_browser_run_playwright",
+        json!({"targetId":"missing","code":"return 1"}),
+    );
+    assert_eq!(missing["isError"], true, "{missing}");
+    assert_eq!(
+        missing["structuredContent"]["browser"]["capture"]["code"], "no_active_page",
+        "{missing}"
+    );
+    assert!(
+        missing["structuredContent"]["browser"]["page"].is_null(),
+        "{missing}"
+    );
+    let result=host.call("agent_browser_run_playwright",json!({"code":"await page.goto('data:text/html,<title>First host program</title><input id=field>'); await page.locator('#field').fill('Shared state'); return {title:await page.title(),dark:await page.evaluate(()=>matchMedia('(prefers-color-scheme: dark)').matches)};"}));
+    assert_eq!(result["isError"], false, "{result}");
+    assert_eq!(
+        result["structuredContent"]["response"]["data"]["result"],
+        json!({"title":"First host program","dark":true})
+    );
+    let browser = host.capture(&result);
+    let title = host.call("agent_browser_get_title", json!({}));
+    assert_eq!(title["isError"], false, "{title}");
+    assert_eq!(
+        title["structuredContent"]["browser"]["page"]["targetId"],
+        browser["page"]["targetId"]
+    );
+    assert_eq!(
+        host.call("agent_browser_close", json!({}))["isError"],
+        false
+    );
+}

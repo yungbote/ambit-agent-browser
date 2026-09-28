@@ -14,7 +14,7 @@ return await page.getByRole('link').allTextContents();
 JS
 ```
 
-The code is an async function body with the actual Playwright `page`, `context`, and `browser` objects. It runs in Node: `document` and `window` exist only inside `page.evaluate()`. The default page is the driver's current target. `--target <id>` selects an exact existing CDP target. MCP exposes `{code, targetId?, timeoutMs?}` as `agent_browser_run_playwright` in the core and host-bound profiles. Ownership and launch settings remain host-selected in host-bound mode.
+The code is an async function body with the actual Playwright `page`, `context`, and `browser` objects. It runs in Node: `document` and `window` exist only inside `page.evaluate()`. The default page is the driver's current target; on a fresh session without an explicit target, the ordinary managed launch creates it automatically. `--target <id>` selects an exact existing CDP target. MCP exposes `{code, targetId?, timeoutMs?}` as `agent_browser_run_playwright` in the core and host-bound profiles. Ownership and launch settings remain host-selected in host-bound mode.
 
 Use normal Playwright locators, frame locators, events, uploads, screenshots and asynchronous composition. Existing tabs and cookies stay in the native browser. New contexts are ordinary separate Playwright contexts and do not inherit the authenticated persistent context. Attachment uses `noDefaults: true` so native focus, media and download configuration are retained. Screenshots and downloads should use the host's existing workspace artifact paths. CDP attachment has Playwright's documented compatibility limits.
 

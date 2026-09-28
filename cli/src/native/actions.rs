@@ -2575,7 +2575,12 @@ fn provider_plugin_launch_options_from_command(cmd: &Value) -> Value {
     Value::Object(options)
 }
 
-fn skip_launch_action(action: &str) -> bool {
+fn skip_launch_action(cmd: &Value, action: &str) -> bool {
+    // A program without an explicit target uses the ordinary managed browser
+    // startup. A named target always refers to an existing browser/tab.
+    if action == "run_playwright" {
+        return cmd.get("targetId").is_some();
+    }
     if action == INTERNAL_DAEMON_SHUTDOWN_ACTION {
         return true;
     }
@@ -2585,7 +2590,6 @@ fn skip_launch_action(action: &str) -> bool {
         "" | "launch"
             | "close"
             | "read"
-            | "run_playwright"
             | "har_stop"
             | "credentials_set"
             | "credentials_get"
@@ -2621,7 +2625,7 @@ fn addresses_active_tab(cmd: &Value, action: &str) -> bool {
         "run_playwright" => cmd.get("targetId").is_none(),
         "tab_close" => cmd.get("tabId").and_then(Value::as_str).is_none(),
         "dialog" => cmd.get("response").and_then(Value::as_str) != Some("status"),
-        _ => !skip_launch_action(action) && !window_actions::explicit_browser_action(cmd),
+        _ => !skip_launch_action(cmd, action) && !window_actions::explicit_browser_action(cmd),
     }
 }
 
@@ -2663,7 +2667,7 @@ fn policy_actions_for_command(
         if local_launch {
             append_launch_mutator_policy_actions_for(&mut actions, &plugins);
         }
-    } else if !skip_launch_action(action) && needs_implicit_launch {
+    } else if !skip_launch_action(cmd, action) && needs_implicit_launch {
         let plugins = plugins_from_command_or_env(cmd);
         let provider_launch = env::var("AGENT_BROWSER_PROVIDER")
             .ok()
@@ -2740,11 +2744,9 @@ pub(crate) async fn execute_command_received(
         json!({ "id": command["id"], "success": false, "code": "browser_observation_stale", "error": "The browser page or viewport changed since this image. Inspect the fresh observation before sending coordinates." })
     } else {
         let operation = async {
-            if let Some(launch) = request
-                .launch
-                .as_ref()
-                .filter(|_| !skip_launch_action(command["action"].as_str().unwrap_or_default()))
-            {
+            if let Some(launch) = request.launch.as_ref().filter(|_| {
+                !skip_launch_action(&command, command["action"].as_str().unwrap_or_default())
+            }) {
                 let mut launch = launch.clone();
                 launch["id"] = command["id"].clone();
                 let response = Box::pin(execute_command_inner(&launch, state)).await;
@@ -3041,7 +3043,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         _ => {}
     }
 
-    let skip_launch = skip_launch_action(action);
+    let skip_launch = skip_launch_action(cmd, action);
     let restore_key_change_needs_launch = !skip_launch
         && command_changes_restore_key(cmd, state)
         && has_active_browser_session(state);
@@ -15439,6 +15441,33 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
                 "{cmd}"
             );
         }
+    }
+
+    #[test]
+    fn playwright_without_a_named_target_uses_managed_implicit_launch() {
+        assert!(!skip_launch_action(
+            &json!({"action":"run_playwright","code":"return 1"}),
+            "run_playwright"
+        ));
+        for target in [json!("existing-target"), json!(""), Value::Null] {
+            assert!(skip_launch_action(
+                &json!({"action":"run_playwright","code":"return 1","targetId":target}),
+                "run_playwright"
+            ));
+        }
+        assert!(!skip_launch_action(
+            &json!({"action":"navigate"}),
+            "navigate"
+        ));
+        assert!(skip_launch_action(&json!({"action":"close"}), "close"));
+    }
+
+    #[tokio::test]
+    async fn playwright_named_target_never_creates_a_replacement_browser() {
+        let mut state = DaemonState::new();
+        let response = execute_command(&json!({"action":"run_playwright","targetId":"missing","code":"return 1","timeoutMs":1000}), &mut state).await;
+        assert_eq!(response["success"], false, "{response}");
+        assert!(state.browser.is_none());
     }
 
     #[test]
