@@ -110,6 +110,33 @@ impl Drop for PointerProbe {
     }
 }
 
+/// Out-of-process frame sessions, each with the session it hangs under.
+type FramePages = Arc<std::sync::Mutex<HashMap<String, String>>>;
+
+/// The page session an out-of-process frame's session shows in, walking up
+/// through nested frames; `None` for a session that is no frame.
+fn frame_page(frames: &FramePages, session: &str) -> Option<String> {
+    let frames = frames.lock().unwrap_or_else(|error| error.into_inner());
+    let mut page = frames.get(session)?;
+    // Frames nest only a few deep; the bound guards a malformed chain.
+    for _ in 0..16 {
+        match frames.get(page) {
+            Some(parent) => page = parent,
+            None => break,
+        }
+    }
+    Some(page.clone())
+}
+
+/// Whether viewers of a frame's page can place an activity: it carries
+/// screen coordinates, as every native sample does, or no point at all
+/// (typing, scrolling). A point in the frame's own CSS pixels cannot be
+/// placed on its page.
+fn placeable_on_page(activity: &Value) -> bool {
+    activity.get("screenX").is_some()
+        || (activity.get("x").is_none() && activity.get("y").is_none())
+}
+
 fn page_generation(pages: &PageGenerations, session: &str) -> String {
     pages
         .lock()
@@ -234,6 +261,8 @@ pub struct CdpClient {
     raw_tx: broadcast::Sender<RawCdpMessage>,
     private_sessions: PrivateSessions,
     target_sessions: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    /// Out-of-process frame sessions and the session each hangs under.
+    frame_pages: FramePages,
     native_pointer_enabled: Arc<AtomicBool>,
     native_pointer_lock: Arc<Mutex<()>>,
     pointer_probes: PointerProbes,
@@ -252,16 +281,23 @@ struct ActivityOwner {
     events: broadcast::Sender<CdpEvent>,
     targets: Arc<std::sync::Mutex<HashMap<String, String>>>,
     pages: PageGenerations,
+    frames: FramePages,
 }
 
 impl ActivityOwner {
-    fn publication(&self, target: &str) -> Option<(String, String)> {
+    /// The owner's session and page generation for `target`: for an
+    /// activity viewers can place, its frame's page.
+    fn publication(&self, target: &str, placeable: bool) -> Option<(String, String)> {
         let session = self
             .targets
             .lock()
             .unwrap()
             .iter()
             .find_map(|(session, observed)| (observed == target).then(|| session.clone()))?;
+        let session = placeable
+            .then(|| frame_page(&self.frames, &session))
+            .flatten()
+            .unwrap_or(session);
         Some((page_generation(&self.pages, &session), session))
     }
 }
@@ -408,6 +444,8 @@ impl CdpClient {
         let private_sessions: PrivateSessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let target_sessions = Arc::new(std::sync::Mutex::new(HashMap::<String, String>::new()));
         let targets_clone = target_sessions.clone();
+        let frame_pages: FramePages = Arc::default();
+        let frames_clone = frame_pages.clone();
 
         let page_generations: PageGenerations = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let pages_clone = page_generations.clone();
@@ -524,6 +562,17 @@ impl CdpClient {
                                     .lock()
                                     .unwrap()
                                     .insert(session.into(), target.into());
+                                // An out-of-process frame hangs under the
+                                // session it was attached through.
+                                if let (Some(parent), "iframe") = (
+                                    parsed.session_id.as_deref(),
+                                    params["targetInfo"]["type"].as_str().unwrap_or_default(),
+                                ) {
+                                    frames_clone
+                                        .lock()
+                                        .unwrap()
+                                        .insert(session.into(), parent.into());
+                                }
                             }
                         }
                     } else if method == "Target.detachedFromTarget" {
@@ -533,6 +582,7 @@ impl CdpClient {
                             .and_then(|params| params["sessionId"].as_str())
                         {
                             targets_clone.lock().unwrap().remove(session);
+                            frames_clone.lock().unwrap().remove(session);
                         }
                     }
                     if method == "Runtime.bindingCalled" {
@@ -689,6 +739,7 @@ impl CdpClient {
             raw_tx,
             private_sessions,
             target_sessions,
+            frame_pages,
             native_pointer_enabled: Arc::new(AtomicBool::new(false)),
             native_pointer_lock: Arc::new(Mutex::new(())),
             pointer_probes,
@@ -874,6 +925,12 @@ impl CdpClient {
 
     pub(crate) fn page_generation(&self, session: &str) -> String {
         page_generation(&self.page_generations, session)
+    }
+
+    /// The page an out-of-process frame's session shows in, or the session
+    /// itself when it is no frame.
+    pub(crate) fn page_of(&self, session: &str) -> String {
+        frame_page(&self.frame_pages, session).unwrap_or_else(|| session.to_owned())
     }
 
     /// The target a session is attached to: for an out-of-process frame,
@@ -1078,6 +1135,10 @@ impl CdpClient {
         }
     }
 
+    /// Observes input to publish once it is acknowledged. Viewers watch a
+    /// page, not its out-of-process frames: an activity in a frame's session
+    /// that they can place (`placeable_on_page`) is published as its page's,
+    /// with the page's generation.
     pub(crate) fn observe_activity(
         &self,
         value: Value,
@@ -1085,13 +1146,24 @@ impl CdpClient {
         generation: String,
         source: InputSource,
     ) -> ActivityObservation {
+        let placeable = placeable_on_page(&value);
+        let (page, generation) = match placeable
+            .then(|| frame_page(&self.frame_pages, session))
+            .flatten()
+        {
+            Some(page) => {
+                let generation = self.page_generation(&page);
+                (page, generation)
+            }
+            None => (session.to_owned(), generation),
+        };
         let observation =
-            ActivityObservation::new(value, session, generation, source, self.event_tx.clone());
+            ActivityObservation::new(value, &page, generation, source, self.event_tx.clone());
         let Some(owner) = self.activity_owner.get() else {
             return observation;
         };
         let target = self.target_sessions.lock().unwrap().get(session).cloned();
-        match target.and_then(|target| owner.publication(&target)) {
+        match target.and_then(|target| owner.publication(&target, placeable)) {
             Some((generation, session)) => {
                 observation.published_as(owner.events.clone(), session, generation)
             }
@@ -1107,6 +1179,7 @@ impl CdpClient {
             events: owner.event_tx.clone(),
             targets: owner.target_sessions.clone(),
             pages: owner.page_generations.clone(),
+            frames: owner.frame_pages.clone(),
         });
     }
 
@@ -1280,6 +1353,83 @@ fn enable_tcp_keepalive(stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::T
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    /// Viewers watch a page, not its out-of-process frames: a frame's
+    /// activity that carries screen coordinates, or no point at all, is
+    /// published as the page's with the page's generation; a point in the
+    /// frame's own CSS pixels stays with the frame, where it belongs.
+    #[tokio::test]
+    async fn a_frames_placeable_activity_is_published_as_its_pages() {
+        use serde_json::json;
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (attached_tx, attached) = tokio::sync::oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for (session, child, kind) in
+                [("page", "frame", "iframe"), ("frame", "inner", "iframe")]
+            {
+                ws.send(Message::Text(
+                    json!({"method":"Target.attachedToTarget","sessionId":session,"params":{
+                        "sessionId":child,"targetInfo":{"targetId":format!("{child}-target"),"type":kind}}})
+                    .to_string(),
+                ))
+                .await
+                .unwrap();
+            }
+            let _ = attached_tx.send(());
+            while ws.next().await.is_some() {}
+        });
+        let client = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        attached.await.unwrap();
+        // The reader handles the attachments in order: wait for the last.
+        for _ in 0..100 {
+            if client.page_of("inner") == "page" {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        assert_eq!(client.page_of("inner"), "page");
+        assert_eq!(client.page_of("page"), "page");
+        let mut events = client.subscribe();
+        let page_generation = client.page_generation("page");
+        let frame_generation = client.page_generation("inner");
+        for activity in [
+            json!({"type":"pointer","eventType":"move","x":5.0,"y":6.0,"screenX":300.0,"screenY":200.0}),
+            json!({"type":"activity","kind":"typing"}),
+            json!({"type":"pointer","eventType":"move","x":5.0,"y":6.0}),
+        ] {
+            client
+                .observe_activity(
+                    activity,
+                    "inner",
+                    frame_generation.clone(),
+                    InputSource::Agent,
+                )
+                .acknowledged();
+        }
+        let mut published = Vec::new();
+        while let Ok(event) = events.try_recv() {
+            if event.method == activity::EVENT {
+                published.push((
+                    event.session_id.unwrap(),
+                    event.params["pageGeneration"].as_str().unwrap().to_owned(),
+                ));
+            }
+        }
+        assert_eq!(
+            published,
+            [
+                ("page".to_owned(), page_generation.clone()),
+                ("page".to_owned(), page_generation),
+                ("inner".to_owned(), frame_generation),
+            ]
+        );
+        server.abort();
+    }
 
     #[tokio::test]
     async fn native_pointer_joins_a_later_event_and_never_relabels_an_unmatched_event() {

@@ -384,8 +384,9 @@ async fn native_input(
             }
             "DOM.scrollIntoViewIfNeeded" => {
                 let element = node_object(client, session, &params).await?;
+                let page = client.page_of(session);
                 control
-                    .agent_native_scroll_into_view(client, session, (&element, session))
+                    .agent_native_scroll_into_view(client, &page, (&element, session))
                     .await?;
             }
             "Input.insertText" => control.agent_native_keys(&[json!({ "type": "input_keyboard", "eventType": "insertText", "text": params["text"] })], KEY_INTERVAL, client, session).await?,

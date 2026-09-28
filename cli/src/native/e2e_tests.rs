@@ -13859,6 +13859,147 @@ async fn e2e_native_mouse_reaches_a_cross_site_iframe() {
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
 
+/// Input aimed inside a cross-site frame (its own renderer and session)
+/// reaches a viewer of the page like any other: every pointer sample of the
+/// travel, the press and the release in display pixels at the real pointer,
+/// and the typing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_native_activity_in_a_cross_site_frame_reaches_viewers() {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        use std::io::{Read, Write};
+        for stream in listener.incoming() {
+            let mut stream = stream.unwrap();
+            std::thread::spawn(move || {
+                let mut request = [0u8; 2048];
+                let read = stream.read(&mut request).unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..read]).to_string();
+                let body = if request.starts_with("GET /child ") {
+                    "<!doctype html><body style='margin:0'><button id=inside style='width:200px;height:60px'>Inside</button><input id=typed style='display:block;width:200px'><script>for(const type of ['click','keydown'])addEventListener(type,e=>parent.postMessage(type,'*'),true)</script>".to_string()
+                } else {
+                    format!("<!doctype html><style>body{{margin:0}}#frame{{position:absolute;left:300px;top:260px;width:320px;height:200px;border:0}}</style><iframe id=frame src='http://localhost:{port}/child'></iframe><script>window.got=[];addEventListener('message',e=>got.push(e.data))</script>")
+                };
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/html\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            });
+        }
+    });
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let enabled =
+        control_test_command(&json!({"action":"stream_enable","port":0}), &mut state).await;
+    assert_success(&enabled);
+    let stream_port = enabled["data"]["port"].as_u64().unwrap();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"navigate","url":format!("http://127.0.0.1:{port}/")}),
+            &mut state,
+        )
+        .await,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(
+        !state.iframe_sessions.is_empty(),
+        "the cross-site frame must be out of process"
+    );
+    let mut request = format!("ws://127.0.0.1:{stream_port}/")
+        .into_client_request()
+        .unwrap();
+    request.headers_mut().insert(
+        "X-Ambit-Browser-Viewer",
+        uuid::Uuid::new_v4().to_string().parse().unwrap(),
+    );
+    let (mut ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    // The snapshot inlines the frame: its refs resolve in the frame's own
+    // session.
+    let snapshot = control_test_command(&json!({"action":"snapshot"}), &mut state).await;
+    assert_success(&snapshot);
+    let refs = get_data(&snapshot)["refs"].as_object().unwrap().clone();
+    let reference = |role: &str| {
+        refs.iter()
+            .find(|(_, entry)| entry["role"] == role)
+            .map(|(id, _)| format!("@{id}"))
+            .unwrap_or_else(|| panic!("the snapshot lists the {role}: {refs:?}"))
+    };
+    let (inside, typed) = (reference("button"), reference("textbox"));
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":inside}), &mut state).await,
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"fill","selector":typed,"value":"hi"}),
+            &mut state,
+        )
+        .await,
+    );
+    let display = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .display_client()
+        .expect("owned display");
+    let pointer = display.pointer().unwrap();
+    let got = control_test_command(&json!({"action":"evaluate","script":"got"}), &mut state).await;
+    assert_success(&got);
+    assert_eq!(
+        got["data"]["result"],
+        json!(["click", "click", "keydown", "keydown"])
+    );
+    // What the viewer received.
+    let mut seen = Vec::new();
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+    while let Ok(Some(Ok(message))) = tokio::time::timeout_at(deadline, ws.next()).await {
+        if let Ok(text) = message.to_text() {
+            if let Ok(event) = serde_json::from_str::<Value>(text) {
+                if event["source"] == "agent" {
+                    seen.push(event);
+                }
+            }
+        }
+    }
+    let pointer_events: Vec<&Value> = seen
+        .iter()
+        .filter(|event| event["type"] == "pointer")
+        .collect();
+    let presses = pointer_events
+        .iter()
+        .filter(|event| event["eventType"] == "press")
+        .count();
+    let moves = pointer_events
+        .iter()
+        .filter(|event| event["eventType"] == "move")
+        .count();
+    assert_eq!(presses, 2, "both presses inside the frame: {seen:?}");
+    assert!(moves >= 4, "{moves} moves: {seen:?}");
+    assert!(pointer_events
+        .iter()
+        .all(|event| event["coordinateSpace"] == "display-pixels"));
+    let last = pointer_events.last().unwrap();
+    assert_eq!(
+        (last["x"].as_f64().unwrap(), last["y"].as_f64().unwrap()),
+        pointer,
+        "the release shows where the real pointer is"
+    );
+    let typing = seen
+        .iter()
+        .filter(|event| event["kind"] == "typing")
+        .count();
+    assert_eq!(typing, 2);
+    println!(
+        "FRAME_ACTIVITY {}",
+        json!({"moves": moves, "presses": presses, "typing": typing, "pointer": [pointer.0, pointer.1]})
+    );
+    let _ = close_current_browser(&mut state).await;
+}
+
 /// A missed settings push heals on the next host launch envelope without
 /// replacing the page, its JavaScript state, or the private Chrome profile.
 #[tokio::test]
