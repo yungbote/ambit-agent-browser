@@ -396,6 +396,68 @@ fn lifecycle_timeout(wait_until: WaitUntil) -> String {
     }
 }
 
+/// Waits on `rx` until the page of `session_id` reaches `wait_until` for the
+/// navigation of `loader_id`, and reports how far it got within `timeout`.
+async fn lifecycle(
+    wait_until: WaitUntil,
+    session_id: &str,
+    loader_id: Option<&str>,
+    rx: &mut broadcast::Receiver<CdpEvent>,
+    timeout: tokio::time::Duration,
+) -> Result<LifecycleWait, String> {
+    let mut commit = loader_id.map(CommitWatch::new);
+    let event_name = match wait_until {
+        WaitUntil::Load => "Page.loadEventFired",
+        WaitUntil::DomContentLoaded => "Page.domContentEventFired",
+        // Its only failure is its deadline.
+        WaitUntil::NetworkIdle => {
+            let reached = poll_network_idle(session_id, rx, timeout, commit.as_mut())
+                .await
+                .is_ok();
+            return Ok(LifecycleWait::conclude(reached, commit));
+        }
+        WaitUntil::None => return Ok(LifecycleWait::Reached),
+    };
+
+    let reached = tokio::time::timeout(timeout, async {
+        loop {
+            match rx.recv().await {
+                Ok(event) => {
+                    if event.session_id.as_deref() != Some(session_id) {
+                        continue;
+                    }
+                    if let Some(watch) = commit.as_mut() {
+                        watch.observe(&event);
+                    }
+                    if event.method == event_name
+                        && commit.as_ref().is_none_or(CommitWatch::committed)
+                    {
+                        return Ok(());
+                    }
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+        Err("Event stream closed".to_string())
+    })
+    .await;
+    match reached {
+        Ok(result) => result.map(|()| LifecycleWait::Reached),
+        Err(_) => Ok(LifecycleWait::conclude(false, commit)),
+    }
+}
+
+/// What an open page that committed but did not reach `wait_until` within
+/// `timeout_ms` says about itself.
+fn load_wait(wait_until: WaitUntil, timeout_ms: u64) -> String {
+    format!(
+        "The page is open at this URL but did not reach {} within {} ms, so parts of it may still be loading. Inspect it instead of opening it again.",
+        wait_until.name(),
+        timeout_ms
+    )
+}
+
 /// Watches a page session for the main frame committing one navigation's
 /// document. Chrome answers `Page.navigate` with the navigation's loader
 /// identifier before the commit; the commit is the main-frame
@@ -559,7 +621,7 @@ pub struct BrowserManager {
 mod tabs;
 #[path = "browser_window.rs"]
 mod window;
-pub(crate) use tabs::url_origin;
+pub(crate) use tabs::{url_origin, BACKGROUND_TABS};
 pub(crate) use window::ACTIVE_PAGE_AMBIGUOUS;
 
 /// Code of the refusal, before it acts, of a command addressed to the active
@@ -887,6 +949,7 @@ impl BrowserManager {
                     "Target.createTarget",
                     &CreateTargetParams {
                         url: "about:blank".to_string(),
+                        background: false,
                     },
                     None,
                 )
@@ -1384,11 +1447,7 @@ impl BrowserManager {
                 // browser process knows the committed page's title without it.
                 let title = self.target_title().await.unwrap_or_default();
                 let mut page = self.record_open_page(page_url, title);
-                page["loadWait"] = json!(format!(
-                    "The page is open at this URL but did not reach {} within {} ms, so parts of it may still be loading. Inspect it instead of opening it again.",
-                    wait_until.name(),
-                    self.default_timeout_ms
-                ));
+                page["loadWait"] = json!(load_wait(wait_until, self.default_timeout_ms));
                 Ok(page)
             }
             LifecycleWait::TimedOut => Err(lifecycle_timeout(wait_until)),
@@ -1482,47 +1541,7 @@ impl BrowserManager {
         rx: &mut broadcast::Receiver<CdpEvent>,
     ) -> Result<LifecycleWait, String> {
         let timeout = tokio::time::Duration::from_millis(self.default_timeout_ms);
-        let mut commit = loader_id.map(CommitWatch::new);
-        let event_name = match wait_until {
-            WaitUntil::Load => "Page.loadEventFired",
-            WaitUntil::DomContentLoaded => "Page.domContentEventFired",
-            // Its only failure is its deadline.
-            WaitUntil::NetworkIdle => {
-                let reached = poll_network_idle(session_id, rx, timeout, commit.as_mut())
-                    .await
-                    .is_ok();
-                return Ok(LifecycleWait::conclude(reached, commit));
-            }
-            WaitUntil::None => return Ok(LifecycleWait::Reached),
-        };
-
-        let reached = tokio::time::timeout(timeout, async {
-            loop {
-                match rx.recv().await {
-                    Ok(event) => {
-                        if event.session_id.as_deref() != Some(session_id) {
-                            continue;
-                        }
-                        if let Some(watch) = commit.as_mut() {
-                            watch.observe(&event);
-                        }
-                        if event.method == event_name
-                            && commit.as_ref().is_none_or(CommitWatch::committed)
-                        {
-                            return Ok(());
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-            Err("Event stream closed".to_string())
-        })
-        .await;
-        match reached {
-            Ok(result) => result.map(|()| LifecycleWait::Reached),
-            Err(_) => Ok(LifecycleWait::conclude(false, commit)),
-        }
+        lifecycle(wait_until, session_id, loader_id, rx, timeout).await
     }
 
     pub async fn get_url(&self) -> Result<String, String> {
@@ -1774,6 +1793,7 @@ impl BrowserManager {
                 "Target.createTarget",
                 &CreateTargetParams {
                     url: "about:blank".to_string(),
+                    background: false,
                 },
                 None,
             )
@@ -1938,6 +1958,7 @@ impl BrowserManager {
                 "Target.createTarget",
                 &CreateTargetParams {
                     url: target_url.to_string(),
+                    background: false,
                 },
                 None,
             )

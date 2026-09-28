@@ -2951,6 +2951,122 @@ async fn e2e_tabs() {
     assert_success(&resp);
 }
 
+/// `tab new --background` opens a tab per URL and loads them all before it
+/// answers, each with its page, its HTTP status or its error, while the
+/// active tab, its refs and its page stay as they were.
+#[tokio::test]
+#[ignore]
+async fn e2e_tab_new_background_loads_every_url_and_keeps_the_active_tab() {
+    let port = serve_each_connection(|path, mut stream| {
+        use std::io::Write;
+        match path {
+            "/missing" => {
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 404 Not Found\r\ncontent-type: text/html\r\ncontent-length: 9\r\nconnection: close\r\n\r\nNot found"
+                );
+            }
+            "/slow" => {
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                write_html(stream, "<!doctype html><title>Slow</title><h1>Slow</h1>");
+            }
+            _ => write_html(stream, "<!doctype html><title>Fast</title><h1>Fast</h1>"),
+        }
+    });
+    let mut state = DaemonState::new();
+    assert_success(
+        &execute_command(
+            &json!({ "id": "1", "action": "launch", "headless": true }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &execute_command(
+            &json!({ "id": "2", "action": "navigate", "url": "data:text/html,<title>Home</title><button>Keep</button>" }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(&execute_command(&json!({ "id": "3", "action": "snapshot" }), &mut state).await);
+
+    let started = std::time::Instant::now();
+    let opened = execute_command(
+        &json!({ "id": "4", "action": "tab_new", "background": true, "urls": [
+            format!("http://127.0.0.1:{port}/slow"),
+            format!("http://127.0.0.1:{port}/fast"),
+            format!("http://127.0.0.1:{port}/missing"),
+            "http://127.0.0.1:1/refused",
+        ] }),
+        &mut state,
+    )
+    .await;
+    let elapsed = started.elapsed();
+    assert_success(&opened);
+    let tabs = get_data(&opened)["tabs"].as_array().unwrap().clone();
+    assert_eq!(tabs.len(), 4, "{opened}");
+    let ids: Vec<&str> = tabs
+        .iter()
+        .map(|tab| tab["tabId"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, ["t2", "t3", "t4", "t5"]);
+    for (tab, title, status) in [
+        (&tabs[0], "Slow", json!(200)),
+        (&tabs[1], "Fast", json!(200)),
+        (&tabs[2], "", json!(404)),
+    ] {
+        assert!(tab.get("error").is_none(), "{tab}");
+        assert_eq!(tab["page"]["title"], title, "{tab}");
+        assert_eq!(tab["httpStatus"], status, "{tab}");
+        for key in ["targetId", "loaderId", "pageGeneration"] {
+            assert!(
+                tab["page"][key]
+                    .as_str()
+                    .is_some_and(|value| !value.is_empty()),
+                "{key}: {tab}"
+            );
+        }
+    }
+    assert!(tabs[0]["page"]["url"].as_str().unwrap().ends_with("/slow"));
+    assert!(
+        tabs[3]["error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()),
+        "{}",
+        tabs[3]
+    );
+    // They loaded at once: the slow page's delay was paid once, not per tab.
+    assert!(elapsed < std::time::Duration::from_secs(5), "{elapsed:?}");
+
+    // The active tab, its page and its refs are as they were.
+    let list = execute_command(&json!({ "id": "5", "action": "tab_list" }), &mut state).await;
+    let listed = get_data(&list)["tabs"].as_array().unwrap().clone();
+    assert_eq!(listed.len(), 5);
+    assert_eq!(listed[0]["active"], true, "{list}");
+    let title = execute_command(&json!({ "id": "6", "action": "title" }), &mut state).await;
+    assert_eq!(get_data(&title)["title"], "Home");
+    assert_success(
+        &execute_command(
+            &json!({ "id": "7", "action": "click", "selector": "@e1" }),
+            &mut state,
+        )
+        .await,
+    );
+
+    // More than the bound is refused before any tab opens.
+    let urls: Vec<String> = (0..9).map(|n| format!("data:text/html,{n}")).collect();
+    let refused = execute_command(
+        &json!({ "id": "8", "action": "tab_new", "background": true, "urls": urls }),
+        &mut state,
+    )
+    .await;
+    assert_eq!(refused["success"], false, "{refused}");
+    let list = execute_command(&json!({ "id": "9", "action": "tab_list" }), &mut state).await;
+    assert_eq!(get_data(&list)["tabs"].as_array().unwrap().len(), 5);
+
+    assert_success(&execute_command(&json!({ "id": "99", "action": "close" }), &mut state).await);
+}
+
 /// A page sets its title and text to any string, a lone surrogate included.
 /// Chrome's replies carrying such text are decoded rather than dropped, so
 /// the commands reading it complete at once, with U+FFFD in its place.

@@ -1,11 +1,24 @@
-//! The open tabs: what is read from each page, and the roster a refusal
-//! lists when its recovery is selecting a tab explicitly.
+//! The open tabs: what is read from each page, the roster a refusal lists
+//! when its recovery is selecting a tab explicitly, and tabs opened in the
+//! background.
 
-use super::{format_tab_id, BrowserManager, PageInfo};
+use super::{
+    format_tab_id, lifecycle, lifecycle_timeout, load_wait, BrowserManager, LifecycleWait,
+    PageInfo, WaitUntil,
+};
 use crate::native::cdp::client::CdpClient;
+use crate::native::cdp::types::{
+    AttachToTargetParams, AttachToTargetResult, CdpEvent, CreateTargetParams, CreateTargetResult,
+    PageNavigateParams, PageNavigateResult,
+};
+use futures_util::future::join_all;
 use futures_util::{stream, StreamExt};
 use serde_json::{json, Value};
 use std::time::Duration;
+use tokio::sync::broadcast;
+
+/// The most tabs one command opens in the background.
+pub(crate) const BACKGROUND_TABS: usize = 8;
 
 /// A refusal lists at most this many tabs; `tab_list` lists every tab.
 const ROSTER_TABS: usize = 20;
@@ -165,6 +178,159 @@ impl BrowserManager {
         }
     }
 
+    /// Opens a blank tab in the background, so the active tab stays the one
+    /// commands act on, and answers its session. Nothing loads in it before
+    /// the session's setup reaches it (`load_background`).
+    pub(crate) async fn tab_new_background(&mut self) -> Result<String, String> {
+        let created: CreateTargetResult = self
+            .client
+            .send_command_typed(
+                "Target.createTarget",
+                &CreateTargetParams {
+                    url: "about:blank".to_string(),
+                    background: true,
+                },
+                None,
+            )
+            .await?;
+        let attached: AttachToTargetResult = self
+            .client
+            .send_command_typed(
+                "Target.attachToTarget",
+                &AttachToTargetParams {
+                    target_id: created.target_id.clone(),
+                    flatten: true,
+                },
+                None,
+            )
+            .await?;
+        self.enable_domains(&attached.session_id).await?;
+        let tab_id = self.next_tab_id;
+        self.next_tab_id += 1;
+        self.pages.push(PageInfo {
+            tab_id,
+            label: None,
+            target_id: created.target_id,
+            session_id: attached.session_id.clone(),
+            url: "about:blank".to_string(),
+            title: String::new(),
+            target_type: "page".to_string(),
+        });
+        Ok(attached.session_id)
+    }
+
+    /// Loads each `(session, url)` of tabs `tab_new_background` opened, all
+    /// at once, each until `wait_until` or the session's timeout as `open`
+    /// loads the active tab. Describes each tab as it ended, in order:
+    /// `{tabId, page: {targetId, loaderId, pageGeneration, url, title},
+    /// httpStatus, loadWait?, error?}`. A tab that failed to load stays open
+    /// with its `error`.
+    pub(crate) async fn load_background(
+        &mut self,
+        tabs: Vec<(String, String)>,
+        wait_until: WaitUntil,
+    ) -> Vec<Value> {
+        let timeout = Duration::from_millis(self.default_timeout_ms);
+        let loads = tabs.into_iter().map(|(session, url)| {
+            let client = self.client.clone();
+            let target = self
+                .pages
+                .iter()
+                .find(|page| page.session_id == session)
+                .map(|page| page.target_id.clone())
+                .unwrap_or_default();
+            async move {
+                let mut lifecycle_events = client.subscribe();
+                let mut responses = client.subscribe();
+                let navigated: Result<PageNavigateResult, String> = client
+                    .send_command_typed(
+                        "Page.navigate",
+                        &PageNavigateParams {
+                            url: url.clone(),
+                            referrer: None,
+                        },
+                        Some(&session),
+                    )
+                    .await;
+                let (loaded, loader) = match navigated {
+                    Err(error) => (Err(error), None),
+                    Ok(PageNavigateResult {
+                        error_text: Some(error),
+                        ..
+                    }) => (Err(format!("Navigation failed: {error}")), None),
+                    Ok(PageNavigateResult { loader_id, .. }) => (
+                        lifecycle(
+                            wait_until,
+                            &session,
+                            loader_id.as_deref(),
+                            &mut lifecycle_events,
+                            timeout,
+                        )
+                        .await,
+                        loader_id,
+                    ),
+                };
+                let status = loader
+                    .as_deref()
+                    .and_then(|loader| document_status(&mut responses, &session, loader));
+                let (page_url, title, current_loader) = identity(&client, &session, &target).await;
+                Tab {
+                    session,
+                    url,
+                    loaded,
+                    status,
+                    page_url,
+                    title,
+                    loader: current_loader.or(loader).unwrap_or_default(),
+                }
+            }
+        });
+        let loaded = join_all(loads).await;
+        loaded
+            .into_iter()
+            .map(|tab| {
+                if let Ok(parsed) = url::Url::parse(&tab.url) {
+                    let origin = parsed.origin().ascii_serialization();
+                    if origin != "null" {
+                        self.visited_origins.insert(origin);
+                    }
+                }
+                let Some(page) = self
+                    .pages
+                    .iter_mut()
+                    .find(|page| page.session_id == tab.session)
+                else {
+                    return json!({ "error": "The tab closed while it loaded." });
+                };
+                page.url = tab.page_url.clone();
+                page.title = tab.title.clone();
+                let mut described = json!({
+                    "tabId": format_tab_id(page.tab_id),
+                    "page": {
+                        "targetId": page.target_id,
+                        "loaderId": tab.loader,
+                        "pageGeneration": self.client.page_generation(&tab.session),
+                        "url": tab.page_url,
+                        "title": tab.title,
+                    },
+                    "httpStatus": tab.status,
+                });
+                match tab.loaded {
+                    Ok(LifecycleWait::Reached) => {}
+                    Ok(LifecycleWait::Committed { .. }) => {
+                        described["loadWait"] =
+                            json!(load_wait(wait_until, self.default_timeout_ms));
+                    }
+                    Ok(LifecycleWait::TimedOut) => {
+                        described["error"] = json!(lifecycle_timeout(wait_until));
+                    }
+                    Err(error) => described["error"] = json!(error),
+                }
+                described
+            })
+            .collect()
+    }
+
     /// The open tabs listed by a refusal or failure whose recovery is selecting
     /// a tab explicitly (`browser_active_page_ambiguous`, `tab_gone`,
     /// `tab_closed_during_command`, `tab_not_found`), bounded unlike
@@ -176,6 +342,91 @@ impl BrowserManager {
             (!self.bound_target_is_gone()).then_some(self.active_page_index),
         )
     }
+}
+
+/// A background tab as its load ended.
+struct Tab {
+    session: String,
+    /// The URL asked for.
+    url: String,
+    loaded: Result<LifecycleWait, String>,
+    status: Option<i64>,
+    /// Where the tab is now, and its document.
+    page_url: String,
+    title: String,
+    loader: String,
+}
+
+/// The HTTP status of the main-frame document `loader` loaded in `session`,
+/// among the events `responses` holds.
+fn document_status(
+    responses: &mut broadcast::Receiver<CdpEvent>,
+    session: &str,
+    loader: &str,
+) -> Option<i64> {
+    let mut status = None;
+    loop {
+        match responses.try_recv() {
+            Ok(event) => {
+                let params = &event.params;
+                if event.method == "Network.responseReceived"
+                    && event.session_id.as_deref() == Some(session)
+                    && params["type"] == "Document"
+                    && params["loaderId"] == loader
+                {
+                    status = params["response"]["status"].as_i64();
+                }
+            }
+            Err(broadcast::error::TryRecvError::Lagged(_)) => {}
+            Err(_) => return status,
+        }
+    }
+}
+
+/// Where the tab of `session` (target `target`) is now: its URL as the
+/// browser process knows it, and, within `OBSERVATION_BOUND`, its document's
+/// title (read as the feedback reads it, or the browser's own while the
+/// renderer is busy) and its main frame's document.
+async fn identity(
+    client: &CdpClient,
+    session: &str,
+    target: &str,
+) -> (String, String, Option<String>) {
+    let info = client
+        .send_command(
+            "Target.getTargetInfo",
+            Some(json!({ "targetId": target })),
+            None,
+        )
+        .await
+        .ok();
+    let known = |key: &str| {
+        info.as_ref()
+            .and_then(|info| info["targetInfo"][key].as_str())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let (title, tree) = tokio::join!(
+        tokio::time::timeout(
+            OBSERVATION_BOUND,
+            observe_page(client, session, TITLE_EXPRESSION)
+        ),
+        tokio::time::timeout(
+            OBSERVATION_BOUND,
+            client.send_command_no_params("Page.getFrameTree", Some(session))
+        ),
+    );
+    let title = match title {
+        Ok(Ok(Value::String(title))) => title,
+        _ => known("title"),
+    };
+    let loader = match tree {
+        Ok(Ok(tree)) => tree["frameTree"]["frame"]["loaderId"]
+            .as_str()
+            .map(String::from),
+        _ => None,
+    };
+    (known("url"), title, loader)
 }
 
 #[cfg(test)]

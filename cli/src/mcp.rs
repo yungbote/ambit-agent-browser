@@ -120,6 +120,7 @@ const TOOL_COOKIES_SET: &str = "agent_browser_cookies_set";
 const TOOL_COOKIES_SET_CURL: &str = "agent_browser_cookies_set_curl";
 const TOOL_COOKIES_CLEAR: &str = "agent_browser_cookies_clear";
 const TOOL_TAB_NEW: &str = "agent_browser_tab_new";
+const TOOL_OPEN_MANY: &str = "agent_browser_open_many";
 const TOOL_TAB_LIST: &str = "agent_browser_tab_list";
 const TOOL_TAB_SWITCH: &str = "agent_browser_tab_switch";
 const TOOL_TAB_CLOSE: &str = "agent_browser_tab_close";
@@ -512,6 +513,7 @@ const TABS_PROFILE_TOOLS: &[&str] = &[
     TOOL_FORWARD,
     TOOL_RELOAD,
     TOOL_TAB_NEW,
+    TOOL_OPEN_MANY,
     TOOL_TAB_LIST,
     TOOL_TAB_SWITCH,
     TOOL_TAB_CLOSE,
@@ -1371,6 +1373,17 @@ fn parity_tools() -> Vec<Value> {
             "Open a new tab after applying session setup before its first navigation.",
             json!({ "url": { "type": "string" }, "label": { "type": "string" } }),
             &[],
+        ),
+        tool(
+            TOOL_OPEN_MANY,
+            "Open many",
+            "Open each URL in a background tab of its own, all loading at once; the active tab stays. Returns each tab's id, page and HTTP status, in the order given; a tab that failed to load stays open with its error.",
+            json!({ "urls": {
+                "type": "array", "items": { "type": "string" },
+                "minItems": 1, "maxItems": crate::native::browser::BACKGROUND_TABS,
+                "description": "URLs to open, one tab each."
+            } }),
+            &["urls"],
         ),
         tool(TOOL_TAB_LIST, "Tab list", "List tabs.", json!({}), &[]),
         tool(
@@ -2414,6 +2427,7 @@ fn prepare_tool(name: &str, arguments: &Value) -> Result<CliInvocation, Protocol
         TOOL_COOKIES_SET_CURL => call_cookies_set_curl(arguments),
         TOOL_COOKIES_CLEAR => call_literal(arguments, &["cookies", "clear"]),
         TOOL_TAB_NEW => call_tab_new(arguments),
+        TOOL_OPEN_MANY => call_open_many(arguments),
         TOOL_TAB_LIST => call_literal(arguments, &["tab", "list"]),
         TOOL_TAB_SWITCH => call_one_string(arguments, "tab", "tab"),
         TOOL_TAB_CLOSE => call_optional_one(arguments, &["tab", "close"], "tab"),
@@ -3276,6 +3290,29 @@ fn call_tab_new(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
         args.push("--label".to_string());
         args.push(label);
     }
+    call_cli_tool(arguments, args, None)
+}
+
+/// `tab new --background <url>...`. A URL is never read as a flag.
+fn call_open_many(arguments: &Value) -> Result<CliInvocation, ProtocolError> {
+    let urls = required_string_array(arguments, "urls")?;
+    let most = crate::native::browser::BACKGROUND_TABS;
+    if urls.len() > most {
+        return Err(ProtocolError::invalid_params(format!(
+            "urls must list at most {most} URLs"
+        )));
+    }
+    if let Some(index) = urls.iter().position(|url| url.starts_with('-')) {
+        return Err(ProtocolError::invalid_params(format!(
+            "urls[{index}] must be a URL"
+        )));
+    }
+    let mut args = vec![
+        "tab".to_string(),
+        "new".to_string(),
+        "--background".to_string(),
+    ];
+    args.extend(urls);
     call_cli_tool(arguments, args, None)
 }
 
@@ -4849,6 +4886,72 @@ mod tests {
             json!({ "theme": 1 }),
         ] {
             assert!(call_set_theme(&arguments).is_err(), "{arguments}");
+        }
+    }
+
+    #[test]
+    fn open_many_parses_through_the_cli_into_background_tabs() {
+        let tool = tools()
+            .into_iter()
+            .find(|tool| tool["name"] == TOOL_OPEN_MANY)
+            .unwrap();
+        let urls = &tool["inputSchema"]["properties"]["urls"];
+        assert_eq!(tool["inputSchema"]["required"], json!(["urls"]));
+        assert_eq!(
+            (urls["minItems"].clone(), urls["maxItems"].clone()),
+            (json!(1), json!(8))
+        );
+        assert_eq!(tool["annotations"]["readOnlyHint"], false);
+        assert!(McpConfig::from_profiles(vec![ToolProfile::Tabs]).allows(TOOL_OPEN_MANY));
+        let invocation = call_open_many(
+            &json!({ "urls": ["https://a.example/", "https://b.example/?q=1"], "timeoutMs": 9000 }),
+        )
+        .unwrap();
+        assert_eq!(
+            invocation.command_args,
+            vec![
+                "tab",
+                "new",
+                "--background",
+                "https://a.example/",
+                "https://b.example/?q=1"
+            ]
+        );
+        assert_eq!(invocation.timeout_ms, 9000);
+        // The MCP tool and the CLI command are one daemon command.
+        let flags = crate::flags::parse_flags_from_config(&[], crate::flags::Config::default());
+        let from_mcp =
+            crate::commands::parse_command_with_input(&invocation.command_args, &flags, None)
+                .unwrap();
+        let from_cli = crate::commands::parse_command(
+            &[
+                "tab",
+                "new",
+                "--background",
+                "https://a.example/",
+                "https://b.example/?q=1",
+            ]
+            .map(String::from),
+            &flags,
+        )
+        .unwrap();
+        for command in [&from_mcp, &from_cli] {
+            assert_eq!(command["action"], "tab_new");
+            assert_eq!(command["background"], true);
+            assert_eq!(
+                command["urls"],
+                json!(["https://a.example/", "https://b.example/?q=1"])
+            );
+        }
+        let nine: Vec<String> = (0..9).map(|n| format!("https://{n}.example/")).collect();
+        for arguments in [
+            json!({}),
+            json!({ "urls": [] }),
+            json!({ "urls": nine }),
+            json!({ "urls": ["--label"] }),
+            json!({ "urls": [7] }),
+        ] {
+            assert!(call_open_many(&arguments).is_err(), "{arguments}");
         }
     }
 

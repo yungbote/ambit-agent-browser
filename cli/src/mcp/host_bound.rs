@@ -38,12 +38,15 @@ const HOST_ARGUMENTS: &[&str] = &[
     "extraArgs",
 ];
 
-/// Host operations: tools the host calls itself and never offers to the
-/// model, marked `"caller": "host"` in the descriptor. Each acts on the
-/// running session as it is: it never starts a daemon or sends launch
-/// settings, and it is neither agent input nor an observation, so it
-/// captures no host feedback.
-const HOST_OPERATIONS: &[&str] = &[TOOL_SET_THEME];
+/// Tools the host calls itself and never offers to the model, marked
+/// `"caller": "host"` in the descriptor. Who calls a tool is apart from how
+/// it is dispatched: opening background tabs is an agent operation.
+const HOST_CALLED: &[&str] = &[TOOL_SET_THEME, TOOL_OPEN_MANY];
+
+/// Session operations: each acts on the running session as it is. It never
+/// starts a daemon or sends launch settings, and it is neither agent input
+/// nor an observation, so it captures no host feedback.
+const SESSION_OPERATIONS: &[&str] = &[TOOL_SET_THEME];
 
 /// Process discovery, supervisor configuration, dependency installation and
 /// cross-session commands belong to the host. Browser auth and state stay in
@@ -124,7 +127,7 @@ fn build_tools() -> Vec<Value> {
                 "coordinateArguments": [{ "x": "/x", "y": "/y" }]
             }});
         }
-        if HOST_OPERATIONS.contains(&name.as_str()) {
+        if HOST_CALLED.contains(&name.as_str()) {
             tool["_meta"] = json!({ "io.ambit/browser": { "caller": "host" } });
         }
     }
@@ -263,7 +266,7 @@ impl HostFlags {
             invocation.stdin_body.as_deref(),
         )
         .map_err(|error| error.format())?;
-        let dispatch = if HOST_OPERATIONS.contains(&name) {
+        let dispatch = if SESSION_OPERATIONS.contains(&name) {
             Dispatch::Session
         } else {
             crate::attach_plugins_to_command(&mut command, &flags.plugins);
@@ -550,7 +553,7 @@ mod tests {
     #[test]
     fn theme_is_a_host_operation_and_host_configuration() {
         let tools = tools();
-        assert_eq!(tools.len(), 131);
+        assert_eq!(tools.len(), 132);
         let set_theme = tools
             .iter()
             .find(|tool| tool["name"] == TOOL_SET_THEME)
@@ -578,7 +581,7 @@ mod tests {
             let host_only = tool["_meta"]["io.ambit/browser"]["caller"] == "host";
             assert_eq!(
                 host_only,
-                HOST_OPERATIONS.contains(&tool["name"].as_str().unwrap()),
+                HOST_CALLED.contains(&tool["name"].as_str().unwrap()),
                 "{}",
                 tool["name"]
             );
@@ -713,6 +716,30 @@ mod tests {
         };
         assert_eq!(launch["action"], "launch");
         assert_eq!(launch["theme"], "dark");
+
+        // Opening background tabs is the host's to call and never the
+        // model's, yet it is an agent operation: custody, gates, launch.
+        let open_many = themed
+            .flags
+            .prepare(
+                TOOL_OPEN_MANY,
+                &json!({ "urls": ["https://a.example/", "https://b.example/"] }),
+            )
+            .unwrap();
+        assert_eq!(
+            tool(TOOL_OPEN_MANY).unwrap()["_meta"],
+            json!({ "io.ambit/browser": { "caller": "host" } })
+        );
+        assert_eq!(open_many.command["action"], "tab_new");
+        assert_eq!(open_many.command["background"], true);
+        assert_eq!(
+            open_many.command["urls"],
+            json!(["https://a.example/", "https://b.example/"])
+        );
+        assert!(matches!(
+            open_many.dispatch,
+            Dispatch::Agent { launch: Some(_) }
+        ));
     }
 
     #[test]

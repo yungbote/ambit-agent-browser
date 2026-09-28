@@ -7752,6 +7752,9 @@ async fn handle_tab_list(state: &mut DaemonState) -> Result<Value, String> {
 }
 
 async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    if cmd.get("background").and_then(Value::as_bool) == Some(true) {
+        return open_background_tabs(cmd, state).await;
+    }
     let url = cmd.get("url").and_then(|v| v.as_str());
     let label = cmd.get("label").and_then(|v| v.as_str());
     let domain_filter = state.domain_filter.read().await.clone();
@@ -7800,6 +7803,47 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     state.refresh_active_iframe_sessions().await;
 
     Ok(result)
+}
+
+/// `tab new --background <url>...`: one background tab per URL, each given
+/// the session's setup and network controls before its first document, all
+/// loading at once. The active tab, its refs and its frame stay as they are.
+async fn open_background_tabs(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let urls: Vec<String> = cmd
+        .get("urls")
+        .and_then(Value::as_array)
+        .map(|urls| {
+            urls.iter()
+                .filter_map(|url| url.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if urls.is_empty() || urls.len() > super::browser::BACKGROUND_TABS {
+        return Err(format!(
+            "tab new --background opens 1 to {} URLs.",
+            super::browser::BACKGROUND_TABS
+        ));
+    }
+    let domain_filter = state.domain_filter.read().await.clone();
+    for url in &urls {
+        check_url_allowed_by_filter(domain_filter.as_ref(), url)?;
+    }
+    let has_proxy_creds = state.proxy_credentials.read().await.is_some();
+    let mut sessions = Vec::with_capacity(urls.len());
+    for _ in &urls {
+        let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
+        sessions.push(mgr.tab_new_background().await?);
+    }
+    for session in &sessions {
+        apply_session_setup(state, session).await?;
+    }
+    install_network_controls_or_close(state, has_proxy_creds).await?;
+    state.drain_cdp_events_background().await?;
+    let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
+    let tabs = mgr
+        .load_background(sessions.into_iter().zip(urls).collect(), WaitUntil::Load)
+        .await;
+    Ok(json!({ "tabs": tabs }))
 }
 
 async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
