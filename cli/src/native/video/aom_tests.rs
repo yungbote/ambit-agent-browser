@@ -182,7 +182,7 @@ fn one_picture_in_one_unit_out_with_key_units_only_where_asked() {
 
 /// The key unit's sequence header says what the codec string and the
 /// pictures claim: profile, level, and the contract's colour (section 2, rev
-/// 3), BT.709 primaries (1), transfer (1) and matrix (1) at limited range.
+/// 4), BT.709 primaries (1), transfer (1) and matrix (1) at full range.
 #[test]
 fn the_sequence_header_signals_the_codec_string_and_colour_description() {
     for (codec, width, height) in [
@@ -217,7 +217,7 @@ fn the_sequence_header_signals_the_codec_string_and_colour_description() {
                 header.matrix,
                 header.full_range
             ),
-            (Some(1), Some(1), Some(1), false)
+            (Some(1), Some(1), Some(1), true)
         );
         assert_eq!(
             header.subsampling,
@@ -240,7 +240,7 @@ fn the_sequence_header_signals_the_codec_string_and_colour_description() {
 /// conversion, the encoder at the still target, a real AV1 decoder
 /// (libaom's own) that reads the colour the bitstream signals, and the
 /// inverse at that range, as the viewer's decoder paints it. The decoder
-/// reads BT.709 at limited range, inside the bars it returns the very
+/// reads the colour `convert` produced, inside the bars it returns the very
 /// samples the encoder was given, and the picture is painted as it was
 /// drawn (`check_painted`). A wrong stride, matrix or range fails this by
 /// tens of dB, a tint, or a page that is not white or black.
@@ -271,7 +271,7 @@ fn text_and_colour_bars_survive_convert_encode_decode_and_the_inverse_matrix() {
                     );
                 }
             }
-            check_painted(&case, scheme, codec.chroma(), &source, &decoded.rgb(), 1);
+            check_painted(&case, scheme, codec.chroma(), &source, &decoded.rgb());
         }
     }
 }
@@ -441,17 +441,15 @@ pub(crate) struct Painted {
 /// Checks a painted fixture (`painted`: four bytes a pixel, red first)
 /// against the drawn one in `scheme` (`source`, BGRX): the bare page exactly
 /// white or black, the white and black bars exact, every other bar within
-/// `saturated` code values (1 for a painter that inverts exactly: limited
-/// range's own rounding), and the text block at least 44 dB RGB PSNR at
-/// 4:4:4 and 30 at 4:2:0, where a wrong stride, matrix or range costs tens
-/// of dB.
+/// one code value (the rounding of 8-bit Y′CbCr), and the text block at
+/// least 44 dB RGB PSNR at 4:4:4 and 30 at 4:2:0, where a wrong stride,
+/// matrix or range costs tens of dB.
 pub(crate) fn check_painted(
     case: &str,
     scheme: Scheme,
     chroma: Chroma,
     source: &[u8],
     painted: &[u8],
-    saturated: u8,
 ) -> Painted {
     let (width, height) = FIXTURE;
     let drawn_at = |x: usize, y: usize| {
@@ -480,11 +478,7 @@ pub(crate) fn check_painted(
             .map(|channel| got[channel].abs_diff(drawn[channel]))
             .max()
             .unwrap();
-        let allowed = if drawn == [255; 3] || drawn == [0; 3] {
-            0
-        } else {
-            saturated
-        };
+        let allowed = u8::from(drawn != [255; 3] && drawn != [0; 3]);
         assert!(error <= allowed, "{case}: bar {drawn:?} painted {got:?}");
         let bar = &mut bars[x * BARS.len() / width];
         *bar = (*bar).max(error);

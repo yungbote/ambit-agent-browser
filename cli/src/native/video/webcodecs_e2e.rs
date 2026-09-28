@@ -3,11 +3,11 @@
 //! still target, then decoded and drawn by a real Chrome the way the viewer
 //! does: a WebCodecs `VideoDecoder` configured from the key unit, the frame
 //! drawn 1:1 on an opaque 2D canvas and read back. Chrome must decode the
-//! very samples libaom decodes, read BT.709 at limited range, and paint the
-//! fixture as it was drawn (`check_painted`, the checks libaom's own decode
-//! and the exact inverse pass) within its painter's measured precision.
-//! Prints `COLOUR <json>`; with `$AMBIT_VIDEO_PROOF` set to a directory,
-//! writes the numbers and each drawn and painted picture there.
+//! very samples libaom decodes, read the colour the stream signals (BT.709
+//! at full range), and paint the fixture as it was drawn (`check_painted`,
+//! the checks libaom's own decode through the exact inverse passes). Prints
+//! `COLOUR <json>`; with `$AMBIT_VIDEO_PROOF` set to a directory, writes the
+//! numbers and each drawn and painted picture there.
 //!
 //! `cargo test --profile ci colour_in_chrome -- --ignored` with
 //! `AGENT_BROWSER_EXECUTABLE_PATH` set.
@@ -18,15 +18,6 @@ use serde_json::{json, Value};
 use super::aom::tests::{check_painted, still_unit, text_fixture, Decoder, DARK, FIXTURE, LIGHT};
 use super::{Chroma, VideoCodec};
 use crate::native::actions::{execute_command, DaemonState};
-
-/// How far Chrome's painter may put a saturated colour's channel. Measured
-/// in Chrome for Testing 149 (headless, software raster): it computes blue
-/// at limited range with a coefficient of 2.0 where BT.709 has 2.112, so
-/// blue lands up to 0.112 × 112 = 12.5 codes off on the most saturated
-/// colours, while red, green, white, black and every grey match the exact
-/// inverse. Signalled full range paints within one code in the same
-/// painter (media-producer/colour/experiment-full-range).
-const CHROME_SATURATED: u8 = 13;
 
 /// Decodes one key unit as the viewer configures its decoder and draws the
 /// frame 1:1 on an opaque 2D canvas. Answers the frame's colour space, its
@@ -161,7 +152,7 @@ async fn e2e_colour_in_chrome_is_what_the_stream_signals() {
             assert!(answer.get("error").is_none(), "{case}: {answer}");
             assert_eq!(
                 answer["colorSpace"],
-                json!({"primaries":"bt709","transfer":"bt709","matrix":"bt709","fullRange":false}),
+                json!({"primaries":"bt709","transfer":"bt709","matrix":"bt709","fullRange":true}),
                 "{case}: Chrome reads the signalled colour"
             );
 
@@ -191,16 +182,8 @@ async fn e2e_colour_in_chrome_is_what_the_stream_signals() {
 
             let painted = bytes(&answer, "pixels");
             assert_eq!(painted.len(), width * height * 4, "{case}");
-            let measured = check_painted(
-                &case,
-                scheme,
-                codec.chroma(),
-                &source,
-                &painted,
-                CHROME_SATURATED,
-            );
-            // Chrome's painter against the exact inverse of the same samples,
-            // which passes the checks with limited range's own rounding.
+            let measured = check_painted(&case, scheme, codec.chroma(), &source, &painted);
+            // Chrome's painter against the exact inverse of the same samples.
             let exact = reference.rgb();
             let inverse = check_painted(
                 &format!("{case}, exact inverse"),
@@ -208,7 +191,6 @@ async fn e2e_colour_in_chrome_is_what_the_stream_signals() {
                 codec.chroma(),
                 &source,
                 &exact,
-                1,
             );
             let (mut differing, mut largest) = (0usize, [0u8; 3]);
             for (chrome, exact) in painted.chunks_exact(4).zip(exact.chunks_exact(4)) {
