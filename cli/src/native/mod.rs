@@ -3,7 +3,8 @@ pub mod a11y;
 #[allow(dead_code)]
 pub mod actions;
 pub(crate) mod activity;
-#[allow(dead_code)] // The qualified viewer transport consumes this private source/subscription seam.
+#[allow(dead_code)]
+// The qualified viewer transport consumes this private source/subscription seam.
 pub(crate) mod audio;
 #[allow(dead_code)]
 pub mod auth;
