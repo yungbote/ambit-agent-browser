@@ -94,3 +94,55 @@ fn measured_opus_priming_places_an_impulse_on_its_source_sample() {
         "decoded impulse aligns after removing the reported priming"
     );
 }
+
+#[cfg(all(target_os = "linux", feature = "browser-audio"))]
+#[test]
+fn opus_fixture_preserves_two_impulses_with_one_priming_trim() {
+    use base64::Engine;
+    let mut encoder = encoder::Encoder::new(AudioCodec::Opus).unwrap();
+    let mut decoder = opus::Decoder::new(SAMPLE_RATE, opus::Channels::Stereo).unwrap();
+    let mut original = vec![0i16; FRAME_SAMPLES * 2 * 6];
+    for frame in [0, 1000] {
+        original[frame * 2] = 20_000;
+        original[frame * 2 + 1] = 20_000;
+    }
+    let mut reference = Vec::new();
+    let mut packets = Vec::new();
+    let mut priming = 0;
+    let mut format = None;
+    for (index, samples) in original.chunks_exact(FRAME_SAMPLES * 2).enumerate() {
+        let packet = encoder
+            .encode(samples, 1_000_000 + index as u64 * 10_000)
+            .unwrap();
+        priming = packet.format.priming_samples as usize;
+        format = Some(packet.format.clone());
+        let mut output = [0i16; FRAME_SAMPLES * 2];
+        assert_eq!(
+            decoder.decode(&packet.data, &mut output, false).unwrap(),
+            FRAME_SAMPLES
+        );
+        reference.extend(output);
+        packets.push(serde_json::json!({"seq":packet.seq,"ts":packet.ts,"data":base64::engine::general_purpose::STANDARD.encode(&packet.data)}));
+    }
+    let aligned = &reference[priming * 2..];
+    for impulse in [0usize, 1000] {
+        let start = impulse.saturating_sub(10);
+        let peak = (start..impulse + 20)
+            .max_by_key(|frame| aligned[frame * 2].unsigned_abs())
+            .unwrap();
+        assert_eq!(peak, impulse, "one trim preserves both source positions");
+    }
+    if let Some(directory) = std::env::var_os("AUDIO_IMPULSE_DIR") {
+        let directory = std::path::Path::new(&directory);
+        std::fs::create_dir_all(directory).unwrap();
+        let fixture = serde_json::json!({"schema":"ambit.opus-impulse/v1","opusVersion":opus::version(),
+            "format":format.unwrap().as_ref(),"sourceFirstTs":1_000_000,"impulseSourceFrames":[0,1000],
+            "packets":packets,"originalPcmS16":original,"nativeDecodedPcmS16":reference,
+            "description":"Synthetic impulses encoded and decoded by the real pinned native codec. Packet ts names input PCM; discard priming once, then use cumulative output samples."});
+        std::fs::write(
+            directory.join("fixture.json"),
+            serde_json::to_vec_pretty(&fixture).unwrap(),
+        )
+        .unwrap();
+    }
+}

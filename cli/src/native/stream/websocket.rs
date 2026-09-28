@@ -1,11 +1,11 @@
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::stream::SplitStream;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, watch, Mutex, Notify, RwLock};
@@ -13,12 +13,14 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
+use crate::native::audio::{AudioCodec, AudioError, AudioSource};
 use crate::native::browser_control::{custody_active, BrowserControl};
 use crate::native::cdp::client::CdpClient;
 use crate::native::display::DisplayClient;
 #[cfg(test)]
 use crate::native::input::keyboard_params;
 
+use super::audio::{AudioTrack, Demand as AudioDemand};
 use super::http::handle_http_request;
 use super::presentation::{Presentation, PresentationConfig};
 use super::{is_allowed_origin, timestamp_ms, IdleActivity, StreamFrame, StreamMedia};
@@ -56,6 +58,8 @@ struct ClientConfig {
     /// `visible` window (`visible=crop`), so the framebuffer may be a size
     /// class larger than the window.
     crops_visible: bool,
+    audio: Option<AudioCodec>,
+    audio_demand: AudioDemand,
 }
 
 impl Default for ClientConfig {
@@ -69,6 +73,8 @@ impl Default for ClientConfig {
             frame_window: 1,
             draws_pointer: false,
             crops_visible: false,
+            audio: None,
+            audio_demand: AudioDemand::default(),
         }
     }
 }
@@ -273,6 +279,13 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
             "cursor" => cfg.draws_pointer = value == "viewer",
             "visible" => cfg.crops_visible = value == "crop",
             "frames" => cfg.binary = value == "binary",
+            "audio" => {
+                cfg.audio = match value {
+                    "opus" => Some(AudioCodec::Opus),
+                    "pcm-s16le" => Some(AudioCodec::PcmS16le),
+                    _ => None,
+                }
+            }
             "frameWindow" => {
                 if let Some(window) = value
                     .parse::<usize>()
@@ -284,6 +297,9 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
             }
             _ => {}
         }
+    }
+    if !cfg.binary {
+        cfg.audio = None;
     }
     let viewer = request
         .lines()
@@ -350,6 +366,7 @@ pub(super) async fn accept_loop(
     media: Arc<StreamMedia>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<DisplayClient>>>>,
+    audio_source: watch::Receiver<Option<AudioSource>>,
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
     browser_control: Arc<Mutex<BrowserControl>>,
@@ -389,6 +406,7 @@ pub(super) async fn accept_loop(
                 let media = media.clone();
                 let client_slot = client_slot.clone();
                 let display_slot = display_slot.clone();
+                let audio_source = audio_source.clone();
                 let client_notify = client_notify.clone();
                 let idle_activity = idle_activity.clone();
                 let browser_control = browser_control.clone();
@@ -414,6 +432,7 @@ pub(super) async fn accept_loop(
                         media,
                         client_slot,
                         display_slot,
+                        audio_source,
                         client_notify,
                         idle_activity,
                         browser_control,
@@ -467,6 +486,7 @@ async fn handle_connection(
     media: Arc<StreamMedia>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<DisplayClient>>>>,
+    audio_source: watch::Receiver<Option<AudioSource>>,
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
     browser_control: Arc<Mutex<BrowserControl>>,
@@ -502,6 +522,7 @@ async fn handle_connection(
             media,
             client_slot,
             display_slot,
+            audio_source,
             client_notify,
             idle_activity,
             browser_control,
@@ -576,6 +597,7 @@ async fn handle_ws_client(
     media: Arc<StreamMedia>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<DisplayClient>>>>,
+    mut audio_source: watch::Receiver<Option<AudioSource>>,
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
     browser_control: Arc<Mutex<BrowserControl>>,
@@ -638,6 +660,7 @@ async fn handle_ws_client(
     let (config_tx, mut config_rx) = watch::channel::<ClientConfig>(initial_config);
     let (ack_tx, mut ack_rx) = watch::channel::<u64>(0);
     let (input_error_tx, mut input_error_rx) = watch::channel::<Option<Value>>(None);
+    let mut audio = AudioTrack::new(initial_config.audio);
     // Spawned before the status, tabs and seed writes below: those are
     // unbounded sends, and a full receive queue would otherwise hold input
     // behind the whole handshake.
@@ -652,6 +675,7 @@ async fn handle_ws_client(
         input_error_tx,
         presentation.clone(),
         connection_id,
+        audio.offered.clone(),
     )));
 
     if let Some(config) = initial_config.presentation {
@@ -678,6 +702,20 @@ async fn handle_ws_client(
     };
     for message in state.messages().await {
         let _ = ws_tx.send(Message::Text(message)).await;
+    }
+    let source = audio_source.borrow_and_update().clone();
+    let offered = audio.bind(source);
+    if !send_audio_metadata(&mut ws_tx, &audio, offered).await {
+        drop(reader_task);
+        retire_viewer(
+            &client_count,
+            &patch_clients,
+            &media,
+            initial_config,
+            &client_notify,
+        )
+        .await;
+        return;
     }
 
     // Invariant: only a successful send writes `last_sent`. `None` means
@@ -737,6 +775,8 @@ async fn handle_ws_client(
 
     loop {
         tokio::select! {
+            // Apply source/demand changes before queued audio, and audio before an unsent image.
+            biased;
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
                     // Shutdown is an explicit lifecycle event. An unlabelled
@@ -748,6 +788,43 @@ async fn handle_ws_client(
             }
             _ = &mut reader_task.0 => {
                 break;
+            }
+            changed = config_rx.changed() => {
+                if changed.is_err() { break; }
+                let cfg = *config_rx.borrow_and_update();
+                let messages = audio.synchronize(cfg.audio_demand);
+                if !send_audio_metadata(&mut ws_tx, &audio, messages).await { break; }
+                next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, cfg.max_fps, controlled));
+                if !cfg.ack_pacing { in_flight.clear(); byte_blocked = false; }
+            }
+            changed = audio_source.changed(), if initial_config.audio.is_some() => {
+                if changed.is_err() { break; }
+                let source = audio_source.borrow_and_update().clone();
+                let messages = audio.bind(source);
+                if !send_audio_metadata(&mut ws_tx, &audio, messages).await { break; }
+            }
+            packet = audio.next() => {
+                let packet = match packet {
+                    Ok(packet) => packet,
+                    Err(reason) => {
+                        let messages = audio.interrupted(reason);
+                        if !send_audio_metadata(&mut ws_tx, &audio, messages).await { break; }
+                        continue;
+                    }
+                };
+                if !audio.accepts(config_rx.borrow().audio_demand) || audio_source.has_changed().unwrap_or(true) { continue; }
+                let Some((configuration, message)) = audio.packet(packet) else {
+                    let messages = audio.interrupted(AudioError::Unavailable);
+                    if !send_audio_metadata(&mut ws_tx, &audio, messages).await { break; }
+                    continue;
+                };
+                if let Some(configuration) = configuration {
+                    if !send_audio_metadata(&mut ws_tx, &audio, vec![configuration]).await { break; }
+                }
+                // A queued packet cannot outlive a mute, source replacement or overrun while
+                // its configuration write was pending. An already-written TCP unit is in flight.
+                if !audio.accepts(config_rx.borrow().audio_demand) || audio_source.has_changed().unwrap_or(true) { continue; }
+                if ws_tx.send(message).await.is_err() { break; }
             }
             msg = broadcast_rx.recv() => {
                 match msg {
@@ -789,23 +866,6 @@ async fn handle_ws_client(
                 presentation_rx.borrow_and_update();
                 next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, config_rx.borrow().max_fps, controlled));
                 if ws_tx.send(Message::Text(presentation.acknowledgment(connection_id, config).to_string())).await.is_err() { break; }
-            }
-            changed = config_rx.changed() => {
-                // The sender lives as long as the reader, so an error here
-                // means the reader ended. Break and let cleanup run.
-                if changed.is_err() {
-                    break;
-                }
-                let cfg = *config_rx.borrow_and_update();
-                // Loosening the cap pulls the deadline into the past, so a
-                // pending frame goes out at once.
-                next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, cfg.max_fps, controlled));
-                // Leaving ack pacing releases a frame that is still waiting on
-                // an acknowledgement the client will now never send.
-                if !cfg.ack_pacing {
-                    in_flight.clear();
-                    byte_blocked = false;
-                }
             }
             changed = custody_rx.changed() => {
                 if changed.is_err() { break; }
@@ -901,6 +961,24 @@ async fn retire_viewer(
     client_notify.notify_one();
 }
 
+async fn send_audio_metadata(
+    writer: &mut SplitSink<WebSocketStream<TcpStream>, Message>,
+    audio: &AudioTrack,
+    messages: Vec<Value>,
+) -> bool {
+    for message in messages {
+        audio.offering(&message);
+        if writer
+            .send(Message::Text(message.to_string()))
+            .await
+            .is_err()
+        {
+            return false;
+        }
+    }
+    true
+}
+
 /// Reads client messages and dispatches them without waiting on frame
 /// delivery. Input reaches CDP sequentially: mouse move, press and release
 /// must not be reordered.
@@ -916,6 +994,7 @@ async fn reader_loop(
     input_errors: watch::Sender<Option<Value>>,
     presentation: Arc<Presentation>,
     connection_id: uuid::Uuid,
+    audio_offered: Arc<AtomicBool>,
 ) {
     while let Some(msg) = ws_rx.next().await {
         match msg {
@@ -925,6 +1004,24 @@ async fn reader_loop(
                     Err(_) => continue,
                 };
                 let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if msg_type == "audio" {
+                    let (Some(enabled), Some(generation)) =
+                        (parsed["enabled"].as_bool(), parsed["generation"].as_u64())
+                    else {
+                        continue;
+                    };
+                    if config.borrow().audio.is_none()
+                        || (enabled && !audio_offered.load(Ordering::Acquire))
+                    {
+                        continue;
+                    }
+                    if config
+                        .send_if_modified(|current| current.audio_demand.set(enabled, generation))
+                    {
+                        idle_activity.mark();
+                    }
+                    continue;
+                }
                 if msg_type == "presentation" {
                     let current = *config.borrow();
                     if let Some(next) = updated_presentation(current, &parsed) {
@@ -1010,6 +1107,28 @@ fn is_user_input_message_type(msg_type: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_negotiation_is_fixed_to_a_supported_binary_codec() {
+        for (query, codec) in [
+            ("frames=binary&audio=opus", Some(AudioCodec::Opus)),
+            ("audio=pcm-s16le&frames=binary", Some(AudioCodec::PcmS16le)),
+            ("audio=opus", None),
+            ("frames=binary&audio=unknown", None),
+            ("frames=binary", None),
+        ] {
+            let config = config_from_upgrade(&format!("GET /?{query} HTTP/1.1\r\n"));
+            assert_eq!(config.audio, codec, "{query}");
+            assert_eq!(config.audio_demand, AudioDemand::default());
+            let changed = apply_config(
+                config,
+                &json!({"maxFps":30,"audio":"pcm-s16le","enabled":true}),
+            )
+            .unwrap();
+            assert_eq!(changed.audio, codec);
+            assert_eq!(changed.audio_demand, AudioDemand::default());
+        }
+    }
 
     #[test]
     fn dashboard_input_messages_count_as_user_activity() {

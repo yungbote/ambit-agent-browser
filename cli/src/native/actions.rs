@@ -1222,6 +1222,7 @@ impl DaemonState {
         if let Some(ref server) = self.stream_server {
             let connected = self.browser.is_some() || display.is_some();
             server.set_display(display).await;
+            server.set_audio(self.window_audio());
             // Update the CDP page session ID so screencast commands target the right page
             let session_id = self
                 .browser

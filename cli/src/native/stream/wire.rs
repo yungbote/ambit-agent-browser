@@ -1,11 +1,46 @@
-//! Negotiated binary image transport. The existing JSON envelope remains the
-//! metadata owner; only JPEG bytes leave its base64 representation on the wire.
+//! Negotiated binary media on the existing viewer connection. Image and audio
+//! retain their own envelopes, limits, epochs and sequence/acknowledgement owners.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 
 const MAX_FRAME_BYTES: usize = 12 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+pub(super) const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+
+/// Audio is one 10 ms unit; it never consumes a JPEG sequence or frame-window slot.
+pub(super) fn binary_audio(packet: &crate::native::audio::AudioPacket) -> Option<Vec<u8>> {
+    use crate::native::audio::{AudioCodec, CHANNELS, FRAME_BYTES, FRAME_SAMPLES, SAMPLE_RATE};
+    let format = &packet.format;
+    if packet.seq == 0
+        || packet.seq > MAX_SAFE_INTEGER
+        || packet.ts > MAX_SAFE_INTEGER
+        || format.sample_rate != SAMPLE_RATE
+        || format.channels != CHANNELS
+        || format.frame_samples != FRAME_SAMPLES
+        || format.priming_samples > SAMPLE_RATE
+        || uuid::Uuid::parse_str(&format.stream_id).is_err()
+        || packet.data.is_empty()
+        || packet.data.len() > 4096
+        || (format.codec == AudioCodec::PcmS16le
+            && (packet.data.len() != FRAME_BYTES || format.priming_samples != 0))
+    {
+        return None;
+    }
+    let header = serde_json::to_vec(&json!({
+        "type":"media", "track":"audio", "codec":format.codec, "streamId":format.stream_id,
+        "seq":packet.seq, "ts":packet.ts, "samples":FRAME_SAMPLES, "byteLength":packet.data.len()
+    }))
+    .ok()?;
+    if header.len() > 1024 {
+        return None;
+    }
+    let mut message = Vec::with_capacity(4 + header.len() + packet.data.len());
+    message.extend_from_slice(&(header.len() as u32).to_be_bytes());
+    message.extend_from_slice(&header);
+    message.extend_from_slice(&packet.data);
+    Some(message)
+}
 
 fn take_image(value: &mut Value) -> Option<Vec<u8>> {
     let object = value.as_object_mut()?;
@@ -66,6 +101,78 @@ pub(super) fn binary_frame(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::audio::{AudioCodec, AudioFormat, AudioPacket};
+    use std::sync::Arc;
+
+    fn packet(codec: AudioCodec, size: usize) -> AudioPacket {
+        AudioPacket {
+            format: Arc::new(AudioFormat {
+                stream_id: uuid::Uuid::new_v4().to_string(),
+                codec,
+                sample_rate: 48_000,
+                channels: 2,
+                frame_samples: 480,
+                priming_samples: if codec == AudioCodec::Opus { 120 } else { 0 },
+            }),
+            seq: 1,
+            ts: 10_000,
+            data: vec![17; size],
+        }
+    }
+    #[test]
+    fn audio_envelope_keeps_its_track_epoch_and_exact_bounded_payload() {
+        for (codec, size) in [(AudioCodec::Opus, 4096), (AudioCodec::PcmS16le, 1920)] {
+            let source = packet(codec, size);
+            let frame = binary_audio(&source).unwrap();
+            let (metadata, payload) = decode(&frame);
+            assert_eq!(payload, source.data);
+            assert_eq!(
+                metadata,
+                json!({"type":"media","track":"audio","codec":codec,
+                "streamId":source.format.stream_id,"seq":1,"ts":10_000,"samples":480,"byteLength":size})
+            );
+            assert!(frame.len() <= 4 + 1024 + 4096);
+        }
+    }
+    #[test]
+    fn invalid_audio_cannot_enter_the_image_or_audio_wire() {
+        let mut bad = vec![
+            packet(AudioCodec::Opus, 0),
+            packet(AudioCodec::Opus, 4097),
+            packet(AudioCodec::PcmS16le, 1919),
+            packet(AudioCodec::PcmS16le, 1921),
+        ];
+        let mut value = packet(AudioCodec::Opus, 80);
+        value.seq = 0;
+        bad.push(value);
+        let mut value = packet(AudioCodec::Opus, 80);
+        value.ts = MAX_SAFE_INTEGER + 1;
+        bad.push(value);
+        let mut value = packet(AudioCodec::Opus, 80);
+        value.seq = MAX_SAFE_INTEGER + 1;
+        bad.push(value);
+        let mut value = packet(AudioCodec::Opus, 80);
+        Arc::make_mut(&mut value.format).stream_id = "not-an-epoch".into();
+        bad.push(value);
+        let mut value = packet(AudioCodec::Opus, 80);
+        Arc::make_mut(&mut value.format).sample_rate = 44_100;
+        bad.push(value);
+        let mut value = packet(AudioCodec::Opus, 80);
+        Arc::make_mut(&mut value.format).channels = 1;
+        bad.push(value);
+        let mut value = packet(AudioCodec::Opus, 80);
+        Arc::make_mut(&mut value.format).frame_samples = 960;
+        bad.push(value);
+        let mut value = packet(AudioCodec::PcmS16le, 1920);
+        Arc::make_mut(&mut value.format).priming_samples = 1;
+        bad.push(value);
+        for value in bad {
+            assert!(binary_audio(&value).is_none(), "{value:?}");
+        }
+        assert!(
+            binary_frame(r#"{"type":"media","track":"audio","seq":1,"data":"AQID"}"#).is_none()
+        );
+    }
 
     fn decode(frame: &[u8]) -> (Value, &[u8]) {
         let end = 4 + u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;

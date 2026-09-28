@@ -1,3 +1,6 @@
+mod audio;
+#[cfg(all(test, target_os = "linux", feature = "browser-audio"))]
+pub(crate) mod audio_e2e;
 mod cdp_loop;
 pub(crate) mod chat;
 mod cursor_identity;
@@ -363,6 +366,7 @@ pub struct StreamServer {
     display_slot: Arc<RwLock<Option<Arc<super::display::DisplayClient>>>>,
     /// Rings when `display_slot` holds another display.
     display_changed: watch::Sender<()>,
+    audio_source: watch::Sender<Option<super::audio::AudioSource>>,
     /// The connected viewers' declarations, cursor identity and applied input.
     pub(crate) media: Arc<StreamMedia>,
     /// The active CDP page session ID (from Target.attachToTarget).
@@ -544,6 +548,7 @@ impl StreamServer {
         let recording = Arc::new(Mutex::new(false));
         let display_slot = Arc::new(RwLock::new(None));
         let (display_changed, _) = watch::channel(());
+        let (audio_source, audio_accept) = watch::channel(None);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let display_slot_accept = display_slot.clone();
         let (custody_bg, custody_layout, media) = {
@@ -598,6 +603,7 @@ impl StreamServer {
                 media_accept,
                 client_slot_clone,
                 display_slot_accept,
+                audio_accept,
                 notify_clone,
                 idle_activity_clone,
                 browser_control_clone,
@@ -671,6 +677,7 @@ impl StreamServer {
                 client_slot: client_slot.clone(),
                 display_slot,
                 display_changed,
+                audio_source,
                 media,
                 cdp_session_id,
                 client_notify,
@@ -692,6 +699,21 @@ impl StreamServer {
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    pub(crate) fn set_audio(&self, source: Option<super::audio::AudioSource>) {
+        self.audio_source.send_if_modified(|current| {
+            let same = match (&*current, &source) {
+                (None, None) => true,
+                (Some(old), Some(new)) => old.same_source(new),
+                _ => false,
+            };
+            if same {
+                return false;
+            }
+            *current = source;
+            true
+        });
     }
 
     pub(crate) async fn set_display(&self, display: Option<Arc<super::display::DisplayClient>>) {

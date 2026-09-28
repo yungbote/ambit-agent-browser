@@ -133,6 +133,15 @@ impl AudioSubscription {
     pub(crate) async fn recv(&mut self) -> Result<AudioPacket, AudioError> {
         self.queue.recv().await
     }
+    /// A packet held by a socket writer is invalid after mute, retirement or overrun.
+    pub(crate) fn is_live(&self) -> bool {
+        self.queue
+            .state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .ended
+            .is_none()
+    }
 }
 impl Drop for AudioSubscription {
     fn drop(&mut self) {
@@ -151,6 +160,15 @@ pub(crate) struct AudioSource {
     shared: Arc<server::Shared>,
 }
 impl AudioSource {
+    pub(crate) fn same_source(&self, other: &Self) -> bool {
+        #[cfg(all(target_os = "linux", feature = "browser-audio"))]
+        return Arc::ptr_eq(&self.shared, &other.shared);
+        #[cfg(not(all(target_os = "linux", feature = "browser-audio")))]
+        {
+            let _ = other;
+            false
+        }
+    }
     pub(crate) const fn compiled() -> bool {
         cfg!(all(target_os = "linux", feature = "browser-audio"))
     }
