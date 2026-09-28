@@ -235,8 +235,8 @@ struct Page {
 }
 
 /// The page's vertical scroller as Chrome drives it: each wheel notch moves
-/// its target 120 CSS px, and each read finds it at most 40 px nearer the
-/// target, the way smooth scrolling animates frame by frame.
+/// its target 120 CSS px, and each read finds it nearer the target, by 40 px
+/// or a third of the way, the way smooth scrolling animates frame by frame.
 #[cfg(target_os = "linux")]
 struct Scroller {
     at: f64,
@@ -246,7 +246,12 @@ struct Scroller {
     wheel: bool,
     /// What the wheel-point probe answers.
     point: Value,
+    /// The centre of the element brought into view, in page CSS pixels.
+    element: f64,
 }
+
+#[cfg(target_os = "linux")]
+const VIEW_HEIGHT: f64 = 640.0;
 
 #[cfg(target_os = "linux")]
 impl Scroller {
@@ -256,9 +261,24 @@ impl Scroller {
         }
     }
 
-    fn read(&mut self) -> Value {
-        self.at += (self.target - self.at).clamp(-40.0, 40.0);
-        json!([0.0, self.at, 0.0, self.most])
+    fn read(&mut self, with_element: bool) -> Value {
+        let gap = self.target - self.at;
+        self.at += gap.signum() * (gap.abs() / 3.0).max(40.0).min(gap.abs());
+        let mut read = vec![json!(0.0), json!(self.at), json!(0.0), json!(self.most)];
+        if with_element {
+            let shown = self.element - self.at;
+            read.extend([
+                json!(0.0),
+                json!(shown - VIEW_HEIGHT / 2.0),
+                json!(false),
+                json!(!(0.0..VIEW_HEIGHT).contains(&shown)),
+            ]);
+        }
+        json!(read)
+    }
+
+    fn hides_element(&self) -> bool {
+        !(0.0..VIEW_HEIGHT).contains(&(self.element - self.at))
     }
 }
 
@@ -327,8 +347,19 @@ fn answer(page: &mut Page, command: &Value) -> Value {
                 .as_str()
                 .unwrap_or_default();
             let scroller = &mut page.scroller;
-            if function == super::scroll::OFFSETS {
-                json!({"result":{"value":scroller.read()}})
+            if function == super::scroll::READ {
+                let with_element = command["params"]["arguments"][0]["objectId"].is_string();
+                json!({"result":{"value":scroller.read(with_element)}})
+            } else if function == super::scroll::HIDER {
+                if scroller.hides_element() {
+                    json!({"result":{"type":"object","objectId":"scroller"}})
+                } else {
+                    json!({"result":{"type":"object","subtype":"null","value":null}})
+                }
+            } else if function.contains("scrollIntoView") {
+                scroller.at = (scroller.element - VIEW_HEIGHT / 2.0).clamp(0.0, scroller.most);
+                scroller.target = scroller.at;
+                json!({"result":{}})
             } else if function == super::scroll::WHEEL_POINT {
                 json!({"result":{"value":scroller.point}})
             } else if function.contains("scrollBy") {
@@ -362,6 +393,7 @@ impl Fake {
                 most: 5000.0,
                 wheel: true,
                 point: json!([640.0, 320.0, 640.0]),
+                element: 300.0,
             },
         }));
         let (pointer_to, mut pointer) = mpsc::unbounded_channel::<(f64, f64)>();
@@ -1097,6 +1129,123 @@ async fn a_takeover_stops_a_scroll_within_a_frame_part_of_the_way() {
     assert!(wheels(&fake.helper_inputs()).len() < 25);
     assert!(!fake.helper_ops().contains(&"reset".to_string()));
     assert!(!control.needs_observation());
+}
+
+/// An element below the view is brought to its middle by the wheel, one
+/// notch per frame, closed on where the element is: no script jump.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_element_below_is_wheeled_to_the_middle_of_the_view() {
+    let fake = Fake::new().await;
+    let mut control = fake.control();
+    fake.place_pointer(shown(640.0, 320.0)).await;
+    fake.page.lock().unwrap().scroller.element = 4000.0;
+    assert!(!control
+        .agent_native_scroll_into_view(&fake.client, "page", ("element", "page"))
+        .await
+        .unwrap());
+    let at = fake.page.lock().unwrap().scroller.at;
+    // 3680 px to the middle is 30.7 notches: 31, one per event.
+    assert!((at - 3680.0).abs() <= 60.0, "at {at}");
+    let inputs = fake.helper_inputs();
+    let wheels = wheels(&inputs);
+    assert_eq!(wheels.len(), 31);
+    assert!(wheels.iter().all(|(_, event)| event["deltaY"] == 100.0));
+    assert_eq!(fake.page_commands("scrollBy"), 0);
+    assert_eq!(fake.page_commands("scrollIntoView"), 0);
+}
+
+/// Far down, the wheel speeds up by turning more notches per event, never
+/// by sending events faster, and the whole scroll stays within its budget.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_long_way_down_turns_more_notches_per_event_within_the_budget() {
+    let fake = Fake::new().await;
+    let mut control = fake.control();
+    fake.place_pointer(shown(640.0, 320.0)).await;
+    {
+        let mut page = fake.page.lock().unwrap();
+        page.scroller.most = 80_000.0;
+        page.scroller.element = 30_000.0;
+    }
+    let started = Instant::now();
+    control
+        .agent_native_scroll_into_view(&fake.client, "page", ("element", "page"))
+        .await
+        .unwrap();
+    let spent = started.elapsed();
+    let inputs = fake.helper_inputs();
+    let wheels = wheels(&inputs);
+    let notches: f64 = wheels
+        .iter()
+        .map(|(_, event)| event["deltaY"].as_f64().unwrap() / 100.0)
+        .sum();
+    assert!(
+        spent <= motion::WHEEL_BUDGET + Duration::from_millis(250),
+        "{spent:?}"
+    );
+    assert!(wheels[0].1["deltaY"] == 100.0, "a single notch first");
+    assert!(wheels
+        .iter()
+        .any(|(_, event)| event["deltaY"].as_f64().unwrap() > 100.0));
+    assert!(wheels
+        .iter()
+        .all(|(_, event)| event["deltaY"].as_f64().unwrap() <= 1000.0));
+    for pair in wheels.windows(2) {
+        let gap = pair[1].0 - pair[0].0;
+        assert!(gap >= motion::FRAME - Duration::from_millis(2), "{gap:?}");
+    }
+    let at = fake.page.lock().unwrap().scroller.at;
+    assert!((at - 29_680.0).abs() <= 60.0, "at {at}");
+    assert!(notches >= 240.0, "{notches} notches");
+}
+
+/// A distance even ten notches an event cannot carry within the budget is
+/// finished by script, as `scrolling`, after the wheel has done its part.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn what_the_wheel_budget_cannot_reach_is_finished_by_script() {
+    let fake = Fake::new().await;
+    let mut control = fake.control();
+    let mut activity = fake.client.subscribe();
+    fake.place_pointer(shown(640.0, 320.0)).await;
+    {
+        let mut page = fake.page.lock().unwrap();
+        page.scroller.most = 400_000.0;
+        page.scroller.element = 300_000.0;
+    }
+    let started = Instant::now();
+    control
+        .agent_native_scroll_into_view(&fake.client, "page", ("element", "page"))
+        .await
+        .unwrap();
+    let spent = started.elapsed();
+    assert!(
+        spent <= motion::WHEEL_BUDGET + Duration::from_millis(300),
+        "{spent:?}"
+    );
+    assert!(!wheels(&fake.helper_inputs()).is_empty());
+    assert_eq!(fake.page_commands("scrollBy"), 1);
+    let at = fake.page.lock().unwrap().scroller.at;
+    assert!((at - 299_680.0).abs() <= 1.0, "at {at}");
+    assert!(agent_activity(&mut activity)
+        .iter()
+        .any(|event| event["kind"] == "scrolling"));
+}
+
+/// An element that already shows needs no scrolling: nothing is sent.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_element_that_shows_is_left_where_it_is() {
+    let fake = Fake::new().await;
+    let mut control = fake.control();
+    fake.place_pointer(shown(640.0, 320.0)).await;
+    control
+        .agent_native_scroll_into_view(&fake.client, "page", ("element", "page"))
+        .await
+        .unwrap();
+    assert!(fake.helper_inputs().is_empty());
+    assert_eq!(fake.page.lock().unwrap().scroller.at, 0.0);
 }
 
 #[cfg(target_os = "linux")]

@@ -13921,12 +13921,12 @@ async fn e2e_reused_launch_reconciles_theme_without_replacing_the_page() {
 #[ignore]
 async fn e2e_native_motion_proof() {
     use crate::native::browser_control::{motion, InterruptReason};
-    use std::time::{Duration, Instant};
+    use std::time::Instant;
     let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
     env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
     env.set("DISPLAY", "");
     let mut state = DaemonState::new();
-    let html = r#"<!doctype html><style>body{margin:0;height:6000px;font:16px sans-serif}#field{position:absolute;left:80px;top:80px;width:420px;font-size:20px}#go{position:absolute;left:880px;top:420px;width:120px;height:40px}#src{position:absolute;left:120px;top:300px;width:60px;height:60px;background:#48f}#dst{position:absolute;left:620px;top:300px;width:90px;height:90px;background:#4a4}#box{position:absolute;left:560px;top:110px;width:300px;height:160px;overflow:auto}#box div{height:2000px}</style><input id=field><button id=go>Go</button><div id=src></div><div id=dst></div><div id=box><div></div></div><script>window.log=[];for(const type of ['pointermove','pointerdown','pointerup','click','keydown','scroll','wheel'])addEventListener(type,e=>log.push({type,t:performance.now(),trusted:e.isTrusted,buttons:e.buttons||0,x:e.clientX||0,y:e.clientY||0,key:e.key||'',scrollY}),{capture:true,passive:true});src.onpointerdown=e=>src.setPointerCapture(e.pointerId)</script>"#;
+    let html = r#"<!doctype html><style>body{margin:0;height:20000px;font:16px sans-serif}#field{position:absolute;left:80px;top:80px;width:420px;font-size:20px}#go{position:absolute;left:880px;top:420px;width:120px;height:40px}#src{position:absolute;left:120px;top:300px;width:60px;height:60px;background:#48f}#dst{position:absolute;left:620px;top:300px;width:90px;height:90px;background:#4a4}#box{position:absolute;left:560px;top:110px;width:300px;height:160px;overflow:auto}#box div{height:2000px}#far{position:absolute;left:600px;top:15000px;width:160px;height:48px}</style><input id=field><button id=go>Go</button><div id=src></div><div id=dst></div><div id=box><div></div></div><button id=far>Far</button><script>window.log=[];for(const type of ['pointermove','pointerdown','pointerup','click','keydown','scroll','wheel'])addEventListener(type,e=>log.push({type,t:performance.now(),trusted:e.isTrusted,buttons:e.buttons||0,x:e.clientX||0,y:e.clientY||0,key:e.key||'',scrollY,id:(e.target&&e.target.id)||''}),{capture:true,passive:true});src.onpointerdown=e=>src.setPointerCapture(e.pointerId)</script>"#;
     assert_success(
         &control_test_command(
             &json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}),
@@ -13957,6 +13957,9 @@ async fn e2e_native_motion_proof() {
     fn gaps(times: &[f64]) -> Vec<f64> {
         times.windows(2).map(|pair| pair[1] - pair[0]).collect()
     }
+    // Events go at most one a frame. Their `ts` is stamped at the helper's
+    // acknowledgement, which jitters by a few ms, so "one a frame" reads as
+    // never two within half a frame.
     fn agent(
         activity: &mut tokio::sync::broadcast::Receiver<crate::native::cdp::types::CdpEvent>,
     ) -> Vec<Value> {
@@ -14201,7 +14204,7 @@ async fn e2e_native_motion_proof() {
     assert!(
         gaps(&notches)
             .iter()
-            .all(|gap| *gap >= motion::FRAME.as_secs_f64() * 1000.0 - 2.0),
+            .all(|gap| *gap >= motion::FRAME.as_secs_f64() * 1000.0 / 2.0),
         "one notch per frame: {:?}",
         gaps(&notches)
     );
@@ -14256,7 +14259,7 @@ async fn e2e_native_motion_proof() {
     assert!(
         wheel_gaps
             .iter()
-            .all(|gap| *gap >= motion::FRAME.as_secs_f64() * 1000.0 - 2.0),
+            .all(|gap| *gap >= motion::FRAME.as_secs_f64() * 1000.0 / 2.0),
         "{wheel_gaps:?}"
     );
     assert_eq!(page_wheels.len(), 3);
@@ -14326,9 +14329,21 @@ async fn e2e_native_motion_proof() {
     let typing = {
         let long = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567";
         let fill = json!({"action":"fill","selector":"#field","value":long});
+        let mut watch = client.subscribe();
         let command = control_test_command(&fill, &mut state);
+        // A person takes control once typing is under way: the field may
+        // first be brought into view and clicked.
         let takeover = async {
-            tokio::time::sleep(Duration::from_millis(400)).await;
+            let mut typed = 0;
+            while typed < 5 {
+                if let Ok(event) = watch.recv().await {
+                    if event.method == crate::native::activity::EVENT
+                        && event.params["kind"] == "typing"
+                    {
+                        typed += 1;
+                    }
+                }
+            }
             (
                 interrupts.raise(InterruptReason::HumanControl),
                 Instant::now(),
@@ -14398,7 +14413,97 @@ async fn e2e_native_motion_proof() {
         json!({"stopped_ms": stopped, "notches": notches, "inputs_after_takeover": after})
     };
 
+    // A click on a button 15,000 px down: the wheel brings it into view,
+    // faster per event the further it is, and never by a script jump.
+    page_log(&mut state).await;
+    agent(&mut activity);
+    let before = control_test_command(&json!({"action":"evaluate","script":"scrollY"}), &mut state)
+        .await["data"]["result"]
+        .as_f64()
+        .unwrap();
+    let started = Instant::now();
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#far"}), &mut state).await,
+    );
+    let far_ms = ms(started);
+    let far_activity = agent(&mut activity);
+    let far_page = page_log(&mut state).await;
+    let turned: Vec<f64> = far_activity
+        .iter()
+        .filter(|event| event["eventType"] == "scroll")
+        .map(ts_ms)
+        .collect();
+    let far_by_script = far_activity
+        .iter()
+        .any(|event| event["kind"] == "scrolling");
+    let landed = control_test_command(
+        &json!({"action":"evaluate","script":"[scrollY, far.getBoundingClientRect().top, innerHeight]"}),
+        &mut state,
+    )
+    .await;
+    let (after, far_top, view) = (
+        landed["data"]["result"][0].as_f64().unwrap(),
+        landed["data"]["result"][1].as_f64().unwrap(),
+        landed["data"]["result"][2].as_f64().unwrap(),
+    );
+    assert!(far_page
+        .iter()
+        .any(|event| event["type"] == "click" && event["id"] == "far"));
+    assert!(!far_by_script, "the wheel brought it into view");
+    assert!(
+        far_top >= 0.0 && far_top + 48.0 <= view,
+        "the button shows: top {far_top} of {view}"
+    );
+    let wheel_ms = turned.last().unwrap() - turned[0];
+    assert!(wheel_ms <= 1500.0, "the wheel turned for {wheel_ms} ms");
+    assert!(
+        gaps(&turned)
+            .iter()
+            .all(|gap| *gap >= motion::FRAME.as_secs_f64() * 1000.0 / 2.0),
+        "one wheel event per frame: {:?}",
+        gaps(&turned)
+    );
+    let far_click = json!({
+        "command_ms": far_ms,
+        "scrolled_px": after - before,
+        "wheel_events": turned.len(),
+        "wheel_ms": wheel_ms,
+        "wheel_interval_ms": stats(&gaps(&turned)),
+        "page_scroll_events": far_page.iter().filter(|event| event["type"] == "scroll").count(),
+        "page_wheel_events": far_page.iter().filter(|event| event["type"] == "wheel").count(),
+        "by_script": far_by_script,
+    });
+
+    // `scrollintoview` back up to the field, by the wheel as well.
+    let started = Instant::now();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"scrollintoview","selector":"#field"}),
+            &mut state,
+        )
+        .await,
+    );
+    let back_ms = ms(started);
+    let back_activity = agent(&mut activity);
+    let back = control_test_command(
+        &json!({"action":"evaluate","script":"[scrollY, field.getBoundingClientRect().top]"}),
+        &mut state,
+    )
+    .await;
+    assert!(!back_activity
+        .iter()
+        .any(|event| event["kind"] == "scrolling"));
+    let field_top = back["data"]["result"][1].as_f64().unwrap();
+    assert!(field_top >= 0.0 && field_top < view, "field at {field_top}");
+    let into_view = json!({
+        "command_ms": back_ms,
+        "scrollY": back["data"]["result"][0],
+        "wheel_events": back_activity.iter().filter(|event| event["eventType"] == "scroll").count(),
+    });
+
     let proof = json!({
+        "far_click": far_click,
+        "scrollintoview": into_view,
         "click": click,
         "fill": fill,
         "drag": drag,

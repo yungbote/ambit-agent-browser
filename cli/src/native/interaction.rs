@@ -28,6 +28,30 @@ pub struct PendingRelease {
     pub button: String,
 }
 
+/// The point native pointer input on an element goes to, in its session:
+/// the owned window's wheel first brings it into view, as a person scrolls
+/// to what they click, so the page never jumps; then its centre is read
+/// where it is. `None` when a JavaScript dialog opened on the way.
+pub(crate) async fn native_point(
+    client: &CdpClient,
+    control: &Mutex<BrowserControl>,
+    session_id: &str,
+    (object_id, effective_session_id): (&str, &str),
+    target: &str,
+) -> Result<Option<(f64, f64)>, CommandError> {
+    if control
+        .lock()
+        .await
+        .agent_native_scroll_into_view(client, session_id, (object_id, effective_session_id))
+        .await?
+    {
+        return Ok(None);
+    }
+    Ok(Some(
+        super::element::object_center(client, effective_session_id, object_id, target).await?,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn click(
     client: &CdpClient,
@@ -39,15 +63,37 @@ pub async fn click(
     click_count: i32,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<ClickResult, CommandError> {
-    let (x, y, effective_session_id) = resolve_element_center(
-        client,
-        session_id,
-        ref_map,
-        selector_or_ref,
-        iframe_sessions,
-    )
-    .await?;
-    if control.lock().await.has_native_display() && click_count > 1 {
+    let native = control.lock().await.has_native_display();
+    let (x, y, effective_session_id) = if native {
+        let (object_id, effective_session_id) = resolve_element_object_id(
+            client,
+            session_id,
+            ref_map,
+            selector_or_ref,
+            iframe_sessions,
+        )
+        .await?;
+        let target = (object_id.as_str(), effective_session_id.as_str());
+        let Some((x, y)) =
+            native_point(client, control, session_id, target, selector_or_ref).await?
+        else {
+            return Ok(ClickResult {
+                dialog_opened: true,
+                pending_release: None,
+            });
+        };
+        (x, y, effective_session_id)
+    } else {
+        resolve_element_center(
+            client,
+            session_id,
+            ref_map,
+            selector_or_ref,
+            iframe_sessions,
+        )
+        .await?
+    };
+    if native && click_count > 1 {
         for _ in 0..click_count {
             let result = dispatch_click(
                 client,
@@ -111,15 +157,21 @@ pub async fn hover(
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<(), CommandError> {
-    let (x, y, effective_session_id) = resolve_element_center(
-        client,
-        session_id,
-        ref_map,
-        selector_or_ref,
-        iframe_sessions,
-    )
-    .await?;
     if control.lock().await.has_native_display() {
+        let (object_id, effective_session_id) = resolve_element_object_id(
+            client,
+            session_id,
+            ref_map,
+            selector_or_ref,
+            iframe_sessions,
+        )
+        .await?;
+        let target = (object_id.as_str(), effective_session_id.as_str());
+        let Some((x, y)) =
+            native_point(client, control, session_id, target, selector_or_ref).await?
+        else {
+            return Ok(());
+        };
         control
             .lock()
             .await
@@ -132,6 +184,14 @@ pub async fn hover(
             .await?;
         return Ok(());
     }
+    let (x, y, effective_session_id) = resolve_element_center(
+        client,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        iframe_sessions,
+    )
+    .await?;
     client
         .send_command_typed::<_, Value>(
             "Input.dispatchMouseEvent",
@@ -326,13 +386,14 @@ async fn click_field(
         iframe_sessions,
     )
     .await?;
-    let (x, y) = super::element::resolve_object_center(
-        client,
-        &effective_session_id,
-        &object_id,
-        selector_or_ref,
-    )
-    .await?;
+    let target = (object_id.as_str(), effective_session_id.as_str());
+    let Some((x, y)) = native_point(client, control, session_id, target, selector_or_ref).await?
+    else {
+        return Ok(Clicked::Dialog(ClickResult {
+            dialog_opened: true,
+            pending_release: None,
+        }));
+    };
     let click = dispatch_click(
         client,
         control,
@@ -798,6 +859,35 @@ pub async fn scroll(
     Ok(())
 }
 
+/// Brings `object_id` (an element in `session_id`) to the middle of the view
+/// by script, published on the tab's page (`page_session`) as `scrolling`:
+/// what the owned window's wheel could not reveal.
+pub(crate) async fn reveal(
+    client: &CdpClient,
+    page_session: &str,
+    session_id: &str,
+    object_id: &str,
+) -> Result<(), String> {
+    let observation = client.observe_activity(
+        serde_json::json!({ "type": "activity", "kind": "scrolling" }),
+        page_session,
+        client.page_generation(page_session),
+        super::activity::InputSource::Agent,
+    );
+    client
+        .send_command(
+            "Runtime.callFunctionOn",
+            Some(serde_json::json!({
+                "objectId": object_id, "returnByValue": true,
+                "functionDeclaration": "function() { this.scrollIntoView({ block: 'center', inline: 'center' }); }",
+            })),
+            Some(session_id),
+        )
+        .await?;
+    observation.acknowledged();
+    Ok(())
+}
+
 /// Scrolls `object_id` (a scroller in `session_id`) by script, published on
 /// the tab's page (`page_session`) as `scrolling`.
 pub(crate) async fn scroll_by(
@@ -1054,24 +1144,39 @@ async fn set_checked(
         let target_id = target["result"]["objectId"].as_str().ok_or(
             "The checkbox activation target changed. Inspect the current page before retrying.",
         )?;
-        let (x, y) = super::element::resolve_object_center(
-            client,
-            &effective_session_id,
-            target_id,
-            selector_or_ref,
-        )
-        .await?;
-        dispatch_click(
-            client,
-            control,
-            &effective_session_id,
-            &[effective_session_id.as_str(), session_id],
-            x,
-            y,
-            "left",
-            1,
-        )
-        .await?
+        let point = if method == "native" {
+            let target = (target_id, effective_session_id.as_str());
+            native_point(client, control, session_id, target, selector_or_ref).await?
+        } else {
+            Some(
+                super::element::resolve_object_center(
+                    client,
+                    &effective_session_id,
+                    target_id,
+                    selector_or_ref,
+                )
+                .await?,
+            )
+        };
+        match point {
+            Some((x, y)) => {
+                dispatch_click(
+                    client,
+                    control,
+                    &effective_session_id,
+                    &[effective_session_id.as_str(), session_id],
+                    x,
+                    y,
+                    "left",
+                    1,
+                )
+                .await?
+            }
+            None => ClickResult {
+                dialog_opened: true,
+                pending_release: None,
+            },
+        }
     };
     if !input.dialog_opened
         && super::element::is_element_checked(

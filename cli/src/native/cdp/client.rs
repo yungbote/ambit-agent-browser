@@ -876,6 +876,12 @@ impl CdpClient {
         page_generation(&self.page_generations, session)
     }
 
+    /// The target a session is attached to: for an out-of-process frame,
+    /// its frame id.
+    pub(crate) fn target_for_session(&self, session: &str) -> Option<String> {
+        self.target_sessions.lock().unwrap().get(session).cloned()
+    }
+
     pub(super) fn session_for_target(&self, target: &str) -> Option<String> {
         self.target_sessions
             .lock()

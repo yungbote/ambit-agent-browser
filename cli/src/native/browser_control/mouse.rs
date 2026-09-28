@@ -322,14 +322,17 @@ fn opens_dialog(event: &CdpEvent, sessions: &[&str]) -> bool {
             .is_none_or(|id| sessions.contains(&id))
 }
 
-/// The clock paced input runs on: one helper event per presenter frame, on
-/// absolute deadlines from a clock started one frame before the first event,
-/// so the first goes at once and a late one never delays the rest. Between
-/// events it stops for a pending interruption and for a JavaScript dialog
-/// opening for the page.
+/// The clock paced input runs on: one helper event per presenter frame.
+/// A glide samples on absolute deadlines from a clock started one frame
+/// before its first sample (`until`), so the first goes at once and a late
+/// one never delays the rest; counted events (wheel notches) go once a frame
+/// (`tick`). Between events it stops for a pending interruption and for a
+/// JavaScript dialog opening for the page.
 struct Pacing<'a> {
     clock: Instant,
-    ticks: u32,
+    /// When the next counted event is due: none yet, so the first goes at
+    /// once.
+    next_tick: Option<Instant>,
     raised: tokio::sync::watch::Receiver<u64>,
     events: tokio::sync::broadcast::Receiver<CdpEvent>,
     interrupts: &'a Interrupts,
@@ -345,7 +348,7 @@ impl<'a> Pacing<'a> {
         let now = Instant::now();
         Self {
             clock: now.checked_sub(motion::FRAME).unwrap_or(now),
-            ticks: 0,
+            next_tick: None,
             raised: interrupts.subscribe(),
             events: client.subscribe(),
             interrupts,
@@ -388,14 +391,20 @@ impl<'a> Pacing<'a> {
         }
     }
 
-    /// Waits for the next frame of the clock that has not passed: the first
-    /// at once, then one per frame. A late tick (after a pause, or a slow
-    /// read) skips the frames it missed rather than bunching the events that
-    /// follow it.
+    /// Waits for the next counted event's frame: the first at once, then one
+    /// frame after the one before. A late event goes at once and the next is
+    /// a whole frame after it, so events never bunch and never come faster
+    /// than one a frame. A raised interruption wakes it early.
     async fn tick(&mut self) {
-        let passed = self.elapsed().as_nanos() / motion::FRAME.as_nanos();
-        self.ticks = (self.ticks + 1).max(u32::try_from(passed).unwrap_or(u32::MAX));
-        self.until(motion::FRAME * self.ticks).await;
+        let now = Instant::now();
+        let due = self.next_tick.unwrap_or(now);
+        if due > now {
+            tokio::select! {
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(due)) => {}
+                _ = self.raised.changed() => {}
+            }
+        }
+        self.next_tick = Some(due.max(now) + motion::FRAME);
     }
 
     /// A page read, unless a dialog opens for the page first (`None`): the

@@ -3354,7 +3354,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         "focus" => handle_focus(cmd, state).await,
         "clear" => handle_clear(cmd, state).await,
         "selectall" => handle_selectall(cmd, state).await,
-        "scrollintoview" => handle_scrollintoview(cmd, state).await,
+        "scrollintoview" => stating(handle_scrollintoview(cmd, state).await, &mut failure_data),
         "dispatch" => handle_dispatch(cmd, state).await,
         "highlight" => handle_highlight(cmd, state).await,
         "tap" => stating(handle_tap(cmd, state).await, &mut failure_data),
@@ -8471,7 +8471,10 @@ async fn handle_selectall(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     Ok(json!({ "selected": selector }))
 }
 
-async fn handle_scrollintoview(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_scrollintoview(
+    cmd: &Value,
+    state: &mut DaemonState,
+) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
@@ -8479,6 +8482,23 @@ async fn handle_scrollintoview(cmd: &Value, state: &mut DaemonState) -> Result<V
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
+    if state.browser_control.lock().await.has_native_display() {
+        let (object, element_session) = super::element::resolve_element_object_id(
+            &mgr.client,
+            &session_id,
+            &state.ref_map,
+            selector,
+            &state.iframe_sessions,
+        )
+        .await?;
+        state
+            .browser_control
+            .lock()
+            .await
+            .agent_native_scroll_into_view(&mgr.client, &session_id, (&object, &element_session))
+            .await?;
+        return Ok(json!({ "scrolled": selector }));
+    }
     interaction::scroll_into_view(
         &mgr.client,
         &session_id,
@@ -11004,24 +11024,38 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Comm
         .and_then(|v| v.as_str())
         .ok_or("Missing 'target' parameter")?;
 
-    let (sx, sy, source_session_id) = super::element::resolve_element_center(
-        &mgr.client,
-        &session_id,
-        &state.ref_map,
-        source,
-        &state.iframe_sessions,
-    )
-    .await?;
-    let (tx, ty, target_session_id) = super::element::resolve_element_center(
-        &mgr.client,
-        &session_id,
-        &state.ref_map,
-        target,
-        &state.iframe_sessions,
-    )
-    .await?;
-
     if state.browser_control.lock().await.has_native_display() {
+        // The wheel brings the source into view, as a person scrolls to what
+        // they drag; the target is read where it is, so a drop point the
+        // view does not show is refused rather than jumped to.
+        let (source_object, source_session_id) = super::element::resolve_element_object_id(
+            &mgr.client,
+            &session_id,
+            &state.ref_map,
+            source,
+            &state.iframe_sessions,
+        )
+        .await?;
+        let picked = (source_object.as_str(), source_session_id.as_str());
+        let control = &state.browser_control;
+        let Some((sx, sy)) =
+            interaction::native_point(&mgr.client, control, &session_id, picked, source).await?
+        else {
+            return Ok(
+                json!({"dragged":false,"dialogOpened":true,"source":source,"target":target}),
+            );
+        };
+        let (target_object, target_session_id) = super::element::resolve_element_object_id(
+            &mgr.client,
+            &session_id,
+            &state.ref_map,
+            target,
+            &state.iframe_sessions,
+        )
+        .await?;
+        let (tx, ty) =
+            super::element::object_center(&mgr.client, &target_session_id, &target_object, target)
+                .await?;
         let dialog_opened = state
             .browser_control
             .lock()
@@ -11045,6 +11079,23 @@ async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, Comm
             json!({"dragged":!dialog_opened,"dialogOpened":dialog_opened,"source":source,"target":target}),
         );
     }
+
+    let (sx, sy, source_session_id) = super::element::resolve_element_center(
+        &mgr.client,
+        &session_id,
+        &state.ref_map,
+        source,
+        &state.iframe_sessions,
+    )
+    .await?;
+    let (tx, ty, target_session_id) = super::element::resolve_element_center(
+        &mgr.client,
+        &session_id,
+        &state.ref_map,
+        target,
+        &state.iframe_sessions,
+    )
+    .await?;
 
     // Mouse down at source
     mgr.client

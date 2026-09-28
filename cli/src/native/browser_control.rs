@@ -770,6 +770,34 @@ impl BrowserControl {
             )
             .await;
         self.observe_native_result(&result);
+        result.map(|_| ())
+    }
+
+    /// Brings `element` (an object id and its session) into view through the
+    /// owned display, as a person does: the wheel turns each scroller hiding
+    /// its centre, and the page never jumps (`mouse_scroll.rs`). Native
+    /// pointer commands call it before they read their target. Returns true
+    /// when a JavaScript dialog opened.
+    pub(crate) async fn agent_native_scroll_into_view(
+        &mut self,
+        client: &CdpClient,
+        page_session: &str,
+        (element, session): (&str, &str),
+    ) -> Result<bool, CommandError> {
+        if let Some(error) = self.agent_error() {
+            return Err(format!("{}: {}", error.code, error.message).into());
+        }
+        let result = self
+            .native_mouse
+            .scroll_into_view(
+                client,
+                self.display.as_ref().ok_or("No owned browser display")?,
+                (page_session, session),
+                element,
+                &self.interrupts,
+            )
+            .await;
+        self.observe_native_result(&result);
         result
     }
 
