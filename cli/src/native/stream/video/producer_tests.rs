@@ -206,8 +206,16 @@ async fn key_units_come_on_subscription_request_and_coded_size_only() {
     assert!(unit(&first).await.key);
     for band in 0..3 {
         rig.paint(band * 10, band * 10 + 5, RED);
-        let unit = unit(&first).await;
-        assert!(!unit.key && unit.quality == Quality::Motion);
+        // A refinement of the previous picture may come first; it is never a
+        // key unit either.
+        let unit = loop {
+            let unit = unit(&first).await;
+            assert!(!unit.key, "only a request or a new size makes a key unit");
+            if unit.quality == Quality::Motion {
+                break unit;
+            }
+        };
+        assert!(!unit.key);
     }
     let second = rig.subscribe();
     let joined = loop {

@@ -677,7 +677,7 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
             coded: buffer.coded,
         });
         match quality {
-            Quality::Motion => refinement.moved(Instant::now()),
+            Quality::Motion => refinement.moved(capture.read),
             Quality::Final => refinement.refined(),
         }
         encoding.publish(Arc::new(Unit {

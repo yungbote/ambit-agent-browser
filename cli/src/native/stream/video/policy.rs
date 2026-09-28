@@ -112,35 +112,38 @@ impl Quality {
     }
 }
 
-/// After the last motion picture, how long the screen must stay still
-/// before it is refined: long enough that a scroll or a drag at 60 pictures
-/// a second keeps its pictures cheap, short enough that the refinement
-/// (about 62 ms for a whole screen of dense text on the node) ends within
-/// 150 ms of the last damage.
+/// How long the screen must stay still after the last picture of motion was
+/// read before that picture is refined: longer than a frame at 60 pictures a
+/// second, so a scroll or a drag keeps its pictures cheap, and short enough
+/// that the refinement of a whole screen of dense text (about 95 ms on the
+/// node, media-producer/refinement-speed.md) ends within 150 ms of the last
+/// damage.
 pub(super) const STILL_AFTER: Duration = Duration::from_millis(30);
 
 /// Whether a stream's current picture still owes its refinement, and since
-/// when. A stream starts refined: nothing is owed before the first motion
-/// picture.
+/// when the screen has been still. A stream starts refined: nothing is owed
+/// before the first picture of motion.
 #[derive(Debug, Default)]
 pub(super) struct Refinement {
-    moved_at: Option<Instant>,
+    still_since: Option<Instant>,
 }
 
 impl Refinement {
-    /// A picture of new damage was encoded at motion quality.
-    pub(super) fn moved(&mut self, now: Instant) {
-        self.moved_at = Some(now);
+    /// A picture of new damage, read from the screen at `read`, was encoded
+    /// at motion quality: the screen has been still since it was read, not
+    /// since its encode ended.
+    pub(super) fn moved(&mut self, read: Instant) {
+        self.still_since = Some(read);
     }
 
     /// When the current picture is due for its refinement, if it owes one.
     pub(super) fn due(&self) -> Option<Instant> {
-        self.moved_at.map(|moved| moved + STILL_AFTER)
+        self.still_since.map(|still| still + STILL_AFTER)
     }
 
     /// The refinement was encoded.
     pub(super) fn refined(&mut self) {
-        self.moved_at = None;
+        self.still_since = None;
     }
 }
 
