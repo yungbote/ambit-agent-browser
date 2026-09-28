@@ -559,6 +559,7 @@ pub struct BrowserManager {
 mod tabs;
 #[path = "browser_window.rs"]
 mod window;
+pub(crate) use tabs::url_origin;
 pub(crate) use window::ACTIVE_PAGE_AMBIGUOUS;
 
 /// Code of the refusal, before it acts, of a command addressed to the active

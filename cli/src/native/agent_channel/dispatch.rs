@@ -12,6 +12,7 @@ use std::time::Instant;
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
+use super::observe;
 use super::step::PreparedStep;
 use super::target::{self, Recorders};
 use super::{Asks, Browser, Finish, FrameContext, StepRecord, StepTiming};
@@ -144,19 +145,30 @@ impl Browser for DaemonBrowser {
 
     async fn finish(&self, frame: &FrameContext<'_>, asks: &Asks<'_>) -> Finish {
         let asked = Instant::now();
-        let state = self.state.lock().await;
+        let mut state = self.state.lock().await;
         let held = Instant::now();
         let request = Self::request(frame, feedback::MAX_CALL_MS);
         let controlled = state.browser_control.lock().await.agent_error();
-        let unavailable = |code: &str| json!({ "status": "unavailable", "code": code });
         let (browser, observation, resolved) = if let Some(error) = controlled {
-            // While a person holds the browser, nothing is read from it.
+            // While a person holds the browser, nothing is read from it: the
+            // capture, the observation and the resolutions say why.
+            let unavailable = json!({ "status": "unavailable", "code": error.code });
             (
                 request.unavailable(error.code),
-                asks.observe.then(|| unavailable(error.code)),
-                (!asks.resolve.is_empty()).then(|| unavailable(error.code)),
+                asks.observe.then(|| unavailable.clone()),
+                (!asks.resolve.is_empty()).then(|| unavailable.clone()),
             )
         } else {
+            let observation = if asks.observe {
+                Some(observe::observation(&mut state, &self.recorders).await)
+            } else {
+                None
+            };
+            let resolved = if asks.resolve.is_empty() {
+                None
+            } else {
+                Some(observe::resolutions(&mut state, &self.recorders, asks.resolve).await)
+            };
             let browser = if asks.capture {
                 match super::reply::private_directory(&request.capture_directory) {
                     Ok(_) => feedback::capture_for(&request, &state).await,
@@ -170,12 +182,7 @@ impl Browser for DaemonBrowser {
                     Err(code) => request.unavailable(code),
                 }
             };
-            (
-                browser,
-                asks.observe
-                    .then(|| unavailable("browser_observation_unavailable")),
-                (!asks.resolve.is_empty()).then(|| unavailable("browser_observation_unavailable")),
-            )
+            (browser, observation, resolved)
         };
         drop(state);
         Finish {

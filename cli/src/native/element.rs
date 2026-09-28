@@ -113,6 +113,56 @@ impl RefMap {
         self.map.remove(ref_id);
     }
 
+    /// The ref already naming `backend_node_id` of frame `frame_id` (`None`
+    /// for the page's own document) in `document`, the document the page
+    /// shows now.
+    pub fn ref_for(
+        &self,
+        backend_node_id: i64,
+        frame_id: Option<&str>,
+        document: Option<&str>,
+    ) -> Option<String> {
+        self.map
+            .iter()
+            .find(|(_, entry)| {
+                entry.backend_node_id == Some(backend_node_id)
+                    && entry.frame_id.as_deref() == frame_id
+                    && entry.document.as_deref() == document
+            })
+            .map(|(ref_id, _)| ref_id.clone())
+    }
+
+    /// Names a node an observation or a resolution found: its existing ref,
+    /// or the next number, bound to `document`. No other ref is renumbered
+    /// or dropped: refs end only where a snapshot, a navigation or a change
+    /// of page ends them.
+    pub fn observed(
+        &mut self,
+        backend_node_id: i64,
+        frame_id: Option<&str>,
+        (role, name): (&str, &str),
+        document: Option<&str>,
+    ) -> String {
+        if let Some(existing) = self.ref_for(backend_node_id, frame_id, document) {
+            return existing;
+        }
+        let ref_id = format!("e{}", self.next_ref);
+        self.next_ref += 1;
+        self.map.insert(
+            ref_id.clone(),
+            RefEntry {
+                backend_node_id: Some(backend_node_id),
+                role: role.to_string(),
+                name: name.to_string(),
+                nth: None,
+                selector: None,
+                frame_id: frame_id.map(str::to_string),
+                document: document.map(str::to_string),
+            },
+        );
+        ref_id
+    }
+
     /// Binds the refs a snapshot just listed to the document it read.
     pub fn bind_document(&mut self, document: &str) {
         for entry in self.map.values_mut() {
@@ -1513,6 +1563,40 @@ mod tests {
 
         assert!(map.get("e1").is_none());
         assert_eq!(map.next_ref_num(), 1);
+    }
+
+    /// An observation or a resolution keeps every ref and only adds: a node
+    /// a snapshot already named keeps its ref, a new node gets the next
+    /// number, and nothing is renumbered, as a snapshot renumbers.
+    #[test]
+    fn an_observed_node_keeps_its_ref_and_a_new_one_gets_the_next() {
+        let mut map = RefMap::new();
+        map.add("e1".to_string(), Some(530), "button", "Compare plans", None);
+        map.add("e2".to_string(), Some(531), "link", "Pricing", None);
+        map.set_next_ref_num(3);
+        map.bind_document("L1");
+        let named = |map: &mut RefMap, node: i64, document: &str| {
+            map.observed(node, None, ("button", "x"), Some(document))
+        };
+        assert_eq!(named(&mut map, 530, "L1"), "e1");
+        assert_eq!(named(&mut map, 741, "L1"), "e3");
+        assert_eq!(named(&mut map, 741, "L1"), "e3");
+        assert_eq!(named(&mut map, 742, "L1"), "e4");
+        // The old refs are untouched.
+        assert_eq!(map.get("e1").unwrap().backend_node_id, Some(530));
+        assert_eq!(map.get("e2").unwrap().backend_node_id, Some(531));
+        assert_eq!(map.get("e3").unwrap().document.as_deref(), Some("L1"));
+        // A document the page no longer shows names none of its nodes: its
+        // refs end as `lookup_ref` ends them, and the new document's node gets
+        // a ref of its own.
+        assert_eq!(named(&mut map, 530, "L2"), "e5");
+        assert_eq!(map.get("e1").unwrap().document.as_deref(), Some("L1"));
+        // A node of a child frame is another node.
+        assert_eq!(
+            map.observed(530, Some("F"), ("button", "x"), Some("L1")),
+            "e6"
+        );
+        assert_eq!(map.get("e6").unwrap().frame_id.as_deref(), Some("F"));
     }
 
     #[test]

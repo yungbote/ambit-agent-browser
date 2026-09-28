@@ -100,6 +100,8 @@ pub(crate) const FACTS: &str = r#"((el) => {
     const box = el.getBoundingClientRect();
     facts.box = { x: box.x, y: box.y, width: box.width, height: box.height };
     facts.text = (el.textContent || '').replace(/\s+/g, ' ').trim().slice(0, 200);
+    const view = el.ownerDocument.defaultView;
+    facts.frameOrigin = view && view !== view.top ? el.ownerDocument.location.href : null;
     return facts;
 })"#;
 
@@ -148,6 +150,39 @@ pub(crate) struct NodeFacts {
     pub(crate) bounds: Bounds,
     /// Its text, whitespace collapsed, at most 200 characters.
     pub(crate) text: String,
+    /// The URL of its document when that is a child frame's.
+    #[serde(default)]
+    pub(crate) frame_origin: Option<String>,
+}
+
+impl NodeFacts {
+    /// The candidate's `effect`: the facts the host judges its own ceiling
+    /// by, with the origin reduced as the tab roster reduces URLs.
+    pub(crate) fn effect(&self) -> Option<Value> {
+        let mut effect = serde_json::Map::new();
+        if let Some(origin) = self.origin.as_deref() {
+            let reduced = crate::native::browser::url_origin(origin);
+            if !reduced.is_empty() {
+                effect.insert("origin".into(), json!(reduced));
+            }
+        }
+        if let Some(method) = self.target.method {
+            effect.insert("method".into(), json!(method));
+        }
+        if let Some(input_type) = &self.target.input_type {
+            effect.insert("inputType".into(), json!(input_type));
+        }
+        if let Some(autocomplete) = &self.autocomplete {
+            effect.insert("autocomplete".into(), json!(autocomplete));
+        }
+        if self.controls {
+            effect.insert("controls".into(), json!(true));
+        }
+        if self.download {
+            effect.insert("download".into(), json!(true));
+        }
+        (!effect.is_empty()).then_some(Value::Object(effect))
+    }
 }
 
 /// An element the channel holds in its isolated world.
@@ -219,23 +254,26 @@ impl Recorders {
     }
 }
 
-/// Resolves `backend_node_id` into the channel's world of `session`.
+/// Resolves `backend_node_id` into the channel's world of `session`. A node
+/// of a child frame that world cannot hold is read in its own frame's page
+/// world instead.
 pub(crate) async fn node(
     client: &CdpClient,
     session: &str,
     context: i64,
     backend_node_id: i64,
 ) -> Result<Node, String> {
-    let resolved = client
-        .send_command(
-            "DOM.resolveNode",
-            Some(
-                json!({ "backendNodeId": backend_node_id, "executionContextId": context,
-                "objectGroup": WORLD }),
-            ),
-            Some(session),
-        )
-        .await?;
+    let resolve = |context: Option<i64>| {
+        let mut params = json!({ "backendNodeId": backend_node_id, "objectGroup": WORLD });
+        if let Some(context) = context {
+            params["executionContextId"] = json!(context);
+        }
+        client.send_command("DOM.resolveNode", Some(params), Some(session))
+    };
+    let resolved = match resolve(Some(context)).await {
+        Ok(resolved) => resolved,
+        Err(_) => resolve(None).await?,
+    };
     let object = resolved["object"]["objectId"]
         .as_str()
         .ok_or("The node is gone")?;
@@ -492,6 +530,14 @@ async fn effect_refusal(
     )
 }
 
+/// Cuts `text` to at most `limit` characters, at a character boundary.
+pub(crate) fn bounded(text: &str, limit: usize) -> String {
+    match text.char_indices().nth(limit) {
+        Some((cut, _)) => text[..cut].to_string(),
+        None => text.to_string(),
+    }
+}
+
 /// A node's accessibility role, name, value and states: the snapshot
 /// projection's fields.
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -564,14 +610,63 @@ mod tests {
 
     #[test]
     fn a_nodes_facts_read_as_the_classifier_takes_them() {
-        let submit: NodeFacts = serde_json::from_value(json!({ "kind": "submit", "method": "post",
-            "inputType": null, "multiline": false, "secret": false,
-            "origin": "https://shop.example/cart", "autocomplete": null, "controls": false,
-            "download": false, "box": { "x": 1, "y": 2, "width": 30, "height": 40 },
-            "text": "Buy" }))
-        .unwrap();
+        let submit = facts(
+            json!({ "kind": "submit", "method": "post", "inputType": null,
+            "multiline": false, "secret": false,
+            "origin": "https://user:secret@shop.example:8443/cart?token=1#pay",
+            "autocomplete": null, "controls": false, "download": false,
+            "box": { "x": 1, "y": 2, "width": 30, "height": 40 }, "text": "Buy" }),
+        );
         assert_eq!(submit.target.kind, ceiling::Kind::Submit);
         assert_eq!(submit.target.method, Some(ceiling::Method::Post));
         assert!(submit.bounds.contains((16.0, 22.0)));
+        assert_eq!(submit.frame_origin, None);
+        // The effect states the facts the host judges its own ceiling by,
+        // its origin reduced as the tab roster reduces URLs.
+        assert_eq!(
+            submit.effect(),
+            Some(json!({ "origin": "https://shop.example:8443", "method": "post" }))
+        );
+        let password = facts(
+            json!({ "kind": "field", "method": "post", "inputType": "password",
+            "multiline": false, "secret": true, "origin": null,
+            "autocomplete": "current-password", "controls": false, "download": false,
+            "box": { "x": 0, "y": 0, "width": 1, "height": 1 }, "text": "" }),
+        );
+        assert!(password.target.secret);
+        assert_eq!(
+            password.effect(),
+            Some(json!({ "method": "post", "inputType": "password",
+                "autocomplete": "current-password" }))
+        );
+        let disclosure = facts(
+            json!({ "kind": "disclosure", "method": null, "inputType": null,
+            "multiline": false, "secret": false, "origin": null, "autocomplete": null,
+            "controls": true, "download": false, "frameOrigin": "https://frame.example/x",
+            "box": { "x": 0, "y": 0, "width": 1, "height": 1 }, "text": "More" }),
+        );
+        assert_eq!(disclosure.effect(), Some(json!({ "controls": true })));
+        assert_eq!(
+            disclosure.frame_origin.as_deref(),
+            Some("https://frame.example/x")
+        );
+        let plain = facts(json!({ "kind": "other", "method": null, "inputType": null,
+            "multiline": false, "secret": false, "origin": null, "autocomplete": null,
+            "controls": false, "download": false,
+            "box": { "x": 0, "y": 0, "width": 1, "height": 1 }, "text": "" }));
+        assert_eq!(plain.effect(), None);
+    }
+
+    fn facts(value: Value) -> NodeFacts {
+        serde_json::from_value(value).unwrap()
+    }
+
+    #[test]
+    fn names_and_values_are_bounded_at_a_character_boundary() {
+        assert_eq!(bounded("abc", 200), "abc");
+        let long = "é".repeat(250);
+        let cut = bounded(&long, 200);
+        assert_eq!(cut.chars().count(), 200);
+        assert!(long.starts_with(&cut));
     }
 }

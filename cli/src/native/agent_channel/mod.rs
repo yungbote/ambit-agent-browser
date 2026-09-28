@@ -30,6 +30,7 @@ pub(crate) mod ceiling;
 pub(crate) mod dispatch;
 pub(crate) mod frame;
 pub(crate) mod ledger;
+pub(crate) mod observe;
 pub(crate) mod reply;
 pub(crate) mod step;
 pub(crate) mod target;

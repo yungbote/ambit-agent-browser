@@ -64,7 +64,7 @@ fn roster_text(value: &str) -> String {
 /// `https://example.com:8443` for a URL with a tuple origin; the scheme alone
 /// (`about:`, `data:`, `file:`, `chrome:`) for one without; nothing for an
 /// unparsable URL.
-fn url_origin(url: &str) -> String {
+pub(crate) fn url_origin(url: &str) -> String {
     match url::Url::parse(url) {
         Ok(parsed) => match parsed.origin() {
             origin @ url::Origin::Tuple(..) => origin.ascii_serialization(),
