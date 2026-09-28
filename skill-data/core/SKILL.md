@@ -438,7 +438,7 @@ agent-browser snapshot -i
 
 ```bash
 agent-browser focus @e1
-agent-browser keyboard inserttext "text"    # bypasses key events
+agent-browser keyboard inserttext "text"    # like a paste
 # or
 agent-browser keyboard type "text"          # raw keystrokes, no selector
 ```
