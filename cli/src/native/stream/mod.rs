@@ -12,6 +12,8 @@ pub(crate) mod presentation;
 mod track;
 mod video;
 #[cfg(all(test, target_os = "linux"))]
+mod video_e2e;
+#[cfg(all(test, target_os = "linux"))]
 mod video_viewer_tests;
 mod websocket;
 mod window_capture;

@@ -13,6 +13,7 @@
 use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void, CStr};
 use std::sync::OnceLock;
 
+use super::convert::COLOUR;
 use super::library::Library;
 use super::{Chroma, EncodeRequest, EncodedUnit, Picture, VideoCodec, VideoEncoder, VideoError};
 
@@ -32,17 +33,19 @@ const Q: c_uint = 3;
 const KF_DISABLED: c_uint = 0;
 const BITS_8: c_uint = 8;
 
-/// CICP code points the sequence header carries: BT.709 primaries, the sRGB
-/// transfer the screen was drawn in, the BT.709 matrix and full range. The
-/// pictures are converted with exactly this matrix and range (`convert`).
-const CICP_PRIMARIES_BT709: c_int = 1;
-const CICP_TRANSFER_SRGB: c_int = 13;
-const CICP_MATRIX_BT709: c_int = 1;
-const COLOR_RANGE_FULL: c_int = 1;
 const CONTENT_SCREEN: c_int = 1;
 const SUPERBLOCK_128: c_int = 1;
 /// The cost tables' update frequency "off": each superblock row reuses them.
 const COST_UPDATE_OFF: c_int = 3;
+/// Encoder speed for pictures of motion: measured on the node, 9, 10 and 11
+/// cost the same (encoder-decision.md).
+const MOTION_SPEED: c_int = 10;
+/// Encoder speed for a refinement. At speed 10 a refinement after a scroll
+/// of more than a few pictures stops near 44.5 dB RGB PSNR on dense text
+/// whatever the quantizer (a second pass adds nothing); at 8 it reaches
+/// 49.1-49.4 dB in one pass for about the same bytes and time
+/// (media-producer/refinement-speed.md).
+const REFINE_SPEED: c_int = 8;
 
 /// Encoder controls (`aomcx.h` ids) this encoder sets.
 mod control {
@@ -328,8 +331,10 @@ pub(super) struct AomEncoder {
     width: u32,
     height: u32,
     level: u8,
-    /// The quantizer the encoder holds; set only when a request differs.
+    /// The quantizer and speed the encoder holds; set only when a request
+    /// differs.
     quantizer: Option<u8>,
+    speed: c_int,
     pictures: i64,
 }
 
@@ -420,6 +425,7 @@ impl AomEncoder {
             height,
             level: level(width, height),
             quantizer: None,
+            speed: MOTION_SPEED,
             pictures: 0,
         };
         // Measured on screen content at the probe's surface (evidence:
@@ -428,7 +434,7 @@ impl AomEncoder {
         // superblocks, no CDEF and frozen cost tables cut 10-20% of the CPU
         // for 1% more bytes. Speeds 9, 10 and 11 cost the same here.
         for (id, value) in [
-            (control::CPU_USED, 10),
+            (control::CPU_USED, MOTION_SPEED),
             (control::TUNE_CONTENT, CONTENT_SCREEN),
             (control::ENABLE_PALETTE, 1),
             (control::SUPERBLOCK_SIZE, SUPERBLOCK_128),
@@ -443,10 +449,15 @@ impl AomEncoder {
             (control::DELTAQ_MODE, 0),
             (control::ENABLE_ORDER_HINT, 0),
             (control::AQ_MODE, 0),
-            (control::COLOR_PRIMARIES, CICP_PRIMARIES_BT709),
-            (control::TRANSFER_CHARACTERISTICS, CICP_TRANSFER_SRGB),
-            (control::MATRIX_COEFFICIENTS, CICP_MATRIX_BT709),
-            (control::COLOR_RANGE, COLOR_RANGE_FULL),
+            // The sequence header says what the pictures are (`COLOUR`);
+            // libaom's range is 0 for limited, 1 for full.
+            (control::COLOR_PRIMARIES, c_int::from(COLOUR.primaries)),
+            (
+                control::TRANSFER_CHARACTERISTICS,
+                c_int::from(COLOUR.transfer),
+            ),
+            (control::MATRIX_COEFFICIENTS, c_int::from(COLOUR.matrix)),
+            (control::COLOR_RANGE, c_int::from(COLOUR.full_range)),
             (control::TARGET_SEQ_LEVEL_IDX, c_int::from(encoder.level)),
         ] {
             encoder
@@ -526,6 +537,16 @@ impl VideoEncoder for AomEncoder {
                 .map_err(VideoError::Failed)?;
             self.quantizer = Some(request.quantizer);
         }
+        let speed = if request.refine {
+            REFINE_SPEED
+        } else {
+            MOTION_SPEED
+        };
+        if self.speed != speed {
+            self.control(control::CPU_USED, speed)
+                .map_err(VideoError::Failed)?;
+            self.speed = speed;
+        }
         let format = match self.codec.chroma() {
             Chroma::Subsampled => IMG_FMT_I420,
             Chroma::Full => IMG_FMT_I444,
@@ -549,10 +570,10 @@ impl VideoEncoder for AomEncoder {
             self.image.planes[index] = plane.as_ptr().cast_mut();
             self.image.strides[index] = *stride as c_int;
         }
-        self.image.primaries = CICP_PRIMARIES_BT709 as c_uint;
-        self.image.transfer = CICP_TRANSFER_SRGB as c_uint;
-        self.image.matrix = CICP_MATRIX_BT709 as c_uint;
-        self.image.range = COLOR_RANGE_FULL as c_uint;
+        self.image.primaries = c_uint::from(COLOUR.primaries);
+        self.image.transfer = c_uint::from(COLOUR.transfer);
+        self.image.matrix = c_uint::from(COLOUR.matrix);
+        self.image.range = c_uint::from(COLOUR.full_range);
         let flags = if request.key { EFLAG_FORCE_KF } else { 0 };
         let pts = self.pictures;
         self.pictures += 1;

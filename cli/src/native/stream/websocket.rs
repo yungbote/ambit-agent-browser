@@ -414,7 +414,7 @@ pub(super) async fn accept_loop(
             }
             // Reap finished connections so the set does not grow without bound.
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
-            accept_result = listener.accept() => {
+            accept_result = crate::native::socket::accept(&listener) => {
                 let Ok((stream, addr)) = accept_result else {
                     break;
                 };

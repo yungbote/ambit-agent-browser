@@ -13,6 +13,8 @@
 // The producer's half exists on Linux only.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
+#[cfg(all(test, target_os = "linux"))]
+mod cpu_bench;
 mod policy;
 #[cfg(target_os = "linux")]
 mod producer;
@@ -36,6 +38,8 @@ use crate::native::display::DisplayClient;
 use crate::native::video::{Declared, VideoCodec, VideoError};
 #[cfg(test)]
 pub(super) use policy::Quality;
+#[cfg(all(test, target_os = "linux"))]
+pub(super) use producer::measured;
 use producer::{Producer, Subscription};
 use subscription::Flow;
 pub(super) use subscription::{Delivery, Unit};

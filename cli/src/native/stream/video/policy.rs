@@ -7,8 +7,10 @@ use std::time::{Duration, Instant};
 
 /// The coded size moves in steps of this many device pixels.
 const CLASS_STEP: u32 = 256;
-/// Headroom a class keeps beyond the window, up to `PROBED`: a dock drag
-/// that grows the window by up to one step stays in its class.
+/// Headroom a class keeps beyond the window: a dock drag that grows the
+/// window by up to one step stays in its class. Within the probed size it
+/// never takes the class past it; a window past it is past what the viewer
+/// probed anyway.
 const HEADROOM: u32 = CLASS_STEP;
 /// The size every viewer probed its decoder at (contract section 6).
 const PROBED: u32 = 2048;
@@ -19,10 +21,15 @@ const SHRINK_MARGIN: u32 = 2 * CLASS_STEP;
 const SHRINK_AFTER: Duration = Duration::from_secs(10);
 
 /// The class of one window dimension: rounded up to a step, plus a step of
-/// headroom while that stays within the probed size.
+/// headroom (only up to the probed size while the window fits it).
 fn class(window: u32) -> u32 {
     let rounded = window.div_ceil(CLASS_STEP) * CLASS_STEP;
-    rounded.max((rounded + HEADROOM).min(PROBED)).min(LARGEST)
+    let roomy = if rounded <= PROBED {
+        (rounded + HEADROOM).min(PROBED)
+    } else {
+        rounded + HEADROOM
+    };
+    roomy.max(rounded).min(LARGEST)
 }
 
 /// The size a stream is encoded at. It grows at once when the window no
@@ -105,35 +112,38 @@ impl Quality {
     }
 }
 
-/// After the last motion picture, how long the screen must stay still
-/// before it is refined: long enough that a scroll or a drag at 60 pictures
-/// a second keeps its pictures cheap, short enough that the refinement
-/// (about 62 ms for a whole screen of dense text on the node) ends within
-/// 150 ms of the last damage.
+/// How long the screen must stay still after the last picture of motion was
+/// read before that picture is refined: longer than a frame at 60 pictures a
+/// second, so a scroll or a drag keeps its pictures cheap, and short enough
+/// that the refinement of a whole screen of dense text (about 95 ms on the
+/// node, media-producer/refinement-speed.md) ends within 150 ms of the last
+/// damage.
 pub(super) const STILL_AFTER: Duration = Duration::from_millis(30);
 
 /// Whether a stream's current picture still owes its refinement, and since
-/// when. A stream starts refined: nothing is owed before the first motion
-/// picture.
+/// when the screen has been still. A stream starts refined: nothing is owed
+/// before the first picture of motion.
 #[derive(Debug, Default)]
 pub(super) struct Refinement {
-    moved_at: Option<Instant>,
+    still_since: Option<Instant>,
 }
 
 impl Refinement {
-    /// A picture of new damage was encoded at motion quality.
-    pub(super) fn moved(&mut self, now: Instant) {
-        self.moved_at = Some(now);
+    /// A picture of new damage, read from the screen at `read`, was encoded
+    /// at motion quality: the screen has been still since it was read, not
+    /// since its encode ended.
+    pub(super) fn moved(&mut self, read: Instant) {
+        self.still_since = Some(read);
     }
 
     /// When the current picture is due for its refinement, if it owes one.
     pub(super) fn due(&self) -> Option<Instant> {
-        self.moved_at.map(|moved| moved + STILL_AFTER)
+        self.still_since.map(|still| still + STILL_AFTER)
     }
 
     /// The refinement was encoded.
     pub(super) fn refined(&mut self) {
-        self.moved_at = None;
+        self.still_since = None;
     }
 }
 
@@ -169,7 +179,8 @@ mod tests {
             (1840, 2048),
             (1888, 2048),
             (2048, 2048),
-            (2049, 2304),
+            (2049, 2560),
+            (3900, 4096),
             (4096, 4096),
         ] {
             assert_eq!(class(window), expected, "{window}");
@@ -216,20 +227,45 @@ mod tests {
         }
     }
 
+    /// Past the probed size too, a drag of 300 CSS px out and back from the
+    /// probe surface (1840 device px wide) grows the class once.
+    #[test]
+    fn a_drag_past_the_probed_size_grows_once() {
+        let origin = Instant::now();
+        let mut coded = CodedSize::new();
+        assert_eq!(coded.fit((1840, 1888), origin), (2048, 2048));
+        let mut sizes = vec![(2048, 2048)];
+        for pass in 0..6 {
+            for step in 0..=30 {
+                let width = if pass % 2 == 0 {
+                    1840 + step * 20
+                } else {
+                    2440 - step * 20
+                };
+                let now = origin + Duration::from_millis(pass * 600 + step * 16);
+                let size = coded.fit((width as u32, 1888), now);
+                if sizes.last() != Some(&size) {
+                    sizes.push(size);
+                }
+            }
+        }
+        assert_eq!(sizes, vec![(2048, 2048), (2560, 2048)]);
+    }
+
     #[test]
     fn a_class_shrinks_only_after_the_window_stayed_two_steps_smaller_for_ten_seconds() {
         let origin = Instant::now();
         let mut coded = CodedSize::new();
-        assert_eq!(coded.fit((3000, 1888), origin), (3072, 2048));
+        assert_eq!(coded.fit((3000, 1888), origin), (3328, 2048));
         let later = |seconds: u64| origin + Duration::from_secs(seconds);
         // One step smaller: never shrinks.
-        assert_eq!(coded.fit((2800, 1888), later(1)), (3072, 2048));
-        assert_eq!(coded.fit((2800, 1888), later(30)), (3072, 2048));
+        assert_eq!(coded.fit((2800, 1888), later(1)), (3328, 2048));
+        assert_eq!(coded.fit((2800, 1888), later(30)), (3328, 2048));
         // Two steps smaller, briefly, then back: the clock restarts.
-        assert_eq!(coded.fit((1800, 1888), later(31)), (3072, 2048));
-        assert_eq!(coded.fit((2900, 1888), later(35)), (3072, 2048));
-        assert_eq!(coded.fit((1800, 1888), later(36)), (3072, 2048));
-        assert_eq!(coded.fit((1800, 1888), later(45)), (3072, 2048));
+        assert_eq!(coded.fit((1800, 1888), later(31)), (3328, 2048));
+        assert_eq!(coded.fit((2900, 1888), later(35)), (3328, 2048));
+        assert_eq!(coded.fit((1800, 1888), later(36)), (3328, 2048));
+        assert_eq!(coded.fit((1800, 1888), later(45)), (3328, 2048));
         assert_eq!(coded.fit((1800, 1888), later(46)), (2048, 2048));
     }
 

@@ -14,6 +14,8 @@ mod bench;
 pub(crate) mod convert;
 #[cfg(target_os = "linux")]
 mod library;
+#[cfg(all(test, target_os = "linux"))]
+mod webcodecs_e2e;
 
 /// libaom's own decoder, for proofs that decode what the producer sent.
 #[cfg(all(test, target_os = "linux"))]
@@ -111,8 +113,8 @@ impl Chroma {
     }
 }
 
-/// One picture in planar Y′CbCr (BT.709 matrix, full range), rows tightly
-/// packed: Y, then Cb, then Cr.
+/// One picture in planar Y′CbCr (BT.709 at limited range, `convert::COLOUR`),
+/// rows tightly packed: Y, then Cb, then Cr.
 pub(crate) struct Picture<'a> {
     pub chroma: Chroma,
     pub width: u32,
@@ -141,12 +143,15 @@ impl<'a> Picture<'a> {
 }
 
 /// What one encode is asked for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EncodeRequest {
     /// A key unit: decodable without references.
     pub key: bool,
     /// The quantizer, 0 (best) to 63.
     pub quantizer: u8,
+    /// A refinement of the picture just encoded, unchanged: it happens once
+    /// per stop, so it may take more effort than a picture of motion.
+    pub refine: bool,
 }
 
 /// One temporal unit of one frame.

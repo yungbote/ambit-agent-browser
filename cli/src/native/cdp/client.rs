@@ -428,7 +428,7 @@ impl CdpClient {
                 .await
                 .map_err(|e| format!("CDP WebSocket connect failed: {}", e))?;
 
-        enable_tcp_keepalive(ws_stream.get_ref());
+        crate::native::socket::tune_dialed(ws_stream.get_ref());
 
         let (ws_tx, mut ws_rx) = ws_stream.split();
         let ws_tx = Arc::new(Mutex::new(ws_tx));
@@ -1329,26 +1329,6 @@ impl InspectProxyHandle {
 /// Enable TCP SO_KEEPALIVE on the underlying socket of a WebSocket connection.
 /// This is best-effort: failures are silently ignored since the WebSocket-level
 /// Ping keepalive provides the primary connection liveness mechanism.
-fn enable_tcp_keepalive(stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>) {
-    let tcp_stream = match stream {
-        tokio_tungstenite::MaybeTlsStream::Plain(s) => s,
-        tokio_tungstenite::MaybeTlsStream::Rustls(s) => s.get_ref().0,
-        _ => return,
-    };
-
-    // SockRef borrows the fd without taking ownership.
-    let sock = socket2::SockRef::from(tcp_stream);
-    let keepalive = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(30));
-
-    // with_interval sets TCP_KEEPINTVL — the time between probes after the
-    // first keepalive probe goes unanswered. Available on most platforms
-    // (Linux, macOS, Windows, FreeBSD, etc.) but not OpenBSD or Haiku.
-    #[cfg(not(any(target_os = "openbsd", target_os = "haiku")))]
-    let keepalive = keepalive.with_interval(std::time::Duration::from_secs(10));
-
-    let _ = sock.set_tcp_keepalive(&keepalive);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

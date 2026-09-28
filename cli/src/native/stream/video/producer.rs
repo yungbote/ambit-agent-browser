@@ -118,6 +118,9 @@ struct Job {
 #[derive(Clone)]
 struct Capture {
     ts: u64,
+    /// When the helper read the screen: the rate is kept between reads, so
+    /// the helper's own latency never lengthens the period.
+    read: Instant,
     visible: Rect,
     surface: Surface,
     input_seq: Option<u64>,
@@ -373,13 +376,15 @@ impl Encoding {
             return;
         };
         let window = (capture.visible.width, capture.visible.height);
-        let coded = mailbox.coded.fit(window, Instant::now());
-        mailbox.pictured = Some(Instant::now());
+        let coded = mailbox.coded.fit(window, capture.read);
+        mailbox.pictured = Some(capture.read);
         mailbox.behind = false;
         // Only the capture thread marks or converts, so the rows can leave
         // the mailbox while the encoder keeps using it.
         let mut stale = std::mem::take(&mut mailbox.stale[buffer.id]);
         drop(mailbox);
+        #[cfg(test)]
+        let converting = Instant::now();
         convert(
             &mut buffer,
             &mut stale,
@@ -388,6 +393,8 @@ impl Encoding {
             coded,
             self.codec.chroma(),
         );
+        #[cfg(test)]
+        measured::converted(capture.ts, converting.elapsed(), reply.timings.clone());
         let mut mailbox = lock(&self.mailbox);
         mailbox.stale[buffer.id] = stale;
         let job = Job {
@@ -509,6 +516,7 @@ fn capture_loop(inner: Weak<Inner>) {
             return;
         };
         let requested = crate::native::stream::monotonic_us();
+        let asked = Instant::now();
         let encodings = lock(&inner.state).encodings.clone();
         let answer = pictures.picture(plan.request, |reply, pixels| {
             let ts = requested + reply.wait_us();
@@ -518,6 +526,7 @@ fn capture_loop(inner: Weak<Inner>) {
             surface.cursor_included = reply.cursor_included;
             let capture = Capture {
                 ts,
+                read: asked + std::time::Duration::from_micros(reply.wait_us()),
                 visible: reply.window(),
                 surface,
                 input_seq: inner.source.media.applied_input_at(ts),
@@ -647,7 +656,10 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
         let request = EncodeRequest {
             key: asked || fresh,
             quantizer: quality.quantizer(),
+            refine: quality == Quality::Final,
         };
+        #[cfg(test)]
+        let encoding_started = Instant::now();
         let unit = match encoder.encode(&buffer.picture.picture(), request) {
             Ok(unit) => unit,
             Err(error) => {
@@ -655,8 +667,17 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
                 return;
             }
         };
+        #[cfg(test)]
+        measured::encoded(measured::Encoded {
+            ts: capture.ts,
+            key: unit.key,
+            quality: quality.label(),
+            bytes: unit.data.len(),
+            encode: encoding_started.elapsed(),
+            coded: buffer.coded,
+        });
         match quality {
-            Quality::Motion => refinement.moved(Instant::now()),
+            Quality::Motion => refinement.moved(capture.read),
             Quality::Final => refinement.refined(),
         }
         encoding.publish(Arc::new(Unit {
@@ -738,6 +759,68 @@ impl Drop for Subscription {
             self.encoding.stop();
         }
         self.producer.inner.nudge();
+    }
+}
+
+/// What the producer measured, for the proofs that run it in process: every
+/// picture's conversion and every unit's encode, newest last.
+#[cfg(test)]
+pub(crate) mod measured {
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    #[derive(Clone, Debug)]
+    pub(crate) struct Encoded {
+        pub ts: u64,
+        pub key: bool,
+        pub quality: &'static str,
+        pub bytes: usize,
+        pub encode: Duration,
+        pub coded: (u32, u32),
+    }
+
+    /// One picture converted for an encoding, with the helper's own timings
+    /// of its capture (its wait, fetch and copy).
+    #[derive(Clone, Debug)]
+    pub(crate) struct Converted {
+        pub ts: u64,
+        pub convert: Duration,
+        pub helper: Option<serde_json::Value>,
+    }
+
+    const KEPT: usize = 100_000;
+    static ENCODED: Mutex<Vec<Encoded>> = Mutex::new(Vec::new());
+    static CONVERTED: Mutex<Vec<Converted>> = Mutex::new(Vec::new());
+
+    fn keep<T>(samples: &Mutex<Vec<T>>, sample: T) {
+        let mut samples = samples.lock().unwrap_or_else(|error| error.into_inner());
+        if samples.len() < KEPT {
+            samples.push(sample);
+        }
+    }
+
+    pub(super) fn encoded(sample: Encoded) {
+        keep(&ENCODED, sample);
+    }
+
+    pub(super) fn converted(ts: u64, convert: Duration, helper: Option<serde_json::Value>) {
+        keep(
+            &CONVERTED,
+            Converted {
+                ts,
+                convert,
+                helper,
+            },
+        );
+    }
+
+    fn drain<T>(samples: &Mutex<Vec<T>>) -> Vec<T> {
+        std::mem::take(&mut *samples.lock().unwrap_or_else(|error| error.into_inner()))
+    }
+
+    /// Everything measured since the last call.
+    pub(crate) fn take() -> (Vec<Encoded>, Vec<Converted>) {
+        (drain(&ENCODED), drain(&CONVERTED))
     }
 }
 

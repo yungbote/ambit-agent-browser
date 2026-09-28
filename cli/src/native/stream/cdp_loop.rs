@@ -630,7 +630,9 @@ pub(super) async fn cdp_event_loop(
                         follow_frames(&mut window_capture, display.as_ref(), &media, &sinks);
                     }
                     _ = client_notify.notified() => {
-                        let viewers = roster.borrow_and_update().viewers();
+                        // Read, not consumed: a roster change pending beside
+                        // this wake is still followed by its own arm.
+                        let viewers = roster.borrow().viewers();
                         // A new viewer or a writer that skipped a delta
                         // needs a whole frame. This uses the existing
                         // wakeup without rotating input coordinates.
@@ -1554,6 +1556,92 @@ mod tests {
         assert_eq!(second["inputSeq"], 7);
         assert_eq!(second["visible"], window);
         assert!(second["ts"].as_u64() > first["ts"].as_u64());
+        let _ = shutdown.send(true);
+        task.await.unwrap();
+    }
+
+    /// The window's frames run only while a viewer is sent frames. A viewer
+    /// that moves to video stops them even when a wake for a whole frame
+    /// rings at the same moment, and moving back starts them again.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn frames_stop_while_every_viewer_is_served_video() {
+        use crate::native::display::DisplayClient;
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        let (display, _control, frames) = DisplayClient::test_channel();
+        display.advertise(&["captureWait"]);
+        let (frame_tx, _messages) = broadcast::channel(64);
+        let (frame_watch, _published) = watch::channel(None);
+        let client_notify = Arc::new(tokio::sync::Notify::new());
+        let (shutdown, shutdown_rx) = watch::channel(false);
+        let (_custody, custody) = watch::channel(None);
+        let media = Arc::new(super::super::StreamMedia::new(Default::default()));
+        let mut viewer = media.seat(Default::default());
+        let (client_slot, session) = (Arc::new(RwLock::new(None)), Arc::new(RwLock::new(None)));
+        let cursors = identities(&frame_tx, &media, &client_slot, &session);
+        let task = tokio::spawn(cdp_event_loop(
+            frame_tx,
+            frame_watch,
+            Arc::new(super::super::ScreencastConfig::default()),
+            client_slot,
+            Arc::new(RwLock::new(Some(display))),
+            Arc::new(super::super::presentation::Presentation::new()),
+            custody,
+            media.clone(),
+            cursors,
+            client_notify.clone(),
+            Arc::new(Mutex::new(false)),
+            session,
+            Arc::new(Mutex::new(1280)),
+            Arc::new(Mutex::new(720)),
+            Arc::new(RwLock::new(Vec::new())),
+            Arc::new(RwLock::new("chrome".to_string())),
+            Arc::new(Mutex::new(false)),
+            shutdown_rx,
+        ));
+        client_notify.notify_one();
+        let mut frames = BufReader::new(frames);
+        async fn next(
+            frames: &mut BufReader<tokio::net::UnixStream>,
+            within: std::time::Duration,
+        ) -> Option<Value> {
+            let mut line = String::new();
+            tokio::time::timeout(within, frames.read_line(&mut line))
+                .await
+                .ok()?
+                .ok()?;
+            Some(serde_json::from_str(&line).unwrap())
+        }
+        async fn unchanged(frames: &mut BufReader<tokio::net::UnixStream>, request: &Value) {
+            let reply = json!({"id": request["id"], "success": true, "data": {"changed": false}});
+            frames
+                .get_mut()
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .unwrap();
+        }
+        let long = std::time::Duration::from_secs(2);
+        let quiet = std::time::Duration::from_millis(200);
+        // The wake and the roster change land together: whichever the loop
+        // takes first, the frames stop.
+        for _ in 0..8 {
+            let in_flight = next(&mut frames, long).await.expect("frames run");
+            viewer.serve(super::super::Audience::Video);
+            client_notify.notify_one();
+            unchanged(&mut frames, &in_flight).await;
+            if let Some(last) = next(&mut frames, quiet).await {
+                unchanged(&mut frames, &last).await;
+            }
+            assert!(
+                next(&mut frames, quiet).await.is_none(),
+                "frames kept running for a viewer served video"
+            );
+            viewer.serve(super::super::Audience::Frames);
+            client_notify.notify_one();
+            let resumed = next(&mut frames, long).await.expect("frames resume");
+            assert_eq!(resumed["force"], true, "frames resume whole");
+            unchanged(&mut frames, &resumed).await;
+        }
         let _ = shutdown.send(true);
         task.await.unwrap();
     }

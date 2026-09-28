@@ -14,7 +14,7 @@
 //! pixels through libaom's own decoder and the inverse matrix.
 
 use super::aom::AomEncoder;
-use super::convert::{to_rgb, Planar};
+use super::convert::{to_rgb, Planar, COLOUR};
 use super::{open, Chroma, EncodeRequest, VideoCodec, VideoEncoder};
 use serde_json::json;
 use std::time::Instant;
@@ -84,6 +84,7 @@ fn rgb_psnr(source: &[u8], picture: &Planar) -> f64 {
         for x in 0..WIDTH {
             let (cx, cy) = if subsampled { (x / 2, y / 2) } else { (x, y) };
             let rgb = to_rgb(
+                COLOUR,
                 planes[0].0[y * WIDTH + x],
                 planes[1].0[cy * chroma_width + cx],
                 planes[2].0[cy * chroma_width + cx],
@@ -117,6 +118,7 @@ fn crop(picture: &Planar, path: &std::path::Path) {
                 (px, py)
             };
             let rgb = to_rgb(
+                COLOUR,
                 planes[0].0[py * WIDTH + px],
                 planes[1].0[cy * chroma_width + cx],
                 planes[2].0[cy * chroma_width + cx],
@@ -200,6 +202,7 @@ fn a_whole_page_change() {
                         EncodeRequest {
                             key: index == 0,
                             quantizer,
+                            ..Default::default()
                         },
                     )
                     .unwrap();
@@ -283,6 +286,7 @@ fn encoder_on_screen_content_at_the_probe_surface() {
                             EncodeRequest {
                                 key: index == 0,
                                 quantizer: motion_quantizer,
+                                ..Default::default()
                             },
                         )
                         .unwrap();
@@ -328,6 +332,7 @@ fn encoder_on_screen_content_at_the_probe_surface() {
                     EncodeRequest {
                         key: true,
                         quantizer,
+                        ..Default::default()
                     },
                 )
                 .unwrap();
@@ -339,7 +344,15 @@ fn encoder_on_screen_content_at_the_probe_surface() {
         }
         // Motion: the previous scroll position, then the still picture at the
         // motion quantizer, then refinements of the same capture.
-        for ladder in [[32u8, 20, 12], [32, 16, 8], [32, 12, 4], [40, 16, 8]] {
+        let ladders: [&[u8]; 6] = [
+            &[32, 20, 12],
+            &[32, 16, 8],
+            &[32, 12, 4],
+            &[40, 16, 8],
+            &[32, 8],
+            &[32, 8, 8],
+        ];
+        for ladder in ladders {
             let mut decoder = super::aom::tests::Decoder::new();
             let mut encoder = open(codec, WIDTH as u32, HEIGHT as u32, 4).unwrap();
             let mut before = Planar::new(chroma, WIDTH as u32, HEIGHT as u32);
@@ -355,6 +368,7 @@ fn encoder_on_screen_content_at_the_probe_surface() {
                     EncodeRequest {
                         key: true,
                         quantizer: ladder[0],
+                        ..Default::default()
                     },
                 )
                 .unwrap();
@@ -368,6 +382,7 @@ fn encoder_on_screen_content_at_the_probe_surface() {
                         EncodeRequest {
                             key: false,
                             quantizer: *quantizer,
+                            ..Default::default()
                         },
                     )
                     .unwrap();
@@ -383,13 +398,84 @@ fn encoder_on_screen_content_at_the_probe_surface() {
                         &std::path::Path::new(&directory).join(format!(
                             "{}-ladder{}-q{quantizer}.png",
                             codec.token(),
-                            ladder.map(|q| q.to_string()).join("-")
+                            ladder
+                                .iter()
+                                .map(|q| q.to_string())
+                                .collect::<Vec<_>>()
+                                .join("-")
                         )),
                     );
                 }
             }
             let entry =
                 json!({"codec": codec.token(), "kind": "refine", "ladder": ladder, "steps": steps});
+            println!("VIDEO_BENCH {entry}");
+            results.push(entry);
+        }
+    }
+    if let Some(out) = std::env::var_os("VIDEO_BENCH_OUT") {
+        std::fs::write(out, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
+    }
+}
+
+/// The refinement of one captured window (`VIDEO_BENCH_STILL`, a 1840x1888
+/// PNG of the screen) after `VIDEO_BENCH_HISTORY` pictures of motion scrolled
+/// 40 px apart (a list, default `1,30,120`), all at the motion speed; the
+/// refinements at the motion speed and at the refinement speed, one pass and
+/// a second.
+#[test]
+#[ignore = "measurement harness: needs a captured window (VIDEO_BENCH_STILL)"]
+fn a_refinement_after_a_scroll() {
+    let still = Page::load(std::path::Path::new(
+        &std::env::var_os("VIDEO_BENCH_STILL").unwrap(),
+    ));
+    let source = still.window(0);
+    let shifted = |by: usize| -> Vec<u8> {
+        let (stride, by) = (WIDTH * 4, by % HEIGHT);
+        let mut shifted = vec![255u8; source.len()];
+        shifted[..(HEIGHT - by) * stride].copy_from_slice(&source[by * stride..]);
+        shifted
+    };
+    let codec = VideoCodec::Av1Full;
+    let mut results = Vec::new();
+    for history in std::env::var("VIDEO_BENCH_HISTORY")
+        .unwrap_or_else(|_| "1,30,120".into())
+        .split(',')
+        .map(|value| value.parse::<usize>().unwrap())
+    {
+        for refine in [false, true] {
+            let mut decoder = super::aom::tests::Decoder::new();
+            let mut encoder = tuned(codec, 4);
+            let mut picture = Planar::new(codec.chroma(), WIDTH as u32, HEIGHT as u32);
+            for step in (0..=history).rev() {
+                let window = if step == 0 {
+                    source.clone()
+                } else {
+                    shifted(step * STEP)
+                };
+                assert!(picture.convert(&window, WIDTH * 4, (WIDTH, HEIGHT), (0, HEIGHT)));
+                let request = EncodeRequest {
+                    key: step == history,
+                    quantizer: 32,
+                    ..Default::default()
+                };
+                decoder.decode(&encoder.encode(&picture.picture(), request).unwrap().data);
+            }
+            let mut passes = Vec::new();
+            for _ in 0..2 {
+                let started = Instant::now();
+                let request = EncodeRequest {
+                    quantizer: 8,
+                    refine,
+                    ..Default::default()
+                };
+                let unit = encoder.encode(&picture.picture(), request).unwrap();
+                let encode_ms = started.elapsed().as_secs_f64() * 1000.0;
+                let decoded = decode(&mut decoder, &unit.data, codec.chroma());
+                passes.push(json!({"bytes": unit.data.len(), "encodeMs": encode_ms,
+                    "psnrRgb": rgb_psnr(&source, &decoded)}));
+            }
+            let entry = json!({"history": history, "refinementSpeed": refine, "passes": passes});
             println!("VIDEO_BENCH {entry}");
             results.push(entry);
         }
