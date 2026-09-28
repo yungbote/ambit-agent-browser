@@ -26,11 +26,17 @@ struct Scripted {
     ran: StdMutex<Vec<String>>,
     started: Notify,
     go: Notify,
+    /// Each channel told it ended, with how many steps had run by then.
+    ended: StdMutex<Vec<(String, usize)>>,
 }
 
 impl Scripted {
     fn ran(&self) -> Vec<String> {
         self.ran.lock().unwrap().clone()
+    }
+
+    fn ended(&self) -> Vec<(String, usize)> {
+        self.ended.lock().unwrap().clone()
     }
 }
 
@@ -88,6 +94,11 @@ impl Browser for Scripted {
             queue_us: 5,
             observe_us: 50,
         }
+    }
+
+    async fn end(&self, channel: ChannelId) {
+        let ran = self.ran.lock().unwrap().len();
+        self.ended.lock().unwrap().push((channel.to_string(), ran));
     }
 }
 
@@ -305,6 +316,14 @@ async fn a_hello_is_refused_for_another_binding_protocol_channel_or_owner() {
     )
     .await;
     assert_eq!(older.reply().await["code"], "agent_channel_fenced");
+    // A connection whose hello was refused opened no channel to end.
+    drop(older.writer);
+    drop(older.lines);
+    tokio::time::timeout(Duration::from_secs(10), older.served)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(browser.ended().is_empty(), "{:?}", browser.ended());
 }
 
 #[tokio::test]
@@ -495,6 +514,8 @@ async fn a_connection_that_ends_mid_sequence_keeps_the_prefix_and_starts_nothing
         browser.ran(),
         ["agent_browser_get_title", "agent_browser_wait_ms"]
     );
+    // The channel ended once its running step was done, and only then.
+    assert_eq!(browser.ended(), [(CHANNEL_A.to_string(), 2)]);
     // A new channel of the same owner reads what happened.
     let mut reopened = Host::open(&endpoint, &browser, hello(CHANNEL_B, json!({}))).await;
     assert_eq!(reopened.reply().await["success"], true);
@@ -663,4 +684,22 @@ async fn frames_past_the_read_ahead_bound_close_the_connection() {
     // The running frame still answers; then the connection ends.
     assert_eq!(host.reply().await["success"], true);
     assert!(host.closed().await);
+}
+
+#[tokio::test]
+async fn a_channel_that_ends_is_told_to_the_browser_after_its_last_step() {
+    let (endpoint, browser) = (endpoint(), Arc::new(Scripted::default()));
+    let (_d, path) = directory();
+    let (mut host, _) = Host::hello(&endpoint, &browser, json!({})).await;
+    host.send(sequence(2, "41", json!([title(), title()]), &path))
+        .await;
+    assert_eq!(host.reply().await["success"], true);
+    assert!(browser.ended().is_empty(), "a live channel has not ended");
+    drop(host.writer);
+    drop(host.lines);
+    tokio::time::timeout(Duration::from_secs(10), host.served)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(browser.ended(), [(CHANNEL_A.to_string(), 2)]);
 }

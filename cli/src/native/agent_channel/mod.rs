@@ -29,6 +29,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader
 pub(crate) mod ceiling;
 pub(crate) mod dispatch;
 pub(crate) mod frame;
+pub(crate) mod landed;
 pub(crate) mod ledger;
 pub(crate) mod observe;
 pub(crate) mod reply;
@@ -83,6 +84,7 @@ impl Identity {
 
 /// A frame's context for the steps it runs.
 pub(crate) struct FrameContext<'a> {
+    pub(crate) channel: ChannelId,
     pub(crate) binding: &'a Binding,
     /// The Action's private browser directory.
     pub(crate) directory: &'a Path,
@@ -159,6 +161,10 @@ pub(crate) trait Browser: Sync {
         frame: &FrameContext<'_>,
         asks: &Asks<'_>,
     ) -> impl Future<Output = Finish> + Send;
+
+    /// `channel` ended and starts nothing more: the input its steps left
+    /// held is released, unless another channel's step acted since.
+    fn end(&self, channel: ChannelId) -> impl Future<Output = ()> + Send;
 }
 
 /// The daemon's agent channels and the browser their steps reach.
@@ -336,6 +342,7 @@ impl Endpoint {
         }
         if let Some(session) = session {
             self.ledger.end(session.channel);
+            browser.end(session.channel).await;
         }
     }
 
@@ -523,6 +530,7 @@ impl Endpoint {
             return refusal(id, FENCED, FENCED_MESSAGE, true);
         }
         let context = FrameContext {
+            channel,
             binding: &session.binding,
             directory: &frame.directory,
             received_at,

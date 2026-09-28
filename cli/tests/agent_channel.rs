@@ -324,10 +324,57 @@ fn e2e_agent_channel_smoke() {
         )]),
     );
     frame["observe"] = json!(true);
-    frame["resolve"] = json!(["#password", "#q", "#toggled", "#nothing", "@e1"]);
+    frame["resolve"] = json!([
+        "#password",
+        "#q",
+        "#toggled",
+        "#nothing",
+        "@e1",
+        "#name",
+        "#go"
+    ]);
     let (reply, elapsed) = channel.call(frame);
     println!(
         "OBSERVE {elapsed:?} {}",
         serde_json::to_string_pretty(&reply).unwrap()
+    );
+    let generation = reply["browser"]["page"]["pageGeneration"].clone();
+    let node = |index: usize| reply["resolved"][index]["backendNodeId"].clone();
+    let (filled, elapsed) = channel.call(sequence(
+        4,
+        "41",
+        &host.action_directory(),
+        json!([{ "op": "agent_browser_fill", "arguments": { "selector": "#name", "text": "Ada Lovelace" },
+            "preconditions": { "pageGeneration": generation, "backendNodeId": node(5), "effects": "fill" } }]),
+    ));
+    println!(
+        "FILL {elapsed:?} {}",
+        serde_json::to_string_pretty(&filled).unwrap()
+    );
+    let fill = &filled["steps"][0];
+    assert_eq!(
+        fill["landed"]["target"]["value"], "Ada Lovelace",
+        "{filled}"
+    );
+    assert!(fill["timing"]["motionUs"].as_u64().unwrap() > 0, "{filled}");
+    let mut frame = sequence(
+        5,
+        "41",
+        &host.action_directory(),
+        json!([{ "op": "agent_browser_click", "arguments": { "selector": "#go" },
+            "preconditions": { "pageGeneration": generation, "backendNodeId": node(6), "effects": "read" } }]),
+    );
+    frame["observe"] = json!(true);
+    let (clicked, elapsed) = channel.call(frame);
+    println!(
+        "CLICK {elapsed:?} {}",
+        serde_json::to_string_pretty(&clicked).unwrap()
+    );
+    let navigation = &clicked["steps"][0]["landed"]["navigation"];
+    assert_eq!(navigation["kind"], "document", "{clicked}");
+    assert_eq!(navigation["httpStatus"], 200, "{clicked}");
+    assert!(
+        navigation["url"].as_str().unwrap().ends_with("/results?q="),
+        "{clicked}"
     );
 }

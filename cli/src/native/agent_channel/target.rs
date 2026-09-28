@@ -201,7 +201,9 @@ pub(crate) struct Recorders(Mutex<HashSet<String>>);
 
 impl Recorders {
     /// The execution context of the channel's world in `session`'s main
-    /// frame, installing the secret-field recorder the first time.
+    /// frame. The first time, the secret-field recorder is installed for
+    /// every document to come, and the landing watcher's binding for every
+    /// context of the world.
     pub(crate) async fn world(&self, client: &CdpClient, session: &str) -> Result<i64, String> {
         let first = {
             let mut recorded = self.0.lock().unwrap_or_else(|error| error.into_inner());
@@ -220,6 +222,13 @@ impl Recorders {
                 .send_command(
                     "Page.addScriptToEvaluateOnNewDocument",
                     Some(json!({ "source": RECORDER, "worldName": WORLD })),
+                    Some(session),
+                )
+                .await?;
+            client
+                .send_command(
+                    "Runtime.addBinding",
+                    Some(json!({ "name": super::landed::BINDING, "executionContextName": WORLD })),
                     Some(session),
                 )
                 .await?;
@@ -364,7 +373,7 @@ async fn find(
 }
 
 /// A refused step, as the native response the host reads.
-fn refusal(command: &Value, code: &str, error: &str, data: Value) -> Value {
+pub(crate) fn refusal(command: &Value, code: &str, error: &str, data: Value) -> Value {
     json!({ "id": command["id"], "success": false, "code": code, "error": error, "data": data })
 }
 
@@ -378,16 +387,17 @@ fn stale(command: &Value, precondition: &str, observed: Value, error: &str) -> V
 }
 
 /// Checks a step's page identity, then, for a judged step, its node, box and
-/// effect ceiling. A step that is not judged may still carry page identity.
+/// effect ceiling, and answers the node the step addresses. A step that is
+/// not judged may still carry page identity.
 pub(crate) async fn check(
     step: &PreparedStep,
     command: &Value,
     state: &DaemonState,
     recorders: &Recorders,
-) -> Result<(), Value> {
+) -> Result<Option<Node>, Value> {
     check_page(&step.preconditions, command, state).await?;
     let Some(judged) = &step.judged else {
-        return Ok(());
+        return Ok(None);
     };
     let found = find(&judged.target, state, recorders)
         .await
@@ -450,7 +460,7 @@ pub(crate) async fn check(
     if !ceiling::admits(judged.ceiling, judged.interaction, &target) {
         return Err(effect_refusal(command, judged, found.as_ref(), &target, client).await);
     }
-    Ok(())
+    Ok(found)
 }
 
 /// `pageGeneration`, then `geometrySha256`: the page the step was chosen on.

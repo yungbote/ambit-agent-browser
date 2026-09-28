@@ -771,6 +771,25 @@ impl DaemonState {
             .and_then(|dialog| dialog.session_id.clone())
     }
 
+    /// Whether a pending JavaScript dialog blocks the active page, so that
+    /// anything touching the page would wait until the dialog is resolved.
+    /// One on a background tab leaves the active tab's renderer responsive.
+    pub(crate) fn dialog_blocks_active_page(&self) -> bool {
+        let Some(dialog) = self.pending_dialog.as_ref() else {
+            return false;
+        };
+        let active = self
+            .browser
+            .as_ref()
+            .and_then(|browser| browser.active_session_id().ok());
+        match (dialog.session_id.as_deref(), active) {
+            (Some(dialog), Some(active)) => dialog == active,
+            // No session on the event is a top-level page dialog; with no
+            // browser, be safe.
+            _ => true,
+        }
+    }
+
     /// The expiry path every command and maintenance tick runs. A sign-in
     /// ends here too, so no agent command can reach a browser a person holds.
     pub(crate) async fn expire_browser_control(
@@ -3267,15 +3286,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
     // Only a dialog on the ACTIVE tab blocks: one on a background tab leaves
     // the active tab's renderer responsive.
     if let Some(ref dialog) = state.pending_dialog {
-        let active_session = state
-            .browser
-            .as_ref()
-            .and_then(|m| m.active_session_id().ok().map(|s| s.to_string()));
-        let on_active_tab = match (&dialog.session_id, &active_session) {
-            (Some(dialog_sid), Some(active_sid)) => dialog_sid == active_sid,
-            // No session on the event = top-level page dialog; no browser = be safe.
-            _ => true,
-        };
+        let on_active_tab = state.dialog_blocks_active_page();
         // Tab and session management must stay usable: switching or closing
         // tabs is exactly how an agent escapes a tab blocked by a dialog.
         let read_touches_active_tab = action == "read"
