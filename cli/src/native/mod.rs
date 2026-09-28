@@ -56,6 +56,7 @@ pub mod tab_binding;
 pub(crate) mod theme;
 #[allow(dead_code)]
 pub mod tracing;
+pub(crate) mod video;
 #[allow(dead_code)]
 pub mod webdriver;
 #[allow(dead_code)]
