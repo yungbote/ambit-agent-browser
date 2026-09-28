@@ -299,6 +299,10 @@ impl std::fmt::Display for DisplayError {
 
 impl std::error::Error for DisplayError {}
 
+#[cfg(target_os = "linux")]
+#[path = "display_pictures.rs"]
+pub(crate) mod pictures;
+
 pub(crate) fn enabled() -> bool {
     std::env::var("AGENT_BROWSER_WINDOW_STREAM").is_ok_and(|value| value == "1")
 }
@@ -316,6 +320,7 @@ pub(crate) fn window_pixels(width: u32, height: u32) -> Result<(u32, u32), Strin
 
 #[cfg(target_os = "linux")]
 mod platform {
+    use super::pictures::PictureChannel;
     use super::*;
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::os::unix::net::UnixStream;
@@ -334,6 +339,9 @@ mod platform {
         /// Captures only. Independent of the control channel so a frame in
         /// flight never delays native input.
         frames: tokio::sync::Mutex<Wire>,
+        /// The video producer's pictures, when the helper was given the
+        /// channel; used only once the helper advertises `pictures`.
+        pictures: Option<PictureChannel>,
         abort_sockets: [UnixStream; 2],
         failed: AtomicBool,
         /// Its owner ended this display on purpose: it stops producing frames
@@ -405,6 +413,7 @@ mod platform {
         fn new(
             control: UnixStream,
             frames: UnixStream,
+            pictures: Option<PictureChannel>,
             surface: Surface,
             ready: bool,
         ) -> Result<Arc<Self>, String> {
@@ -422,6 +431,7 @@ mod platform {
                 identity: uuid::Uuid::new_v4().to_string(),
                 control: tokio::sync::Mutex::new(wire(control)?),
                 frames: tokio::sync::Mutex::new(wire(frames)?),
+                pictures,
                 abort_sockets,
                 failed: AtomicBool::new(false),
                 retired: AtomicBool::new(false),
@@ -457,6 +467,7 @@ mod platform {
             let client = Self::new(
                 control.client,
                 frames.client,
+                None,
                 Surface::new(2560, 1440),
                 true,
             )
@@ -468,8 +479,35 @@ mod platform {
             (client, peer(control.helper), peer(frames.helper))
         }
 
+        /// A client whose picture channel the test serves (`FakeHelper`),
+        /// advertising `pictures`.
+        #[cfg(test)]
+        pub(crate) fn test_pictures() -> (Arc<Self>, super::pictures::fake::FakeHelper) {
+            let control = channel().unwrap();
+            let frames = channel().unwrap();
+            let handover = PictureChannel::create().unwrap();
+            let helper = super::pictures::fake::FakeHelper::from(&handover);
+            let client = Self::new(
+                control.client,
+                frames.client,
+                Some(handover.channel),
+                Surface::new(2560, 1440),
+                true,
+            )
+            .unwrap();
+            client.advertise(&["captureWait", "cursorIdentity", "pictures"]);
+            (client, helper)
+        }
+
         pub(crate) fn identity(&self) -> &str {
             &self.identity
+        }
+
+        /// The picture channel, once the helper advertised `pictures`.
+        pub(crate) fn pictures(&self) -> Option<&PictureChannel> {
+            self.pictures
+                .as_ref()
+                .filter(|channel| channel.available() && self.has("pictures"))
         }
         pub(crate) fn surface(&self) -> Surface {
             self.surface.read().unwrap().value.clone()
@@ -582,6 +620,9 @@ mod platform {
             self.failed.store(true, Ordering::Release);
             for socket in &self.abort_sockets {
                 let _ = socket.shutdown(std::net::Shutdown::Both);
+            }
+            if let Some(pictures) = &self.pictures {
+                pictures.abort();
             }
         }
 
@@ -854,6 +895,9 @@ mod platform {
                 .into();
             let helper_in: OwnedFd = control.helper.into();
             let frame_channel: OwnedFd = frames.helper.into();
+            // Pictures are optional: without the shared memory the helper
+            // is spawned as before and simply never advertises them.
+            let pictures = PictureChannel::create().ok();
             let mut command = Command::new(executable);
             command
                 .args([
@@ -867,18 +911,36 @@ mod platform {
                 .stdin(Stdio::from(helper_in))
                 .stdout(Stdio::from(helper_out))
                 .stderr(Stdio::null());
-            let frame_fd = frame_channel.as_raw_fd();
-            // SAFETY: dup2 is async-signal-safe and the only work done between
-            // fork and exec. The duplicate has no close-on-exec flag, so the
-            // helper inherits exactly this descriptor as its frame channel.
+            let mut inherited = vec![(frame_channel.as_raw_fd(), FRAME_CHANNEL_FD)];
+            if let Some(handover) = &pictures {
+                command
+                    .env("BROWSER_DISPLAY_PICTURE_FD", super::pictures::CHANNEL_FD.to_string())
+                    .env("BROWSER_DISPLAY_PIXELS_FD", super::pictures::PIXELS_FD.to_string());
+                inherited.push((handover.helper_socket.as_raw_fd(), super::pictures::CHANNEL_FD));
+                inherited.push((handover.helper_pixels.as_raw_fd(), super::pictures::PIXELS_FD));
+            }
+            // SAFETY: fcntl and dup2 are async-signal-safe and the only work
+            // done between fork and exec. Every source first moves above the
+            // targets (closed at exec), so a source already on a target number
+            // is never overwritten before it is placed; each placed duplicate
+            // has no close-on-exec flag, so the helper inherits exactly these.
             unsafe {
                 use std::os::unix::process::CommandExt;
                 command.pre_exec(move || {
-                    if libc::dup2(frame_fd, FRAME_CHANNEL_FD) == FRAME_CHANNEL_FD {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::last_os_error())
+                    let mut moved = [(0, 0); 3];
+                    for (index, (source, target)) in inherited.iter().enumerate() {
+                        let above = libc::fcntl(*source, libc::F_DUPFD_CLOEXEC, 16);
+                        if above < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        moved[index] = (above, *target);
                     }
+                    for (above, target) in &moved[..inherited.len()] {
+                        if libc::dup2(*above, *target) != *target {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
                 });
             }
             let child = command
@@ -888,6 +950,7 @@ mod platform {
             let client = DisplayClient::new(
                 control.client,
                 frames.client,
+                pictures.map(|handover| handover.channel),
                 Surface::new(MAX_DISPLAY_SIZE, MAX_DISPLAY_SIZE),
                 false,
             )?;
