@@ -1235,10 +1235,15 @@ impl BrowserControl {
                 if let Some((client, _)) = browser {
                     neutralize_held(client, &mut self.stream_held).await?;
                 }
+                // The window is the one every viewer already paints: its
+                // generation stays, so the frame on screen is current for the
+                // new controller at once, with no whole frame or key unit to
+                // wait for. The previous controller is refused by the lease
+                // and its sequence, and the agent by the page generations
+                // rotated below and the observation it now owes.
                 if let Some(display) = self.display.as_ref() {
                     display.reset().await.map_err(|_| ControlError::unknown())?;
                     self.native_mouse.reset();
-                    display.invalidate().await;
                 }
                 self.stream_outcome_unknown = false;
                 let (expires_at, deadline) = request.deadline(Instant::now())?;

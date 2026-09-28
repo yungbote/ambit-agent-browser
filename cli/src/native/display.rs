@@ -826,18 +826,12 @@ mod platform {
             Ok(info)
         }
 
-        pub(crate) async fn invalidate(&self) {
-            let _wire = self.control.lock().await;
-            let mut surface = self.surface.write().unwrap();
-            surface.value.generation = uuid::Uuid::new_v4().to_string();
-            surface.changed_at = std::time::Instant::now();
-        }
-
         /// One capture: a frame when the display changed since the previous
         /// capture, and the cursor's identity when asked and changed. A
-        /// generation rotated or a layout applied while the frame was in
-        /// flight makes the frame stale (transient), never a helper failure,
-        /// and so does retirement: a closing window is never published.
+        /// layout applied while the frame was in flight makes the frame stale
+        /// (transient), never a helper failure, and so does retirement: a
+        /// closing window is never published. The surface generation names
+        /// the window and never changes while this client serves it.
         pub(crate) async fn capture(
             &self,
             request: CaptureRequest,
@@ -874,7 +868,7 @@ mod platform {
                         operation_performed: Some(json!(false)),
                     });
                 }
-                state.value.clone()
+                (state.value.width, state.value.height)
             };
             let mut command = json!({
                 "op": "capture", "cursor": request.cursor,
@@ -901,10 +895,7 @@ mod platform {
             let capture: Capture =
                 serde_json::from_value(reply).map_err(|_| DisplayError::unavailable())?;
             let after = self.surface();
-            if after.generation != before.generation
-                || (after.width, after.height) != (before.width, before.height)
-                || !capture.fits(&after)
-            {
+            if (after.width, after.height) != before || !capture.fits(&after) {
                 return Err(Self::stale());
             }
             if !capture.coherent(request, &after) {
@@ -1506,12 +1497,16 @@ mod platform {
             helper.await.unwrap();
         }
 
+        /// An unchanged capture yields no frame, and a frame taken across a
+        /// layout is stale, never a helper failure: the next one is taken at
+        /// the new size.
         #[tokio::test]
-        async fn unchanged_capture_yields_no_frame_and_a_rotated_generation_is_transient() {
-            let (display, _peer, frames) = DisplayClient::test_channel();
-            let (rotate, rotated) = oneshot::channel();
+        async fn unchanged_capture_yields_no_frame_and_one_across_a_layout_is_transient() {
+            let (display, peer, frames) = DisplayClient::test_channel();
+            let (in_flight, flying) = oneshot::channel();
             let helper = tokio::spawn(async move {
                 let mut frames = BufReader::new(frames);
+                let mut peer = BufReader::new(peer);
                 let first = read_request(&mut frames).await;
                 reply(
                     &mut frames,
@@ -1520,7 +1515,9 @@ mod platform {
                 .await;
                 let second = read_request(&mut frames).await;
                 assert_eq!(second["force"], true);
-                rotate.send(()).unwrap();
+                in_flight.send(()).unwrap();
+                // A layout lands while the frame is in flight.
+                answer_resize(&mut peer, (1280, 720)).await;
                 reply(
                     &mut frames,
                     json!({"id":second["id"],"success":true,"data":frame(2560, 1440, true)}),
@@ -1529,10 +1526,11 @@ mod platform {
                 let third = read_request(&mut frames).await;
                 reply(
                     &mut frames,
-                    json!({"id":third["id"],"success":true,"data":frame(2560, 1440, true)}),
+                    json!({"id":third["id"],"success":true,"data":frame(1280, 720, true)}),
                 )
                 .await;
             });
+            let generation = display.surface().generation;
             assert!(display.capture(CAPTURE).await.unwrap().frame.is_none());
             let owner = display.clone();
             let forced = tokio::spawn(async move {
@@ -1543,13 +1541,20 @@ mod platform {
                     })
                     .await
             });
-            rotated.await.unwrap();
-            display.invalidate().await;
+            flying.await.unwrap();
+            let layout = display.layout().await;
+            display
+                .resize(&layout, 1280, 720, Some(7), false)
+                .await
+                .unwrap();
+            drop(layout);
             let error = forced.await.unwrap().unwrap_err();
             assert_eq!(error.code, "display_frame_stale");
             assert!(error.is_transient());
             assert!(display.available());
-            assert!(display.capture(CAPTURE).await.unwrap().frame.is_some());
+            let (_, surface) = display.capture(CAPTURE).await.unwrap().frame.unwrap();
+            assert_eq!((surface.width, surface.height), (1280, 720));
+            assert_eq!(surface.generation, generation, "the window is the same");
             helper.await.unwrap();
         }
 
@@ -1781,9 +1786,6 @@ impl DisplayClient {
         match *self {}
     }
 
-    pub(crate) async fn invalidate(&self) {
-        match *self {}
-    }
     pub(crate) async fn capture(&self, _: CaptureRequest) -> Result<Captured, DisplayError> {
         match *self {}
     }
