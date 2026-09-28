@@ -13859,6 +13859,407 @@ async fn e2e_native_mouse_reaches_a_cross_site_iframe() {
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
 
+/// A recording of one journey as a viewer of the dock sees it: open a form,
+/// fill three fields, scroll to a button far below, click it, drag a
+/// slider. The pictures are the helper's own captures of the window (no
+/// cursor in them); the pointer is drawn from the samples the driver
+/// published, at their media-clock times, as the viewer draws it. Writes
+/// `journey.mp4`, a contact sheet and stills of key moments to
+/// `$AMBIT_MOTION_RECORDING`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn e2e_native_motion_recording() {
+    use crate::native::display::CaptureRequest;
+    use image::{imageops, Rgb, RgbImage};
+    use std::io::Write;
+    let out = std::path::PathBuf::from(
+        std::env::var("AMBIT_MOTION_RECORDING").expect("AMBIT_MOTION_RECORDING names the output"),
+    );
+    std::fs::create_dir_all(out.join("stills")).unwrap();
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<!doctype html><style>body{margin:0;font:18px sans-serif;background:#f6f6f8;color:#222}form{padding:28px 32px;max-width:560px}h1{font-size:24px;margin:0 0 8px}label{display:block;margin:16px 0 6px;color:#444}input[type=text],input[type=email],textarea{width:100%;font-size:18px;padding:8px;box-sizing:border-box;border:1px solid #99a;border-radius:6px}#spacer{height:12000px;background:repeating-linear-gradient(#f6f6f8 0 160px,#dfe3ee 160px 320px)}#end{padding:32px}#submit{font-size:20px;padding:12px 28px}#slider{width:420px}</style><form><h1>Contact</h1><label>Name</label><input id=name type=text><label>Email</label><input id=email type=email><label>Message</label><textarea id=message rows=3></textarea></form><div id=spacer></div><div id=end><button id=submit type=button>Send</button><p><input id=slider type=range min=0 max=100 value=0> <span id=out>0</span></p></div><script>slider.oninput=()=>out.textContent=slider.value;submit.onclick=()=>submit.textContent='Sent'</script>"#;
+    assert_success(
+        &control_test_command(
+            &json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}),
+            &mut state,
+        )
+        .await,
+    );
+    state.apply_window_layout(733, 896, None).await.unwrap();
+    let client = state.browser.as_ref().unwrap().client.clone();
+    let display = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .display_client()
+        .expect("owned display");
+    let factor = f64::from(display.surface().device_scale_factor);
+
+    // The pictures: whole captures of the window, as fast as they come, at
+    // most 60 a second, each stamped on the media clock.
+    let (stop, stopped) = tokio::sync::watch::channel(false);
+    let pictures = {
+        let display = display.clone();
+        tokio::spawn(async move {
+            let request = CaptureRequest {
+                cursor: false,
+                budget_bytes: 0,
+                force: true,
+                patches: false,
+                ..Default::default()
+            };
+            let mut taken = Vec::new();
+            let mut next = tokio::time::Instant::now();
+            while !*stopped.borrow() {
+                if let Ok(captured) = display.capture(request).await {
+                    if let Some((capture, _)) = captured.frame {
+                        if let Some(data) = capture.data {
+                            let ts = crate::native::stream::monotonic_us();
+                            taken.push((ts, STANDARD.decode(data).unwrap(), capture.visible));
+                        }
+                    }
+                }
+                next += std::time::Duration::from_micros(16_667);
+                tokio::time::sleep_until(next.max(tokio::time::Instant::now())).await;
+            }
+            taken
+        })
+    };
+    let mut activity = client.subscribe();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+
+    // The journey.
+    for (field, value) in [
+        ("#name", "Ada Lovelace"),
+        ("#email", "ada@example.com"),
+        ("#message", "Notes on the Analytical Engine"),
+    ] {
+        assert_success(
+            &control_test_command(
+                &json!({"action":"fill","selector":field,"value":value}),
+                &mut state,
+            )
+            .await,
+        );
+    }
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#submit"}), &mut state).await,
+    );
+    let slider = control_test_command(
+        &json!({"action":"evaluate","script":"(r => [r.left, r.top + r.height / 2, r.width])(slider.getBoundingClientRect())"}),
+        &mut state,
+    )
+    .await;
+    let (left, middle, width) = (
+        slider["data"]["result"][0].as_f64().unwrap(),
+        slider["data"]["result"][1].as_f64().unwrap(),
+        slider["data"]["result"][2].as_f64().unwrap(),
+    );
+    for command in [
+        json!({"action":"mousemove","x":left + 8.0,"y":middle}),
+        json!({"action":"mousedown","button":"left"}),
+        json!({"action":"mousemove","x":left + width * 0.8,"y":middle}),
+        json!({"action":"mouseup","button":"left"}),
+    ] {
+        assert_success(&control_test_command(&command, &mut state).await);
+    }
+    let result = control_test_command(
+        &json!({"action":"evaluate","script":"[document.getElementById('name').value, email.value, message.value, submit.textContent, +slider.value]"}),
+        &mut state,
+    )
+    .await;
+    tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+    stop.send(true).unwrap();
+    let pictures = pictures.await.unwrap();
+    assert_eq!(
+        result["data"]["result"],
+        json!([
+            "Ada Lovelace",
+            "ada@example.com",
+            "Notes on the Analytical Engine",
+            "Sent",
+            result["data"]["result"][4]
+        ])
+    );
+    assert!(result["data"]["result"][4].as_f64().unwrap() >= 60.0);
+
+    // The pointer as the viewer draws it: every published sample, in
+    // display pixels, at its time.
+    let mut samples = Vec::new();
+    while let Ok(event) = activity.try_recv() {
+        let params = event.params;
+        if event.method != crate::native::activity::EVENT
+            || params["source"] != "agent"
+            || params["type"] != "pointer"
+        {
+            continue;
+        }
+        if let (Some(ts), Some(x), Some(y)) = (
+            params["ts"].as_u64(),
+            params["screenX"].as_f64(),
+            params["screenY"].as_f64(),
+        ) {
+            samples.push((
+                ts,
+                x * factor,
+                y * factor,
+                params["buttons"].as_i64().unwrap_or(0),
+                params["eventType"].as_str().unwrap_or_default().to_owned(),
+            ));
+        }
+    }
+    samples.sort_by_key(|sample| sample.0);
+    assert!(samples.len() > 40, "{} samples", samples.len());
+    // No teleport: the pointer never moves further between two published
+    // samples than a travel's own steps. The longest travel (250 ms across
+    // the window's diagonal) peaks under 300 display pixels a sample.
+    let mut steps: Vec<(f64, u64, String)> = samples
+        .windows(2)
+        .map(|pair| {
+            (
+                (pair[1].1 - pair[0].1).hypot(pair[1].2 - pair[0].2),
+                pair[1].0,
+                format!("{} -> {}", pair[0].4, pair[1].4),
+            )
+        })
+        .collect();
+    steps.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    assert!(steps[0].0 < 300.0, "the pointer jumped: {:?}", &steps[..3]);
+    std::fs::write(
+        out.join("samples.json"),
+        serde_json::to_vec_pretty(&samples.iter().map(|(ts, x, y, buttons, kind)| json!({"ts": ts, "x": x, "y": y, "buttons": buttons, "eventType": kind})).collect::<Vec<_>>()).unwrap(),
+    )
+    .unwrap();
+
+    // The standard arrow, tip at (0, 0), in output pixels.
+    const ARROW: [(f64, f64); 7] = [
+        (0.0, 0.0),
+        (0.0, 17.0),
+        (4.2, 13.2),
+        (7.2, 20.0),
+        (10.0, 18.8),
+        (7.0, 12.2),
+        (12.0, 12.2),
+    ];
+    fn inside(point: (f64, f64), polygon: &[(f64, f64)]) -> bool {
+        let mut crossing = false;
+        let mut previous = polygon[polygon.len() - 1];
+        for &vertex in polygon {
+            if (vertex.1 > point.1) != (previous.1 > point.1)
+                && point.0
+                    < (previous.0 - vertex.0) * (point.1 - vertex.1) / (previous.1 - vertex.1)
+                        + vertex.0
+            {
+                crossing = !crossing;
+            }
+            previous = vertex;
+        }
+        crossing
+    }
+    fn draw_pointer(frame: &mut RgbImage, at: (f64, f64), pressed: bool) {
+        let fill = if pressed {
+            Rgb([40, 40, 48])
+        } else {
+            Rgb([255, 255, 255])
+        };
+        let edge = if pressed {
+            Rgb([255, 255, 255])
+        } else {
+            Rgb([20, 20, 24])
+        };
+        for dy in -2..24 {
+            for dx in -2..16 {
+                let (px, py) = (at.0 as i64 + dx, at.1 as i64 + dy);
+                if px < 0
+                    || py < 0
+                    || px >= i64::from(frame.width())
+                    || py >= i64::from(frame.height())
+                {
+                    continue;
+                }
+                let local = (f64::from(dx as i32) + 0.5, f64::from(dy as i32) + 0.5);
+                let within = inside(local, &ARROW);
+                let near = [(-1.0, 0.0), (1.0, 0.0), (0.0, -1.0), (0.0, 1.0)]
+                    .iter()
+                    .any(|(ox, oy)| inside((local.0 + ox, local.1 + oy), &ARROW));
+                if within {
+                    frame.put_pixel(px as u32, py as u32, fill);
+                } else if near {
+                    frame.put_pixel(px as u32, py as u32, edge);
+                }
+            }
+        }
+    }
+
+    // The timeline: 60 frames a second, each the newest picture and the
+    // newest pointer sample at that moment, at half the window's pixels.
+    let start = pictures.first().unwrap().0;
+    let end = pictures.last().unwrap().0;
+    let visible = pictures[0].2;
+    let decode = |bytes: &[u8]| -> RgbImage {
+        let picture = image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg)
+            .unwrap()
+            .to_rgb8();
+        let picture = match &visible {
+            Some(rect) => imageops::crop_imm(
+                &picture,
+                rect.x as u32,
+                rect.y as u32,
+                rect.width,
+                rect.height,
+            )
+            .to_image(),
+            None => picture,
+        };
+        // Half the window's pixels, even-sized for the encoder.
+        imageops::resize(
+            &picture,
+            (picture.width() / 2) & !1,
+            (picture.height() / 2) & !1,
+            imageops::FilterType::Triangle,
+        )
+    };
+    let first = decode(&pictures[0].1);
+    let (width, height) = (first.width(), first.height());
+    let origin = visible
+        .as_ref()
+        .map_or((0.0, 0.0), |rect| (f64::from(rect.x), f64::from(rect.y)));
+    let mut encoder = std::process::Command::new("ffmpeg")
+        .args([
+            "-y",
+            "-loglevel",
+            "error",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            &format!("{width}x{height}"),
+            "-r",
+            "60",
+            "-i",
+            "-",
+            "-c:v",
+            "libx264",
+            "-pix_fmt",
+            "yuv420p",
+            "-crf",
+            "18",
+        ])
+        .arg(out.join("journey.mp4"))
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .expect("ffmpeg");
+    let mut stdin = encoder.stdin.take().unwrap();
+    let frame_us = 16_667;
+    let (mut picture_index, mut decoded_index, mut decoded) = (0usize, 0usize, first);
+    let mut sheet_frames = Vec::new();
+    let total = ((end - start) / frame_us) as usize;
+    let key_moments: Vec<(u64, String)> = {
+        let mut moments = Vec::new();
+        let presses: Vec<&(u64, f64, f64, i64, String)> = samples
+            .iter()
+            .filter(|sample| sample.4 == "press")
+            .collect();
+        if let Some(first_press) = presses.first() {
+            moments.push((
+                first_press.0.saturating_sub(120_000),
+                "glide-to-name".to_owned(),
+            ));
+        }
+        if let Some(scroll) = samples.iter().find(|sample| sample.4 == "scroll") {
+            moments.push((scroll.0 + 300_000, "scrolling".to_owned()));
+        }
+        if let Some(click) = presses.iter().rev().nth(1) {
+            moments.push((click.0, "press-send".to_owned()));
+        }
+        if let Some(held) = samples
+            .iter()
+            .rev()
+            .find(|sample| sample.3 != 0 && sample.4 == "move")
+        {
+            moments.push((held.0, "dragging-slider".to_owned()));
+        }
+        moments
+    };
+    for index in 0..=total {
+        let t = start + index as u64 * frame_us;
+        while picture_index + 1 < pictures.len() && pictures[picture_index + 1].0 <= t {
+            picture_index += 1;
+        }
+        if picture_index != decoded_index {
+            decoded = decode(&pictures[picture_index].1);
+            decoded_index = picture_index;
+        }
+        let mut frame = decoded.clone();
+        if let Some(sample) = samples.iter().rev().find(|sample| sample.0 <= t) {
+            let at = ((sample.1 - origin.0) / 2.0, (sample.2 - origin.1) / 2.0);
+            draw_pointer(&mut frame, at, sample.3 != 0);
+        }
+        stdin.write_all(frame.as_raw()).unwrap();
+        if index % 15 == 0 {
+            sheet_frames.push((
+                t,
+                imageops::resize(
+                    &frame,
+                    width / 3,
+                    height / 3,
+                    imageops::FilterType::Triangle,
+                ),
+            ));
+        }
+        for (moment, name) in &key_moments {
+            if t <= *moment && *moment < t + frame_us {
+                frame
+                    .save(out.join("stills").join(format!("{name}.png")))
+                    .unwrap();
+            }
+        }
+    }
+    drop(stdin);
+    assert!(encoder.wait().unwrap().success());
+    // The contact sheet: a still every quarter second, left to right.
+    let columns = 8u32;
+    let rows = (sheet_frames.len() as u32).div_ceil(columns);
+    let (cell_w, cell_h) = (width / 3, height / 3);
+    let mut sheet = RgbImage::from_pixel(columns * cell_w, rows * cell_h, Rgb([12, 12, 16]));
+    for (index, (_, cell)) in sheet_frames.iter().enumerate() {
+        let (column, row) = (index as u32 % columns, index as u32 / columns);
+        imageops::replace(
+            &mut sheet,
+            cell,
+            i64::from(column * cell_w),
+            i64::from(row * cell_h),
+        );
+    }
+    sheet.save(out.join("contact-sheet.png")).unwrap();
+    let gaps: Vec<f64> = pictures
+        .windows(2)
+        .map(|pair| (pair[1].0 - pair[0].0) as f64 / 1000.0)
+        .collect();
+    let summary = json!({
+        "pictures": pictures.len(),
+        "picture_interval_ms_mean": gaps.iter().sum::<f64>() / gaps.len() as f64,
+        "samples": samples.len(),
+        "largest_steps_px": steps.iter().take(3).map(|(step, _, between)| json!({"px": step, "between": between})).collect::<Vec<_>>(),
+        "duration_ms": (end - start) as f64 / 1000.0,
+        "output_frames": total + 1,
+        "output_size": [width, height],
+        "key_moments": key_moments.iter().map(|(t, name)| json!({"name": name, "at_ms": (*t as f64 - start as f64) / 1000.0})).collect::<Vec<_>>(),
+        "journey_result": result["data"]["result"],
+    });
+    std::fs::write(
+        out.join("recording.json"),
+        serde_json::to_vec_pretty(&summary).unwrap(),
+    )
+    .unwrap();
+    println!("RECORDING {summary}");
+    let _ = close_current_browser(&mut state).await;
+}
+
 /// Input aimed inside a cross-site frame (its own renderer and session)
 /// reaches a viewer of the page like any other: every pointer sample of the
 /// travel, the press and the release in display pixels at the real pointer,
