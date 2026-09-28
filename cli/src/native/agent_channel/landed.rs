@@ -17,7 +17,8 @@
 //! ends the wait at once, and then no final read is taken: the block says
 //! what was recorded, with `pending`. Otherwise custody is taken again only
 //! for the final read of the addressed element and of the tabs the step
-//! opened (`Landing::read`).
+//! opened (`Landing::read`), which also leaves the active page painted, as
+//! the file protocol's capture does, so the next step's input reaches it.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -42,9 +43,9 @@ const SETTLE_LIMIT: Duration = Duration::from_millis(400);
 const MOST_CHANGES: u64 = 10_000;
 /// The most characters of an element's value `target.value` reports.
 const MOST_VALUE_CHARS: usize = 1024;
-/// How long cleaning up the page's watcher may take: a dialog blocks the
-/// page's scripts, and the watcher then stops once the dialog is answered.
-const STOP_WAIT: Duration = Duration::from_millis(100);
+/// How long making a page paint may take: a page too busy to answer is left
+/// as it is.
+const PAINT_WAIT: Duration = Duration::from_millis(1000);
 
 /// The binding the watcher reports through: installed only in the channel's
 /// world, so page script can neither call it nor see it.
@@ -104,12 +105,14 @@ pub(crate) fn lands(response: &Value) -> bool {
 static TOKENS: AtomicU64 = AtomicU64::new(1);
 
 /// A person's hold on the browser, watched without command custody: a
-/// takeover raised in the interruption registry, or a lease that holds
-/// custody.
+/// takeover asked for since the watch began (pending, or already holding
+/// command custody while it takes the browser), or a lease that holds it.
 pub(crate) struct PersonWatch {
     interrupts: Interrupts,
     raised: watch::Receiver<u64>,
     custody: watch::Receiver<Option<Instant>>,
+    /// The takeovers raised before the watch began.
+    takeovers: u64,
 }
 
 impl PersonWatch {
@@ -118,6 +121,7 @@ impl PersonWatch {
         let interrupts = control.interrupts();
         Self {
             raised: interrupts.subscribe(),
+            takeovers: interrupts.takeovers(),
             interrupts,
             custody: control.custody(),
         }
@@ -126,6 +130,7 @@ impl PersonWatch {
     /// Whether a person holds the browser, or is taking it now.
     pub(crate) fn holds(&self) -> bool {
         self.interrupts.takeover()
+            || self.interrupts.takeovers() != self.takeovers
             || self
                 .custody
                 .borrow()
@@ -444,8 +449,9 @@ impl Landing {
         }
     }
 
-    /// Stops the page's watcher. Needs no custody: it only ends this step's
-    /// own recording.
+    /// Stops the page's watcher. Needs no custody, since it only ends this
+    /// step's own recording, and waits for no answer: a page busy with a
+    /// navigation or blocked by a dialog stops it when it can.
     pub(crate) async fn stop_watching(&self) {
         let Some((page, context)) = self
             .page
@@ -454,18 +460,17 @@ impl Landing {
         else {
             return;
         };
-        let _ = tokio::time::timeout(
-            STOP_WAIT,
-            page.client.send_command(
+        let _ = page
+            .client
+            .enqueue_command(
                 "Runtime.callFunctionOn",
                 Some(
                     json!({ "functionDeclaration": UNWATCH, "executionContextId": context,
                     "arguments": [{ "value": self.token }] }),
                 ),
                 Some(&page.session),
-            ),
-        )
-        .await;
+            )
+            .await;
     }
 
     /// The block when no final read may be taken: what was recorded.
@@ -485,6 +490,11 @@ impl Landing {
         self.note_available();
         let _ = state.drain_cdp_events_background().await;
         let blocked = self.recorded.dialog.is_some() || state.dialog_blocks_active_page();
+        if let (Some(browser), false) = (state.browser.as_ref(), blocked) {
+            if let Ok(session) = browser.active_session_id() {
+                painted(&browser.client, session).await;
+            }
+        }
         let client = self.page.as_ref().map(|page| page.client.clone());
         let target = match (&self.target, client, blocked) {
             (Some(node), Some(client), false) => Some(element_state(&client, node).await),
@@ -531,6 +541,41 @@ impl Landing {
         }
         landed
     }
+}
+
+/// Makes the page of `session` paint if it has not yet. Until a document
+/// has painted, Chrome drops the discrete input (a press, a key) it is sent,
+/// and it holds a same-origin navigation's first paint up to 500 ms for a
+/// page that shows nothing contentful; a tab loaded in the background has
+/// not painted when it is brought forward. The file protocol's capture at
+/// the end of every call makes the page paint; a step on the channel ends
+/// the same way, so the next step's input reaches the page. The check reads
+/// the page's own paint timing: a page that misreports it keeps only its
+/// own input from arriving, as it could by ignoring that input.
+async fn painted(client: &CdpClient, session: &str) {
+    let paint = async {
+        let read = client
+            .send_command(
+                "Runtime.evaluate",
+                Some(
+                    json!({ "expression": "performance.getEntriesByType('paint').length > 0",
+                    "returnByValue": true }),
+                ),
+                Some(session),
+            )
+            .await;
+        if !read.is_ok_and(|read| read["result"]["value"] == true) {
+            let _ = client
+                .send_command(
+                    "Page.captureScreenshot",
+                    Some(json!({ "format": "jpeg", "quality": 1,
+                        "clip": { "x": 0, "y": 0, "width": 1, "height": 1, "scale": 1 } })),
+                    Some(session),
+                )
+                .await;
+        }
+    };
+    let _ = tokio::time::timeout(PAINT_WAIT, paint).await;
 }
 
 async fn next_event(

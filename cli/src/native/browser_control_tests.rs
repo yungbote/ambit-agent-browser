@@ -1659,10 +1659,13 @@ async fn a_held_modifier_rides_on_every_native_event_until_its_release() {
     assert_eq!(
         masks,
         [
-            ("keyDown".into(), "ShiftLeft".into(), 0),
+            // The helper sets the modifier keys to each event's mask: Shift
+            // going down carries its own bit, or the helper would lift it at
+            // once, and its release does not, or it would press it again.
+            ("keyDown".into(), "ShiftLeft".into(), 8),
             ("keyDown".into(), "KeyA".into(), 8),
             ("keyUp".into(), "KeyA".into(), 8),
-            ("keyUp".into(), "ShiftLeft".into(), 8),
+            ("keyUp".into(), "ShiftLeft".into(), 0),
             ("keyDown".into(), "KeyB".into(), 0),
             ("keyUp".into(), "KeyB".into(), 0),
         ]
