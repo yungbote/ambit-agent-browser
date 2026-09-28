@@ -1511,3 +1511,157 @@ async fn taking_control_ends_the_agents_held_gesture_for_layouts() {
         started.elapsed()
     );
 }
+
+/// Text goes in key by key: one helper request per key, each press one
+/// `KEY_INTERVAL` after the one before, a paste as one stroke.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typing_sends_one_key_per_interval() {
+    let (display, mut ops, _frames) = acknowledging_display();
+    let mut control = BrowserControl {
+        display: Some(display),
+        ..BrowserControl::default()
+    };
+    let text = "type me!";
+    let mut events = super::super::interaction::native_text_events(text);
+    events.extend(super::super::interaction::native_paste_events(
+        "pasted as a person pastes",
+    ));
+    control
+        .agent_native_keys(&events, motion::KEY_INTERVAL)
+        .await
+        .unwrap();
+    let mut arrivals = Vec::new();
+    while let Ok(request) = ops.try_recv() {
+        arrivals.push(request);
+    }
+    // One request per character, and one for the paste.
+    assert_eq!(arrivals.len(), text.chars().count() + 1);
+    let presses: Vec<_> = arrivals
+        .iter()
+        .map(|request| {
+            request["events"][0]["eventType"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        })
+        .collect();
+    assert!(presses[..text.len()].iter().all(|kind| kind == "keyDown"));
+    assert_eq!(presses.last().unwrap(), "insertText");
+    assert!(arrivals[..text.len()]
+        .iter()
+        .all(|request| request["events"].as_array().unwrap().len() == 2));
+}
+
+/// The cadence is measured where it is kept: consecutive key presses are
+/// at least one interval apart, and a burst never builds up.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn key_presses_keep_their_interval() {
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+    let (display, peer, _frames) = crate::native::display::DisplayClient::test_channel();
+    let arrivals = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let log = arrivals.clone();
+    tokio::spawn(async move {
+        let mut peer = tokio::io::BufReader::new(peer);
+        let mut line = String::new();
+        while peer.read_line(&mut line).await.is_ok_and(|read| read > 0) {
+            let request: Value = serde_json::from_str(&line).unwrap();
+            line.clear();
+            log.lock().unwrap().push(Instant::now());
+            let reply = json!({ "id": request["id"], "success": true, "data": {} });
+            if peer
+                .get_mut()
+                .write_all(format!("{reply}\n").as_bytes())
+                .await
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+    let mut control = BrowserControl {
+        display: Some(display),
+        ..BrowserControl::default()
+    };
+    let events = super::super::interaction::native_text_events("twenty characters ok");
+    control
+        .agent_native_keys(&events, motion::KEY_INTERVAL)
+        .await
+        .unwrap();
+    let arrivals = arrivals.lock().unwrap().clone();
+    assert_eq!(arrivals.len(), 20);
+    let gaps: Vec<_> = arrivals.windows(2).map(|pair| pair[1] - pair[0]).collect();
+    let floor = motion::KEY_INTERVAL - Duration::from_millis(1);
+    assert!(gaps.iter().all(|gap| *gap >= floor), "{gaps:?}");
+    let total = *arrivals.last().unwrap() - arrivals[0];
+    assert!(
+        total < motion::KEY_INTERVAL * 19 + Duration::from_millis(150),
+        "no gap grows: {gaps:?}"
+    );
+}
+
+/// A takeover stops typing after the key in flight: nothing is held
+/// between keys, and the report counts exactly the characters the helper
+/// received.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_takeover_stops_typing_after_the_current_key_and_counts_it() {
+    let (display, mut ops, _frames) = acknowledging_display();
+    let mut control = BrowserControl {
+        display: Some(display),
+        ..BrowserControl::default()
+    };
+    let interrupts = control.interrupts();
+    let text = "exactly counted text";
+    let events = super::super::interaction::native_text_events(text);
+    let typing = control.agent_native_keys(&events, motion::KEY_INTERVAL);
+    let takeover = async {
+        for _ in 0..6 {
+            ops.recv().await.unwrap();
+        }
+        let raised = Instant::now();
+        (interrupts.raise(InterruptReason::HumanControl), raised)
+    };
+    let (typed, (takeover, raised)) = tokio::join!(typing, takeover);
+    let stopped = raised.elapsed();
+    drop(takeover);
+    let failure = typed.unwrap_err();
+    assert!(
+        failure.error.starts_with("browser_operation_interrupted: "),
+        "{}",
+        failure.error
+    );
+    let mut sent = 6;
+    while ops.try_recv().is_ok() {
+        sent += 1;
+    }
+    let data = failure.data.unwrap();
+    assert_eq!(data["charactersTyped"], sent, "{data}");
+    assert!(
+        failure
+            .error
+            .contains(&format!("after {sent} of {} characters", text.len())),
+        "{}",
+        failure.error
+    );
+    assert_eq!(data["interruptedBy"], "human");
+    assert!(
+        stopped <= motion::KEY_INTERVAL + Duration::from_millis(10),
+        "{stopped:?}"
+    );
+    // Stopped before its first key, typing sent nothing: the person holds
+    // the browser.
+    let takeover = interrupts.raise(InterruptReason::HumanControl);
+    let refused = control
+        .agent_native_keys(&events, motion::KEY_INTERVAL)
+        .await
+        .unwrap_err();
+    drop(takeover);
+    assert!(
+        refused.error.starts_with("browser_controlled_by_user: "),
+        "{}",
+        refused.error
+    );
+    assert!(ops.try_recv().is_err());
+}

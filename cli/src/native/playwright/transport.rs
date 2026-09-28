@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::native::browser_control::motion::KEY_INTERVAL;
 use crate::native::browser_control::BrowserControl;
 use crate::native::cdp::client::CdpClient;
 
@@ -377,7 +378,7 @@ async fn native_input(
             "Input.dispatchMouseEvent" => {
                 control.agent_native_mouse(native_mouse_params(&params), client, session, &[session]).await?;
             }
-            "Input.insertText" => control.agent_native_keys(&[json!({ "type": "input_keyboard", "eventType": "insertText", "text": params["text"] })]).await?,
+            "Input.insertText" => control.agent_native_keys(&[json!({ "type": "input_keyboard", "eventType": "insertText", "text": params["text"] })], KEY_INTERVAL).await?,
             "Input.dispatchKeyEvent" => {
                 let event = native_keyboard_event(&params);
                 // CDP commands are browser editing commands, not key names.
@@ -385,7 +386,7 @@ async fn native_input(
                 if params.get("commands").is_some_and(|commands| commands.as_array().is_some_and(|values| !values.is_empty())) {
                     client.send_command(method, Some(params), Some(session)).await?;
                 } else {
-                    control.agent_native_keys(&[event]).await?;
+                    control.agent_native_keys(&[event], KEY_INTERVAL).await?;
                 }
             }
             _ => unreachable!(),

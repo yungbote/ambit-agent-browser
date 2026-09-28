@@ -402,6 +402,8 @@ pub(crate) struct BrowserControl {
     /// before it waits for command custody; the agent's paced input stops
     /// at its next sample or key without that custody being needed.
     interrupts: Interrupts,
+    /// When the agent's last key press went, which paces the next one.
+    key_sent_at: Option<Instant>,
 }
 
 impl Default for BrowserControl {
@@ -418,6 +420,7 @@ impl Default for BrowserControl {
             custody: watch::channel(None).0,
             applied_input: Default::default(),
             interrupts: Interrupts::default(),
+            key_sent_at: None,
         }
     }
 }
@@ -425,6 +428,36 @@ impl Default for BrowserControl {
 /// Whether a published lease deadline still grants a human custody now.
 pub(crate) fn custody_active(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| deadline > Instant::now())
+}
+
+/// What a pending interruption makes of typing: stopped before its first
+/// stroke, nothing was sent; stopped later, it was interrupted after an
+/// exact number of characters, and nothing is held between strokes.
+fn typing_stopped(
+    reason: InterruptReason,
+    started: bool,
+    typed: usize,
+    total: usize,
+) -> CommandError {
+    let human = reason == InterruptReason::HumanControl;
+    if !started && human {
+        return format!("browser_controlled_by_user: {TAKEOVER_MESSAGE}").into();
+    }
+    let who = if human {
+        "The user took control of this browser"
+    } else {
+        "The browser owner stopped this input"
+    };
+    let mut data = json!({
+        "executionStopped": true, "effectsMayHaveOccurred": started, "charactersTyped": typed,
+    });
+    if human {
+        data["interruptedBy"] = json!("human");
+    }
+    CommandError::with_data(
+        format!("browser_operation_interrupted: {who} after {typed} of {total} characters were typed. Inspect the page before continuing; do not replay the text."),
+        data,
+    )
 }
 
 /// Where one human input batch goes: the owned window's native devices, or
@@ -517,34 +550,70 @@ impl BrowserControl {
         self.display.is_some()
     }
 
-    /// Agent keyboard through the owned display. Each batch is one ordered
-    /// native sequence at the helper; a batch that may have started leaves
-    /// an uncertain outcome and releases whatever the helper still holds.
-    pub(crate) async fn agent_native_keys(&mut self, events: &[Value]) -> Result<(), String> {
+    /// Agent keyboard through the owned display, one stroke at a time: a key
+    /// press goes `interval` after the previous one and a paste is one
+    /// stroke, so text appears key by key (`motion::strokes`). A pending
+    /// interruption stops typing before the next press, and the report says
+    /// exactly how many characters went in. A stroke that may have started
+    /// leaves an uncertain outcome and releases whatever the helper holds.
+    pub(crate) async fn agent_native_keys(
+        &mut self,
+        events: &[Value],
+        interval: Duration,
+    ) -> Result<(), CommandError> {
         if let Some(error) = self.agent_error() {
-            return Err(format!("{}: {}", error.code, error.message));
+            return Err(format!("{}: {}", error.code, error.message).into());
         }
         self.native_mouse
             .require_known()
             .map_err(|error| error.replace("mouse input", "keyboard input"))?;
-        let display = self.display.as_ref().ok_or("No owned browser display")?;
-        for batch in events.chunks(MAX_EVENTS) {
-            if let Err(error) = display.input(batch).await {
+        let display = self.display.clone().ok_or("No owned browser display")?;
+        let strokes = motion::strokes(events);
+        let total = strokes.iter().map(|stroke| stroke.characters).sum();
+        let mut raised = self.interrupts.subscribe();
+        let mut typed = 0;
+        for (index, stroke) in strokes.iter().enumerate() {
+            if stroke.paced {
+                let due = motion::key_due(self.key_sent_at, Instant::now(), interval);
+                loop {
+                    if let Some(reason) = self.interrupts.pending() {
+                        return Err(typing_stopped(reason, index > 0, typed, total));
+                    }
+                    if Instant::now() >= due {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(due)) => {}
+                        _ = raised.changed() => {}
+                    }
+                }
+                self.key_sent_at = Some(Instant::now());
+            }
+            for batch in events[stroke.events.clone()].chunks(MAX_EVENTS) {
+                let Err(error) = display.input(batch).await else {
+                    continue;
+                };
                 if error.operation_performed == Some(json!(false)) {
-                    return Err(format!(
-                        "The native browser window did not accept this keyboard input ({error})."
-                    ));
+                    return Err(if index == 0 {
+                        format!("The native browser window did not accept this keyboard input ({error}).").into()
+                    } else {
+                        CommandError::with_data(
+                            format!("The native browser window did not accept this keyboard input after {typed} of {total} characters were typed ({error}). Inspect the page before continuing."),
+                            json!({ "charactersTyped": typed }),
+                        )
+                    });
                 }
                 self.needs_observation = true;
                 let mut message = format!(
                     "browser_control_outcome_unknown: Native keyboard input may have executed ({error}). Inspect the page before retrying; do not replay the text."
                 );
-                if let Err(release) = self.native_mouse.release(display).await {
+                if let Err(release) = self.native_mouse.release(&display).await {
                     message.push(' ');
                     message.push_str(&release);
                 }
-                return Err(message);
+                return Err(message.into());
             }
+            typed += stroke.characters;
         }
         Ok(())
     }

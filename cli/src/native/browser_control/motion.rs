@@ -1,12 +1,15 @@
 //! The shape of the agent's visible input: where the pointer is at each
-//! moment of a travel.
+//! moment of a travel, and when each key goes.
 //!
 //! A person watching the browser sees the input the driver really sends, so
 //! this is a schedule, never an animation: the native input owner executes it
 //! one helper request at a time, under its usual custody, layout proof and
 //! interruption rules (`mouse.rs`, `BrowserControl::agent_native_keys`).
 
-use std::time::Duration;
+use std::ops::Range;
+use std::time::{Duration, Instant};
+
+use serde_json::Value;
 
 /// One presenter frame at 60 Hz. Pointer samples and wheel notches go once
 /// per frame. A viewer that negotiates 120 Hz does not change it yet.
@@ -15,6 +18,13 @@ pub(crate) const FRAME: Duration = Duration::from_micros(16_667);
 /// A pointer at most this far from where an event lands, in CSS pixels, is
 /// already there: the event goes without travel.
 pub(crate) const REACHED_CSS_PX: f64 = 3.0;
+
+/// The time between two keys, far faster than a person types.
+pub(crate) const KEY_INTERVAL: Duration = Duration::from_millis(25);
+
+/// A fill value longer than this many characters arrives as one visible
+/// paste, the way a person enters it, instead of key by key.
+pub(crate) const PASTE_ABOVE_CHARS: usize = 64;
 
 // Fitts's law (Shannon form) with a fast person's constants, at 2.5 times
 // their speed, clamped so no travel is instant or dawdles.
@@ -105,9 +115,73 @@ impl Glide {
     }
 }
 
+/// When the next key may go: one `interval` after the previous key was
+/// sent, or now when that moment has passed. A late key never makes the
+/// following ones hurry.
+pub(crate) fn key_due(previous: Option<Instant>, now: Instant, interval: Duration) -> Instant {
+    previous.map_or(now, |previous| (previous + interval).max(now))
+}
+
+/// A run of keyboard events the helper applies in one request: one key
+/// press with the events that follow it up to the next press, or one
+/// paste. A paced stroke waits for its turn; `characters` is how much of
+/// the requested text it enters.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Stroke {
+    pub events: Range<usize>,
+    pub paced: bool,
+    pub characters: usize,
+}
+
+const MODIFIER_KEYS: [&str; 4] = ["Shift", "Control", "Alt", "Meta"];
+
+/// Whether a keyboard event is a stroke's own press: any key other than a
+/// modifier going down, or a paste. Releases and modifiers ride with it.
+fn presses(event: &Value) -> bool {
+    match event["eventType"].as_str() {
+        Some("insertText") => true,
+        Some("keyDown" | "rawKeyDown" | "char") => !event["key"]
+            .as_str()
+            .is_some_and(|key| MODIFIER_KEYS.contains(&key)),
+        _ => false,
+    }
+}
+
+/// The text a keyboard event enters, in characters.
+fn entered(event: &Value) -> usize {
+    match event["eventType"].as_str() {
+        Some("insertText" | "keyDown" | "rawKeyDown" | "char") => event["text"]
+            .as_str()
+            .map_or(0, |text| text.chars().count()),
+        _ => 0,
+    }
+}
+
+/// Splits helper keyboard events into strokes, in order and without gaps.
+/// Events before the first press form one unpaced stroke.
+pub(crate) fn strokes(events: &[Value]) -> Vec<Stroke> {
+    let mut strokes: Vec<Stroke> = Vec::new();
+    for (index, event) in events.iter().enumerate() {
+        let press = presses(event);
+        match strokes.last_mut() {
+            Some(stroke) if !press => {
+                stroke.events.end = index + 1;
+                stroke.characters += entered(event);
+            }
+            _ => strokes.push(Stroke {
+                events: index..index + 1,
+                paced: press,
+                characters: entered(event),
+            }),
+        }
+    }
+    strokes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     fn millis(duration: Duration) -> f64 {
         duration.as_secs_f64() * 1000.0
@@ -207,6 +281,81 @@ mod tests {
                 point: (600.0, 0.0),
                 next: None
             }
+        );
+    }
+
+    #[test]
+    fn keys_go_one_interval_apart_and_a_late_key_never_hurries_the_next() {
+        let now = Instant::now();
+        assert_eq!(key_due(None, now, KEY_INTERVAL), now);
+        let previous = now - Duration::from_millis(10);
+        assert_eq!(
+            key_due(Some(previous), now, KEY_INTERVAL),
+            previous + KEY_INTERVAL
+        );
+        let long_ago = now - Duration::from_millis(80);
+        assert_eq!(key_due(Some(long_ago), now, KEY_INTERVAL), now);
+    }
+
+    #[test]
+    fn keyboard_events_split_into_strokes_that_count_their_text() {
+        let key = |event: &str, key: &str, text: Option<&str>| {
+            let mut value = json!({"type":"input_keyboard","eventType":event,"key":key});
+            if let Some(text) = text {
+                value["text"] = json!(text);
+            }
+            value
+        };
+        let events = [
+            key("keyDown", "Shift", None),
+            key("keyDown", "H", Some("H")),
+            key("keyUp", "H", None),
+            key("keyUp", "Shift", None),
+            key("keyDown", "i", Some("i")),
+            key("keyUp", "i", None),
+            json!({"type":"input_keyboard","eventType":"insertText","text":"é漢"}),
+            key("keyDown", "Enter", None),
+            key("keyUp", "Enter", None),
+        ];
+        assert_eq!(
+            strokes(&events),
+            [
+                Stroke {
+                    events: 0..1,
+                    paced: false,
+                    characters: 0
+                },
+                Stroke {
+                    events: 1..4,
+                    paced: true,
+                    characters: 1
+                },
+                Stroke {
+                    events: 4..6,
+                    paced: true,
+                    characters: 1
+                },
+                Stroke {
+                    events: 6..7,
+                    paced: true,
+                    characters: 2
+                },
+                Stroke {
+                    events: 7..9,
+                    paced: true,
+                    characters: 0
+                },
+            ]
+        );
+        assert!(strokes(&[]).is_empty());
+        // A lone release (a program's key up) is one unpaced stroke.
+        assert_eq!(
+            strokes(&[key("keyUp", "a", None)]),
+            [Stroke {
+                events: 0..1,
+                paced: false,
+                characters: 0
+            }]
         );
     }
 }
