@@ -661,7 +661,8 @@ impl NativeMouse {
             .active_window()
             .ok_or("The active browser window is unavailable")?;
         let window = (window.id, window.x, window.y, window.width, window.height);
-        let pointer = match self.probe(client, session, display, window).await? {
+        let (measured, moved) = self.probe(client, session, display, window).await?;
+        let pointer = match measured {
             Some(pointer) => pointer,
             None => calibrate(client, session).await?,
         };
@@ -672,6 +673,11 @@ impl NativeMouse {
             window,
         };
         self.current(&mapping, client, display).await?;
+        // The measurement moved the real pointer: viewers see it arrive
+        // there before anything travels from it.
+        if let Some(point) = moved {
+            self.published(point, &mapping, client, display)?;
+        }
         self.mappings.insert(session.into(), mapping.clone());
         Ok(mapping)
     }
@@ -679,16 +685,17 @@ impl NativeMouse {
     /// Measures the page natively: a one-pixel move where the pointer
     /// already is, too small to see, which the renderer under it reports as
     /// a trusted event. A pointer with no known place first appears at the
-    /// window's centre and is measured there. `None` when this page's own
-    /// document does not receive the move (the pointer is over the browser's
-    /// controls, a child frame or another window).
+    /// window's centre and is measured there. The measurement is `None` when
+    /// this page's own document does not receive the move (the pointer is
+    /// over the browser's controls, a child frame or another window); the
+    /// point is where the move went, when one was sent.
     async fn probe(
         &mut self,
         client: &CdpClient,
         session: &str,
         display: &DisplayClient,
         window: (u32, i32, i32, u32, u32),
-    ) -> Result<Option<NativePointer>, String> {
+    ) -> Result<(Option<NativePointer>, Option<(f64, f64)>), String> {
         let (_, left, top, width, height) = window;
         let (left, top) = (f64::from(left), f64::from(top));
         let (right, bottom) = (left + f64::from(width), top + f64::from(height));
@@ -703,13 +710,13 @@ impl NativeMouse {
             _ => center,
         };
         let Ok(probe) = client.arm_pointer_probe(session).await else {
-            return Ok(None);
+            return Ok((None, None));
         };
         let atomic = display.atomic_input().await;
         self.same_layout(display)?;
         self.send_move(at, self.modifiers, display).await?;
         drop(atomic);
-        Ok(probe.measured(PROBE_WAIT).await)
+        Ok((probe.measured(PROBE_WAIT).await, Some(at)))
     }
 
     /// Records what a press at `point` must reach, unless an aim there
@@ -853,6 +860,18 @@ impl NativeMouse {
         self.same_layout(display)?;
         self.send_move(point, modifiers, display).await?;
         drop(atomic);
+        self.published(point, mapping, client, display)
+    }
+
+    /// Publishes an acknowledged move of the real pointer to `point`
+    /// (display pixels) to viewers, as the agent's pointer.
+    fn published(
+        &self,
+        point: (f64, f64),
+        mapping: &Mapping,
+        client: &CdpClient,
+        display: &DisplayClient,
+    ) -> Result<(), String> {
         let surface = display.surface();
         let (x, y) = mapping.page(point, &surface)?;
         let factor = f64::from(surface.device_scale_factor);

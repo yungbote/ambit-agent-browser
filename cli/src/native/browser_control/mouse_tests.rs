@@ -665,12 +665,14 @@ async fn a_click_far_from_the_pointer_travels_there_before_its_press() {
 
 /// A pointer with no known place (the first gesture of a display) appears
 /// at the window's centre and is measured there by its own trusted report:
-/// no CDP hover reaches the page, and the travel starts where it appeared.
+/// no CDP hover reaches the page, viewers see it appear there, and the
+/// travel starts where it appeared.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pointer_with_no_known_place_appears_at_the_windows_centre() {
     let fake = Fake::new().await;
     let mut control = fake.control();
+    let mut activity = fake.client.subscribe();
     assert_eq!(fake.display.pointer(), None);
     control
         .agent_native_mouse(moved(100.0, 100.0), &fake.client, "page", &["page"])
@@ -684,6 +686,20 @@ async fn a_pointer_with_no_known_place_appears_at_the_windows_centre() {
     assert!(inputs.len() > 3, "it travelled from there");
     assert_eq!(fake.page_commands("Input.dispatchMouseEvent"), 0);
     assert_eq!(fake.display.pointer(), Some(shown(100.0, 100.0)));
+    // The first thing viewers see is the pointer appearing at the centre,
+    // then each sample of its travel.
+    let moves: Vec<_> = agent_activity(&mut activity)
+        .into_iter()
+        .filter(|event| event["eventType"] == "move")
+        .collect();
+    let screen = |event: &Value| {
+        (
+            event["screenX"].as_f64().unwrap() * 2.0,
+            event["screenY"].as_f64().unwrap() * 2.0,
+        )
+    };
+    assert_eq!(screen(&moves[0]), (1280.0, 720.0));
+    assert_eq!(moves.len(), inputs.len());
 }
 
 /// A takeover stops the travel at its next sample: the press never goes,

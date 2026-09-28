@@ -13986,11 +13986,30 @@ async fn e2e_native_motion_proof() {
     }
     let ms = |started: Instant| started.elapsed().as_secs_f64() * 1000.0;
 
-    // Start far from every target.
+    // Start far from every target. The pointer has no place yet: viewers
+    // first see it appear at the window's centre, where it is measured.
+    assert_eq!(display.pointer(), None);
     assert_success(
         &control_test_command(&json!({"action":"mousemove","x":20,"y":600}), &mut state).await,
     );
-    agent(&mut activity);
+    let appeared = agent(&mut activity)
+        .into_iter()
+        .find(|event| event["eventType"] == "move")
+        .expect("the pointer's appearance was published");
+    let info = display.info().await.unwrap();
+    let window = info.active_window().unwrap();
+    let centre = (
+        f64::from(window.x) + (f64::from(window.width) / 2.0).floor(),
+        f64::from(window.y) + (f64::from(window.height) / 2.0).floor(),
+    );
+    let factor = f64::from(display.surface().device_scale_factor);
+    assert_eq!(
+        (
+            appeared["screenX"].as_f64().unwrap() * factor,
+            appeared["screenY"].as_f64().unwrap() * factor
+        ),
+        centre
+    );
     page_log(&mut state).await;
 
     // One click, far from the pointer.
