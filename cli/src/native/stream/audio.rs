@@ -23,7 +23,7 @@ impl AudioTrack {
     pub(super) fn new(codec: AudioCodec) -> Self {
         Self {
             codec,
-            offer: Offer::new("audio", codec.token()),
+            offer: Offer::new("audio", Some(codec.token())),
             source: None,
             subscription: None,
             demand: Demand::default(),

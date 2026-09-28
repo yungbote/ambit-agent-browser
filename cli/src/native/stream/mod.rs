@@ -11,6 +11,8 @@ pub(crate) mod layout;
 pub(crate) mod presentation;
 mod track;
 mod video;
+#[cfg(all(test, target_os = "linux"))]
+mod video_viewer_tests;
 mod websocket;
 mod window_capture;
 mod wire;
@@ -151,32 +153,120 @@ fn seq_in_serialized_frame(frame: &str) -> Option<u64> {
         .and_then(|v| v.get("seq").and_then(|s| s.as_u64()))
 }
 
-/// What the connected viewers declared on their upgrade, counted so the
-/// capture loop and the window layout can follow the roster's capabilities.
+/// How a connected viewer is served.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Audience {
+    /// JPEG frames.
+    Frames,
+    /// The video track, instead of frames.
+    Video,
+}
+
+/// What a viewer declared on its upgrade that shapes the frames it is sent.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct ViewerRoster {
-    pub viewers: usize,
-    /// Viewers that draw the pointer themselves (`cursor=viewer`), from
-    /// pointer samples and cursor identities.
-    pub draw_pointer: usize,
-    /// Viewers that draw frames 1:1 from the top-left cropped to `visible`
+pub(crate) struct FrameNeeds {
+    /// It draws the pointer itself (`cursor=viewer`), from pointer samples
+    /// and cursor identities.
+    pub draws_pointer: bool,
+    /// It draws frames 1:1 from the top-left cropped to `visible`
     /// (`visible=crop`), so the framebuffer may be a size class larger than
     /// the window.
+    pub crops_visible: bool,
+    /// It composites damage patches over its last whole frame (`patches=1`).
+    pub patches: bool,
+}
+
+/// Who is watching and how, so the capture loop and the window layout follow
+/// the viewers' capabilities.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct ViewerRoster {
+    /// Viewers sent frames, and of them those that draw the pointer, crop to
+    /// `visible`, and composite patches.
+    pub frames: usize,
+    pub draw_pointer: usize,
     pub crop_visible: usize,
+    pub patches: usize,
+    /// Viewers sent video instead. They draw `visible` 1:1 from the top-left
+    /// and the pointer themselves.
+    pub video: usize,
 }
 
 impl ViewerRoster {
-    /// Whether frames must carry the native pointer: some viewer does not
-    /// draw it, and no person controls the window (their own cursor is the
-    /// pointer). Pointer motion is then never frame damage.
+    pub(crate) fn viewers(self) -> usize {
+        self.frames + self.video
+    }
+
+    /// Whether frames must carry the native pointer: some viewer of frames
+    /// does not draw it, and no person controls the window (their own cursor
+    /// is the pointer). Pointer motion is then never frame damage.
     pub(crate) fn composites_cursor(self, controlled: bool) -> bool {
-        !controlled && self.draw_pointer < self.viewers
+        !controlled && self.draw_pointer < self.frames
     }
 
     /// Whether every connected viewer crops to the window: only then may the
     /// framebuffer stay at a size class through a resize.
     pub(crate) fn crops_visible(self) -> bool {
-        self.viewers > 0 && self.crop_visible == self.viewers
+        self.viewers() > 0 && self.crop_visible == self.frames
+    }
+
+    /// Whether frames may travel as patches: every viewer of frames
+    /// composites them.
+    pub(crate) fn patches(self) -> bool {
+        self.patches == self.frames
+    }
+
+    fn count(&mut self, needs: FrameNeeds, audience: Audience, joined: bool) {
+        let step = |count: &mut usize, counted: bool| {
+            if counted {
+                *count = if joined {
+                    *count + 1
+                } else {
+                    count.saturating_sub(1)
+                };
+            }
+        };
+        match audience {
+            Audience::Video => step(&mut self.video, true),
+            Audience::Frames => {
+                step(&mut self.frames, true);
+                step(&mut self.draw_pointer, needs.draws_pointer);
+                step(&mut self.crop_visible, needs.crops_visible);
+                step(&mut self.patches, needs.patches);
+            }
+        }
+    }
+}
+
+/// A connected viewer's place in the roster: it joins served frames, may
+/// move between audiences, and leaves when dropped, on every path.
+pub(crate) struct Seat {
+    media: Arc<StreamMedia>,
+    needs: FrameNeeds,
+    audience: Audience,
+}
+
+impl Seat {
+    /// Serves this viewer `audience` from now on; whether that changed.
+    pub(crate) fn serve(&mut self, audience: Audience) -> bool {
+        if audience == self.audience {
+            return false;
+        }
+        let (needs, before) = (self.needs, self.audience);
+        self.media.roster.send_modify(|roster| {
+            roster.count(needs, before, false);
+            roster.count(needs, audience, true);
+        });
+        self.audience = audience;
+        true
+    }
+}
+
+impl Drop for Seat {
+    fn drop(&mut self) {
+        let (needs, audience) = (self.needs, self.audience);
+        self.media
+            .roster
+            .send_modify(|roster| roster.count(needs, audience, false));
     }
 }
 
@@ -237,24 +327,15 @@ impl StreamMedia {
         }
     }
 
-    pub(super) fn viewer_joined(&self, draws_pointer: bool, crops_visible: bool) {
-        self.roster.send_modify(|roster| {
-            roster.viewers += 1;
-            roster.draw_pointer += usize::from(draws_pointer);
-            roster.crop_visible += usize::from(crops_visible);
-        });
-    }
-
-    pub(super) fn viewer_left(&self, draws_pointer: bool, crops_visible: bool) {
-        self.roster.send_modify(|roster| {
-            roster.viewers = roster.viewers.saturating_sub(1);
-            roster.draw_pointer = roster
-                .draw_pointer
-                .saturating_sub(usize::from(draws_pointer));
-            roster.crop_visible = roster
-                .crop_visible
-                .saturating_sub(usize::from(crops_visible));
-        });
+    /// Seats a viewer that connected; it is served frames until it moves.
+    pub(crate) fn seat(self: &Arc<Self>, needs: FrameNeeds) -> Seat {
+        self.roster
+            .send_modify(|roster| roster.count(needs, Audience::Frames, true));
+        Seat {
+            media: self.clone(),
+            needs,
+            audience: Audience::Frames,
+        }
     }
 
     pub(crate) fn roster(&self) -> ViewerRoster {
@@ -360,10 +441,6 @@ pub struct StreamServer {
     /// Latest-value channel for screencast frames. Slow clients skip straight
     /// to the newest frame instead of draining a stale ordered backlog.
     frame_watch: watch::Sender<Option<Arc<StreamFrame>>>,
-    client_count: Arc<Mutex<usize>>,
-    /// Connected clients that composite damage patches; when every client
-    /// does, window frames may travel as patches.
-    patch_clients: Arc<std::sync::atomic::AtomicUsize>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<super::display::DisplayClient>>>>,
     /// Rings when `display_slot` holds another display.
@@ -538,8 +615,6 @@ impl StreamServer {
         let (frame_tx, _) = broadcast::channel::<String>(64);
         let (frame_watch_tx, frame_watch_rx) = watch::channel::<Option<Arc<StreamFrame>>>(None);
         let screencast_config = Arc::new(ScreencastConfig::from_env());
-        let client_count = Arc::new(Mutex::new(0usize));
-        let patch_clients = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let client_notify = Arc::new(Notify::new());
         let screencasting = Arc::new(Mutex::new(false));
         let cdp_session_id = Arc::new(RwLock::new(None::<String>));
@@ -549,7 +624,7 @@ impl StreamServer {
         let last_engine = Arc::new(RwLock::new("chrome".to_string()));
         let recording = Arc::new(Mutex::new(false));
         let display_slot = Arc::new(RwLock::new(None));
-        let (display_changed, _) = watch::channel(());
+        let (display_changed, display_changes) = watch::channel(());
         let (audio_source, audio_accept) = watch::channel(None);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let display_slot_accept = display_slot.clone();
@@ -574,11 +649,23 @@ impl StreamServer {
             },
             shutdown_rx.clone(),
         ));
+        // One owner of the pointer's identity for frames and video alike, so
+        // identities reach viewers in the order the helper reported them.
+        let cursors = cursor_identity::CursorIdentities::new(
+            frame_tx.clone(),
+            media.clone(),
+            client_slot.clone(),
+            cdp_session_id.clone(),
+        );
+        let video = Arc::new(video::VideoHub::new(
+            display_slot.clone(),
+            display_changes,
+            media.clone(),
+            cursors.clone(),
+        ));
         let media_accept = media.clone();
 
         let frame_tx_clone = frame_tx.clone();
-        let client_count_clone = client_count.clone();
-        let patch_clients_accept = patch_clients.clone();
         let client_slot_clone = client_slot.clone();
         let notify_clone = client_notify.clone();
         let idle_activity_clone = idle_activity.clone();
@@ -600,12 +687,11 @@ impl StreamServer {
                 listener,
                 frame_tx_clone,
                 frame_watch_accept,
-                client_count_clone,
-                patch_clients_accept,
                 media_accept,
                 client_slot_clone,
                 display_slot_accept,
                 audio_accept,
+                video,
                 notify_clone,
                 idle_activity_clone,
                 browser_control_clone,
@@ -628,8 +714,6 @@ impl StreamServer {
         let display_slot_bg = display_slot.clone();
         let client_notify_bg = client_notify.clone();
         let screencasting_bg = screencasting.clone();
-        let client_count_bg = client_count.clone();
-        let patch_clients_bg = patch_clients.clone();
         let cdp_session_bg = cdp_session_id.clone();
         let vw_bg = viewport_width.clone();
         let vh_bg = viewport_height.clone();
@@ -650,10 +734,9 @@ impl StreamServer {
                 presentation_bg,
                 custody_bg,
                 media_bg,
+                cursors,
                 client_notify_bg,
                 screencasting_bg,
-                client_count_bg,
-                patch_clients_bg,
                 cdp_session_bg,
                 vw_bg,
                 vh_bg,
@@ -674,8 +757,6 @@ impl StreamServer {
                 frame_tx,
                 frame_watch: frame_watch_tx,
                 screencast_config,
-                client_count,
-                patch_clients,
                 client_slot: client_slot.clone(),
                 display_slot,
                 display_changed,
@@ -990,35 +1071,74 @@ pub fn is_allowed_origin(origin: Option<&str>) -> bool {
 mod tests {
     use super::*;
 
-    /// Frames composite the native pointer only while a viewer that does not
-    /// draw it is connected and no person controls the window; the size
-    /// class is allowed only while every viewer crops to the window.
+    /// Frames composite the native pointer only while a viewer of frames
+    /// that does not draw it is connected and no person controls the window;
+    /// the size class is allowed only while every viewer crops to the window.
     #[test]
     fn the_roster_decides_pointer_compositing_and_visible_cropping() {
-        let media = StreamMedia::new(Default::default());
+        let media = Arc::new(StreamMedia::new(Default::default()));
         assert!(
             !media.composites_cursor(false),
             "no viewer needs the pointer"
         );
         assert!(!media.roster().crops_visible(), "no viewer crops");
-        media.viewer_joined(true, true);
+        let cropping = media.seat(FrameNeeds {
+            draws_pointer: true,
+            crops_visible: true,
+            patches: true,
+        });
         assert!(!media.composites_cursor(false));
         assert!(media.roster().crops_visible());
-        media.viewer_joined(false, false);
+        let whole = media.seat(FrameNeeds::default());
         assert!(media.composites_cursor(false));
         assert!(
             !media.composites_cursor(true),
             "a controlling person's own cursor is the pointer"
         );
         assert!(!media.roster().crops_visible());
-        media.viewer_left(false, false);
+        assert!(!media.roster().patches());
+        drop(whole);
         assert!(!media.composites_cursor(false));
         assert!(media.roster().crops_visible());
-        media.viewer_left(true, true);
+        drop(cropping);
         assert_eq!(media.roster(), ViewerRoster::default());
         assert!(media.cursor().is_none());
         media.set_cursor(Some("{\"type\":\"cursor\"}".into()));
         assert_eq!(media.cursor().as_deref(), Some("{\"type\":\"cursor\"}"));
+    }
+
+    /// A viewer served video leaves the audience of frames: frames follow
+    /// only the viewers that receive them, and a video viewer, which crops
+    /// and draws its own pointer, never holds the framebuffer to the window.
+    /// It returns to frames with its declaration, and leaves from wherever
+    /// it is.
+    #[test]
+    fn a_video_viewer_leaves_the_audience_of_frames_and_returns_to_it() {
+        let media = Arc::new(StreamMedia::new(Default::default()));
+        let mut watching = media.seat(FrameNeeds::default());
+        assert!(media.composites_cursor(false));
+        assert!(!media.roster().crops_visible());
+        assert!(watching.serve(Audience::Video));
+        assert!(!watching.serve(Audience::Video), "already served video");
+        let roster = media.roster();
+        assert_eq!((roster.frames, roster.video, roster.viewers()), (0, 1, 1));
+        assert!(
+            !media.composites_cursor(false),
+            "no frames need the pointer"
+        );
+        assert!(roster.crops_visible(), "video alone never holds the window");
+        let patching = media.seat(FrameNeeds {
+            patches: true,
+            ..FrameNeeds::default()
+        });
+        assert!(media.roster().patches());
+        assert!(watching.serve(Audience::Frames));
+        assert!(!media.roster().patches(), "a whole-frame viewer is back");
+        assert!(media.composites_cursor(false));
+        drop(patching);
+        assert!(watching.serve(Audience::Video));
+        drop(watching);
+        assert_eq!(media.roster(), ViewerRoster::default());
     }
 
     #[test]

@@ -409,6 +409,16 @@ mod platform {
         Ok(Channel { client, helper })
     }
 
+    /// A display for tests: the client, the helper's ends of its control
+    /// and frame channels, and its picture channel's helper.
+    #[cfg(test)]
+    pub(crate) struct TestPictures {
+        pub display: Arc<DisplayClient>,
+        pub control: tokio::net::UnixStream,
+        pub frames: tokio::net::UnixStream,
+        pub helper: super::pictures::fake::FakeHelper,
+    }
+
     impl DisplayClient {
         fn new(
             control: UnixStream,
@@ -479,10 +489,11 @@ mod platform {
             (client, peer(control.helper), peer(frames.helper))
         }
 
-        /// A client whose picture channel the test serves (`FakeHelper`),
-        /// advertising `pictures`.
+        /// A client whose control and frame peers the test drives, and
+        /// whose picture channel it serves (`FakeHelper`), advertising
+        /// `pictures`.
         #[cfg(test)]
-        pub(crate) fn test_pictures() -> (Arc<Self>, super::pictures::fake::FakeHelper) {
+        pub(crate) fn test_pictures() -> TestPictures {
             let control = channel().unwrap();
             let frames = channel().unwrap();
             let handover = PictureChannel::create().unwrap();
@@ -496,7 +507,16 @@ mod platform {
             )
             .unwrap();
             client.advertise(&["captureWait", "cursorIdentity", "pictures"]);
-            (client, helper)
+            let peer = |socket: UnixStream| {
+                socket.set_nonblocking(true).unwrap();
+                tokio::net::UnixStream::from_std(socket).unwrap()
+            };
+            TestPictures {
+                display: client,
+                control: peer(control.helper),
+                frames: peer(frames.helper),
+                helper,
+            }
         }
 
         pub(crate) fn identity(&self) -> &str {
@@ -1515,6 +1535,8 @@ mod platform {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use platform::TestPictures;
 #[cfg(target_os = "linux")]
 pub(crate) use platform::{AtomicInput, DisplayClient, DisplayProcess};
 

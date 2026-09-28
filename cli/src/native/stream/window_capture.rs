@@ -10,12 +10,12 @@
 //! cancelled: that would end the helper link. Stopping takes effect when it
 //! answers.
 
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use serde_json::json;
-use tokio::sync::{broadcast, watch, Mutex, Notify};
+use tokio::sync::{broadcast, watch, Notify};
 
 use super::cursor_identity::CursorIdentities;
 use super::presentation::Presentation;
@@ -37,9 +37,8 @@ pub(super) struct Sinks {
     pub frame_watch: watch::Sender<Option<Arc<StreamFrame>>>,
     pub presentation: Arc<Presentation>,
     pub custody: watch::Receiver<Option<Instant>>,
+    /// Who is sent frames, and what they composite.
     pub media: Arc<StreamMedia>,
-    pub client_count: Arc<Mutex<usize>>,
-    pub patch_clients: Arc<AtomicUsize>,
     pub cursors: CursorIdentities,
 }
 
@@ -139,10 +138,9 @@ async fn run(
         }
         let controlled = custody_active(*custody.borrow_and_update());
         let pacing = sinks.presentation.capture_pacing(controlled);
-        let viewers = *sinks.client_count.lock().await;
-        // Patches amend a whole frame every viewer holds; one viewer that
+        // Patches amend a whole frame every viewer of frames holds; one that
         // does not composite them makes the next frame whole for everyone.
-        let patches = sinks.patch_clients.load(Ordering::Acquire) == viewers;
+        let patches = sinks.media.roster().patches();
         if refresh.wanted.swap(false, Ordering::AcqRel) || !patches && published.patches {
             published.generation = None;
         }
@@ -267,11 +265,27 @@ mod tests {
         sinks: Sinks,
         _control: UnixStream,
         _custody: watch::Sender<Option<Instant>>,
+        _seat: super::super::Seat,
     }
 
     /// One viewer that composites neither patches nor the pointer, and no
     /// presenter: passive pacing (15 fps, a 66 ms period).
     fn harness(features: &[&str]) -> Harness {
+        harness_for(features, super::super::FrameNeeds::default())
+    }
+
+    /// One viewer that composites patches.
+    fn patching_harness(features: &[&str]) -> Harness {
+        harness_for(
+            features,
+            super::super::FrameNeeds {
+                patches: true,
+                ..super::super::FrameNeeds::default()
+            },
+        )
+    }
+
+    fn harness_for(features: &[&str], viewer: super::super::FrameNeeds) -> Harness {
         let (display, control, frames) = DisplayClient::test_channel();
         display.advertise(features);
         let (frame_tx, messages) = broadcast::channel(64);
@@ -279,7 +293,7 @@ mod tests {
         let (custody_sender, custody) = watch::channel(None);
         let applied = Arc::new(super::super::AppliedInput::default());
         let media = Arc::new(StreamMedia::new(applied.clone()));
-        media.viewer_joined(false, false);
+        let seat = media.seat(viewer);
         let sinks = Sinks {
             cursors: CursorIdentities::new(
                 frame_tx.clone(),
@@ -292,8 +306,6 @@ mod tests {
             presentation: Arc::new(Presentation::new()),
             custody,
             media: media.clone(),
-            client_count: Arc::new(Mutex::new(1)),
-            patch_clients: Arc::new(AtomicUsize::new(0)),
         };
         Harness {
             display,
@@ -305,6 +317,7 @@ mod tests {
             sinks,
             _control: control,
             _custody: custody_sender,
+            _seat: seat,
         }
     }
 
@@ -455,8 +468,7 @@ mod tests {
     /// patch would amend a frame no viewer holds: the next frame is whole.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_dropped_frame_makes_the_next_one_whole() {
-        let mut h = harness(&["captureWait"]);
-        h.sinks.patch_clients.store(1, Ordering::Release);
+        let mut h = patching_harness(&["captureWait"]);
         let _capture = WindowCapture::start(h.display.clone(), h.sinks.clone());
         let first = h.request().await;
         assert_eq!(first["force"], true);
@@ -502,8 +514,7 @@ mod tests {
     /// A new viewer needs a whole frame without waiting for the pacing.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refresh_asks_for_a_whole_frame_at_once() {
-        let mut h = harness(&[]);
-        h.sinks.patch_clients.store(1, Ordering::Release);
+        let mut h = patching_harness(&[]);
         let capture = WindowCapture::start(h.display.clone(), h.sinks.clone());
         let first = h.request().await;
         h.answer(&first, whole(0)).await;

@@ -177,7 +177,7 @@ async fn follow_once(
     // of a size-class framebuffer outside the window.
     let surface = display.surface();
     let window = display.window();
-    if roster.crop_visible < roster.viewers && (surface.width, surface.height) != window {
+    if roster.crop_visible < roster.frames && (surface.width, surface.height) != window {
         if let Ok(applied) = apply(
             display,
             window.0 / DEVICE_SCALE_FACTOR,
@@ -234,6 +234,7 @@ async fn follow_presenter(
 mod tests {
     use super::*;
     use crate::native::stream::presentation::PresentationConfig;
+    use crate::native::stream::FrameNeeds;
     use serde_json::{json, Value};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
     use tokio::net::UnixStream;
@@ -288,6 +289,15 @@ mod tests {
         media: Arc<StreamMedia>,
         viewport: Viewport,
         _frames: UnixStream,
+        _seat: crate::native::stream::Seat,
+    }
+
+    fn viewer(draws_pointer: bool, crops_visible: bool) -> FrameNeeds {
+        FrameNeeds {
+            draws_pointer,
+            crops_visible,
+            patches: false,
+        }
     }
 
     fn setup(features: &[&str], crops: bool) -> Setup {
@@ -304,7 +314,7 @@ mod tests {
             },
         );
         let media = Arc::new(StreamMedia::new(Default::default()));
-        media.viewer_joined(true, crops);
+        let seat = media.seat(viewer(true, crops));
         Setup {
             display,
             helper: Helper(
@@ -319,6 +329,7 @@ mod tests {
                 changed: Arc::new(Notify::new()),
             },
             _frames: frames,
+            _seat: seat,
         }
     }
 
@@ -508,8 +519,8 @@ mod tests {
             changed: Arc::new(Notify::new()),
         };
 
-        let cropping = StreamMedia::new(Default::default());
-        cropping.viewer_joined(true, true);
+        let cropping = Arc::new(StreamMedia::new(Default::default()));
+        let _cropper = cropping.seat(viewer(true, true));
         follow_once(&presentation, &display, &cropping, false, &viewport).await;
         let mut line = String::new();
         let quiet = tokio::time::timeout(
@@ -519,9 +530,9 @@ mod tests {
         .await;
         assert!(quiet.is_err(), "nothing to lay out: {line}");
 
-        let whole = StreamMedia::new(Default::default());
-        whole.viewer_joined(true, true);
-        whole.viewer_joined(false, false);
+        let whole = Arc::new(StreamMedia::new(Default::default()));
+        let _cropper = whole.seat(viewer(true, true));
+        let _whole = whole.seat(viewer(false, false));
         let pass = follow_once(&presentation, &display, &whole, false, &viewport);
         let answered = async {
             helper.info((1792, 1280), (1560, 1200)).await;

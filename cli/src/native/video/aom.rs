@@ -363,7 +363,8 @@ impl AomEncoder {
             || height == 0
             || width > 4096
             || height > 4096
-            || (chroma == Chroma::Subsampled && (width % 2 != 0 || height % 2 != 0))
+            || (chroma == Chroma::Subsampled
+                && (!width.is_multiple_of(2) || !height.is_multiple_of(2)))
         {
             return Err(VideoError::Unavailable(format!(
                 "no AV1 encoder for {} at {width}x{height}",

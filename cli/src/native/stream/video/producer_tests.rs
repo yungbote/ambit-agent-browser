@@ -2,139 +2,24 @@
 //! channel's fake), with the real encoder, and libaom's decoder to see what
 //! a viewer would paint.
 
+use super::super::testing::{Change, FakeScreen, BLUE, GREEN, GREY, RED};
 use super::*;
-use crate::native::display::pictures::fake::FakeHelper;
 use crate::native::video::convert::to_rgb;
 use crate::native::video::{Chroma, Decoded, Decoder};
-use serde_json::{json, Value};
-use std::sync::mpsc;
+use serde_json::Value;
 use std::time::Duration;
 use tokio::sync::{broadcast, RwLock};
 
-const GREY: [u8; 4] = [128, 128, 128, 0];
-const RED: [u8; 4] = [0, 0, 255, 0];
-const BLUE: [u8; 4] = [255, 0, 0, 0];
-const GREEN: [u8; 4] = [0, 255, 0, 0];
-
-/// What the screen does next.
-enum Change {
-    /// Rows `[top, bottom)` now show one colour (BGRX).
-    Paint {
-        top: u32,
-        bottom: u32,
-        colour: [u8; 4],
-    },
-    /// The window is laid out anew inside a framebuffer of `framebuffer`,
-    /// every row repainted.
-    Layout {
-        framebuffer: (u32, u32),
-        window: (u32, u32),
-        colour: [u8; 4],
-    },
-    /// The next answer contradicts itself.
-    Break,
-}
-
-struct Screen {
-    framebuffer: (u32, u32),
-    window: (u32, u32),
-    rows: Vec<[u8; 4]>,
-    /// Rows changed since the previous picture.
-    dirty: Vec<bool>,
-    broken: bool,
-}
-
-impl Screen {
-    fn apply(&mut self, change: Change) {
-        match change {
-            Change::Paint {
-                top,
-                bottom,
-                colour,
-            } => {
-                for row in top..bottom {
-                    self.rows[row as usize] = colour;
-                    self.dirty[row as usize] = true;
-                }
-            }
-            Change::Layout {
-                framebuffer,
-                window,
-                colour,
-            } => {
-                self.framebuffer = framebuffer;
-                self.window = window;
-                self.rows = vec![colour; framebuffer.1 as usize];
-                self.dirty = vec![true; framebuffer.1 as usize];
-            }
-            Change::Break => self.broken = true,
-        }
-    }
-}
-
-/// The helper: each picture writes the rows painted since the previous one
-/// (every row when forced) into the slot and names them; an unchanged
-/// answer is held for the request's wait unless the screen changes.
-fn serve(
-    mut helper: FakeHelper,
-    mut screen: Screen,
-    changes: mpsc::Receiver<Change>,
-    requests: mpsc::Sender<Value>,
-) {
-    while let Some(request) = helper.next_request() {
-        let _ = requests.send(request.clone());
-        let forced = request["force"] == true;
-        if !forced && !screen.dirty.contains(&true) {
-            let wait = Duration::from_millis(request["waitMs"].as_u64().unwrap_or(0));
-            if let Ok(change) = changes.recv_timeout(wait) {
-                screen.apply(change);
-            }
-        }
-        while let Ok(change) = changes.try_recv() {
-            screen.apply(change);
-        }
-        let (width, height) = screen.framebuffer;
-        if screen.broken {
-            helper.answer(
-                &request,
-                json!({"changed":true,"width":width,"height":height,"stride":width * 4 + 1,
-                    "rows":[],"cursorIncluded":request["cursor"]}),
-            );
-            continue;
-        }
-        let mut runs: Vec<[u32; 2]> = Vec::new();
-        for row in 0..height {
-            if forced || screen.dirty[row as usize] {
-                helper.paint(width, row, row + 1, screen.rows[row as usize]);
-                match runs.last_mut() {
-                    Some(run) if run[1] == row => run[1] = row + 1,
-                    _ => runs.push([row, row + 1]),
-                }
-            }
-        }
-        screen.dirty.fill(false);
-        if runs.is_empty() {
-            helper.answer(&request, json!({"changed": false}));
-            continue;
-        }
-        let mut data = json!({"changed":true,"width":width,"height":height,"stride":width * 4,
-            "rows":runs,"cursorIncluded":request["cursor"],"timings":{"waitUs":0}});
-        if screen.window != screen.framebuffer {
-            data["visible"] = json!({"x":0,"y":0,"width":screen.window.0,"height":screen.window.1});
-        }
-        helper.answer(&request, data);
-    }
-}
-
 struct Rig {
     producer: Arc<Producer>,
-    changes: mpsc::Sender<Change>,
-    requests: mpsc::Receiver<Value>,
+    screen: FakeScreen,
 }
 
 /// A producer of a 640x480 grey window.
 fn rig() -> Rig {
-    let (display, helper) = DisplayClient::test_pictures();
+    let crate::native::display::TestPictures {
+        display, helper, ..
+    } = DisplayClient::test_pictures();
     let (frame_tx, _) = broadcast::channel(16);
     let media = Arc::new(StreamMedia::new(Default::default()));
     let cursors = CursorIdentities::new(
@@ -150,20 +35,9 @@ fn rig() -> Rig {
         runtime: tokio::runtime::Handle::current(),
     })
     .unwrap();
-    let (changes, changed) = mpsc::channel();
-    let (requested, requests) = mpsc::channel();
-    let screen = Screen {
-        framebuffer: (640, 480),
-        window: (640, 480),
-        rows: vec![GREY; 480],
-        dirty: vec![false; 480],
-        broken: false,
-    };
-    std::thread::spawn(move || serve(helper, screen, changed, requested));
     Rig {
         producer,
-        changes,
-        requests,
+        screen: FakeScreen::new(helper),
     }
 }
 
@@ -177,18 +51,16 @@ impl Rig {
     }
 
     fn paint(&self, top: u32, bottom: u32, colour: [u8; 4]) {
-        self.changes
-            .send(Change::Paint {
-                top,
-                bottom,
-                colour,
-            })
-            .unwrap();
+        self.screen.paint(top, bottom, colour);
+    }
+
+    fn change(&self, change: Change) {
+        self.screen.changes.send(change).unwrap();
     }
 
     /// The requests the helper received so far.
     fn requested(&self) -> Vec<Value> {
-        self.requests.try_iter().collect()
+        self.screen.requested()
     }
 }
 
@@ -357,13 +229,11 @@ async fn key_units_come_on_subscription_request_and_coded_size_only() {
     assert_eq!(asked.coded, (1024, 768));
 
     // Inside the size class: the window grows, no key unit.
-    rig.changes
-        .send(Change::Layout {
-            framebuffer: (1024, 768),
-            window: (700, 480),
-            colour: BLUE,
-        })
-        .unwrap();
+    rig.change(Change::Layout {
+        framebuffer: (1024, 768),
+        window: (700, 480),
+        colour: BLUE,
+    });
     let grown = loop {
         let unit = unit(&second).await;
         if unit.visible.width == 700 {
@@ -372,13 +242,11 @@ async fn key_units_come_on_subscription_request_and_coded_size_only() {
     };
     assert!(!grown.key && grown.coded == (1024, 768));
     // Past it: a new coded size begins with a key unit.
-    rig.changes
-        .send(Change::Layout {
-            framebuffer: (1200, 768),
-            window: (1100, 480),
-            colour: GREEN,
-        })
-        .unwrap();
+    rig.change(Change::Layout {
+        framebuffer: (1200, 768),
+        window: (1100, 480),
+        colour: GREEN,
+    });
     let resized = loop {
         let unit = unit(&second).await;
         if unit.visible.width == 1100 {
@@ -502,7 +370,7 @@ async fn a_broken_helper_ends_every_subscription_with_its_reason() {
     let rig = rig();
     let viewer = rig.subscribe();
     assert!(unit(&viewer).await.key);
-    rig.changes.send(Change::Break).unwrap();
+    rig.change(Change::Break);
     rig.paint(0, 4, RED);
     loop {
         match delivery(&viewer).await {

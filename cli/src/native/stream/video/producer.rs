@@ -141,7 +141,7 @@ struct Due {
 /// What the encode thread does next.
 enum Work {
     /// A new picture, and whether a viewer asked for a key unit.
-    Picture(Job, bool),
+    Picture(Box<Job>, bool),
     /// The held picture again, as a key unit.
     Key,
     /// The held picture again, at the still target.
@@ -411,7 +411,7 @@ impl Encoding {
             }
             if let Some(job) = mailbox.job.take() {
                 let key = std::mem::take(&mut mailbox.key_requested);
-                return Some(Work::Picture(job, key));
+                return Some(Work::Picture(Box::new(job), key));
             }
             if holds && std::mem::take(&mut mailbox.key_requested) {
                 return Some(Work::Key);

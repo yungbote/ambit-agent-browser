@@ -7,7 +7,8 @@
 //!   Only after it may the viewer ask for the track.
 //! - `unavailable` (the current generation, 0 before any request): the
 //!   producer cannot serve it, or could not serve the request of that
-//!   generation. It never masquerades as success.
+//!   generation. It never masquerades as success. Without any codec to
+//!   offer, it names none.
 //! - `started` (the current generation): a subscription epoch began; its
 //!   units carry the fresh `streamId` it names. A producer-side end of an
 //!   epoch (overrun, discontinuity, source rebind) begins another epoch under
@@ -68,7 +69,8 @@ pub(super) fn admit(offered: Option<&AtomicBool>, message: &Value) -> Option<(bo
 /// The offer one track holds with its viewer.
 pub(super) struct Offer {
     track: &'static str,
-    codec: &'static str,
+    /// The codec offered; none when the producer has none for this viewer.
+    codec: Option<&'static str>,
     /// The offer the viewer was last told, if any.
     told: Option<bool>,
     /// Read by the connection's reader: a request to enable is admitted only
@@ -77,7 +79,7 @@ pub(super) struct Offer {
 }
 
 impl Offer {
-    pub(super) fn new(track: &'static str, codec: &'static str) -> Self {
+    pub(super) fn new(track: &'static str, codec: Option<&'static str>) -> Self {
         Self {
             track,
             codec,
@@ -86,23 +88,25 @@ impl Offer {
         }
     }
 
-    pub(super) fn codec(&self) -> &'static str {
-        self.codec
-    }
-
     /// The flag the reader consults before admitting `enabled:true`.
     pub(super) fn offered(&self) -> Arc<AtomicBool> {
         self.offered.clone()
     }
 
     fn record(&self, state: &str) -> Value {
-        json!({"type": self.track, "state": state, "codec": self.codec})
+        let mut record = json!({"type": self.track, "state": state});
+        if let Some(codec) = self.codec {
+            record["codec"] = json!(codec);
+        }
+        record
     }
 
     /// `available` or `unavailable` when the producer's readiness differs
     /// from what the viewer holds. The reader is armed before the record is
-    /// written, so a viewer's prompt reply cannot race the writer.
+    /// written, so a viewer's prompt reply cannot race the writer. Without a
+    /// codec the producer is never ready.
     pub(super) fn declare(&mut self, ready: bool, generation: u64) -> Option<Value> {
+        let ready = ready && self.codec.is_some();
         if self.told == Some(ready) {
             return None;
         }
@@ -187,7 +191,7 @@ mod tests {
         let disable = json!({"type":"audio","enabled":false,"generation":2});
         assert_eq!(admit(None, &enable), None, "undeclared");
         assert_eq!(admit(None, &disable), None, "undeclared");
-        let offer = Offer::new("audio", "opus");
+        let offer = Offer::new("audio", Some("opus"));
         let offered = offer.offered();
         assert_eq!(admit(Some(&offered), &enable), None, "not yet offered");
         assert_eq!(admit(Some(&offered), &disable), Some((false, 2)));
@@ -195,9 +199,26 @@ mod tests {
         assert_eq!(admit(Some(&offered), &enable), Some((true, 1)));
     }
 
+    /// Without any codec for the viewer, the producer says so once, with
+    /// the generation it answers, and never claims to be available.
+    #[test]
+    fn an_offer_without_a_codec_is_unavailable_and_names_none() {
+        let mut offer = Offer::new("video", None);
+        assert_eq!(
+            offer.declare(true, 0),
+            Some(json!({"type":"video","state":"unavailable","generation":0}))
+        );
+        assert_eq!(offer.declare(true, 0), None);
+        assert!(!offer.offered().load(Ordering::Acquire));
+        assert_eq!(
+            offer.stopped(2),
+            json!({"type":"video","state":"stopped","generation":2})
+        );
+    }
+
     #[test]
     fn the_offer_is_declared_once_per_change_and_arms_the_reader() {
-        let mut offer = Offer::new("audio", "opus");
+        let mut offer = Offer::new("audio", Some("opus"));
         assert_eq!(
             offer.declare(false, 0),
             Some(json!({"type":"audio","state":"unavailable","codec":"opus","generation":0}))
