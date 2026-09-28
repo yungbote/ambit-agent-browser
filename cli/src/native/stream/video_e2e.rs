@@ -625,6 +625,49 @@ async fn e2e_native_video_producer_proof() {
     });
     all.append(&mut hover);
 
+    // A person takes control: the window is the one the viewer paints, so
+    // its generation stays and nothing is sent again for it.
+    rest(&mut received, &mut all).await;
+    let painted = all
+        .iter()
+        .rev()
+        .find_map(|seen| match seen {
+            Seen::Unit(header, _, _) => Some(header["surface"]["generation"].clone()),
+            _ => None,
+        })
+        .unwrap();
+    let controller = uuid::Uuid::new_v4().to_string();
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 30_000;
+    let acquired = command(
+        &mut state,
+        json!({"action":"ambit_browser_control","op":"acquire","controllerId":controller,"expiresAt":expires}),
+    )
+    .await;
+    let mut controlled = gather(&mut received, Duration::from_millis(500)).await;
+    let after_acquire = controlled
+        .iter()
+        .filter(|seen| matches!(seen, Seen::Unit(..) | Seen::Frame(..)))
+        .count();
+    assert_eq!(
+        acquired["surface"]["generation"], painted,
+        "the generation stays"
+    );
+    assert_eq!(after_acquire, 0, "taking control sends no picture again");
+    command(
+        &mut state,
+        json!({"action":"ambit_browser_control","op":"release","controllerId":controller}),
+    )
+    .await;
+    let take_control = json!({
+        "generationKept": true,
+        "picturesWithin500Ms": after_acquire,
+    });
+    all.append(&mut controlled);
+
     let units: Vec<&Value> = all
         .iter()
         .filter_map(|seen| match seen {
@@ -646,6 +689,7 @@ async fn e2e_native_video_producer_proof() {
         "still": still,
         "drag": drag_json,
         "motion": motion_json,
+        "takeControl": take_control,
         "units": units.len(),
     });
     println!("VIDEO {report}");
