@@ -77,7 +77,7 @@ async fn accept_loop(
     proxy_port: u16,
 ) {
     loop {
-        let (stream, _) = match listener.accept().await {
+        let (stream, _) = match crate::native::socket::accept(&listener).await {
             Ok(s) => s,
             Err(_) => continue,
         };
