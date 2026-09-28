@@ -4,6 +4,9 @@ pub mod a11y;
 pub mod actions;
 pub(crate) mod activity;
 #[allow(dead_code)]
+// The endpoint that reads these frames and holds this ledger follows.
+pub(crate) mod agent_channel;
+#[allow(dead_code)]
 // The qualified viewer transport consumes this private source/subscription seam.
 pub(crate) mod audio;
 #[allow(dead_code)]
