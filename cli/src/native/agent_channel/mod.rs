@@ -568,7 +568,8 @@ impl Endpoint {
             step,
         };
         // The ledger keeps every result over its bound as a reference to
-        // the file it is written to now.
+        // the file it is written to now, and each step's arguments, so a
+        // recovering host can tell its steps apart.
         let steps: Vec<Value> = records.iter().map(StepRecord::to_json).collect();
         let references: Vec<Option<Value>> = steps
             .iter()
@@ -581,8 +582,10 @@ impl Endpoint {
         let kept: Vec<Value> = steps
             .iter()
             .zip(&references)
-            .map(|(step, reference)| {
+            .zip(&frame.steps)
+            .map(|((step, reference), sent)| {
                 let mut step = step.clone();
+                step["arguments"] = sent.arguments.clone();
                 if let Some(reference) = reference {
                     step["result"] = reference.clone();
                 }

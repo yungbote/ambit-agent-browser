@@ -28,6 +28,8 @@ const READ: usize = CANDIDATES + 30;
 const FRAMES: usize = 16;
 /// The longest name or value a candidate carries, in characters.
 const TEXT: usize = 200;
+/// The longest path a frame carries, in characters.
+const PATH: usize = 128;
 
 /// Lists the interactive elements in the band in their order, keeps the
 /// first `READ` of them for the host to read, and measures the frames and
@@ -85,9 +87,9 @@ fn scan() -> String {
     for (const frame of document.querySelectorAll('iframe, frame')) {{
         const box = frame.getBoundingClientRect();
         if (!meets(box)) continue;
-        let origin = '';
-        try {{ origin = new URL(frame.getAttribute('src') || 'about:blank', document.baseURI).href; }} catch (_) {{}}
-        frames.push({{ origin, box: {{ x: box.x, y: box.y, width: box.width, height: box.height }} }});
+        let url = '';
+        try {{ url = new URL(frame.getAttribute('src') || 'about:blank', document.baseURI).href; }} catch (_) {{}}
+        frames.push({{ url, box: {{ x: box.x, y: box.y, width: box.width, height: box.height }} }});
         if (frames.length === {FRAMES}) break;
     }}
     const canvases = Array.from(document.querySelectorAll('canvas'), (canvas) => canvas.getBoundingClientRect())
@@ -117,9 +119,25 @@ struct Scan {
 
 #[derive(Deserialize)]
 struct ScannedFrame {
-    origin: String,
+    url: String,
     #[serde(rename = "box")]
     bounds: Value,
+}
+
+impl ScannedFrame {
+    /// The frame as an observation lists it: its URL's origin, reduced as
+    /// the tab roster reduces URLs, and its path alone (no query, no
+    /// fragment; empty for a URL without one, such as `data:`), at most
+    /// `PATH` characters. Its content is not observed.
+    fn listed(&self) -> Value {
+        let path = url::Url::parse(&self.url)
+            .ok()
+            .filter(|url| !url.cannot_be_a_base())
+            .map(|url| target::bounded(url.path(), PATH))
+            .unwrap_or_default();
+        json!({ "origin": crate::native::browser::url_origin(&self.url), "path": path,
+            "box": self.bounds, "observed": false })
+    }
 }
 
 /// A node as a candidate: its ref, identity, box, accessibility and facts.
@@ -249,14 +267,7 @@ async fn observe(state: &mut DaemonState, recorders: &Recorders) -> Result<Value
             Some(&page.session),
         )
         .await;
-    let frames: Vec<Value> = scan
-        .frames
-        .iter()
-        .map(|frame| {
-            json!({ "origin": crate::native::browser::url_origin(&frame.origin),
-                "box": frame.bounds, "observed": false })
-        })
-        .collect();
+    let frames: Vec<Value> = scan.frames.iter().map(ScannedFrame::listed).collect();
     Ok(json!({
         "viewport": scan.viewport,
         "candidates": candidates,
@@ -469,4 +480,33 @@ async fn matches(state: &DaemonState, client: &CdpClient, page: &str, selector: 
     read.ok()
         .and_then(|read| read["result"]["value"].as_i64())
         .unwrap_or(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn listed(url: &str) -> Value {
+        ScannedFrame {
+            url: url.into(),
+            bounds: json!({ "x": 0, "y": 0, "width": 300, "height": 150 }),
+        }
+        .listed()
+    }
+
+    #[test]
+    fn a_frame_is_listed_by_its_origin_and_its_path_alone() {
+        let challenge = listed("https://www.google.com/recaptcha/api2/anchor?k=site#top");
+        assert_eq!(challenge["origin"], "https://www.google.com");
+        assert_eq!(challenge["path"], "/recaptcha/api2/anchor");
+        assert_eq!(challenge["observed"], false);
+        assert_eq!(challenge["box"]["width"], 300);
+        // A path is cut at 128 characters; a URL without one has none.
+        let long = listed(&format!("https://ads.example/{}?q=1", "a".repeat(300)));
+        assert_eq!(long["path"].as_str().unwrap().chars().count(), PATH);
+        assert!(long["path"].as_str().unwrap().starts_with("/aaa"));
+        assert_eq!(listed("data:text/html,<p>hi</p>")["path"], "");
+        assert_eq!(listed("about:blank")["path"], "");
+        assert_eq!(listed("")["origin"], "");
+    }
 }

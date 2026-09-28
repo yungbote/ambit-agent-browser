@@ -32,8 +32,10 @@ pub(crate) struct Retained {
 
 impl Retained {
     /// Writes `result`'s bytes and answers the reference that stands in for
-    /// it. A failed write leaves the reference without `path`: the result is
-    /// lost to the host, and the step's outcome stands.
+    /// it. The reference keeps the result's outcome, `isError` and its
+    /// failure `code`, so a host that cannot read the file back can still
+    /// settle the step. A failed write leaves the reference without `path`:
+    /// the result is lost to the host, and the step's outcome stands.
     pub(crate) fn write(&self, result: &Value) -> Value {
         let bytes = serde_json::to_vec(result).unwrap_or_default();
         let mut reference = json!({
@@ -42,7 +44,14 @@ impl Retained {
             "contentDigest": format!("sha256:{:x}", Sha256::digest(&bytes)),
             "readWith": "workspace_file",
             "format": "json",
+            "isError": result["isError"] == true,
         });
+        if let Some(code) = result
+            .pointer("/structuredContent/response/code")
+            .and_then(Value::as_str)
+        {
+            reference["code"] = json!(code);
+        }
         let name = format!("{}-{}-{}.json", self.channel, self.id, self.step);
         if let Ok(path) = write_private(&self.directory.join("steps"), &name, &bytes) {
             reference["path"] = json!(path);
@@ -188,7 +197,8 @@ mod tests {
             reference,
             json!({ "complete": false, "sizeBytes": bytes.len(),
                 "contentDigest": format!("sha256:{:x}", Sha256::digest(&bytes)),
-                "path": path, "readWith": "workspace_file", "format": "json" })
+                "path": path, "readWith": "workspace_file", "format": "json",
+                "isError": false })
         );
         assert!(is_reference(&reference) && !is_reference(&big));
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
@@ -204,6 +214,13 @@ mod tests {
         let again = retained(&directory, 2).write(&result("other"));
         assert!(again.get("path").is_none());
         assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        // A failed step's reference says so, with its code.
+        let failed = json!({ "isError": true, "content": [{ "type": "text", "text": "x" }],
+            "structuredContent": { "response": { "success": false,
+                "code": "browser_operation_interrupted", "error": "x" } } });
+        let reference = retained(&directory, 3).write(&failed);
+        assert_eq!(reference["isError"], true);
+        assert_eq!(reference["code"], "browser_operation_interrupted");
     }
 
     #[cfg(unix)]

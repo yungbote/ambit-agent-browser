@@ -374,6 +374,7 @@ async fn a_sequence_runs_its_steps_in_order_and_answers_each_with_the_frame_timi
         &path,
     );
     frame["observe"] = json!(true);
+    let frame_steps = frame["steps"].clone();
     host.send(frame).await;
     let reply = host.reply().await;
     assert_eq!(reply["id"], 7);
@@ -401,11 +402,18 @@ async fn a_sequence_runs_its_steps_in_order_and_answers_each_with_the_frame_timi
         browser.ran(),
         ["agent_browser_open", "agent_browser_get_text"]
     );
-    // Its outcome is in the ledger, as the reply carried it.
+    // Its outcome is in the ledger, as the reply carried it, with each
+    // step's arguments beside its result.
     host.send(op_status(8, "41", Some((CHANNEL_A, 7)), 0)).await;
     let status = host.reply().await;
     assert_eq!(status["data"]["state"], "settled", "{status}");
-    assert_eq!(status["data"]["result"]["steps"], reply["steps"]);
+    let kept = status["data"]["result"]["steps"].as_array().unwrap();
+    for (index, (kept, answered)) in kept.iter().zip(steps).enumerate() {
+        let mut answered = answered.clone();
+        answered["arguments"] = frame_steps[index]["arguments"].clone();
+        assert_eq!(*kept, answered);
+    }
+    assert_eq!(kept.len(), 2);
     assert_eq!(status["data"]["result"]["browser"], reply["browser"]);
     assert_eq!(status["data"]["result"]["success"], true);
 }

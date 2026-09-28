@@ -583,6 +583,17 @@ mod tests {
             panic!("not a sequence");
         };
         assert!(push.owner.is_none());
+        // The host derives the Action's id as a name-based (v5) UUID: any
+        // canonical UUID is an Action's.
+        let mut derived = sequence(json!({ "steps": [], "observe": true }));
+        derived["actionId"] = json!("9b0c5e3a-6d1f-5a2b-8c4d-0e1f2a3b4c5d");
+        let (_, Frame::Sequence(derived)) = Frame::parse(&derived).unwrap() else {
+            panic!("not a sequence");
+        };
+        assert_eq!(
+            derived.owner.unwrap().action.0.to_string(),
+            "9b0c5e3a-6d1f-5a2b-8c4d-0e1f2a3b4c5d"
+        );
     }
 
     #[test]
