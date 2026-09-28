@@ -98,11 +98,21 @@ pub(super) fn point_fenced(command: &Value) -> bool {
 /// moved under the agent; a command that names its target runs, and the
 /// host's feedback shows it the page it acted on.
 pub(super) fn observation_required(command: &Value, needs_observation: bool) -> bool {
+    observation_required_with(command, needs_observation, point_fenced(command))
+}
+
+/// `observation_required` for a command whose point is fenced as its
+/// transport says (`HostFence::fences_point`).
+pub(crate) fn observation_required_with(
+    command: &Value,
+    needs_observation: bool,
+    point_fenced: bool,
+) -> bool {
     needs_observation
         && match target(command) {
             Target::Named => false,
             Target::Focus | Target::Pointer | Target::Any => true,
-            Target::Point => !point_fenced(command),
+            Target::Point => !point_fenced,
         }
 }
 
@@ -274,7 +284,7 @@ impl DaemonState {
     /// single tab is the active page, the refusal also lists the open tabs
     /// (`data`, see `BrowserManager::tab_roster`): the caller can select one
     /// explicitly without a `tab_list` round. Nothing is selected for it.
-    pub(super) fn window_refusal(&self, id: &Value, code: &str, message: &str) -> Value {
+    pub(crate) fn window_refusal(&self, id: &Value, code: &str, message: &str) -> Value {
         let mut refusal = json!({ "id": id, "success": false, "code": code, "error": message });
         if code == ACTIVE_PAGE_AMBIGUOUS {
             if let Some(browser) = self.browser.as_ref() {

@@ -3,6 +3,7 @@ pub mod a11y;
 #[allow(dead_code)]
 pub mod actions;
 pub(crate) mod activity;
+pub(crate) mod agent_channel;
 pub(crate) mod audio;
 #[allow(dead_code)]
 pub mod auth;

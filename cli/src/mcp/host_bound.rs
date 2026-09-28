@@ -1,6 +1,12 @@
 //! The host selects one browser session; tool arguments remain browser data.
 //! Schemas derive from the normal MCP catalog and commands use its preparation
 //! helpers and the canonical CLI parser, without reparsing data as global flags.
+//!
+//! Two transports carry host-bound calls, and both prepare a call here
+//! (`HostFlags::prepare`), so what the host may send cannot drift between
+//! them: the spawned MCP client, which then sends the command to the daemon
+//! (`HostBinding::call`), and the daemon's agent channel, which dispatches it
+//! in the daemon itself (`native::agent_channel`).
 
 use super::*;
 use crate::commands::parse_command_with_input;
@@ -11,8 +17,9 @@ use crate::native::theme::Theme;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use std::path::PathBuf;
+use std::sync::OnceLock;
 
-pub(super) const PROFILE: &str = "ambit-host-bound-v1";
+pub(crate) const PROFILE: &str = "ambit-host-bound-v1";
 
 const HOST_ARGUMENTS: &[&str] = &[
     "session",
@@ -31,12 +38,15 @@ const HOST_ARGUMENTS: &[&str] = &[
     "extraArgs",
 ];
 
-/// Host operations: tools the host calls itself and never offers to the
-/// model, marked `"caller": "host"` in the descriptor. Each acts on the
-/// running session as it is: it never starts a daemon or sends launch
-/// settings, and it is neither agent input nor an observation, so it
-/// captures no host feedback.
-const HOST_OPERATIONS: &[&str] = &[TOOL_SET_THEME];
+/// Tools the host calls itself and never offers to the model, marked
+/// `"caller": "host"` in the descriptor. Who calls a tool is apart from how
+/// it is dispatched: opening background tabs is an agent operation.
+const HOST_CALLED: &[&str] = &[TOOL_SET_THEME, TOOL_OPEN_MANY];
+
+/// Session operations: each acts on the running session as it is. It never
+/// starts a daemon or sends launch settings, and it is neither agent input
+/// nor an observation, so it captures no host feedback.
+const SESSION_OPERATIONS: &[&str] = &[TOOL_SET_THEME];
 
 /// Process discovery, supervisor configuration, dependency installation and
 /// cross-session commands belong to the host. Browser auth and state stay in
@@ -74,7 +84,23 @@ pub(super) fn allows(name: &str) -> bool {
     )
 }
 
-pub(super) fn tools() -> Vec<Value> {
+pub(crate) fn tools() -> Vec<Value> {
+    catalog().to_vec()
+}
+
+/// The profile's tools, built once per process: they are fixed by this
+/// binary, and every call on either transport is checked against them.
+fn catalog() -> &'static [Value] {
+    static CATALOG: OnceLock<Vec<Value>> = OnceLock::new();
+    CATALOG.get_or_init(build_tools)
+}
+
+/// The profile's tool `name`, with its pinned schema and annotations.
+pub(crate) fn tool(name: &str) -> Option<&'static Value> {
+    catalog().iter().find(|tool| tool["name"] == name)
+}
+
+fn build_tools() -> Vec<Value> {
     let mut tools: Vec<_> = super::tools()
         .into_iter()
         .filter(|tool| tool["name"].as_str().is_some_and(allows))
@@ -101,7 +127,7 @@ pub(super) fn tools() -> Vec<Value> {
                 "coordinateArguments": [{ "x": "/x", "y": "/y" }]
             }});
         }
-        if HOST_OPERATIONS.contains(&name.as_str()) {
+        if HOST_CALLED.contains(&name.as_str()) {
             tool["_meta"] = json!({ "io.ambit/browser": { "caller": "host" } });
         }
     }
@@ -109,17 +135,32 @@ pub(super) fn tools() -> Vec<Value> {
     tools
 }
 
-pub(super) fn descriptor() -> Value {
-    // serde_json's default object map sorts keys recursively. Tool names are
-    // sorted too, matching the host's canonical-JSON catalog digest.
-    let mut descriptor = json!({
-        "profile": PROFILE, "capabilityVersion": 1,
-        "driverVersion": env!("CARGO_PKG_VERSION"), "tools": tools(),
-    });
-    descriptor["schemaSha256"] = json!(format!(
-        "sha256:{:x}",
-        Sha256::digest(serde_json::to_vec(&descriptor).unwrap())
-    ));
+pub(crate) fn descriptor() -> Value {
+    static DESCRIPTOR: OnceLock<Value> = OnceLock::new();
+    DESCRIPTOR
+        .get_or_init(|| {
+            // serde_json's default object map sorts keys recursively. Tool
+            // names are sorted too, matching the host's canonical-JSON
+            // catalog digest.
+            let mut descriptor = json!({
+                "profile": PROFILE, "capabilityVersion": 1,
+                "driverVersion": env!("CARGO_PKG_VERSION"), "tools": tools(),
+            });
+            descriptor["schemaSha256"] = json!(format!(
+                "sha256:{:x}",
+                Sha256::digest(serde_json::to_vec(&descriptor).unwrap())
+            ));
+            descriptor
+        })
+        .clone()
+}
+
+/// The descriptor without its tools: what MCP `initialize` advertises under
+/// `experimental["io.ambit/browser"]` and the agent channel's `hello` answers
+/// as its catalog.
+pub(crate) fn catalog_identity() -> Value {
+    let mut descriptor = descriptor();
+    descriptor.as_object_mut().unwrap().remove("tools");
     descriptor
 }
 
@@ -141,10 +182,114 @@ struct HostConfig {
     theme: Option<Theme>,
 }
 
+/// The session and launch settings a binding fixes for every call it makes.
+/// A spawned client derives them from its configuration file
+/// (`HostBinding::load`); the daemon's agent channel from a `hello`'s binding,
+/// in the daemon's own environment, which the daemon inherited from the
+/// client that started it. No tool argument changes them.
+#[derive(Debug, Clone)]
+pub(crate) struct HostFlags {
+    flags: Flags,
+}
+
+/// How a prepared call reaches the browser.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Dispatch {
+    /// A host operation: it acts on the running session as it is. It never
+    /// starts a daemon or a browser, is neither agent input nor an
+    /// observation, and captures no host feedback.
+    Session,
+    /// An agent operation, dispatched through the daemon's host feedback path
+    /// (custody, observation gates, host deadline). `launch` starts the
+    /// browser the binding describes when none runs.
+    Agent { launch: Option<Value> },
+}
+
+/// A host-bound call as both transports dispatch it: checked against the
+/// pinned profile and parsed by the canonical CLI parser. Nothing about it has
+/// been sent anywhere.
+#[derive(Debug, Clone)]
+pub(crate) struct HostCall {
+    pub(crate) command: Value,
+    /// The call's host deadline.
+    pub(crate) timeout_ms: u64,
+    pub(crate) dispatch: Dispatch,
+    /// The flags the call was parsed with, for a transport that must start
+    /// the daemon they describe.
+    flags: Flags,
+}
+
+impl HostFlags {
+    pub(crate) fn new(
+        namespace: &str,
+        session: &str,
+        theme: Option<Theme>,
+    ) -> Result<Self, String> {
+        let mut flags = parse_flags_from_config(&[], Config::default());
+        flags.namespace = Some(namespace.to_string());
+        flags.session = session.to_string();
+        flags.require_sandbox = true;
+        flags.json = true;
+        // The binding is the only theme source here, env included.
+        flags.theme = theme.map(|theme| theme.as_str().to_string());
+        if flags.cdp.is_some() || flags.auto_connect || flags.provider.is_some() {
+            return Err("Host-bound browser sessions require a locally owned browser.".into());
+        }
+        if let Some(path) = flags.ca_cert.as_ref() {
+            crate::ca_bundle::load(path)?;
+        }
+        Ok(Self { flags })
+    }
+
+    /// Prepares `name` with `arguments`, in the order the host-bound profile
+    /// checks a call: membership in the profile, no argument that overrides a
+    /// host setting, the tool's own preparation and deadline bound, the
+    /// canonical parser, then (for an agent operation) the binding's plugins,
+    /// tab pinning, restore settings and launch configuration. A refusal is
+    /// the message a host shows for invalid arguments; nothing was sent.
+    pub(crate) fn prepare(&self, name: &str, arguments: &Value) -> Result<HostCall, String> {
+        let schema = tool(name).ok_or("Tool is not in the host-bound browser profile.")?;
+        let values = arguments.as_object().ok_or("arguments must be an object")?;
+        let properties = schema["inputSchema"]["properties"].as_object().unwrap();
+        if values.keys().any(|key| !properties.contains_key(key)) {
+            return Err("Tool arguments cannot override host browser settings.".into());
+        }
+        let invocation = prepare_tool(name, arguments).map_err(|error| error.message)?;
+        if invocation.timeout_ms > MAX_CALL_MS {
+            return Err("timeoutMs must be at most 120000.".into());
+        }
+        let mut flags = self.flags.clone();
+        apply_cli_flags(&invocation.global_args, &mut flags);
+        let mut command = parse_command_with_input(
+            &invocation.command_args,
+            &flags,
+            invocation.stdin_body.as_deref(),
+        )
+        .map_err(|error| error.format())?;
+        let dispatch = if SESSION_OPERATIONS.contains(&name) {
+            Dispatch::Session
+        } else {
+            crate::attach_plugins_to_command(&mut command, &flags.plugins);
+            crate::attach_pin_tab_to_command(&mut command, &flags);
+            crate::attach_restore_config_to_command(&mut command, &flags);
+            Dispatch::Agent {
+                launch: crate::should_send_local_launch_config(&flags, &command)
+                    .then(|| crate::build_local_launch_command(&flags)),
+            }
+        };
+        Ok(HostCall {
+            command,
+            timeout_ms: invocation.timeout_ms,
+            dispatch,
+            flags,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub(super) struct HostBinding {
     config: HostConfig,
-    flags: Flags,
+    flags: HostFlags,
 }
 
 impl HostBinding {
@@ -179,58 +324,29 @@ impl HostBinding {
         // Set once before any daemon or runtime starts. Per-call tool data
         // cannot change socket resolution or the host's launch snapshot.
         env::set_var("AGENT_BROWSER_NAMESPACE", &config.namespace);
-        let mut flags = parse_flags_from_config(&[], Config::default());
-        flags.namespace = Some(config.namespace.clone());
-        flags.session = config.session.clone();
-        flags.require_sandbox = true;
-        flags.json = true;
-        // The configuration is the only theme source here, env included.
-        flags.theme = config.theme.map(|theme| theme.as_str().to_string());
-        if flags.cdp.is_some() || flags.auto_connect || flags.provider.is_some() {
-            return Err("Host-bound browser sessions require a locally owned browser.".into());
-        }
-        if let Some(path) = flags.ca_cert.as_ref() {
-            crate::ca_bundle::load(path)?;
-        }
+        let flags = HostFlags::new(&config.namespace, &config.session, config.theme)?;
         Ok(Self { config, flags })
     }
 
+    /// The spawned client's transport: the shared preparation, then the
+    /// daemon started if needed and the command sent to it with the
+    /// configuration's host feedback request.
     pub(super) fn call(&self, name: &str, arguments: &Value) -> Result<Value, ProtocolError> {
-        let schema = tools()
-            .into_iter()
-            .find(|tool| tool["name"] == name)
-            .ok_or_else(|| {
-                ProtocolError::invalid_params("Tool is not in the host-bound browser profile.")
-            })?;
-        let values = arguments
-            .as_object()
-            .ok_or_else(|| ProtocolError::invalid_params("arguments must be an object"))?;
-        let properties = schema["inputSchema"]["properties"].as_object().unwrap();
-        if values.keys().any(|key| !properties.contains_key(key)) {
-            return Err(ProtocolError::invalid_params(
-                "Tool arguments cannot override host browser settings.",
-            ));
-        }
-        let invocation = prepare_tool(name, arguments)?;
-        if invocation.timeout_ms > MAX_CALL_MS {
-            return Err(ProtocolError::invalid_params(
-                "timeoutMs must be at most 120000.",
-            ));
-        }
-        let mut flags = self.flags.clone();
-        apply_cli_flags(&invocation.global_args, &mut flags);
-        let mut command = parse_command_with_input(
-            &invocation.command_args,
-            &flags,
-            invocation.stdin_body.as_deref(),
-        )
-        .map_err(|error| ProtocolError::invalid_params(error.format()))?;
-        if HOST_OPERATIONS.contains(&name) {
-            return Ok(result(send_command_if_running(command, &flags.session)));
-        }
-        crate::attach_plugins_to_command(&mut command, &flags.plugins);
-        crate::attach_pin_tab_to_command(&mut command, &flags);
-        crate::attach_restore_config_to_command(&mut command, &flags);
+        let HostCall {
+            mut command,
+            timeout_ms,
+            dispatch,
+            flags,
+        } = self
+            .flags
+            .prepare(name, arguments)
+            .map_err(ProtocolError::invalid_params)?;
+        let launch = match dispatch {
+            Dispatch::Session => {
+                return Ok(result(send_command_if_running(command, &flags.session)))
+            }
+            Dispatch::Agent { launch } => launch,
+        };
         let setup = crate::DaemonSetup::new(&flags);
         if let Err(error) = ensure_daemon(&flags.session, &setup.options(&flags)) {
             return Ok(result(Response {
@@ -239,8 +355,6 @@ impl HostBinding {
                 ..Response::default()
             }));
         }
-        let launch = crate::should_send_local_launch_config(&flags, &command)
-            .then(|| crate::build_local_launch_command(&flags));
         if command["action"] == "run_playwright" {
             command[crate::native::playwright::ENVIRONMENT_FIELD] = json!({
                 "semanticJudgementConfigPath": self.config.semantic_judgement_config_path,
@@ -250,7 +364,7 @@ impl HostBinding {
         }
         command[REQUEST_FIELD] = json!({ "namespace": self.config.namespace,
             "session": self.config.session, "captureDirectory": self.config.capture_directory,
-            "timeoutMs": invocation.timeout_ms, "expectedObservation": self.config.expected_observation,
+            "timeoutMs": timeout_ms, "expectedObservation": self.config.expected_observation,
             "launch": launch });
         Ok(result(
             send_command_detailed(command, &flags.session).unwrap_or_else(Response::from),
@@ -258,14 +372,23 @@ impl HostBinding {
     }
 }
 
-fn result(mut response: Response) -> Value {
-    let browser = response.browser.take();
+/// A daemon response as the host-bound `CallToolResult`: the text the model
+/// reads and the response itself. The spawned client adds the feedback it
+/// captured (`result`); the agent channel reports feedback once per frame.
+pub(crate) fn step_result(response: Response) -> Value {
     let success = response.success;
     let response = serde_json::to_value(response).unwrap();
     json!({ "isError": !success,
         "content": [{ "type": "text", "text": response_text(&response).unwrap_or_else(|| response.to_string()) }],
-        "structuredContent": { "response": response, "browser": browser },
+        "structuredContent": { "response": response },
     })
+}
+
+fn result(mut response: Response) -> Value {
+    let browser = response.browser.take();
+    let mut result = step_result(response);
+    result["structuredContent"]["browser"] = json!(browser);
+    result
 }
 
 #[cfg(test)]
@@ -430,7 +553,7 @@ mod tests {
     #[test]
     fn theme_is_a_host_operation_and_host_configuration() {
         let tools = tools();
-        assert_eq!(tools.len(), 131);
+        assert_eq!(tools.len(), 132);
         let set_theme = tools
             .iter()
             .find(|tool| tool["name"] == TOOL_SET_THEME)
@@ -458,7 +581,7 @@ mod tests {
             let host_only = tool["_meta"]["io.ambit/browser"]["caller"] == "host";
             assert_eq!(
                 host_only,
-                HOST_OPERATIONS.contains(&tool["name"].as_str().unwrap()),
+                HOST_CALLED.contains(&tool["name"].as_str().unwrap()),
                 "{}",
                 tool["name"]
             );
@@ -499,6 +622,124 @@ mod tests {
             tools.iter().any(|tool| tool["name"] == TOOL_SET_THEME),
             config(json!({ "theme": "dark" })).is_ok()
         );
+    }
+
+    fn binding(theme: Option<Theme>) -> HostBinding {
+        HostBinding {
+            config: serde_json::from_value(json!({ "version": 1, "namespace": "host",
+                "session": "browser", "requireSandbox": true, "captureDirectory": "/" }))
+            .unwrap(),
+            flags: HostFlags::new("host", "browser", theme).unwrap(),
+        }
+    }
+
+    /// Both transports prepare a call here, so they refuse the same calls
+    /// with the same words before anything is sent: the spawned client as
+    /// invalid parameters, the agent channel as a rejected operation.
+    #[test]
+    fn both_transports_refuse_a_call_the_profile_refuses_with_the_same_words() {
+        let binding = binding(None);
+        for (name, arguments, message) in [
+            (
+                TOOL_BATCH,
+                json!({ "commands": ["open https://example.test/"] }),
+                "Tool is not in the host-bound browser profile.",
+            ),
+            (
+                "agent_browser_nonexistent",
+                json!({}),
+                "Tool is not in the host-bound browser profile.",
+            ),
+            (
+                TOOL_CLICK,
+                json!({ "selector": "#go", "session": "elsewhere" }),
+                "Tool arguments cannot override host browser settings.",
+            ),
+            (TOOL_CLICK, json!(["#go"]), "arguments must be an object"),
+            (
+                TOOL_GET_TEXT,
+                json!({ "selector": "main", "timeoutMs": MAX_CALL_MS + 1 }),
+                "timeoutMs must be at most 120000.",
+            ),
+        ] {
+            let refused = binding.flags.prepare(name, &arguments).unwrap_err();
+            assert_eq!(refused, message, "{name} {arguments}");
+            let error = binding.call(name, &arguments).unwrap_err();
+            assert_eq!(error.code, -32602);
+            assert_eq!(error.message, refused, "{name} {arguments}");
+        }
+        // A tool's own preparation and the canonical parser refuse too.
+        let refused = binding
+            .flags
+            .prepare(TOOL_CLICK, &json!({ "selector": 7 }))
+            .unwrap_err();
+        assert_eq!(
+            binding
+                .call(TOOL_CLICK, &json!({ "selector": 7 }))
+                .unwrap_err()
+                .message,
+            refused
+        );
+    }
+
+    /// A host operation acts on the running session without launch settings;
+    /// an agent operation carries the binding's plugins, pinning, restore
+    /// settings and launch configuration, whichever transport sends it.
+    #[test]
+    fn a_prepared_call_says_how_it_reaches_the_browser() {
+        let themed = binding(Some(Theme::Dark));
+        let theme = themed
+            .flags
+            .prepare(TOOL_SET_THEME, &json!({ "theme": "light" }))
+            .unwrap();
+        assert_eq!(theme.dispatch, Dispatch::Session);
+        assert_eq!(theme.command["action"], crate::native::theme::ACTION);
+        assert!(theme.command.get("plugins").is_none());
+        assert_eq!(theme.timeout_ms, DEFAULT_TIMEOUT_MS);
+
+        let click = themed
+            .flags
+            .prepare(TOOL_CLICK, &json!({ "selector": "#go", "timeoutMs": 900 }))
+            .unwrap();
+        assert_eq!(click.command["action"], "click");
+        assert_eq!(click.command["selector"], "#go");
+        assert!(click.command["plugins"].is_array());
+        assert_eq!(click.timeout_ms, 900);
+        let Dispatch::Agent {
+            launch: Some(launch),
+        } = click.dispatch
+        else {
+            panic!(
+                "a themed binding launches with its theme: {:?}",
+                click.dispatch
+            );
+        };
+        assert_eq!(launch["action"], "launch");
+        assert_eq!(launch["theme"], "dark");
+
+        // Opening background tabs is the host's to call and never the
+        // model's, yet it is an agent operation: custody, gates, launch.
+        let open_many = themed
+            .flags
+            .prepare(
+                TOOL_OPEN_MANY,
+                &json!({ "urls": ["https://a.example/", "https://b.example/"] }),
+            )
+            .unwrap();
+        assert_eq!(
+            tool(TOOL_OPEN_MANY).unwrap()["_meta"],
+            json!({ "io.ambit/browser": { "caller": "host" } })
+        );
+        assert_eq!(open_many.command["action"], "tab_new");
+        assert_eq!(open_many.command["background"], true);
+        assert_eq!(
+            open_many.command["urls"],
+            json!(["https://a.example/", "https://b.example/"])
+        );
+        assert!(matches!(
+            open_many.dispatch,
+            Dispatch::Agent { launch: Some(_) }
+        ));
     }
 
     #[test]

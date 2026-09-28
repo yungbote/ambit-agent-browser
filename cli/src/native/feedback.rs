@@ -169,12 +169,58 @@ async fn observe(state: &DaemonState) -> Result<Observation, &'static str> {
     })
 }
 
+/// The active page's identity and geometry digest, as a capture records
+/// them: `{targetId, loaderId, pageGeneration, url, title}`.
+pub(crate) async fn page_identity(
+    state: &DaemonState,
+) -> Result<(ObservationId, Value), &'static str> {
+    match tokio::time::timeout(CAPTURE_TIMEOUT, observe(state)).await {
+        Ok(Ok(observation)) => Ok((observation.id, observation.page)),
+        Ok(Err(code)) => Err(code),
+        Err(_) => Err("capture_timeout"),
+    }
+}
+
+/// A capture for `request` of the active page, under the same checks as a
+/// host-bound command's: the feedback object, or the code that stands for
+/// it being unavailable.
+pub(crate) async fn capture_for(request: &FeedbackRequest, state: &DaemonState) -> Value {
+    let browser = match tokio::time::timeout(CAPTURE_TIMEOUT, capture(request, state)).await {
+        Ok(Ok(browser)) => browser,
+        Ok(Err(code)) => request.unavailable(code),
+        Err(_) => request.unavailable("capture_timeout"),
+    };
+    if browser["capture"].get("path").is_some() {
+        state.browser_control.lock().await.observed();
+    }
+    browser
+}
+
 pub(crate) async fn matches_expected(request: &FeedbackRequest, state: &DaemonState) -> bool {
     let Some(expected) = request.expected_observation.as_ref() else {
         return true;
     };
     matches!(tokio::time::timeout(CAPTURE_TIMEOUT, observe(state)).await,
         Ok(Ok(observation)) if observation.id == *expected)
+}
+
+/// The file protocol's fence: a command carrying image coordinates runs only
+/// on the page and viewport of the image they were read from.
+pub(crate) struct ImageFence<'a>(pub(crate) &'a FeedbackRequest);
+
+impl super::actions::HostFence for ImageFence<'_> {
+    fn fences_point(&self) -> bool {
+        self.0.expected_observation.is_some()
+    }
+
+    async fn admit(&mut self, command: &Value, state: &mut DaemonState) -> Result<(), Value> {
+        if matches_expected(self.0, state).await {
+            return Ok(());
+        }
+        Err(
+            json!({ "id": command["id"], "success": false, "code": "browser_observation_stale", "error": "The browser page or viewport changed since this image. Inspect the fresh observation before sending coordinates." }),
+        )
+    }
 }
 
 fn write_capture(directory: &Path, bytes: &[u8]) -> Result<PathBuf, &'static str> {

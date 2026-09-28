@@ -20,6 +20,7 @@ use tokio::sync::watch;
 mod interrupts;
 pub(crate) mod motion;
 mod mouse;
+pub(crate) mod paced;
 
 pub(crate) use interrupts::{InterruptReason, Interruption, Interrupts};
 
@@ -575,6 +576,7 @@ impl BrowserControl {
         let strokes = motion::strokes(events);
         let total = strokes.iter().map(|stroke| stroke.characters).sum();
         let mut raised = self.interrupts.subscribe();
+        let _paced = paced::Span::begin();
         let mut typed = 0;
         for (index, stroke) in strokes.iter().enumerate() {
             if stroke.paced {
@@ -684,6 +686,18 @@ impl BrowserControl {
             .await
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
         self.finish_native_dialog().await
+    }
+
+    /// The agent channel whose steps acted last has ended: what they left
+    /// held (a `keydown` without its `keyup`, a button down) is settled as a
+    /// program's is when it ends. Nothing is sent when nothing is held, nor
+    /// while a person holds the browser: taking it released the agent's.
+    pub(crate) async fn finish_agent_channel(&mut self, client: &CdpClient) -> Result<(), String> {
+        let held = self.native_mouse.needs_release() || self.stream_held.next_release().is_some();
+        if !held || self.agent_error().is_some() {
+            return Ok(());
+        }
+        self.finish_agent_program(client).await
     }
 
     fn observe_native_result<T>(&mut self, result: &Result<T, CommandError>) {

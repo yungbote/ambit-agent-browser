@@ -1618,11 +1618,15 @@ fn parse_command_inner(
                     //   tab new [url]
                     //   tab new --label <name> [url]
                     //   tab new [url] --label <name>
+                    //   tab new --background <url>...  (1 to 8 tabs, loaded at
+                    //   once; the active tab stays)
                     let mut cmd = json!({ "id": id, "action": "tab_new" });
+                    let background = rest[1..].contains(&"--background");
+                    let mut urls = Vec::new();
                     let mut i = 1;
                     while i < rest.len() {
                         match rest[i] {
-                            "--label" => {
+                            "--label" if !background => {
                                 let name = rest.get(i + 1).ok_or(ParseError::MissingArguments {
                                     context: "tab new --label".to_string(),
                                     usage: "tab new --label <name> [url]",
@@ -1630,17 +1634,33 @@ fn parse_command_inner(
                                 cmd["label"] = json!(name);
                                 i += 2;
                             }
-                            other if !other.starts_with("--") && cmd.get("url").is_none() => {
-                                cmd["url"] = json!(other);
+                            "--background" => i += 1,
+                            other
+                                if !other.starts_with("--") && (background || urls.is_empty()) =>
+                            {
+                                urls.push(other);
                                 i += 1;
                             }
                             other => {
                                 return Err(ParseError::UnknownSubcommand {
                                     subcommand: other.to_string(),
-                                    valid_options: &["--label", "<url>"],
+                                    valid_options: &["--label", "--background", "<url>"],
                                 });
                             }
                         }
+                    }
+                    if background {
+                        let most = crate::native::browser::BACKGROUND_TABS;
+                        if urls.is_empty() || urls.len() > most {
+                            return Err(ParseError::InvalidValue {
+                                message: format!("tab new --background opens 1 to {most} URLs"),
+                                usage: "tab new --background <url>...",
+                            });
+                        }
+                        cmd["background"] = json!(true);
+                        cmd["urls"] = json!(urls);
+                    } else if let Some(url) = urls.first() {
+                        cmd["url"] = json!(url);
                     }
                     Ok(cmd)
                 }
@@ -4620,6 +4640,51 @@ mod tests {
         .unwrap();
         assert_eq!(cmd["url"], "https://docs.example.com");
         assert_eq!(cmd["label"], "docs");
+    }
+
+    #[test]
+    fn test_tab_new_background_opens_every_url_and_one_label_is_refused() {
+        let cmd = parse_command(
+            &args("tab new --background https://a.example https://b.example/x?y=1"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(cmd["action"], "tab_new");
+        assert_eq!(cmd["background"], true);
+        assert_eq!(
+            cmd["urls"],
+            json!(["https://a.example", "https://b.example/x?y=1"])
+        );
+        assert!(cmd.get("url").is_none());
+        // The flag may come after the URLs.
+        let after = parse_command(
+            &args("tab new https://a.example --background"),
+            &default_flags(),
+        )
+        .unwrap();
+        assert_eq!(after["urls"], json!(["https://a.example"]));
+        // One to eight URLs; a label names one tab, not several.
+        assert!(parse_command(&args("tab new --background"), &default_flags()).is_err());
+        let nine = (0..9)
+            .map(|index| format!("https://{index}.example"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(parse_command(
+            &args(&format!("tab new --background {nine}")),
+            &default_flags()
+        )
+        .is_err());
+        assert!(parse_command(
+            &args("tab new --background --label docs https://a.example"),
+            &default_flags()
+        )
+        .is_err());
+        // Without the flag, a second URL is still refused.
+        assert!(parse_command(
+            &args("tab new https://a.example https://b.example"),
+            &default_flags()
+        )
+        .is_err());
     }
 
     #[test]

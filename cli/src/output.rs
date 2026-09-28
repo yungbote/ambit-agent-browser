@@ -801,6 +801,44 @@ pub fn print_response_with_opts(resp: &Response, action: Option<&str>, opts: &Ou
             }
             return;
         }
+        // Tabs opened in the background, each with its page or its error
+        if action == Some("tab_new") {
+            if let Some(tabs) = data.get("tabs").and_then(|v| v.as_array()) {
+                for tab in tabs {
+                    let tab_id = tab.get("tabId").and_then(|v| v.as_str()).unwrap_or("?");
+                    let page = &tab["page"];
+                    let url = page["url"].as_str().unwrap_or("");
+                    if let Some(error) = tab.get("error").and_then(|v| v.as_str()) {
+                        println!(
+                            "{} [{}] {} {}",
+                            color::error_indicator(),
+                            tab_id,
+                            url,
+                            color::dim(error)
+                        );
+                        continue;
+                    }
+                    let title = page["title"]
+                        .as_str()
+                        .filter(|title| !title.is_empty())
+                        .unwrap_or("Untitled");
+                    let loading = if tab.get("loadWait").is_some() {
+                        " (still loading)"
+                    } else {
+                        ""
+                    };
+                    println!(
+                        "{} Tab opened [{}] {} - {}{}",
+                        color::success_indicator(),
+                        tab_id,
+                        title,
+                        url,
+                        loading
+                    );
+                }
+                return;
+            }
+        }
         // Tabs
         if let Some(tabs) = data.get("tabs").and_then(|v| v.as_array()) {
             for tab in tabs {
@@ -2666,6 +2704,14 @@ emulation overrides and browser theme before their first document loads.
 Tabs a person opens and popups get the same setup when the session
 discovers them.
 
+`tab new --background` opens one tab per URL (1 to 8) without leaving the
+active tab: its page, refs and frame stay. The tabs load at once, each until
+`load` or the session's timeout, and the command answers when all have
+ended. JSON output lists data.tabs in the order given, each with its tabId,
+page (targetId, loaderId, pageGeneration, url, title) and httpStatus; a tab
+that committed but did not finish loading carries loadWait, and one that
+failed to load stays open with its error. Switch to a tab to read it.
+
 Each session remembers its active tab (bound by CDP target id) and returns
 to it after a daemon restart. With --pin-tab, a command addressed to the
 bound tab once it is closed is refused with a `tab_gone` error before it
@@ -2681,6 +2727,7 @@ Operations:
   list                       List open tabs with their ids and labels (default)
   new [url]                  Open a new tab
   new --label <name> [url]   Open a new tab with a label like `docs` or `app`
+  new --background <url>...  Open 1 to 8 tabs in the background, loaded at once
   close [t<N>|label|target]  Close a tab (current if no ref given)
   <t<N>|label|target>        Switch to a tab by id, label, or CDP target id
 
@@ -2694,6 +2741,7 @@ Examples:
   agent-browser tab new
   agent-browser tab new https://example.com
   agent-browser tab new --label docs https://docs.example.com
+  agent-browser tab new --background https://a.example https://b.example
   agent-browser tab t2
   agent-browser tab docs
   agent-browser tab close

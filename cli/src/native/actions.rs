@@ -771,6 +771,25 @@ impl DaemonState {
             .and_then(|dialog| dialog.session_id.clone())
     }
 
+    /// Whether a pending JavaScript dialog blocks the active page, so that
+    /// anything touching the page would wait until the dialog is resolved.
+    /// One on a background tab leaves the active tab's renderer responsive.
+    pub(crate) fn dialog_blocks_active_page(&self) -> bool {
+        let Some(dialog) = self.pending_dialog.as_ref() else {
+            return false;
+        };
+        let active = self
+            .browser
+            .as_ref()
+            .and_then(|browser| browser.active_session_id().ok());
+        match (dialog.session_id.as_deref(), active) {
+            (Some(dialog), Some(active)) => dialog == active,
+            // No session on the event is a top-level page dialog; with no
+            // browser, be safe.
+            _ => true,
+        }
+    }
+
     /// The expiry path every command and maintenance tick runs. A sign-in
     /// ends here too, so no agent command can reach a browser a person holds.
     pub(crate) async fn expire_browser_control(
@@ -2735,6 +2754,43 @@ pub(crate) async fn execute_command_received(
             return json!({ "id": cmd["id"], "success": false, "code": "browser_feedback_invalid", "error": error })
         }
     };
+    let mut response = run_host_command(
+        cmd,
+        &request,
+        state,
+        received_at,
+        &mut super::feedback::ImageFence(&request),
+    )
+    .await;
+    super::feedback::attach(&request, &mut response, state).await;
+    response
+}
+
+/// What a host-bound command must still find once the custody and
+/// observation gates admitted it, checked before its first input: the page
+/// and viewport of the image its point was read from (the file protocol's
+/// `feedback::ImageFence`), or an agent-channel step's preconditions.
+pub(crate) trait HostFence {
+    /// Whether the viewport point the command carries is checked against the
+    /// page it was chosen on. Such a point needs no fresh observation after a
+    /// person used the browser: the fence refuses it if the page moved.
+    fn fences_point(&self) -> bool;
+
+    /// Admits the command, or refuses it with a native response.
+    async fn admit(&mut self, command: &Value, state: &mut DaemonState) -> Result<(), Value>;
+}
+
+/// A host-bound command once the window admitted it, as both transports run
+/// it: the custody gate, the observation gate and the caller's fence, then
+/// the operation, after the launch the request carries, under the host
+/// deadline. `cmd` still carries the host's request.
+pub(crate) async fn run_host_command(
+    cmd: &Value,
+    request: &super::feedback::FeedbackRequest,
+    state: &mut DaemonState,
+    received_at: std::time::Instant,
+    fence: &mut impl HostFence,
+) -> Value {
     let mut command = cmd.clone();
     command
         .as_object_mut()
@@ -2742,18 +2798,26 @@ pub(crate) async fn execute_command_received(
         .remove(super::feedback::REQUEST_FIELD);
     let expiry_error = state.expire_browser_control().await.err();
     let controlled = expiry_error.or(state.browser_control.lock().await.agent_error());
-    // The command still carries the host's request here: whether its point
-    // is fenced by the image it came from is part of that request.
-    let requires_observation = window_actions::observation_required(
-        cmd,
+    let requires_observation = window_actions::observation_required_with(
+        &command,
         state.browser_control.lock().await.needs_observation(),
+        fence.fences_point(),
     );
-    let mut response = if let Some(error) = controlled {
-        json!({ "id": command["id"], "success": false, "code": error.code, "error": error.message })
+    // A person's control is reported before a stale page, and the fence is
+    // asked only once both gates admitted the command.
+    let refusal = if let Some(error) = controlled {
+        Some(
+            json!({ "id": command["id"], "success": false, "code": error.code, "error": error.message }),
+        )
     } else if requires_observation {
-        json!({ "id": command["id"], "success": false, "code": "browser_observation_required", "error": window_actions::OBSERVATION_REQUIRED })
-    } else if !super::feedback::matches_expected(&request, state).await {
-        json!({ "id": command["id"], "success": false, "code": "browser_observation_stale", "error": "The browser page or viewport changed since this image. Inspect the fresh observation before sending coordinates." })
+        Some(
+            json!({ "id": command["id"], "success": false, "code": "browser_observation_required", "error": window_actions::OBSERVATION_REQUIRED }),
+        )
+    } else {
+        fence.admit(&command, state).await.err()
+    };
+    let response = if let Some(refusal) = refusal {
+        refusal
     } else {
         let operation = async {
             if let Some(launch) = request
@@ -2814,7 +2878,6 @@ pub(crate) async fn execute_command_received(
     if response["success"] == true && window_actions::observes_page(&command) {
         state.browser_control.lock().await.observed();
     }
-    super::feedback::attach(&request, &mut response, state).await;
     response
 }
 
@@ -3223,15 +3286,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
     // Only a dialog on the ACTIVE tab blocks: one on a background tab leaves
     // the active tab's renderer responsive.
     if let Some(ref dialog) = state.pending_dialog {
-        let active_session = state
-            .browser
-            .as_ref()
-            .and_then(|m| m.active_session_id().ok().map(|s| s.to_string()));
-        let on_active_tab = match (&dialog.session_id, &active_session) {
-            (Some(dialog_sid), Some(active_sid)) => dialog_sid == active_sid,
-            // No session on the event = top-level page dialog; no browser = be safe.
-            _ => true,
-        };
+        let on_active_tab = state.dialog_blocks_active_page();
         // Tab and session management must stay usable: switching or closing
         // tabs is exactly how an agent escapes a tab blocked by a dialog.
         let read_touches_active_tab = action == "read"
@@ -4723,7 +4778,8 @@ async fn apply_launch_mutator_plugins(
     Ok(())
 }
 
-fn require_sandbox_from_env() -> bool {
+/// The daemon's launch policy: whether it launches Chrome only sandboxed.
+pub(crate) fn require_sandbox_from_env() -> bool {
     matches!(
         env::var("AGENT_BROWSER_REQUIRE_SANDBOX").as_deref(),
         Ok("1" | "true")
@@ -7696,6 +7752,9 @@ async fn handle_tab_list(state: &mut DaemonState) -> Result<Value, String> {
 }
 
 async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    if cmd.get("background").and_then(Value::as_bool) == Some(true) {
+        return open_background_tabs(cmd, state).await;
+    }
     let url = cmd.get("url").and_then(|v| v.as_str());
     let label = cmd.get("label").and_then(|v| v.as_str());
     let domain_filter = state.domain_filter.read().await.clone();
@@ -7744,6 +7803,47 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     state.refresh_active_iframe_sessions().await;
 
     Ok(result)
+}
+
+/// `tab new --background <url>...`: one background tab per URL, each given
+/// the session's setup and network controls before its first document, all
+/// loading at once. The active tab, its refs and its frame stay as they are.
+async fn open_background_tabs(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+    let urls: Vec<String> = cmd
+        .get("urls")
+        .and_then(Value::as_array)
+        .map(|urls| {
+            urls.iter()
+                .filter_map(|url| url.as_str().map(String::from))
+                .collect()
+        })
+        .unwrap_or_default();
+    if urls.is_empty() || urls.len() > super::browser::BACKGROUND_TABS {
+        return Err(format!(
+            "tab new --background opens 1 to {} URLs.",
+            super::browser::BACKGROUND_TABS
+        ));
+    }
+    let domain_filter = state.domain_filter.read().await.clone();
+    for url in &urls {
+        check_url_allowed_by_filter(domain_filter.as_ref(), url)?;
+    }
+    let has_proxy_creds = state.proxy_credentials.read().await.is_some();
+    let mut sessions = Vec::with_capacity(urls.len());
+    for _ in &urls {
+        let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
+        sessions.push(mgr.tab_new_background().await?);
+    }
+    for session in &sessions {
+        apply_session_setup(state, session).await?;
+    }
+    install_network_controls_or_close(state, has_proxy_creds).await?;
+    state.drain_cdp_events_background().await?;
+    let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
+    let tabs = mgr
+        .load_background(sessions.into_iter().zip(urls).collect(), WaitUntil::Load)
+        .await;
+    Ok(json!({ "tabs": tabs }))
 }
 
 async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
@@ -17768,5 +17868,80 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             let auto_handled = auto_dialog && matches!(*dialog_type, "beforeunload" | "alert");
             assert!(!auto_handled, "{dialog_type} should NOT be auto-handled");
         }
+    }
+
+    /// A fence that refuses every command it is asked about and counts them.
+    struct RefusingFence {
+        points: bool,
+        asked: usize,
+    }
+
+    impl HostFence for RefusingFence {
+        fn fences_point(&self) -> bool {
+            self.points
+        }
+
+        async fn admit(&mut self, command: &Value, _: &mut DaemonState) -> Result<(), Value> {
+            self.asked += 1;
+            Err(json!({ "id": command["id"], "success": false,
+                "code": "browser_observation_stale", "error": "fenced" }))
+        }
+    }
+
+    /// Both transports' host path asks its fence only after the custody and
+    /// observation gates admitted the command: a person's control is reported
+    /// before an observation the agent owes, and both before a stale page. A
+    /// point the fence checks needs no fresh observation.
+    #[tokio::test]
+    async fn the_host_path_asks_its_fence_after_custody_and_observation() {
+        let mut state = DaemonState::new();
+        let request = super::super::feedback::FeedbackRequest {
+            namespace: String::new(),
+            session: state.session_id.clone(),
+            capture_directory: "/".into(),
+            timeout_ms: 1_000,
+            expected_observation: None,
+            launch: None,
+        };
+        let point = json!({ "id": "p", "action": "mousemove", "x": 10, "y": 20,
+            super::super::feedback::REQUEST_FIELD: {} });
+        let named = json!({ "id": "n", "action": "click", "selector": "#go",
+            super::super::feedback::REQUEST_FIELD: {} });
+        let now = std::time::Instant::now;
+
+        let interrupts = state.browser_control.lock().await.interrupts();
+        let takeover =
+            interrupts.raise(super::super::browser_control::InterruptReason::HumanControl);
+        let mut unfenced = RefusingFence {
+            points: false,
+            asked: 0,
+        };
+        let refused = run_host_command(&named, &request, &mut state, now(), &mut unfenced).await;
+        assert_eq!(refused["code"], "browser_controlled_by_user", "{refused}");
+        assert_eq!(refused["id"], "n");
+        assert_eq!(unfenced.asked, 0);
+        drop(takeover);
+
+        // An input's outcome became unknown: the agent owes an observation.
+        state
+            .browser_control
+            .lock()
+            .await
+            .cancel_native_input()
+            .await
+            .unwrap();
+        let refused = run_host_command(&point, &request, &mut state, now(), &mut unfenced).await;
+        assert_eq!(refused["code"], "browser_observation_required", "{refused}");
+        assert_eq!(unfenced.asked, 0);
+        let refused = run_host_command(&named, &request, &mut state, now(), &mut unfenced).await;
+        assert_eq!(refused["error"], "fenced", "{refused}");
+        assert_eq!(unfenced.asked, 1);
+        let mut fenced = RefusingFence {
+            points: true,
+            asked: 0,
+        };
+        let refused = run_host_command(&point, &request, &mut state, now(), &mut fenced).await;
+        assert_eq!(refused["error"], "fenced", "{refused}");
+        assert_eq!(fenced.asked, 1);
     }
 }

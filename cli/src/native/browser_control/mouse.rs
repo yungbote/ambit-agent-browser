@@ -337,6 +337,7 @@ struct Pacing<'a> {
     events: tokio::sync::broadcast::Receiver<CdpEvent>,
     interrupts: &'a Interrupts,
     dialog_sessions: &'a [&'a str],
+    _paced: super::paced::Span,
 }
 
 impl<'a> Pacing<'a> {
@@ -353,6 +354,7 @@ impl<'a> Pacing<'a> {
             events: client.subscribe(),
             interrupts,
             dialog_sessions,
+            _paced: super::paced::Span::begin(),
         }
     }
 
