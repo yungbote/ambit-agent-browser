@@ -9,6 +9,7 @@ mod discovery;
 mod http;
 pub(crate) mod layout;
 pub(crate) mod presentation;
+mod track;
 mod websocket;
 mod window_capture;
 mod wire;

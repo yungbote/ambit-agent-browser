@@ -44,20 +44,40 @@ async fn next(socket: &mut Socket) -> (Value, Vec<u8>) {
         }
     }
 }
-async fn state(socket: &mut Socket, expected: &str, generation: Option<u64>) -> Value {
+/// The next audio record in `expected` state and generation. Packets of any
+/// epoch may precede it (they were in flight), and so may only the records
+/// `allowed` names: an answer the viewer did not ask for fails the test.
+async fn record_after(
+    socket: &mut Socket,
+    expected: &str,
+    generation: Option<u64>,
+    allowed: &[(&str, Option<u64>)],
+) -> Value {
     tokio::time::timeout(Duration::from_secs(3), async {
         loop {
             let (header, _) = next(socket).await;
-            if header["type"] == "audio"
-                && header["state"] == expected
+            if header["type"] != "audio" {
+                continue;
+            }
+            if header["state"] == expected
                 && generation.is_none_or(|generation| header["generation"] == generation)
             {
                 return header;
             }
+            assert!(
+                allowed
+                    .iter()
+                    .any(|(state, generation)| header["state"] == *state
+                        && header.get("generation").and_then(Value::as_u64) == *generation),
+                "unexpected audio record {header} before {expected} {generation:?}"
+            );
         }
     })
     .await
     .unwrap_or_else(|_| panic!("missing audio {expected} generation {generation:?}"))
+}
+async fn state(socket: &mut Socket, expected: &str, generation: Option<u64>) -> Value {
+    record_after(socket, expected, generation, &[]).await
 }
 async fn request(socket: &mut Socket, enabled: bool, generation: u64) {
     socket
@@ -67,9 +87,12 @@ async fn request(socket: &mut Socket, enabled: bool, generation: u64) {
         .await
         .unwrap();
 }
+/// The next packet, which must belong to `stream_id`: no audio record may
+/// interrupt a running epoch.
 async fn packet(socket: &mut Socket, stream_id: &Value) -> (Value, Vec<u8>) {
     loop {
         let (header, bytes) = next(socket).await;
+        assert_ne!(header["type"], "audio", "an unasked record: {header}");
         if header["type"] == "media" && header["track"] == "audio" {
             assert_eq!(
                 &header["streamId"], stream_id,
@@ -196,7 +219,15 @@ async fn e2e_audio_generation_and_independent_image_flow() {
         request(&mut socket, false, 4).await;
         request(&mut socket, true, 5).await;
         request(&mut socket, true, 6).await;
-        let latest = state(&mut socket, "started", Some(6)).await;
+        // Coalescing may skip the older requests' answers, never add others:
+        // a newer generation retires the previous epoch without `stopped`.
+        let latest = record_after(
+            &mut socket,
+            "started",
+            Some(6),
+            &[("stopped", Some(4)), ("started", Some(5))],
+        )
+        .await;
         assert_ne!(latest["streamId"], second["streamId"]);
         assert_eq!(packet(&mut socket, &latest["streamId"]).await.0["seq"], 1);
         request(&mut socket, true, 6).await;
@@ -211,7 +242,16 @@ async fn e2e_audio_generation_and_independent_image_flow() {
         assert_eq!(packet(&mut socket, &renewed["streamId"]).await.0["seq"], 1);
         server.set_audio(None);
         server.set_audio(Some(source.clone()));
-        let rebound = state(&mut socket, "started", Some(7)).await;
+        // The writer may see the removal (a truthful unavailable, then the
+        // offer again) or only the rebind; either way the standing request
+        // continues in a new epoch without a `stopped` it never asked for.
+        let rebound = record_after(
+            &mut socket,
+            "started",
+            Some(7),
+            &[("unavailable", Some(7)), ("available", None)],
+        )
+        .await;
         assert_ne!(
             rebound["streamId"], renewed["streamId"],
             "coalesced source removal still retires the epoch"

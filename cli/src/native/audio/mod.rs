@@ -19,6 +19,12 @@ pub(crate) const CHANNELS: u8 = 2;
 pub(crate) const FRAME_SAMPLES: usize = 480;
 pub(crate) const FRAME_BYTES: usize = FRAME_SAMPLES * CHANNELS as usize * 2;
 /// Six 10 ms units. On overflow the subscription ends instead of replaying old sound.
+// The capture server is the queue's only producer; without it only the
+// consumer side is compiled.
+#[cfg_attr(
+    not(all(target_os = "linux", feature = "browser-audio")),
+    allow(dead_code)
+)]
 const QUEUE_FRAMES: usize = 6;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
@@ -26,6 +32,23 @@ const QUEUE_FRAMES: usize = 6;
 pub(crate) enum AudioCodec {
     Opus,
     PcmS16le,
+}
+
+impl AudioCodec {
+    /// The token a viewer declares on its upgrade (`audio=<token>`) and every
+    /// audio record and packet names.
+    pub(crate) const fn token(self) -> &'static str {
+        match self {
+            Self::Opus => "opus",
+            Self::PcmS16le => "pcm-s16le",
+        }
+    }
+
+    pub(crate) fn parse(token: &str) -> Option<Self> {
+        [Self::Opus, Self::PcmS16le]
+            .into_iter()
+            .find(|codec| codec.token() == token)
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
@@ -55,7 +78,15 @@ pub(crate) struct AudioPacket {
 pub(crate) enum AudioError {
     Unavailable,
     Retired,
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "browser-audio")),
+        allow(dead_code)
+    )]
     Overrun,
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "browser-audio")),
+        allow(dead_code)
+    )]
     Discontinuity,
 }
 
@@ -80,6 +111,10 @@ pub(super) struct AudioQueue {
     wake: tokio::sync::Notify,
 }
 impl AudioQueue {
+    #[cfg_attr(
+        not(all(target_os = "linux", feature = "browser-audio")),
+        allow(dead_code)
+    )]
     fn push(&self, packet: AudioPacket) -> bool {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         if state.ended.is_some() {
@@ -168,9 +203,6 @@ impl AudioSource {
             let _ = other;
             false
         }
-    }
-    pub(crate) const fn compiled() -> bool {
-        cfg!(all(target_os = "linux", feature = "browser-audio"))
     }
     pub(crate) fn observe(&self) -> AudioObservation {
         #[cfg(all(target_os = "linux", feature = "browser-audio"))]
