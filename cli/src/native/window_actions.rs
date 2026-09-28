@@ -98,11 +98,21 @@ pub(super) fn point_fenced(command: &Value) -> bool {
 /// moved under the agent; a command that names its target runs, and the
 /// host's feedback shows it the page it acted on.
 pub(super) fn observation_required(command: &Value, needs_observation: bool) -> bool {
+    observation_required_with(command, needs_observation, point_fenced(command))
+}
+
+/// `observation_required` for a command whose point is fenced as its
+/// transport says (`HostFence::fences_point`).
+pub(crate) fn observation_required_with(
+    command: &Value,
+    needs_observation: bool,
+    point_fenced: bool,
+) -> bool {
     needs_observation
         && match target(command) {
             Target::Named => false,
             Target::Focus | Target::Pointer | Target::Any => true,
-            Target::Point => !point_fenced(command),
+            Target::Point => !point_fenced,
         }
 }
 

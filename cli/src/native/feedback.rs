@@ -177,6 +177,25 @@ pub(crate) async fn matches_expected(request: &FeedbackRequest, state: &DaemonSt
         Ok(Ok(observation)) if observation.id == *expected)
 }
 
+/// The file protocol's fence: a command carrying image coordinates runs only
+/// on the page and viewport of the image they were read from.
+pub(crate) struct ImageFence<'a>(pub(crate) &'a FeedbackRequest);
+
+impl super::actions::HostFence for ImageFence<'_> {
+    fn fences_point(&self) -> bool {
+        self.0.expected_observation.is_some()
+    }
+
+    async fn admit(&mut self, command: &Value, state: &mut DaemonState) -> Result<(), Value> {
+        if matches_expected(self.0, state).await {
+            return Ok(());
+        }
+        Err(
+            json!({ "id": command["id"], "success": false, "code": "browser_observation_stale", "error": "The browser page or viewport changed since this image. Inspect the fresh observation before sending coordinates." }),
+        )
+    }
+}
+
 fn write_capture(directory: &Path, bytes: &[u8]) -> Result<PathBuf, &'static str> {
     let directory = directory
         .canonicalize()
