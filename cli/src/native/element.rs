@@ -623,7 +623,8 @@ async fn check_object_interception(
 }
 
 /// Resolve an already-selected DOM node through the same geometry and hit
-/// testing used for references. No temporary selector or DOM marker is needed.
+/// testing used for references, scrolled into view by script first. No
+/// temporary selector or DOM marker is needed.
 pub(crate) async fn resolve_object_center(
     client: &CdpClient,
     session_id: &str,
@@ -637,6 +638,18 @@ pub(crate) async fn resolve_object_center(
             Some(session_id),
         )
         .await?;
+    object_center(client, session_id, object_id, target).await
+}
+
+/// A node's click point where it is now, with the same hit testing, and no
+/// scrolling: the owned window's pointer brings nodes into view with the
+/// wheel before it reads them here.
+pub(crate) async fn object_center(
+    client: &CdpClient,
+    session_id: &str,
+    object_id: &str,
+    target: &str,
+) -> Result<(f64, f64), String> {
     let result: DomGetBoxModelResult = client
         .send_command_typed(
             "DOM.getBoxModel",

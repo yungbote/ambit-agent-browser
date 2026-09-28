@@ -299,6 +299,10 @@ impl std::fmt::Display for DisplayError {
 
 impl std::error::Error for DisplayError {}
 
+#[cfg(target_os = "linux")]
+#[path = "display_pictures.rs"]
+pub(crate) mod pictures;
+
 pub(crate) fn enabled() -> bool {
     std::env::var("AGENT_BROWSER_WINDOW_STREAM").is_ok_and(|value| value == "1")
 }
@@ -316,6 +320,7 @@ pub(crate) fn window_pixels(width: u32, height: u32) -> Result<(u32, u32), Strin
 
 #[cfg(target_os = "linux")]
 mod platform {
+    use super::pictures::PictureChannel;
     use super::*;
     use std::os::fd::{AsRawFd, OwnedFd};
     use std::os::unix::net::UnixStream;
@@ -334,6 +339,9 @@ mod platform {
         /// Captures only. Independent of the control channel so a frame in
         /// flight never delays native input.
         frames: tokio::sync::Mutex<Wire>,
+        /// The video producer's pictures, when the helper was given the
+        /// channel; used only once the helper advertises `pictures`.
+        pictures: Option<PictureChannel>,
         abort_sockets: [UnixStream; 2],
         failed: AtomicBool,
         /// Its owner ended this display on purpose: it stops producing frames
@@ -415,10 +423,21 @@ mod platform {
         Ok(Channel { client, helper })
     }
 
+    /// A display for tests: the client, the helper's ends of its control
+    /// and frame channels, and its picture channel's helper.
+    #[cfg(test)]
+    pub(crate) struct TestPictures {
+        pub display: Arc<DisplayClient>,
+        pub control: tokio::net::UnixStream,
+        pub frames: tokio::net::UnixStream,
+        pub helper: super::pictures::fake::FakeHelper,
+    }
+
     impl DisplayClient {
         fn new(
             control: UnixStream,
             frames: UnixStream,
+            pictures: Option<PictureChannel>,
             surface: Surface,
             ready: bool,
         ) -> Result<Arc<Self>, String> {
@@ -436,6 +455,7 @@ mod platform {
                 identity: uuid::Uuid::new_v4().to_string(),
                 control: tokio::sync::Mutex::new(wire(control)?),
                 frames: tokio::sync::Mutex::new(wire(frames)?),
+                pictures,
                 abort_sockets,
                 failed: AtomicBool::new(false),
                 retired: AtomicBool::new(false),
@@ -493,6 +513,7 @@ mod platform {
             let client = Self::new(
                 control.client,
                 frames.client,
+                None,
                 Surface::new(2560, 1440),
                 true,
             )
@@ -504,8 +525,45 @@ mod platform {
             (client, peer(control.helper), peer(frames.helper))
         }
 
+        /// A client whose control and frame peers the test drives, and
+        /// whose picture channel it serves (`FakeHelper`), advertising
+        /// `pictures`.
+        #[cfg(test)]
+        pub(crate) fn test_pictures() -> TestPictures {
+            let control = channel().unwrap();
+            let frames = channel().unwrap();
+            let handover = PictureChannel::create().unwrap();
+            let helper = super::pictures::fake::FakeHelper::from(&handover);
+            let client = Self::new(
+                control.client,
+                frames.client,
+                Some(handover.channel),
+                Surface::new(2560, 1440),
+                true,
+            )
+            .unwrap();
+            client.advertise(&["captureWait", "cursorIdentity", "pictures"]);
+            let peer = |socket: UnixStream| {
+                socket.set_nonblocking(true).unwrap();
+                tokio::net::UnixStream::from_std(socket).unwrap()
+            };
+            TestPictures {
+                display: client,
+                control: peer(control.helper),
+                frames: peer(frames.helper),
+                helper,
+            }
+        }
+
         pub(crate) fn identity(&self) -> &str {
             &self.identity
+        }
+
+        /// The picture channel, once the helper advertised `pictures`.
+        pub(crate) fn pictures(&self) -> Option<&PictureChannel> {
+            self.pictures
+                .as_ref()
+                .filter(|channel| channel.available() && self.has("pictures"))
         }
         pub(crate) fn surface(&self) -> Surface {
             self.surface.read().unwrap().value.clone()
@@ -618,6 +676,9 @@ mod platform {
             self.failed.store(true, Ordering::Release);
             for socket in &self.abort_sockets {
                 let _ = socket.shutdown(std::net::Shutdown::Both);
+            }
+            if let Some(pictures) = &self.pictures {
+                pictures.abort();
             }
         }
 
@@ -765,18 +826,12 @@ mod platform {
             Ok(info)
         }
 
-        pub(crate) async fn invalidate(&self) {
-            let _wire = self.control.lock().await;
-            let mut surface = self.surface.write().unwrap();
-            surface.value.generation = uuid::Uuid::new_v4().to_string();
-            surface.changed_at = std::time::Instant::now();
-        }
-
         /// One capture: a frame when the display changed since the previous
         /// capture, and the cursor's identity when asked and changed. A
-        /// generation rotated or a layout applied while the frame was in
-        /// flight makes the frame stale (transient), never a helper failure,
-        /// and so does retirement: a closing window is never published.
+        /// layout applied while the frame was in flight makes the frame stale
+        /// (transient), never a helper failure, and so does retirement: a
+        /// closing window is never published. The surface generation names
+        /// the window and never changes while this client serves it.
         pub(crate) async fn capture(
             &self,
             request: CaptureRequest,
@@ -813,7 +868,7 @@ mod platform {
                         operation_performed: Some(json!(false)),
                     });
                 }
-                state.value.clone()
+                (state.value.width, state.value.height)
             };
             let mut command = json!({
                 "op": "capture", "cursor": request.cursor,
@@ -840,10 +895,7 @@ mod platform {
             let capture: Capture =
                 serde_json::from_value(reply).map_err(|_| DisplayError::unavailable())?;
             let after = self.surface();
-            if after.generation != before.generation
-                || (after.width, after.height) != (before.width, before.height)
-                || !capture.fits(&after)
-            {
+            if (after.width, after.height) != before || !capture.fits(&after) {
                 return Err(Self::stale());
             }
             if !capture.coherent(request, &after) {
@@ -926,6 +978,9 @@ mod platform {
                 .into();
             let helper_in: OwnedFd = control.helper.into();
             let frame_channel: OwnedFd = frames.helper.into();
+            // Pictures are optional: without the shared memory the helper
+            // is spawned as before and simply never advertises them.
+            let pictures = PictureChannel::create().ok();
             let mut command = Command::new(executable);
             command
                 .args([
@@ -939,18 +994,48 @@ mod platform {
                 .stdin(Stdio::from(helper_in))
                 .stdout(Stdio::from(helper_out))
                 .stderr(Stdio::null());
-            let frame_fd = frame_channel.as_raw_fd();
-            // SAFETY: dup2 is async-signal-safe and the only work done between
-            // fork and exec. The duplicate has no close-on-exec flag, so the
-            // helper inherits exactly this descriptor as its frame channel.
+            let mut inherited = vec![(frame_channel.as_raw_fd(), FRAME_CHANNEL_FD)];
+            if let Some(handover) = &pictures {
+                command
+                    .env(
+                        "BROWSER_DISPLAY_PICTURE_FD",
+                        super::pictures::CHANNEL_FD.to_string(),
+                    )
+                    .env(
+                        "BROWSER_DISPLAY_PIXELS_FD",
+                        super::pictures::PIXELS_FD.to_string(),
+                    );
+                inherited.push((
+                    handover.helper_socket.as_raw_fd(),
+                    super::pictures::CHANNEL_FD,
+                ));
+                inherited.push((
+                    handover.helper_pixels.as_raw_fd(),
+                    super::pictures::PIXELS_FD,
+                ));
+            }
+            // SAFETY: fcntl and dup2 are async-signal-safe and the only work
+            // done between fork and exec. Every source first moves above the
+            // targets (closed at exec), so a source already on a target number
+            // is never overwritten before it is placed; each placed duplicate
+            // has no close-on-exec flag, so the helper inherits exactly these.
             unsafe {
                 use std::os::unix::process::CommandExt;
                 command.pre_exec(move || {
-                    if libc::dup2(frame_fd, FRAME_CHANNEL_FD) == FRAME_CHANNEL_FD {
-                        Ok(())
-                    } else {
-                        Err(std::io::Error::last_os_error())
+                    let mut moved = [(0, 0); 3];
+                    for (index, (source, target)) in inherited.iter().enumerate() {
+                        let above = libc::fcntl(*source, libc::F_DUPFD_CLOEXEC, 16);
+                        if above < 0 {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                        moved[index] = (above, *target);
                     }
+                    for (above, target) in &moved[..inherited.len()] {
+                        if libc::dup2(*above, *target) != *target {
+                            return Err(std::io::Error::last_os_error());
+                        }
+                    }
+                    Ok(())
                 });
             }
             let child = command
@@ -960,6 +1045,7 @@ mod platform {
             let client = DisplayClient::new(
                 control.client,
                 frames.client,
+                pictures.map(|handover| handover.channel),
                 Surface::new(MAX_DISPLAY_SIZE, MAX_DISPLAY_SIZE),
                 false,
             )?;
@@ -1411,12 +1497,16 @@ mod platform {
             helper.await.unwrap();
         }
 
+        /// An unchanged capture yields no frame, and a frame taken across a
+        /// layout is stale, never a helper failure: the next one is taken at
+        /// the new size.
         #[tokio::test]
-        async fn unchanged_capture_yields_no_frame_and_a_rotated_generation_is_transient() {
-            let (display, _peer, frames) = DisplayClient::test_channel();
-            let (rotate, rotated) = oneshot::channel();
+        async fn unchanged_capture_yields_no_frame_and_one_across_a_layout_is_transient() {
+            let (display, peer, frames) = DisplayClient::test_channel();
+            let (in_flight, flying) = oneshot::channel();
             let helper = tokio::spawn(async move {
                 let mut frames = BufReader::new(frames);
+                let mut peer = BufReader::new(peer);
                 let first = read_request(&mut frames).await;
                 reply(
                     &mut frames,
@@ -1425,7 +1515,9 @@ mod platform {
                 .await;
                 let second = read_request(&mut frames).await;
                 assert_eq!(second["force"], true);
-                rotate.send(()).unwrap();
+                in_flight.send(()).unwrap();
+                // A layout lands while the frame is in flight.
+                answer_resize(&mut peer, (1280, 720)).await;
                 reply(
                     &mut frames,
                     json!({"id":second["id"],"success":true,"data":frame(2560, 1440, true)}),
@@ -1434,10 +1526,11 @@ mod platform {
                 let third = read_request(&mut frames).await;
                 reply(
                     &mut frames,
-                    json!({"id":third["id"],"success":true,"data":frame(2560, 1440, true)}),
+                    json!({"id":third["id"],"success":true,"data":frame(1280, 720, true)}),
                 )
                 .await;
             });
+            let generation = display.surface().generation;
             assert!(display.capture(CAPTURE).await.unwrap().frame.is_none());
             let owner = display.clone();
             let forced = tokio::spawn(async move {
@@ -1448,13 +1541,20 @@ mod platform {
                     })
                     .await
             });
-            rotated.await.unwrap();
-            display.invalidate().await;
+            flying.await.unwrap();
+            let layout = display.layout().await;
+            display
+                .resize(&layout, 1280, 720, Some(7), false)
+                .await
+                .unwrap();
+            drop(layout);
             let error = forced.await.unwrap().unwrap_err();
             assert_eq!(error.code, "display_frame_stale");
             assert!(error.is_transient());
             assert!(display.available());
-            assert!(display.capture(CAPTURE).await.unwrap().frame.is_some());
+            let (_, surface) = display.capture(CAPTURE).await.unwrap().frame.unwrap();
+            assert_eq!((surface.width, surface.height), (1280, 720));
+            assert_eq!(surface.generation, generation, "the window is the same");
             helper.await.unwrap();
         }
 
@@ -1599,6 +1699,8 @@ mod platform {
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use platform::TestPictures;
 #[cfg(target_os = "linux")]
 pub(crate) use platform::{AtomicInput, DisplayClient, DisplayProcess};
 
@@ -1684,9 +1786,6 @@ impl DisplayClient {
         match *self {}
     }
 
-    pub(crate) async fn invalidate(&self) {
-        match *self {}
-    }
     pub(crate) async fn capture(&self, _: CaptureRequest) -> Result<Captured, DisplayError> {
         match *self {}
     }

@@ -1,16 +1,21 @@
-//! The agent's `scroll` in the owned window, as a person scrolls: the
-//! pointer goes where the wheel reaches the scroller, and the wheel turns one
-//! notch per frame until the scroller is where the command asked. Chrome's
-//! own smooth scrolling animates each notch.
+//! The agent's scrolling in the owned window, as a person scrolls: the
+//! pointer goes where the wheel reaches the scroller, and the wheel turns
+//! until the scroller is where it should be, one event per frame. Chrome's
+//! own smooth scrolling animates each notch. `scroll` asks for a distance;
+//! bringing an element into view (`scrollintoview`, and every native pointer
+//! command before it reads its target) asks for the element's centre in the
+//! middle of what each scroller hiding it shows, outermost first.
 //!
-//! The loop is closed on the scroller. It reads the scroller's offsets once
-//! per frame while it waits, and each round sends the notches the remaining
-//! distance needs at the distance per notch the scroller has shown. A
-//! scroller the wheel leaves unmoved for `motion::WHEEL_STALL` after a
-//! round's first notch (a canvas that takes the wheel, overflow a person
-//! cannot scroll), one no visible point turns, and a distance shorter than
-//! half a notch are scrolled by script instead: published as `scrolling`,
-//! with no pointer path. No motion is invented.
+//! The loop is closed on the scroller. It reads the scroller (and the
+//! element) once per frame while it waits, and each round sends the notches
+//! the remaining distance needs at the distance per notch the scroller has
+//! shown. A long distance turns more notches per event rather than more
+//! events (`motion::wheel_events`), within `motion::WHEEL_BUDGET`. Script
+//! takes over, published as `scrolling` with no pointer path, for a scroller
+//! the wheel leaves unmoved for `motion::WHEEL_STALL` after a round's first
+//! notch (a canvas that takes the wheel, overflow a person cannot scroll),
+//! one no visible point turns, a distance under half a notch, and whatever
+//! the budget cannot reach. No motion is invented.
 
 use std::time::{Duration, Instant};
 
@@ -38,7 +43,70 @@ const SETTLED_FRAMES: u32 = 3;
 /// The longest a scroller may keep moving after a round's last notch.
 const SETTLE_LIMIT: Duration = Duration::from_secs(1);
 
-pub(super) const OFFSETS: &str = "function() { return [this.scrollLeft, this.scrollTop, this.scrollWidth - this.clientWidth, this.scrollHeight - this.clientHeight]; }";
+/// The part of `motion::WHEEL_BUDGET` kept for the scroller to settle after
+/// the last notch: Chrome's smooth scroll ends about 110 ms after the last
+/// wheel event (measured at 1, 3 and 10 notches an event), then the loop
+/// sees it still for `SETTLED_FRAMES`.
+const SETTLE_RESERVE: Duration = Duration::from_millis(250);
+
+/// The most nested scrollers one element is brought through by the wheel.
+const MOST_SCROLLERS: usize = 3;
+
+/// A scroller's offsets and how far each can go, then, given an element (in
+/// its document or a same-origin frame inside it), how far the element's
+/// centre is from the middle of what the scroller shows and whether it lies
+/// outside it, per axis. All in CSS pixels of the scroller's document.
+pub(super) const READ: &str = r#"function(element) {
+    const offsets = [this.scrollLeft, this.scrollTop, this.scrollWidth - this.clientWidth, this.scrollHeight - this.clientHeight];
+    if (!element) return offsets;
+    const doc = this.ownerDocument, win = doc.defaultView, root = doc.scrollingElement || doc.documentElement;
+    const box = element.getBoundingClientRect();
+    let x = box.left + box.width / 2, y = box.top + box.height / 2;
+    for (let w = element.ownerDocument.defaultView; w && w !== win && w.frameElement; w = w.parent) {
+        const frame = w.frameElement, rect = frame.getBoundingClientRect();
+        x += rect.left + frame.clientLeft;
+        y += rect.top + frame.clientTop;
+    }
+    let left = 0, top = 0;
+    if (this !== root) {
+        const rect = this.getBoundingClientRect();
+        left = rect.left + this.clientLeft;
+        top = rect.top + this.clientTop;
+    }
+    const width = this.clientWidth, height = this.clientHeight;
+    return offsets.concat([x - (left + width / 2), y - (top + height / 2),
+        x < left || x >= left + width, y < top || y >= top + height]);
+}"#;
+
+/// The outermost scroller that hides this element's centre, walking up
+/// through shadow trees and same-origin frames, or null when it shows.
+pub(super) const HIDER: &str = r#"function() {
+    const parent = el => el.assignedSlot || el.parentElement || (el.parentNode && el.parentNode.host) || null;
+    const scrolls = el => {
+        const style = getComputedStyle(el);
+        return /^(auto|scroll|overlay)$/.test(style.overflowX) || /^(auto|scroll|overlay)$/.test(style.overflowY);
+    };
+    const box = this.getBoundingClientRect();
+    let x = box.left + box.width / 2, y = box.top + box.height / 2;
+    let hider = null, doc = this.ownerDocument, node = parent(this);
+    for (;;) {
+        const root = doc.scrollingElement || doc.documentElement;
+        const hides = (el, left, top) => x < left || x >= left + el.clientWidth || y < top || y >= top + el.clientHeight;
+        for (; node && node !== root; node = parent(node)) {
+            if (!scrolls(node)) continue;
+            const rect = node.getBoundingClientRect();
+            if (hides(node, rect.left + node.clientLeft, rect.top + node.clientTop)) hider = node;
+        }
+        if (hides(root, 0, 0)) hider = root;
+        const frame = doc.defaultView.frameElement;
+        if (!frame) return hider;
+        const rect = frame.getBoundingClientRect();
+        x += rect.left + frame.clientLeft;
+        y += rect.top + frame.clientTop;
+        doc = frame.ownerDocument;
+        node = parent(frame);
+    }
+}"#;
 
 /// Where a wheel turned in the direction `(dx, dy)` reaches this scroller
 /// first, as near the pointer `(px, py)` (null when unknown) as a point can
@@ -105,21 +173,24 @@ pub(super) const WHEEL_POINT: &str = r#"function(px, py, dx, dy) {
 /// Two values, one per axis: horizontal, then vertical.
 type Axes<T> = [T; 2];
 
-/// Where a scroller is and how far it can go, in CSS pixels.
+/// What a scroll turns its scroller toward.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Offsets {
-    at: Axes<f64>,
-    most: Axes<f64>,
+enum Goal<'a> {
+    /// This far, in CSS pixels, from where the scroller started.
+    By(Axes<f64>),
+    /// Until this element's centre is in the middle of what it shows.
+    Into(&'a str),
 }
 
-impl Offsets {
-    /// How far the scroller still has to go to be `delta` from `start`, as
-    /// far as it can go now: content that grows lets it go further.
-    fn remaining(&self, start: Axes<f64>, delta: Axes<f64>) -> Axes<f64> {
-        std::array::from_fn(|axis| {
-            (start[axis] + delta[axis]).clamp(0.0, self.most[axis].max(0.0)) - self.at[axis]
-        })
-    }
+/// One read of a scroller, in CSS pixels: where it is, how far it can go,
+/// and for an element, how far its centre is from the middle of what the
+/// scroller shows and whether it lies outside it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Reading {
+    at: Axes<f64>,
+    most: Axes<f64>,
+    aim: Axes<f64>,
+    outside: Axes<bool>,
 }
 
 /// The direction a scroll asks for on one axis: +1, -1, or 0 for none.
@@ -167,16 +238,36 @@ async fn call(
     Ok(read["result"]["value"].clone())
 }
 
-async fn offsets(client: &CdpClient, session: &str, scroller: &str) -> Result<Offsets, String> {
-    let value = call(client, session, scroller, OFFSETS, json!([])).await?;
+async fn read(
+    client: &CdpClient,
+    session: &str,
+    scroller: &str,
+    goal: Goal<'_>,
+) -> Result<Reading, String> {
+    let arguments = match goal {
+        Goal::By(_) => json!([]),
+        Goal::Into(element) => json!([{ "objectId": element }]),
+    };
+    let value = call(client, session, scroller, READ, arguments).await?;
     let number = |index: usize| value[index].as_f64().filter(|value| value.is_finite());
-    match (number(0), number(1), number(2), number(3)) {
-        (Some(x), Some(y), Some(most_x), Some(most_y)) => Ok(Offsets {
-            at: [x, y],
-            most: [most_x, most_y],
-        }),
-        _ => Err("The scroller could not be read.".into()),
-    }
+    let (Some(x), Some(y), Some(most_x), Some(most_y)) =
+        (number(0), number(1), number(2), number(3))
+    else {
+        return Err("The scroller could not be read.".into());
+    };
+    let aim = match goal {
+        Goal::By(_) => [0.0, 0.0],
+        Goal::Into(_) => match (number(4), number(5)) {
+            (Some(aim_x), Some(aim_y)) => [aim_x, aim_y],
+            _ => return Err("The scroller could not be read.".into()),
+        },
+    };
+    Ok(Reading {
+        at: [x, y],
+        most: [most_x, most_y],
+        aim,
+        outside: [value[6] == true, value[7] == true],
+    })
 }
 
 async fn wheel_point(
@@ -220,48 +311,135 @@ async fn page_scroller(client: &CdpClient, mapping: &Mapping) -> Result<String, 
         .ok_or_else(|| "The page has no scrolling element.".into())
 }
 
-/// Where one scroll stands while its wheel turns.
+/// The outermost scroller hiding `element`'s centre (`HIDER`), if any.
+async fn hider(client: &CdpClient, session: &str, element: &str) -> Result<Option<String>, String> {
+    let found = client
+        .send_command(
+            "Runtime.callFunctionOn",
+            Some(json!({ "objectId": element, "functionDeclaration": HIDER })),
+            Some(session),
+        )
+        .await?;
+    if found.get("exceptionDetails").is_some() {
+        return Err("The element to bring into view could not be read.".into());
+    }
+    Ok(found["result"]["objectId"].as_str().map(str::to_owned))
+}
+
+/// The `<iframe>` element in `page_session` that shows the out-of-process
+/// frame `session` renders, when it can be found.
+async fn frame_owner(client: &CdpClient, page_session: &str, session: &str) -> Option<String> {
+    let frame = client.target_for_session(session)?;
+    let owner = client
+        .send_command(
+            "DOM.getFrameOwner",
+            Some(json!({ "frameId": frame })),
+            Some(page_session),
+        )
+        .await
+        .ok()?;
+    let node = client
+        .send_command(
+            "DOM.resolveNode",
+            Some(json!({ "backendNodeId": owner["backendNodeId"] })),
+            Some(page_session),
+        )
+        .await
+        .ok()?;
+    node["object"]["objectId"].as_str().map(str::to_owned)
+}
+
+/// Where a scroll is going, from its first reading.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Course<'a> {
+    goal: Goal<'a>,
+    /// Where the scroller started.
+    start: Axes<f64>,
+    /// The direction each axis moves: +1, -1, or 0 for an axis left alone.
+    /// Into view, only an axis on which the centre lies outside moves.
+    toward: Axes<f64>,
+}
+
+impl<'a> Course<'a> {
+    fn new(goal: Goal<'a>, first: &Reading) -> Self {
+        let toward = match goal {
+            Goal::By(delta) => delta.map(direction),
+            Goal::Into(_) => std::array::from_fn(|axis| {
+                if first.outside[axis] {
+                    direction(first.aim[axis])
+                } else {
+                    0.0
+                }
+            }),
+        };
+        Self {
+            goal,
+            start: first.at,
+            toward,
+        }
+    }
+
+    /// How far the scroller still has to go on each axis it moves, as far
+    /// as it can go now: content that grows lets it go further.
+    fn remaining(&self, now: &Reading) -> Axes<f64> {
+        std::array::from_fn(|axis| {
+            if self.toward[axis] == 0.0 {
+                return 0.0;
+            }
+            let goal = match self.goal {
+                Goal::By(delta) => self.start[axis] + delta[axis],
+                Goal::Into(_) => now.at[axis] + now.aim[axis],
+            };
+            goal.clamp(0.0, now.most[axis].max(0.0)) - now.at[axis]
+        })
+    }
+
+    /// How many notches each axis still needs, at `per_notch` CSS pixels a
+    /// notch.
+    fn wanted(&self, now: &Reading, per_notch: Axes<f64>) -> Axes<u32> {
+        let left = self.remaining(now);
+        std::array::from_fn(|axis| {
+            motion::notches_toward(left[axis], self.toward[axis], per_notch[axis])
+        })
+    }
+}
+
+/// One scroll's scroller, and the course it takes.
 struct Scroll<'a> {
     client: &'a CdpClient,
     page_session: &'a str,
     session: &'a str,
     scroller: String,
-    start: Axes<f64>,
-    delta: Axes<f64>,
+    course: Course<'a>,
 }
 
 impl Scroll<'_> {
-    async fn read(&self, pacing: &mut Pacing<'_>) -> Result<Option<Offsets>, CommandError> {
+    async fn read(&self, pacing: &mut Pacing<'_>) -> Result<Option<Reading>, CommandError> {
         pacing
-            .observe(offsets(self.client, self.session, &self.scroller))
+            .observe(read(
+                self.client,
+                self.session,
+                &self.scroller,
+                self.course.goal,
+            ))
             .await
     }
 
-    /// How many notches each axis still needs, at `per_notch` CSS pixels a
-    /// notch.
-    fn wanted(&self, at: &Offsets, per_notch: Axes<f64>) -> Axes<u32> {
-        let left = at.remaining(self.start, self.delta);
-        std::array::from_fn(|axis| {
-            motion::notches_toward(left[axis], direction(self.delta[axis]), per_notch[axis])
-        })
-    }
-
     /// The rest of the way by script, published as `scrolling`.
-    async fn by_script(&self, at: &Offsets) -> Result<(), CommandError> {
-        let [delta_x, delta_y] = at.remaining(self.start, self.delta);
-        if delta_x == 0.0 && delta_y == 0.0 {
-            return Ok(());
+    async fn by_script(&self, now: &Reading) -> Result<bool, CommandError> {
+        let [delta_x, delta_y] = self.course.remaining(now);
+        if delta_x != 0.0 || delta_y != 0.0 {
+            crate::native::interaction::scroll_by(
+                self.client,
+                self.page_session,
+                self.session,
+                &self.scroller,
+                delta_x,
+                delta_y,
+            )
+            .await?;
         }
-        crate::native::interaction::scroll_by(
-            self.client,
-            self.page_session,
-            self.session,
-            &self.scroller,
-            delta_x,
-            delta_y,
-        )
-        .await
-        .map_err(Into::into)
+        Ok(false)
     }
 }
 
@@ -269,7 +447,8 @@ impl NativeMouse {
     /// Scrolls by `delta` CSS pixels, as far as the scroller can go, with the
     /// wheel: `scroller` is an object id in `session`, or `None` for that
     /// page's own scroller. `page_session` is the tab's page, whose dialogs
-    /// end the scroll as well as `session`'s.
+    /// end the scroll as well as `session`'s. Returns true when a dialog
+    /// opened.
     #[allow(clippy::too_many_arguments)]
     pub(in crate::native::browser_control) async fn scroll(
         &mut self,
@@ -280,34 +459,100 @@ impl NativeMouse {
         scroller: Option<&str>,
         delta: (f64, f64),
         interrupts: &Interrupts,
-    ) -> Result<(), CommandError> {
+    ) -> Result<bool, CommandError> {
         self.require_known()?;
+        let goal = Goal::By([delta.0, delta.1]);
         let result = self
             .scroll_with_wheel(
                 client,
                 display,
-                page_session,
-                session,
+                (page_session, session),
                 scroller,
-                delta,
+                goal,
                 interrupts,
             )
-            .await
-            .map(|()| false);
-        self.finish(result, display).await.map(|_| ())
+            .await;
+        self.finish(result, display).await
     }
 
-    #[allow(clippy::too_many_arguments)]
+    /// Brings `element` (an object id in `session`) into view as a person
+    /// does: each scroller hiding its centre, outermost first, is turned by
+    /// the wheel until the centre is in the middle of what it shows. An
+    /// element of an out-of-process frame first has its frame brought into
+    /// view in the page. Nothing moves while the centre shows, and whatever
+    /// the wheel leaves hidden is revealed by script, as `scrolling`.
+    /// Returns true when a dialog opened.
+    pub(in crate::native::browser_control) async fn scroll_into_view(
+        &mut self,
+        client: &CdpClient,
+        display: &DisplayClient,
+        (page_session, session): (&str, &str),
+        element: &str,
+        interrupts: &Interrupts,
+    ) -> Result<bool, CommandError> {
+        self.require_known()?;
+        let result = self
+            .bring_into_view(
+                client,
+                display,
+                (page_session, session),
+                element,
+                interrupts,
+            )
+            .await;
+        self.finish(result, display).await
+    }
+
+    async fn bring_into_view(
+        &mut self,
+        client: &CdpClient,
+        display: &DisplayClient,
+        (page_session, session): (&str, &str),
+        element: &str,
+        interrupts: &Interrupts,
+    ) -> Result<bool, CommandError> {
+        let mut targets = Vec::with_capacity(2);
+        if session != page_session {
+            if let Some(owner) = frame_owner(client, page_session, session).await {
+                targets.push((page_session, owner));
+            }
+        }
+        targets.push((session, element.to_owned()));
+        for (session, element) in &targets {
+            for _ in 0..MOST_SCROLLERS {
+                let Some(scroller) = hider(client, session, element).await? else {
+                    break;
+                };
+                if self
+                    .scroll_with_wheel(
+                        client,
+                        display,
+                        (page_session, session),
+                        Some(&scroller),
+                        Goal::Into(element),
+                        interrupts,
+                    )
+                    .await?
+                {
+                    return Ok(true);
+                }
+            }
+            if hider(client, session, element).await?.is_some() {
+                crate::native::interaction::reveal(client, page_session, session, element).await?;
+            }
+        }
+        Ok(false)
+    }
+
     async fn scroll_with_wheel(
         &mut self,
         client: &CdpClient,
         display: &DisplayClient,
-        page_session: &str,
-        session: &str,
+        (page_session, session): (&str, &str),
         scroller: Option<&str>,
-        delta: (f64, f64),
+        goal: Goal<'_>,
         interrupts: &Interrupts,
-    ) -> Result<(), CommandError> {
+    ) -> Result<bool, CommandError> {
         self.same_layout(display)?;
         if let Some(reason) = interrupts.pending() {
             return Err(stopped(reason, Acted::Nothing));
@@ -319,38 +564,45 @@ impl NativeMouse {
         };
         let dialog_sessions = [session, page_session];
         let mut pacing = Pacing::start(client, interrupts, &dialog_sessions);
-        let Some(start) = pacing.observe(offsets(client, session, &scroller)).await? else {
-            return Ok(());
+        let Some(first) = pacing
+            .observe(read(client, session, &scroller, goal))
+            .await?
+        else {
+            return Ok(true);
         };
         let scroll = Scroll {
             client,
             page_session,
             session,
             scroller,
-            start: start.at,
-            delta: [delta.0, delta.1],
+            course: Course::new(goal, &first),
         };
         let surface = display.surface();
         let scale = mapping.scale()?;
-        let toward = scroll.delta.map(direction);
         let mut per_notch = [NOTCH_DIP * f64::from(surface.device_scale_factor) / scale; 2];
-        if scroll.wanted(&start, per_notch) == [0, 0] {
+        if scroll.course.wanted(&first, per_notch) == [0, 0] {
             // Nothing to scroll, or less than half a notch: no wheel turns
             // that little.
-            return scroll.by_script(&start).await;
+            return scroll.by_script(&first).await;
         }
         let pointer = display
             .pointer()
             .and_then(|pointer| mapping.page(pointer, &surface).ok());
-        let point = wheel_point(client, session, &scroll.scroller, pointer, toward);
+        let point = wheel_point(
+            client,
+            session,
+            &scroll.scroller,
+            pointer,
+            scroll.course.toward,
+        );
         let Some(found) = pacing.observe(point).await? else {
-            return Ok(());
+            return Ok(true);
         };
         let Some((to, (x, y), width)) = found.and_then(|(x, y, width)| {
             let to = mapping.point(x, y, &surface).ok()?;
             Some((to, (x, y), width))
         }) else {
-            return scroll.by_script(&start).await;
+            return scroll.by_script(&first).await;
         };
         let from = self.origin(&mapping, display, &surface)?;
         if let Some(glide) = Glide::new(from, to, width * scale, motion::REACHED_CSS_PX * scale) {
@@ -366,28 +618,38 @@ impl NativeMouse {
                 )
                 .await?
             {
-                return Ok(());
+                return Ok(true);
             }
         }
-        let mut at = start;
+        let budget = (motion::WHEEL_BUDGET - SETTLE_RESERVE).as_nanos() / motion::FRAME.as_nanos();
+        let mut frames_until: Option<Instant> = None;
+        let mut now = first;
         let mut acted = Acted::Nothing;
-        for _ in 0..ROUNDS {
-            let count = scroll.wanted(&at, per_notch);
+        for round in 0..=ROUNDS {
+            let count = scroll.course.wanted(&now, per_notch);
             if count == [0, 0] {
-                break;
+                return Ok(false);
             }
-            let from = at;
-            for index in 0..count[0].max(count[1]) {
+            // The frames left for notches: the whole budget until the first
+            // notch starts its clock.
+            let frames = frames_until.map_or(budget, |until| {
+                until.saturating_duration_since(Instant::now()).as_nanos()
+                    / motion::FRAME.as_nanos()
+            });
+            let frames = u32::try_from(frames).unwrap_or(u32::MAX);
+            let events = count.map(|notches| motion::wheel_events(notches, frames));
+            if round == ROUNDS || events.iter().all(Vec::is_empty) {
+                return scroll.by_script(&now).await;
+            }
+            let from = now;
+            for index in 0..events[0].len().max(events[1].len()) {
                 pacing.tick().await;
                 if pacing.check(acted)? {
-                    return Ok(());
+                    return Ok(true);
                 }
                 let [delta_x, delta_y] = std::array::from_fn(|axis| {
-                    if index < count[axis] {
-                        toward[axis] * motion::NOTCH_DELTA
-                    } else {
-                        0.0
-                    }
+                    let notches = events[axis].get(index).copied().unwrap_or(0);
+                    scroll.course.toward[axis] * f64::from(notches) * motion::NOTCH_DELTA
                 });
                 let params = json!({
                     "type": "mouseWheel", "x": x, "y": y, "deltaX": delta_x, "deltaY": delta_y,
@@ -400,22 +662,23 @@ impl NativeMouse {
                 if index > 0 {
                     continue;
                 }
-                // The wheel has to reach the scroller: wait for it to move.
                 let turned = Instant::now();
+                frames_until.get_or_insert(turned + motion::WHEEL_BUDGET - SETTLE_RESERVE);
+                // The wheel has to reach the scroller: wait for it to move.
                 loop {
                     pacing.tick().await;
                     if pacing.check(acted)? {
-                        return Ok(());
+                        return Ok(true);
                     }
-                    let Some(now) = scroll.read(&mut pacing).await? else {
-                        return Ok(());
+                    let Some(read) = scroll.read(&mut pacing).await? else {
+                        return Ok(true);
                     };
-                    if now.at != from.at {
-                        at = now;
+                    if read.at != from.at {
+                        now = read;
                         break;
                     }
                     if turned.elapsed() >= motion::WHEEL_STALL {
-                        return scroll.by_script(&now).await;
+                        return scroll.by_script(&read).await;
                     }
                 }
             }
@@ -424,26 +687,27 @@ impl NativeMouse {
             while still < SETTLED_FRAMES && turned.elapsed() < SETTLE_LIMIT {
                 pacing.tick().await;
                 if pacing.check(acted)? {
-                    return Ok(());
+                    return Ok(true);
                 }
-                let Some(now) = scroll.read(&mut pacing).await? else {
-                    return Ok(());
+                let Some(read) = scroll.read(&mut pacing).await? else {
+                    return Ok(true);
                 };
-                still = if now.at == at.at { still + 1 } else { 0 };
-                at = now;
+                still = if read.at == now.at { still + 1 } else { 0 };
+                now = read;
             }
             per_notch = std::array::from_fn(|axis| {
-                let moved = at.at[axis] - from.at[axis];
+                let moved = now.at[axis] - from.at[axis];
+                let notches = events[axis].iter().sum();
                 learned(
                     per_notch[axis],
                     moved,
-                    count[axis],
-                    at.at[axis],
-                    at.most[axis],
+                    notches,
+                    now.at[axis],
+                    now.most[axis],
                 )
             });
         }
-        Ok(())
+        Ok(false)
     }
 }
 
@@ -451,28 +715,67 @@ impl NativeMouse {
 mod tests {
     use super::*;
 
+    fn reading(at: Axes<f64>, most: Axes<f64>, aim: Axes<f64>, outside: Axes<bool>) -> Reading {
+        Reading {
+            at,
+            most,
+            aim,
+            outside,
+        }
+    }
+
     #[test]
-    fn a_scroll_goes_as_far_as_its_scroller_can_go_now() {
-        let at = Offsets {
-            at: [0.0, 120.0],
-            most: [0.0, 2000.0],
-        };
-        assert_eq!(at.remaining([0.0, 0.0], [0.0, 300.0]), [0.0, 180.0]);
+    fn a_scroll_by_a_distance_goes_as_far_as_its_scroller_can_go_now() {
+        let first = reading([0.0, 120.0], [0.0, 2000.0], [0.0; 2], [false; 2]);
+        let by = Course::new(Goal::By([0.0, 300.0]), &first);
+        assert_eq!(by.toward, [0.0, 1.0]);
+        assert_eq!(by.remaining(&first), [0.0, 300.0]);
         // Past either end the goal is the end.
-        assert_eq!(at.remaining([0.0, 0.0], [0.0, 5000.0]), [0.0, 1880.0]);
-        assert_eq!(at.remaining([0.0, 0.0], [-50.0, -300.0]), [0.0, -120.0]);
+        let far = Course::new(Goal::By([0.0, 5000.0]), &first);
+        assert_eq!(far.remaining(&first), [0.0, 1880.0]);
+        let back = Course::new(Goal::By([-50.0, -300.0]), &first);
+        assert_eq!(back.remaining(&first), [0.0, -120.0]);
         // Content that grew lets it go further than it could at the start.
-        let grown = Offsets {
-            most: [0.0, 9000.0],
-            ..at
-        };
-        assert_eq!(grown.remaining([0.0, 0.0], [0.0, 5000.0]), [0.0, 4880.0]);
+        let grown = reading([0.0, 120.0], [0.0, 9000.0], [0.0; 2], [false; 2]);
+        assert_eq!(far.remaining(&grown), [0.0, 5000.0]);
         // A scroller that cannot move has nowhere to go.
-        let fixed = Offsets {
-            at: [0.0, 0.0],
-            most: [-15.0, 0.0],
-        };
-        assert_eq!(fixed.remaining([0.0, 0.0], [300.0, 300.0]), [0.0, 0.0]);
+        let fixed = reading([0.0, 0.0], [-15.0, 0.0], [0.0; 2], [false; 2]);
+        let stuck = Course::new(Goal::By([300.0, 300.0]), &fixed);
+        assert_eq!(stuck.remaining(&fixed), [0.0, 0.0]);
+    }
+
+    /// Into view: only an axis on which the centre lies outside moves, and it
+    /// moves until the centre is in the middle, as far as the scroller goes.
+    #[test]
+    fn an_element_is_brought_to_the_middle_of_what_hides_it() {
+        // The centre is 9000 px below the middle and outside; 40 px right of
+        // the middle but inside.
+        let first = reading([0.0, 0.0], [300.0, 12000.0], [40.0, 9000.0], [false, true]);
+        let into = Course::new(Goal::Into("element"), &first);
+        assert_eq!(into.toward, [0.0, 1.0]);
+        assert_eq!(into.remaining(&first), [0.0, 9000.0]);
+        assert_eq!(into.wanted(&first, [120.0; 2]), [0, 75]);
+        // Part of the way there the goal is where the element is now.
+        let later = reading(
+            [0.0, 6000.0],
+            [300.0, 12000.0],
+            [40.0, 3100.0],
+            [false, false],
+        );
+        assert_eq!(into.remaining(&later), [0.0, 3100.0]);
+        // An element near the end is brought as far as the scroller goes.
+        let end = reading(
+            [0.0, 11900.0],
+            [300.0, 12000.0],
+            [0.0, 400.0],
+            [false, false],
+        );
+        assert_eq!(into.remaining(&end), [0.0, 100.0]);
+        // Above: upward.
+        let above = reading([0.0, 5000.0], [0.0, 12000.0], [0.0, -2000.0], [false, true]);
+        let up = Course::new(Goal::Into("element"), &above);
+        assert_eq!(up.toward, [0.0, -1.0]);
+        assert_eq!(up.remaining(&above), [0.0, -2000.0]);
     }
 
     #[test]

@@ -4,8 +4,6 @@ pub mod a11y;
 pub mod actions;
 pub(crate) mod activity;
 pub(crate) mod agent_channel;
-#[allow(dead_code)]
-// The qualified viewer transport consumes this private source/subscription seam.
 pub(crate) mod audio;
 #[allow(dead_code)]
 pub mod auth;
@@ -59,6 +57,7 @@ pub mod tab_binding;
 pub(crate) mod theme;
 #[allow(dead_code)]
 pub mod tracing;
+pub(crate) mod video;
 #[allow(dead_code)]
 pub mod webdriver;
 #[allow(dead_code)]

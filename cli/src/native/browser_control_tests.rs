@@ -1049,6 +1049,53 @@ fn acknowledging_display() -> (
     (display, received, frames)
 }
 
+/// Taking control of the owned window keeps its generation: the frame every
+/// viewer already paints is current for the new controller, so its first
+/// input is admitted at once, with no new frame to wait for. The previous
+/// controller is refused by its lease, not by the window.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn taking_control_keeps_the_windows_generation() {
+    let (display, mut ops, _frames) = acknowledging_display();
+    let painted = display.surface().generation;
+    let mut control = BrowserControl::default();
+    control.set_display(Some(display.clone()));
+    let acquired = control
+        .execute(parse(command("acquire", OWNER)), None)
+        .await
+        .unwrap();
+    assert_eq!(ops.recv().await.unwrap()["op"], "reset");
+    assert_eq!(acquired["surface"]["generation"], painted.as_str());
+    assert_eq!(display.surface().generation, painted);
+    let moved = parse(
+        json!({ "action": ACTION, "op": "input", "controllerId": OWNER,
+        "sequence": 1, "expectedSurfaceGeneration": painted,
+        "events": [{ "type": "input_mouse", "eventType": "mouseMoved", "x": 5, "y": 5 }] }),
+    );
+    assert_eq!(
+        control.execute(moved, None).await.unwrap()["status"],
+        "applied"
+    );
+    assert_eq!(ops.recv().await.unwrap()["op"], "input");
+
+    control
+        .execute(parse(command("release", OWNER)), None)
+        .await
+        .unwrap();
+    control
+        .execute(parse(command("acquire", OTHER)), None)
+        .await
+        .unwrap();
+    let stale = parse(
+        json!({ "action": ACTION, "op": "input", "controllerId": OWNER,
+        "sequence": 2, "expectedSurfaceGeneration": painted,
+        "events": [{ "type": "input_mouse", "eventType": "mouseMoved", "x": 6, "y": 6 }] }),
+    );
+    let refused = control.execute(stale, None).await.unwrap_err();
+    assert_eq!(refused.code, "browser_control_stale", "{refused:?}");
+    assert_eq!(display.surface().generation, painted);
+}
+
 #[test]
 fn sign_in_event_shape_is_exact_and_judged_after_the_sequence() {
     for (idle, expected) in [(10_000, 10), (600_000, 600), (3_600_000, 3600)] {
@@ -1569,6 +1616,90 @@ async fn typing_sends_one_key_per_interval() {
     assert!(arrivals[..text.len()]
         .iter()
         .all(|request| request["events"].as_array().unwrap().len() == 2));
+}
+
+/// A key held down (`keydown`) stays held: its modifier rides on every
+/// native event after it, so the helper never lets it go early, until its
+/// own release. While held it is input to release on cancellation.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_modifier_rides_on_every_native_event_until_its_release() {
+    use super::super::interaction::{native_key_transition, native_text_events};
+    let (display, mut ops, _frames) = acknowledging_display();
+    let browser = Browser::new().await;
+    let mut control = BrowserControl {
+        display: Some(display),
+        ..BrowserControl::default()
+    };
+    for events in [
+        vec![native_key_transition("Shift", "keyDown")],
+        native_text_events("a"),
+        vec![native_key_transition("Shift", "keyUp")],
+        native_text_events("b"),
+    ] {
+        control
+            .agent_native_keys(&events, motion::KEY_INTERVAL, &browser.client, "page")
+            .await
+            .unwrap();
+    }
+    let mut sent = Vec::new();
+    while let Ok(request) = ops.try_recv() {
+        sent.extend(request["events"].as_array().unwrap().clone());
+    }
+    let masks: Vec<(String, String, i64)> = sent
+        .iter()
+        .map(|event| {
+            (
+                event["eventType"].as_str().unwrap().to_owned(),
+                event["code"].as_str().unwrap_or_default().to_owned(),
+                event["modifiers"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        masks,
+        [
+            ("keyDown".into(), "ShiftLeft".into(), 0),
+            ("keyDown".into(), "KeyA".into(), 8),
+            ("keyUp".into(), "KeyA".into(), 8),
+            ("keyUp".into(), "ShiftLeft".into(), 8),
+            ("keyDown".into(), "KeyB".into(), 0),
+            ("keyUp".into(), "KeyB".into(), 0),
+        ]
+    );
+    assert!(!control.native_mouse.needs_release());
+}
+
+/// A key the agent holds is released when its native input is cancelled,
+/// as held buttons are: the helper is reset and nothing stays down.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_key_is_released_when_native_input_is_cancelled() {
+    let (display, mut ops, _frames) = acknowledging_display();
+    let browser = Browser::new().await;
+    let mut control = BrowserControl {
+        display: Some(display),
+        ..BrowserControl::default()
+    };
+    control
+        .agent_native_keys(
+            &[super::super::interaction::native_key_transition(
+                "a", "keyDown",
+            )],
+            motion::KEY_INTERVAL,
+            &browser.client,
+            "page",
+        )
+        .await
+        .unwrap();
+    assert!(control.native_mouse.needs_release());
+    control.cancel_native_input().await.unwrap();
+    let mut ops_seen = Vec::new();
+    while let Ok(request) = ops.try_recv() {
+        ops_seen.push(request["op"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(ops_seen, ["input", "reset"]);
+    assert!(!control.native_mouse.needs_release());
 }
 
 /// The cadence is measured where it is kept: consecutive key presses are

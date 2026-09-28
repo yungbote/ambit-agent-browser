@@ -1945,6 +1945,11 @@ Usage: agent-browser keydown <key>
 Presses a key down without releasing it. Use keyup to release.
 Useful for holding modifier keys.
 
+In an owned window (AGENT_BROWSER_WINDOW_STREAM=1) the real key goes
+down and stays down: a held modifier applies to the clicks and keys
+that follow (keydown Shift, then click, is a shift-click) until keyup,
+and a person taking control releases it.
+
 Global Options:
   --json               Output as JSON
   --session <name>     Use specific session
@@ -1985,7 +1990,9 @@ Lexical, ProseMirror, CodeMirror, and Monaco.
 Subcommands:
   type <text>          Type text character-by-character with real
                        key events (keydown, keypress, keyup per char)
-  inserttext <text>    Insert text without key events (like paste)
+  inserttext <text>    Insert text without key events (like paste);
+                       in an owned window up to 64 characters are typed
+                       with real keys and longer text is pasted
 
 Note: For key combos (Enter, Control+a), use the 'press' command
 directly — it already operates on the current focus.
@@ -2018,9 +2025,10 @@ Usage: agent-browser scroll [direction] [amount] [options]
 Scrolls the page or a specific element in the specified direction.
 
 In an owned window (AGENT_BROWSER_WINDOW_STREAM=1) the pointer goes
-where the wheel reaches the scroller and the wheel turns one notch
-(about 120 px) per frame, so the distance is the nearest whole number
-of notches. When no wheel can move the scroller, it scrolls by script.
+where the wheel reaches the scroller and the wheel turns one event per
+frame, a notch (about 120 px) each, more notches per event for a long
+way, for at most about 1.5 s; the distance is the nearest whole number
+of notches. What no wheel can move or reach in time scrolls by script.
 
 Arguments:
   direction            up, down, left, right (default: down)
@@ -2048,6 +2056,11 @@ agent-browser scrollintoview - Scroll element into view
 Usage: agent-browser scrollintoview <selector>
 
 Scrolls the page until the specified element is visible in the viewport.
+
+In an owned window (AGENT_BROWSER_WINDOW_STREAM=1) the wheel turns each
+scroller hiding the element until its centre is in the middle, as
+scroll does; commands that act on an element scroll to it this way
+first.
 
 Aliases: scrollinto
 
@@ -3897,7 +3910,7 @@ Core Commands:
   fill <sel> <text>          Clear and fill
   press <key>                Press key (Enter, Tab, Control+a)
   keyboard type <text>       Type text with real keystrokes (no selector)
-  keyboard inserttext <text> Insert text without key events
+  keyboard inserttext <text> Insert text like a paste
   hover <sel>                Hover element
   focus <sel>                Focus element
   check <sel>                Check checkbox
