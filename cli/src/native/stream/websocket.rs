@@ -414,7 +414,7 @@ pub(super) async fn accept_loop(
             }
             // Reap finished connections so the set does not grow without bound.
             Some(_) = connections.join_next(), if !connections.is_empty() => {}
-            accept_result = accept(&listener) => {
+            accept_result = crate::native::socket::accept(&listener) => {
                 let Ok((stream, addr)) = accept_result else {
                     break;
                 };
@@ -478,17 +478,6 @@ pub(super) async fn accept_loop(
     {
         connections.shutdown().await;
     }
-}
-
-/// One connection, with Nagle's algorithm off. Every message on it is a live
-/// picture, sound, pointer sample or record: held back behind an
-/// unacknowledged write, a small one waited for the peer's delayed
-/// acknowledgement, up to 40 ms (measured behind the toolbox:
-/// media-producer/toolbox). A socket that refuses the option still serves.
-async fn accept(listener: &TcpListener) -> std::io::Result<(TcpStream, SocketAddr)> {
-    let (stream, address) = listener.accept().await?;
-    let _ = stream.set_nodelay(true);
-    Ok((stream, address))
 }
 
 fn is_websocket_upgrade(request: &str) -> bool {
@@ -1200,15 +1189,6 @@ fn is_user_input_message_type(msg_type: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A viewer's socket sends every write at once: Nagle's algorithm is off.
-    #[tokio::test]
-    async fn a_viewer_socket_never_holds_a_write_for_an_acknowledgement() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let (accepted, _client) = tokio::join!(accept(&listener), TcpStream::connect(address));
-        assert!(accepted.unwrap().0.nodelay().unwrap());
-    }
 
     #[test]
     fn audio_negotiation_is_fixed_to_a_supported_binary_codec() {

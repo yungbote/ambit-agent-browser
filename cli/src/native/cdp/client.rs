@@ -428,7 +428,7 @@ impl CdpClient {
                 .await
                 .map_err(|e| format!("CDP WebSocket connect failed: {}", e))?;
 
-        tune_socket(ws_stream.get_ref());
+        crate::native::socket::tune_dialed(ws_stream.get_ref());
 
         let (ws_tx, mut ws_rx) = ws_stream.split();
         let ws_tx = Arc::new(Mutex::new(ws_tx));
@@ -1329,52 +1329,10 @@ impl InspectProxyHandle {
 /// Enable TCP SO_KEEPALIVE on the underlying socket of a WebSocket connection.
 /// This is best-effort: failures are silently ignored since the WebSocket-level
 /// Ping keepalive provides the primary connection liveness mechanism.
-/// The CDP socket's options: Nagle's algorithm off, so a command written
-/// while another is unanswered leaves at once instead of waiting for Chrome's
-/// acknowledgement of the first (a read behind a 30 ms evaluation waited
-/// 27 ms: media-producer/cdp), and keepalive probes on a quiet connection.
-fn tune_socket(stream: &tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>) {
-    let tcp_stream = match stream {
-        tokio_tungstenite::MaybeTlsStream::Plain(s) => s,
-        tokio_tungstenite::MaybeTlsStream::Rustls(s) => s.get_ref().0,
-        _ => return,
-    };
-    let _ = tcp_stream.set_nodelay(true);
-
-    // SockRef borrows the fd without taking ownership.
-    let sock = socket2::SockRef::from(tcp_stream);
-    let keepalive = socket2::TcpKeepalive::new().with_time(std::time::Duration::from_secs(30));
-
-    // with_interval sets TCP_KEEPINTVL — the time between probes after the
-    // first keepalive probe goes unanswered. Available on most platforms
-    // (Linux, macOS, Windows, FreeBSD, etc.) but not OpenBSD or Haiku.
-    #[cfg(not(any(target_os = "openbsd", target_os = "haiku")))]
-    let keepalive = keepalive.with_interval(std::time::Duration::from_secs(10));
-
-    let _ = sock.set_tcp_keepalive(&keepalive);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
-
-    /// Every command leaves at once and a quiet connection is probed: the
-    /// CDP socket has Nagle's algorithm off and keepalive on.
-    #[tokio::test]
-    async fn the_cdp_socket_sends_each_write_at_once_and_keeps_alive() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let (dialed, _accepted) =
-            tokio::join!(tokio::net::TcpStream::connect(address), listener.accept());
-        let stream = tokio_tungstenite::MaybeTlsStream::Plain(dialed.unwrap());
-        tune_socket(&stream);
-        let tokio_tungstenite::MaybeTlsStream::Plain(tcp) = &stream else {
-            unreachable!("a plain stream")
-        };
-        assert!(tcp.nodelay().unwrap());
-        assert!(socket2::SockRef::from(tcp).keepalive().unwrap());
-    }
 
     /// Viewers watch a page, not its out-of-process frames: a frame's
     /// activity that carries screen coordinates, or no point at all, is

@@ -3,6 +3,8 @@
 //! custody remains with the daemon and human input remains with BrowserControl.
 
 mod transport;
+#[cfg(test)]
+mod tunnel_e2e;
 
 use std::process::Stdio;
 use std::sync::{Arc, Mutex};

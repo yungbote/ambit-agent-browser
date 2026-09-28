@@ -564,6 +564,7 @@ async fn proxy_session_stream(mut stream: tokio::net::TcpStream, port: u16) {
             return;
         }
     };
+    crate::native::socket::tune_dialed(upstream_ws.get_ref());
     let client_ws = match tokio_tungstenite::accept_async(stream).await {
         Ok(ws) => ws,
         Err(_) => return,
@@ -648,7 +649,7 @@ pub async fn run_dashboard_server(port: u16) {
 
 async fn run_dashboard_listener(listener: TcpListener) {
     loop {
-        let Ok((stream, _addr)) = listener.accept().await else {
+        let Ok((stream, _addr)) = crate::native::socket::accept(&listener).await else {
             break;
         };
         tokio::spawn(async move {
