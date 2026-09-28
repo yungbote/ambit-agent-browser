@@ -14462,7 +14462,7 @@ async fn e2e_reused_launch_reconciles_theme_without_replacing_the_page() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn e2e_native_motion_proof() {
-    use crate::native::browser_control::{motion, InterruptReason};
+    use crate::native::browser_control::InterruptReason;
     use std::time::Instant;
     let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
     env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
@@ -14499,9 +14499,16 @@ async fn e2e_native_motion_proof() {
     fn gaps(times: &[f64]) -> Vec<f64> {
         times.windows(2).map(|pair| pair[1] - pair[0]).collect()
     }
-    // Events go at most one a frame. Their `ts` is stamped at the helper's
-    // acknowledgement, which jitters by a few ms, so "one a frame" reads as
-    // never two within half a frame.
+    // Events go at most one a frame; the send side is proven in the unit
+    // tests. Here `ts` is stamped at the helper's acknowledgement, and one
+    // acknowledgement delayed under load makes the next look early, so a
+    // burst reads as two consecutive gaps that together span less than a
+    // frame, or gaps that average less than one.
+    fn one_a_frame(gaps: &[f64]) -> bool {
+        let frame = crate::native::browser_control::motion::FRAME.as_secs_f64() * 1000.0;
+        gaps.windows(2).all(|pair| pair[0] + pair[1] >= frame)
+            && gaps.iter().sum::<f64>() >= frame * gaps.len() as f64 - 12.0
+    }
     fn agent(
         activity: &mut tokio::sync::broadcast::Receiver<crate::native::cdp::types::CdpEvent>,
     ) -> Vec<Value> {
@@ -14763,9 +14770,7 @@ async fn e2e_native_motion_proof() {
     assert!(!by_script, "the wheel moved the page");
     assert!(notches.len() >= 4, "{} notches", notches.len());
     assert!(
-        gaps(&notches)
-            .iter()
-            .all(|gap| *gap >= motion::FRAME.as_secs_f64() * 1000.0 / 2.0),
+        one_a_frame(&gaps(&notches)),
         "one notch per frame: {:?}",
         gaps(&notches)
     );
@@ -14817,12 +14822,7 @@ async fn e2e_native_motion_proof() {
         .windows(2)
         .all(|pair| pair[0]["x"] == pair[1]["x"] && pair[0]["y"] == pair[1]["y"]));
     let wheel_gaps = gaps(&turned.iter().map(|event| ts_ms(event)).collect::<Vec<_>>());
-    assert!(
-        wheel_gaps
-            .iter()
-            .all(|gap| *gap >= motion::FRAME.as_secs_f64() * 1000.0 / 2.0),
-        "{wheel_gaps:?}"
-    );
+    assert!(one_a_frame(&wheel_gaps), "{wheel_gaps:?}");
     assert_eq!(page_wheels.len(), 3);
     let wheel = json!({
         "command_ms": wheel_ms,
@@ -15018,9 +15018,7 @@ async fn e2e_native_motion_proof() {
     let wheel_ms = turned.last().unwrap() - turned[0];
     assert!(wheel_ms <= 1500.0, "the wheel turned for {wheel_ms} ms");
     assert!(
-        gaps(&turned)
-            .iter()
-            .all(|gap| *gap >= motion::FRAME.as_secs_f64() * 1000.0 / 2.0),
+        one_a_frame(&gaps(&turned)),
         "one wheel event per frame: {:?}",
         gaps(&turned)
     );
