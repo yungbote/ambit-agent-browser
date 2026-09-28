@@ -2018,9 +2018,10 @@ Usage: agent-browser scroll [direction] [amount] [options]
 Scrolls the page or a specific element in the specified direction.
 
 In an owned window (AGENT_BROWSER_WINDOW_STREAM=1) the pointer goes
-where the wheel reaches the scroller and the wheel turns one notch
-(about 120 px) per frame, so the distance is the nearest whole number
-of notches. When no wheel can move the scroller, it scrolls by script.
+where the wheel reaches the scroller and the wheel turns one event per
+frame, a notch (about 120 px) each, more notches per event for a long
+way, for at most about 1.5 s; the distance is the nearest whole number
+of notches. What no wheel can move or reach in time scrolls by script.
 
 Arguments:
   direction            up, down, left, right (default: down)
@@ -2048,6 +2049,11 @@ agent-browser scrollintoview - Scroll element into view
 Usage: agent-browser scrollintoview <selector>
 
 Scrolls the page until the specified element is visible in the viewport.
+
+In an owned window (AGENT_BROWSER_WINDOW_STREAM=1) the wheel turns each
+scroller hiding the element until its centre is in the middle, as
+scroll does; commands that act on an element scroll to it this way
+first.
 
 Aliases: scrollinto
 
