@@ -1618,6 +1618,90 @@ async fn typing_sends_one_key_per_interval() {
         .all(|request| request["events"].as_array().unwrap().len() == 2));
 }
 
+/// A key held down (`keydown`) stays held: its modifier rides on every
+/// native event after it, so the helper never lets it go early, until its
+/// own release. While held it is input to release on cancellation.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_modifier_rides_on_every_native_event_until_its_release() {
+    use super::super::interaction::{native_key_transition, native_text_events};
+    let (display, mut ops, _frames) = acknowledging_display();
+    let browser = Browser::new().await;
+    let mut control = BrowserControl {
+        display: Some(display),
+        ..BrowserControl::default()
+    };
+    for events in [
+        vec![native_key_transition("Shift", "keyDown")],
+        native_text_events("a"),
+        vec![native_key_transition("Shift", "keyUp")],
+        native_text_events("b"),
+    ] {
+        control
+            .agent_native_keys(&events, motion::KEY_INTERVAL, &browser.client, "page")
+            .await
+            .unwrap();
+    }
+    let mut sent = Vec::new();
+    while let Ok(request) = ops.try_recv() {
+        sent.extend(request["events"].as_array().unwrap().clone());
+    }
+    let masks: Vec<(String, String, i64)> = sent
+        .iter()
+        .map(|event| {
+            (
+                event["eventType"].as_str().unwrap().to_owned(),
+                event["code"].as_str().unwrap_or_default().to_owned(),
+                event["modifiers"].as_i64().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        masks,
+        [
+            ("keyDown".into(), "ShiftLeft".into(), 0),
+            ("keyDown".into(), "KeyA".into(), 8),
+            ("keyUp".into(), "KeyA".into(), 8),
+            ("keyUp".into(), "ShiftLeft".into(), 8),
+            ("keyDown".into(), "KeyB".into(), 0),
+            ("keyUp".into(), "KeyB".into(), 0),
+        ]
+    );
+    assert!(!control.native_mouse.needs_release());
+}
+
+/// A key the agent holds is released when its native input is cancelled,
+/// as held buttons are: the helper is reset and nothing stays down.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_held_key_is_released_when_native_input_is_cancelled() {
+    let (display, mut ops, _frames) = acknowledging_display();
+    let browser = Browser::new().await;
+    let mut control = BrowserControl {
+        display: Some(display),
+        ..BrowserControl::default()
+    };
+    control
+        .agent_native_keys(
+            &[super::super::interaction::native_key_transition(
+                "a", "keyDown",
+            )],
+            motion::KEY_INTERVAL,
+            &browser.client,
+            "page",
+        )
+        .await
+        .unwrap();
+    assert!(control.native_mouse.needs_release());
+    control.cancel_native_input().await.unwrap();
+    let mut ops_seen = Vec::new();
+    while let Ok(request) = ops.try_recv() {
+        ops_seen.push(request["op"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(ops_seen, ["input", "reset"]);
+    assert!(!control.native_mouse.needs_release());
+}
+
 /// The cadence is measured where it is kept: consecutive key presses are
 /// at least one interval apart, and a burst never builds up.
 #[cfg(target_os = "linux")]

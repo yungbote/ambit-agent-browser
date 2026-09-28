@@ -28,6 +28,30 @@ pub struct PendingRelease {
     pub button: String,
 }
 
+/// The point native pointer input on an element goes to, in its session:
+/// the owned window's wheel first brings it into view, as a person scrolls
+/// to what they click, so the page never jumps; then its centre is read
+/// where it is. `None` when a JavaScript dialog opened on the way.
+pub(crate) async fn native_point(
+    client: &CdpClient,
+    control: &Mutex<BrowserControl>,
+    session_id: &str,
+    (object_id, effective_session_id): (&str, &str),
+    target: &str,
+) -> Result<Option<(f64, f64)>, CommandError> {
+    if control
+        .lock()
+        .await
+        .agent_native_scroll_into_view(client, session_id, (object_id, effective_session_id))
+        .await?
+    {
+        return Ok(None);
+    }
+    Ok(Some(
+        super::element::object_center(client, effective_session_id, object_id, target).await?,
+    ))
+}
+
 #[allow(clippy::too_many_arguments)]
 pub async fn click(
     client: &CdpClient,
@@ -39,15 +63,37 @@ pub async fn click(
     click_count: i32,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<ClickResult, CommandError> {
-    let (x, y, effective_session_id) = resolve_element_center(
-        client,
-        session_id,
-        ref_map,
-        selector_or_ref,
-        iframe_sessions,
-    )
-    .await?;
-    if control.lock().await.has_native_display() && click_count > 1 {
+    let native = control.lock().await.has_native_display();
+    let (x, y, effective_session_id) = if native {
+        let (object_id, effective_session_id) = resolve_element_object_id(
+            client,
+            session_id,
+            ref_map,
+            selector_or_ref,
+            iframe_sessions,
+        )
+        .await?;
+        let target = (object_id.as_str(), effective_session_id.as_str());
+        let Some((x, y)) =
+            native_point(client, control, session_id, target, selector_or_ref).await?
+        else {
+            return Ok(ClickResult {
+                dialog_opened: true,
+                pending_release: None,
+            });
+        };
+        (x, y, effective_session_id)
+    } else {
+        resolve_element_center(
+            client,
+            session_id,
+            ref_map,
+            selector_or_ref,
+            iframe_sessions,
+        )
+        .await?
+    };
+    if native && click_count > 1 {
         for _ in 0..click_count {
             let result = dispatch_click(
                 client,
@@ -111,15 +157,21 @@ pub async fn hover(
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<(), CommandError> {
-    let (x, y, effective_session_id) = resolve_element_center(
-        client,
-        session_id,
-        ref_map,
-        selector_or_ref,
-        iframe_sessions,
-    )
-    .await?;
     if control.lock().await.has_native_display() {
+        let (object_id, effective_session_id) = resolve_element_object_id(
+            client,
+            session_id,
+            ref_map,
+            selector_or_ref,
+            iframe_sessions,
+        )
+        .await?;
+        let target = (object_id.as_str(), effective_session_id.as_str());
+        let Some((x, y)) =
+            native_point(client, control, session_id, target, selector_or_ref).await?
+        else {
+            return Ok(());
+        };
         control
             .lock()
             .await
@@ -132,6 +184,14 @@ pub async fn hover(
             .await?;
         return Ok(());
     }
+    let (x, y, effective_session_id) = resolve_element_center(
+        client,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        iframe_sessions,
+    )
+    .await?;
     client
         .send_command_typed::<_, Value>(
             "Input.dispatchMouseEvent",
@@ -326,13 +386,14 @@ async fn click_field(
         iframe_sessions,
     )
     .await?;
-    let (x, y) = super::element::resolve_object_center(
-        client,
-        &effective_session_id,
-        &object_id,
-        selector_or_ref,
-    )
-    .await?;
+    let target = (object_id.as_str(), effective_session_id.as_str());
+    let Some((x, y)) = native_point(client, control, session_id, target, selector_or_ref).await?
+    else {
+        return Ok(Clicked::Dialog(ClickResult {
+            dialog_opened: true,
+            pending_release: None,
+        }));
+    };
     let click = dispatch_click(
         client,
         control,
@@ -410,7 +471,7 @@ pub(crate) async fn native_fill(
     value: &str,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<NativeFill, CommandError> {
-    use super::browser_control::motion::{KEY_INTERVAL, PASTE_ABOVE_CHARS};
+    use super::browser_control::motion::KEY_INTERVAL;
     let field = match click_field(
         client,
         control,
@@ -445,11 +506,7 @@ pub(crate) async fn native_fill(
         }
     }
     if !value.is_empty() {
-        let events = if value.chars().count() > PASTE_ABOVE_CHARS {
-            native_paste_events(value)
-        } else {
-            native_text_events(value)
-        };
+        let events = native_inserted_events(value);
         type_after_click(control, client, session_id, &events, KEY_INTERVAL).await?;
     }
     let state = field_state(
@@ -798,6 +855,35 @@ pub async fn scroll(
     Ok(())
 }
 
+/// Brings `object_id` (an element in `session_id`) to the middle of the view
+/// by script, published on the tab's page (`page_session`) as `scrolling`:
+/// what the owned window's wheel could not reveal.
+pub(crate) async fn reveal(
+    client: &CdpClient,
+    page_session: &str,
+    session_id: &str,
+    object_id: &str,
+) -> Result<(), String> {
+    let observation = client.observe_activity(
+        serde_json::json!({ "type": "activity", "kind": "scrolling" }),
+        page_session,
+        client.page_generation(page_session),
+        super::activity::InputSource::Agent,
+    );
+    client
+        .send_command(
+            "Runtime.callFunctionOn",
+            Some(serde_json::json!({
+                "objectId": object_id, "returnByValue": true,
+                "functionDeclaration": "function() { this.scrollIntoView({ block: 'center', inline: 'center' }); }",
+            })),
+            Some(session_id),
+        )
+        .await?;
+    observation.acknowledged();
+    Ok(())
+}
+
 /// Scrolls `object_id` (a scroller in `session_id`) by script, published on
 /// the tab's page (`page_session`) as `scrolling`.
 pub(crate) async fn scroll_by(
@@ -1054,24 +1140,39 @@ async fn set_checked(
         let target_id = target["result"]["objectId"].as_str().ok_or(
             "The checkbox activation target changed. Inspect the current page before retrying.",
         )?;
-        let (x, y) = super::element::resolve_object_center(
-            client,
-            &effective_session_id,
-            target_id,
-            selector_or_ref,
-        )
-        .await?;
-        dispatch_click(
-            client,
-            control,
-            &effective_session_id,
-            &[effective_session_id.as_str(), session_id],
-            x,
-            y,
-            "left",
-            1,
-        )
-        .await?
+        let point = if method == "native" {
+            let target = (target_id, effective_session_id.as_str());
+            native_point(client, control, session_id, target, selector_or_ref).await?
+        } else {
+            Some(
+                super::element::resolve_object_center(
+                    client,
+                    &effective_session_id,
+                    target_id,
+                    selector_or_ref,
+                )
+                .await?,
+            )
+        };
+        match point {
+            Some((x, y)) => {
+                dispatch_click(
+                    client,
+                    control,
+                    &effective_session_id,
+                    &[effective_session_id.as_str(), session_id],
+                    x,
+                    y,
+                    "left",
+                    1,
+                )
+                .await?
+            }
+            None => ClickResult {
+                dialog_opened: true,
+                pending_release: None,
+            },
+        }
     };
     if !input.dialog_opened
         && super::element::is_element_checked(
@@ -1671,6 +1772,16 @@ pub(crate) fn native_text_events(text: &str) -> Vec<Value> {
 }
 
 /// The events of one visible paste of `text`, as a person pastes a value.
+/// Text inserted as a person enters it: typed key by key, or one visible
+/// paste above `motion::PASTE_ABOVE_CHARS` characters.
+pub(crate) fn native_inserted_events(text: &str) -> Vec<Value> {
+    if text.chars().count() > super::browser_control::motion::PASTE_ABOVE_CHARS {
+        native_paste_events(text)
+    } else {
+        native_text_events(text)
+    }
+}
+
 pub(crate) fn native_paste_events(text: &str) -> Vec<Value> {
     vec![json!({ "type": "input_keyboard", "eventType": "insertText", "text": text })]
 }
@@ -1703,8 +1814,29 @@ fn native_key_events(key: &str, code: &str, modifiers: i32) -> Vec<Value> {
     ]
 }
 
+/// One key going down or up in the owned window, as `keydown` and `keyup`
+/// send it: its physical key, and the text a printable key types as it goes
+/// down.
+pub(crate) fn native_key_transition(key: &str, event_type: &str) -> Value {
+    let (key_name, code, _) = named_key_info(key);
+    let mut event = serde_json::json!({
+        "type": "input_keyboard", "eventType": event_type, "key": key_name, "code": code,
+        "modifiers": 0,
+    });
+    if event_type != "keyUp" {
+        if let Some(text) = key_text(&key_name).filter(|text| text != "\r" && text != "\t") {
+            event["text"] = serde_json::json!(text);
+        }
+    }
+    event
+}
+
 fn named_key_info(key: &str) -> (String, String, i32) {
     match key.to_lowercase().as_str() {
+        "shift" => ("Shift".to_string(), "ShiftLeft".to_string(), 16),
+        "control" | "ctrl" => ("Control".to_string(), "ControlLeft".to_string(), 17),
+        "alt" | "option" => ("Alt".to_string(), "AltLeft".to_string(), 18),
+        "meta" | "command" | "cmd" => ("Meta".to_string(), "MetaLeft".to_string(), 91),
         "enter" | "return" => ("Enter".to_string(), "Enter".to_string(), 13),
         "tab" => ("Tab".to_string(), "Tab".to_string(), 9),
         "escape" | "esc" => ("Escape".to_string(), "Escape".to_string(), 27),
@@ -1733,6 +1865,47 @@ fn named_key_info(key: &str) -> (String, String, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `inserttext` in the owned window: up to 64 characters are typed key
+    /// by key, longer text is one visible paste.
+    #[test]
+    fn inserted_text_is_typed_up_to_the_paste_threshold() {
+        let short = native_inserted_events("hi");
+        assert!(short.iter().all(|event| event["eventType"] != "insertText"));
+        assert_eq!(
+            short
+                .iter()
+                .filter(|event| event["eventType"] == "keyDown")
+                .count(),
+            2
+        );
+        let long = "x".repeat(65);
+        assert_eq!(
+            native_inserted_events(&long),
+            [serde_json::json!({"type":"input_keyboard","eventType":"insertText","text":long})]
+        );
+    }
+
+    /// `keydown` and `keyup` name the physical key the helper knows, and a
+    /// printable key types its text only as it goes down.
+    #[test]
+    fn a_key_transition_names_its_physical_key() {
+        let shift = native_key_transition("Shift", "keyDown");
+        assert_eq!(
+            (shift["key"].as_str(), shift["code"].as_str()),
+            (Some("Shift"), Some("ShiftLeft"))
+        );
+        assert!(shift.get("text").is_none());
+        assert_eq!(
+            native_key_transition("ctrl", "keyUp")["code"],
+            "ControlLeft"
+        );
+        assert_eq!(native_key_transition("a", "keyDown")["text"], "a");
+        assert!(native_key_transition("a", "keyUp").get("text").is_none());
+        assert!(native_key_transition("Enter", "keyDown")
+            .get("text")
+            .is_none());
+    }
 
     #[test]
     fn native_text_types_keymap_characters_and_pastes_the_rest_one_at_a_time() {

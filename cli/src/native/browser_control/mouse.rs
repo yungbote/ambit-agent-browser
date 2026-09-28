@@ -16,7 +16,7 @@
 //! hit test at the end of travel refuses a press the aimed element no longer
 //! receives. Only the display helper sends buttons.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -322,14 +322,17 @@ fn opens_dialog(event: &CdpEvent, sessions: &[&str]) -> bool {
             .is_none_or(|id| sessions.contains(&id))
 }
 
-/// The clock paced input runs on: one helper event per presenter frame, on
-/// absolute deadlines from a clock started one frame before the first event,
-/// so the first goes at once and a late one never delays the rest. Between
-/// events it stops for a pending interruption and for a JavaScript dialog
-/// opening for the page.
+/// The clock paced input runs on: one helper event per presenter frame.
+/// A glide samples on absolute deadlines from a clock started one frame
+/// before its first sample (`until`), so the first goes at once and a late
+/// one never delays the rest; counted events (wheel notches) go once a frame
+/// (`tick`). Between events it stops for a pending interruption and for a
+/// JavaScript dialog opening for the page.
 struct Pacing<'a> {
     clock: Instant,
-    ticks: u32,
+    /// When the next counted event is due: none yet, so the first goes at
+    /// once.
+    next_tick: Option<Instant>,
     raised: tokio::sync::watch::Receiver<u64>,
     events: tokio::sync::broadcast::Receiver<CdpEvent>,
     interrupts: &'a Interrupts,
@@ -345,7 +348,7 @@ impl<'a> Pacing<'a> {
         let now = Instant::now();
         Self {
             clock: now.checked_sub(motion::FRAME).unwrap_or(now),
-            ticks: 0,
+            next_tick: None,
             raised: interrupts.subscribe(),
             events: client.subscribe(),
             interrupts,
@@ -388,14 +391,20 @@ impl<'a> Pacing<'a> {
         }
     }
 
-    /// Waits for the next frame of the clock that has not passed: the first
-    /// at once, then one per frame. A late tick (after a pause, or a slow
-    /// read) skips the frames it missed rather than bunching the events that
-    /// follow it.
+    /// Waits for the next counted event's frame: the first at once, then one
+    /// frame after the one before. A late event goes at once and the next is
+    /// a whole frame after it, so events never bunch and never come faster
+    /// than one a frame. A raised interruption wakes it early.
     async fn tick(&mut self) {
-        let passed = self.elapsed().as_nanos() / motion::FRAME.as_nanos();
-        self.ticks = (self.ticks + 1).max(u32::try_from(passed).unwrap_or(u32::MAX));
-        self.until(motion::FRAME * self.ticks).await;
+        let now = Instant::now();
+        let due = self.next_tick.unwrap_or(now);
+        if due > now {
+            tokio::select! {
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(due)) => {}
+                _ = self.raised.changed() => {}
+            }
+        }
+        self.next_tick = Some(due.max(now) + motion::FRAME);
     }
 
     /// A page read, unless a dialog opens for the page first (`None`): the
@@ -441,6 +450,37 @@ fn coordinates(params: &Value) -> Result<Option<(f64, f64)>, String> {
     Ok(Some((x, y)))
 }
 
+/// The modifier bit (Alt 1, Control 2, Meta 4, Shift 8) a key event's key
+/// is, or 0 for any other key.
+fn modifier_bit(event: &Value) -> i64 {
+    let code = event["code"].as_str().unwrap_or_default();
+    let key = event["key"].as_str().unwrap_or_default();
+    let name = code
+        .strip_suffix("Left")
+        .or_else(|| code.strip_suffix("Right"))
+        .unwrap_or(key);
+    match name {
+        "Alt" => 1,
+        "Control" => 2,
+        "Meta" => 4,
+        "Shift" => 8,
+        _ => 0,
+    }
+}
+
+/// The helper's identity of a key: its physical code, or its key when it
+/// names none.
+fn key_identity(event: &Value) -> Option<String> {
+    event["code"]
+        .as_str()
+        .filter(|code| !code.is_empty() && *code != "Unidentified")
+        .or_else(|| event["key"].as_str())
+        .map(str::to_owned)
+}
+
+/// The agent's native input held through the display helper: pointer
+/// mappings and aim, the buttons and modifiers its mouse events hold, and
+/// the keys it pressed without releasing (a `keydown`).
 #[derive(Default)]
 pub(super) struct NativeMouse {
     /// Measured page-to-display mappings by page session, kept while each
@@ -449,6 +489,10 @@ pub(super) struct NativeMouse {
     aim: Option<Aim>,
     buttons: i64,
     modifiers: i64,
+    /// Keys held down, by identity, with the modifier bit each is. Every
+    /// native event carries the held modifiers, so the helper, which sets
+    /// modifier keys to each event's mask, never lets one go early.
+    keys: BTreeMap<String, i64>,
     /// Set before the helper can perform input. Cancellation cannot clear it.
     unknown: bool,
 }
@@ -478,7 +522,36 @@ impl NativeMouse {
     }
 
     pub(super) fn needs_release(&self) -> bool {
-        self.buttons != 0 || self.modifiers != 0 || self.unknown
+        self.buttons != 0 || self.modifiers != 0 || !self.keys.is_empty() || self.unknown
+    }
+
+    /// The modifiers the held keys are.
+    pub(super) fn held_modifiers(&self) -> i64 {
+        self.keys.values().fold(0, |held, bit| held | bit)
+    }
+
+    /// A native event's modifier mask: the one it asks for, and those held.
+    fn holding(&self, requested: i64) -> i64 {
+        requested | self.held_modifiers()
+    }
+
+    /// Keyboard events the helper acknowledged: a press holds its key until
+    /// its release.
+    pub(super) fn keys_acknowledged(&mut self, events: &[Value]) {
+        for event in events {
+            let Some(identity) = key_identity(event) else {
+                continue;
+            };
+            match event["eventType"].as_str() {
+                Some("keyDown" | "rawKeyDown") => {
+                    self.keys.insert(identity, modifier_bit(event));
+                }
+                Some("keyUp") => {
+                    self.keys.remove(&identity);
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Cleanup has its own real acknowledgement. It never turns an earlier
@@ -588,7 +661,8 @@ impl NativeMouse {
             .active_window()
             .ok_or("The active browser window is unavailable")?;
         let window = (window.id, window.x, window.y, window.width, window.height);
-        let pointer = match self.probe(client, session, display, window).await? {
+        let (measured, moved) = self.probe(client, session, display, window).await?;
+        let pointer = match measured {
             Some(pointer) => pointer,
             None => calibrate(client, session).await?,
         };
@@ -599,6 +673,11 @@ impl NativeMouse {
             window,
         };
         self.current(&mapping, client, display).await?;
+        // The measurement moved the real pointer: viewers see it arrive
+        // there before anything travels from it.
+        if let Some(point) = moved {
+            self.published(point, &mapping, client, display)?;
+        }
         self.mappings.insert(session.into(), mapping.clone());
         Ok(mapping)
     }
@@ -606,16 +685,17 @@ impl NativeMouse {
     /// Measures the page natively: a one-pixel move where the pointer
     /// already is, too small to see, which the renderer under it reports as
     /// a trusted event. A pointer with no known place first appears at the
-    /// window's centre and is measured there. `None` when this page's own
-    /// document does not receive the move (the pointer is over the browser's
-    /// controls, a child frame or another window).
+    /// window's centre and is measured there. The measurement is `None` when
+    /// this page's own document does not receive the move (the pointer is
+    /// over the browser's controls, a child frame or another window); the
+    /// point is where the move went, when one was sent.
     async fn probe(
         &mut self,
         client: &CdpClient,
         session: &str,
         display: &DisplayClient,
         window: (u32, i32, i32, u32, u32),
-    ) -> Result<Option<NativePointer>, String> {
+    ) -> Result<(Option<NativePointer>, Option<(f64, f64)>), String> {
         let (_, left, top, width, height) = window;
         let (left, top) = (f64::from(left), f64::from(top));
         let (right, bottom) = (left + f64::from(width), top + f64::from(height));
@@ -630,13 +710,13 @@ impl NativeMouse {
             _ => center,
         };
         let Ok(probe) = client.arm_pointer_probe(session).await else {
-            return Ok(None);
+            return Ok((None, None));
         };
         let atomic = display.atomic_input().await;
         self.same_layout(display)?;
         self.send_move(at, self.modifiers, display).await?;
         drop(atomic);
-        Ok(probe.measured(PROBE_WAIT).await)
+        Ok((probe.measured(PROBE_WAIT).await, Some(at)))
     }
 
     /// Records what a press at `point` must reach, unless an aim there
@@ -748,6 +828,7 @@ impl NativeMouse {
         modifiers: i64,
         display: &DisplayClient,
     ) -> Result<(), String> {
+        let modifiers = self.holding(modifiers);
         let event = json!({
             "type": "input_mouse", "eventType": "mouseMoved", "x": point.0, "y": point.1,
             "buttons": self.buttons, "modifiers": modifiers,
@@ -779,6 +860,18 @@ impl NativeMouse {
         self.same_layout(display)?;
         self.send_move(point, modifiers, display).await?;
         drop(atomic);
+        self.published(point, mapping, client, display)
+    }
+
+    /// Publishes an acknowledged move of the real pointer to `point`
+    /// (display pixels) to viewers, as the agent's pointer.
+    fn published(
+        &self,
+        point: (f64, f64),
+        mapping: &Mapping,
+        client: &CdpClient,
+        display: &DisplayClient,
+    ) -> Result<(), String> {
         let surface = display.surface();
         let (x, y) = mapping.page(point, &surface)?;
         let factor = f64::from(surface.device_scale_factor);
@@ -1117,16 +1210,18 @@ impl NativeMouse {
             "mouseReleased" => self.buttons & !button,
             _ => self.buttons,
         };
-        let modifiers = params["modifiers"].as_i64().unwrap_or(0);
+        let modifiers = self.holding(params["modifiers"].as_i64().unwrap_or(0));
         let surface = display.surface();
         let mut event = crate::native::input::stream_event("input_mouse", params);
         event["x"] = json!(point.0);
         event["y"] = json!(point.1);
         event["buttons"] = json!(buttons);
+        event["modifiers"] = json!(modifiers);
         let mut activity =
             crate::native::activity::from_command("Input.dispatchMouseEvent", params)
                 .ok_or("Invalid mouse activity")?;
         activity["buttons"] = json!(buttons);
+        activity["modifiers"] = json!(modifiers);
         activity["screenX"] = json!(point.0 / f64::from(surface.device_scale_factor));
         activity["screenY"] = json!(point.1 / f64::from(surface.device_scale_factor));
         let observation = client.observe_activity(

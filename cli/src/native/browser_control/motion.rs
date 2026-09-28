@@ -38,6 +38,16 @@ const MOST_WHEEL_DELTA: f64 = 32768.0;
 /// scroll goes by script instead.
 pub(crate) const WHEEL_STALL: Duration = Duration::from_millis(400);
 
+/// The longest a scroll turns the wheel, from its first notch until the
+/// scroller settles. A longer distance turns more notches per event; what
+/// even that cannot reach in time goes by script.
+pub(crate) const WHEEL_BUDGET: Duration = Duration::from_millis(1500);
+
+/// The most notches one wheel event carries. Chrome scrolls exactly the
+/// notches of events up to three, and 99 % of them at ten per event
+/// (measured with the owned window's helper, 60 events a second).
+const MOST_NOTCHES_PER_EVENT: u32 = 10;
+
 // Fitts's law (Shannon form) with a fast person's constants, at 2.5 times
 // their speed, clamped so no travel is instant or dawdles.
 const FITTS_A_MS: f64 = 50.0;
@@ -214,6 +224,30 @@ pub(crate) fn notches_toward(remaining: f64, toward: f64, per_notch: f64) -> u32
     (ahead / per_notch).round().min(f64::from(u32::MAX)) as u32
 }
 
+/// How a round of `notches` goes out in at most `frames` wheel events, one
+/// per frame: the first a single notch, which proves the wheel reaches its
+/// scroller before more follow, the rest as even as whole notches allow. A
+/// longer scroll speeds up by turning more notches per event, never by
+/// sending events faster, up to `MOST_NOTCHES_PER_EVENT`; the events then
+/// carry fewer than `notches` when even that cannot reach in time, and the
+/// caller finishes the rest by script. Returns the notches per event.
+pub(crate) fn wheel_events(notches: u32, frames: u32) -> Vec<u32> {
+    if notches == 0 || frames == 0 {
+        return Vec::new();
+    }
+    let (rest, slots) = (notches - 1, frames - 1);
+    if rest == 0 || slots == 0 {
+        return vec![1];
+    }
+    let size = rest.div_ceil(slots).min(MOST_NOTCHES_PER_EVENT);
+    let count = rest.div_ceil(size).min(slots);
+    let carried = rest.min(size * count);
+    let (each, extra) = (carried / count, carried % count);
+    std::iter::once(1)
+        .chain((0..count).map(|index| each + u32::from(index < extra)))
+        .collect()
+}
+
 /// Splits helper keyboard events into strokes, in order and without gaps.
 /// Events before the first press form one unpaced stroke.
 pub(crate) fn strokes(events: &[Value]) -> Vec<Stroke> {
@@ -382,6 +416,38 @@ mod tests {
             assert_eq!(notches_toward(300.0, 1.0, per_notch), 0);
         }
         assert_eq!(notches_toward(f64::INFINITY, 1.0, 120.0), 0);
+    }
+
+    /// A long scroll speeds up with more notches per event, never with more
+    /// events: one per frame, a single probing notch first, even sizes after
+    /// it, and at most ten a event; what that cannot carry is left over.
+    #[test]
+    fn a_long_scroll_turns_more_notches_per_event_not_more_events() {
+        assert!(wheel_events(0, 60).is_empty());
+        assert!(wheel_events(5, 0).is_empty());
+        assert_eq!(wheel_events(1, 60), [1]);
+        assert_eq!(wheel_events(5, 60), [1; 5]);
+        assert_eq!(wheel_events(5, 1), [1]);
+        // 107 notches in 72 frames: one, then 53 events of two.
+        let long = wheel_events(107, 72);
+        assert_eq!(long[0], 1);
+        assert_eq!(long.len(), 54);
+        assert!(long[1..].iter().all(|size| *size == 2));
+        assert_eq!(long.iter().sum::<u32>(), 107);
+        // Uneven counts differ by at most one notch.
+        let uneven = wheel_events(50, 20);
+        assert_eq!(uneven.iter().sum::<u32>(), 50);
+        assert!(uneven.len() <= 20);
+        let (least, most) = (
+            uneven[1..].iter().min().unwrap(),
+            uneven[1..].iter().max().unwrap(),
+        );
+        assert!(most - least <= 1, "{uneven:?}");
+        // Beyond ten a event the frames cannot carry it: the rest is left.
+        let far = wheel_events(1000, 72);
+        assert_eq!(far.len(), 72);
+        assert!(far[1..].iter().all(|size| *size == MOST_NOTCHES_PER_EVENT));
+        assert_eq!(far.iter().sum::<u32>(), 1 + 71 * MOST_NOTCHES_PER_EVENT);
     }
 
     #[test]

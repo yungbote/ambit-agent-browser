@@ -604,8 +604,20 @@ impl BrowserControl {
                         InputSource::Agent,
                     )
                 });
-            for batch in events[stroke.events.clone()].chunks(MAX_EVENTS) {
+            // Held keys' modifiers ride on every event: the helper sets the
+            // modifier keys to each event's mask.
+            let held = self.native_mouse.held_modifiers();
+            let stroke_events: Vec<Value> = events[stroke.events.clone()]
+                .iter()
+                .map(|event| {
+                    let mut event = event.clone();
+                    event["modifiers"] = json!(event["modifiers"].as_i64().unwrap_or(0) | held);
+                    event
+                })
+                .collect();
+            for batch in stroke_events.chunks(MAX_EVENTS) {
                 let Err(error) = display.input(batch).await else {
+                    self.native_mouse.keys_acknowledged(batch);
                     continue;
                 };
                 if error.operation_performed == Some(json!(false)) {
@@ -766,6 +778,34 @@ impl BrowserControl {
                 session,
                 object,
                 delta,
+                &self.interrupts,
+            )
+            .await;
+        self.observe_native_result(&result);
+        result.map(|_| ())
+    }
+
+    /// Brings `element` (an object id and its session) into view through the
+    /// owned display, as a person does: the wheel turns each scroller hiding
+    /// its centre, and the page never jumps (`mouse_scroll.rs`). Native
+    /// pointer commands call it before they read their target. Returns true
+    /// when a JavaScript dialog opened.
+    pub(crate) async fn agent_native_scroll_into_view(
+        &mut self,
+        client: &CdpClient,
+        page_session: &str,
+        (element, session): (&str, &str),
+    ) -> Result<bool, CommandError> {
+        if let Some(error) = self.agent_error() {
+            return Err(format!("{}: {}", error.code, error.message).into());
+        }
+        let result = self
+            .native_mouse
+            .scroll_into_view(
+                client,
+                self.display.as_ref().ok_or("No owned browser display")?,
+                (page_session, session),
+                element,
                 &self.interrupts,
             )
             .await;

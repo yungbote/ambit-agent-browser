@@ -91,6 +91,9 @@ impl Drop for Tunnel {
 /// Program commands written to the browser and not yet acknowledged.
 const MAX_PENDING_COMMANDS: usize = 256;
 
+/// Commands the native input owner runs in wire order: real input, and the
+/// scroll into view Playwright asks for before it acts on an element, which
+/// the owned window turns with the wheel.
 fn is_input(method: &str) -> bool {
     matches!(
         method,
@@ -98,6 +101,7 @@ fn is_input(method: &str) -> bool {
             | "Input.dispatchKeyEvent"
             | "Input.insertText"
             | "Input.dispatchTouchEvent"
+            | "DOM.scrollIntoViewIfNeeded"
     )
 }
 
@@ -378,6 +382,13 @@ async fn native_input(
             "Input.dispatchMouseEvent" => {
                 control.agent_native_mouse(native_mouse_params(&params), client, session, &[session]).await?;
             }
+            "DOM.scrollIntoViewIfNeeded" => {
+                let element = node_object(client, session, &params).await?;
+                let page = client.page_of(session);
+                control
+                    .agent_native_scroll_into_view(client, &page, (&element, session))
+                    .await?;
+            }
             "Input.insertText" => control.agent_native_keys(&[json!({ "type": "input_keyboard", "eventType": "insertText", "text": params["text"] })], KEY_INTERVAL, client, session).await?,
             "Input.dispatchKeyEvent" => {
                 let event = native_keyboard_event(&params);
@@ -406,6 +417,27 @@ async fn native_input(
         control.agent_input(kind, params, client, session).await?;
     }
     Ok(())
+}
+
+/// The object of the node a DOM command names by object, backend node or
+/// node id.
+async fn node_object(client: &CdpClient, session: &str, params: &Value) -> Result<String, String> {
+    if let Some(object) = params["objectId"].as_str() {
+        return Ok(object.to_owned());
+    }
+    let mut node = json!({});
+    for field in ["backendNodeId", "nodeId"] {
+        if let Some(id) = params.get(field) {
+            node[field] = id.clone();
+        }
+    }
+    let resolved = client
+        .send_command("DOM.resolveNode", Some(node), Some(session))
+        .await?;
+    resolved["object"]["objectId"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| "The node to scroll into view no longer exists.".into())
 }
 
 fn native_mouse_params(params: &Value) -> Value {
@@ -446,6 +478,7 @@ mod tests {
     fn only_real_input_commands_use_the_native_input_owner() {
         assert!(is_input("Input.dispatchMouseEvent"));
         assert!(is_input("Input.insertText"));
+        assert!(is_input("DOM.scrollIntoViewIfNeeded"));
         assert!(!is_input("Runtime.evaluate"));
         assert!(!is_input("Runtime.callFunctionOn"));
         assert!(!is_input("Input.imeSetComposition"));
