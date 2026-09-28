@@ -157,7 +157,7 @@ Set `--download-path <dir>` or `AGENT_BROWSER_DOWNLOAD_PATH` to retain files in 
 agent-browser mouse move 100 200      # Move mouse
 agent-browser mouse down left         # Press button
 agent-browser mouse up left           # Release button
-agent-browser mouse wheel 100         # Scroll wheel
+agent-browser mouse wheel 100         # Scroll wheel where the pointer is
 ```
 
 ## Semantic Locators (alternative to refs)

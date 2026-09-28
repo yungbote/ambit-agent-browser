@@ -1711,6 +1711,12 @@ Usage: agent-browser fill <selector> <text>
 Clears the input field and fills it with the specified text.
 This replaces any existing content in the field.
 
+In an owned window (AGENT_BROWSER_WINDOW_STREAM=1) the pointer travels
+to the field and clicks it, any text in it is selected, and the value
+is typed one key per 25 ms (over 64 characters, pasted at once). A
+field whose own handlers left other text reports valueMatches: false
+with its value; nothing rewrites it.
+
 Global Options:
   --json               Output as JSON
   --session <name>     Use specific session
@@ -1729,6 +1735,10 @@ Usage: agent-browser type <selector> <text>
 
 Types text into the specified element character by character.
 Unlike fill, this does not clear existing content first.
+
+In an owned window (AGENT_BROWSER_WINDOW_STREAM=1) the pointer travels
+to the element and clicks it, the caret goes after its text (--clear
+empties it instead), and keys go one per 25 ms or per a longer --delay.
 
 Global Options:
   --json               Output as JSON
@@ -2006,6 +2016,11 @@ agent-browser scroll - Scroll the page
 Usage: agent-browser scroll [direction] [amount] [options]
 
 Scrolls the page or a specific element in the specified direction.
+
+In an owned window (AGENT_BROWSER_WINDOW_STREAM=1) the pointer goes
+where the wheel reaches the scroller and the wheel turns one notch
+(about 120 px) per frame, so the distance is the nearest whole number
+of notches. When no wheel can move the scroller, it scrolls by script.
 
 Arguments:
   direction            up, down, left, right (default: down)
@@ -2424,9 +2439,13 @@ Performs low-level mouse operations for precise control.
 
 Subcommands:
   move <x> <y>         Move mouse to coordinates
-  down [button]        Press mouse button (left, right, middle)
-  up [button]          Release mouse button
-  wheel <dy> [dx]      Scroll mouse wheel
+  down [button]        Press mouse button (left, right, middle) where it is
+  up [button]          Release mouse button where it is
+  wheel <dy> [dx]      Scroll mouse wheel where the pointer is
+
+In an owned window (AGENT_BROWSER_WINDOW_STREAM=1) the real pointer
+travels to each point, and the wheel turns one notch (100 units) per
+frame.
 
 Global Options:
   --json               Output as JSON
@@ -4214,7 +4233,9 @@ Environment:
   AGENT_BROWSER_STREAM_PORT      Override WebSocket streaming port (default: OS-assigned)
   AGENT_BROWSER_WINDOW_STREAM    1 = stream the owned Chromium window on private Linux X11
                                 Human control 60 fps, presenter 30, secondary viewers 15
-                                Mouse tools move the real cursor; headless/CDP input is unchanged
+                                (a presenter gets 60 while the agent's input is on screen)
+                                The agent's pointer travels to each target, keys go one per
+                                25 ms and the wheel one notch per frame; headless/CDP input is unchanged
                                 Failed gestures release held input; uncertain actions are never replayed
   AGENT_BROWSER_DISPLAY_HELPER   Native window helper path (default: beside agent-browser)
   AGENT_BROWSER_STREAM_QUALITY   JPEG quality 0-100 (default: 80)
