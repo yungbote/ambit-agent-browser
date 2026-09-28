@@ -101,10 +101,10 @@ const CALIBRATION_PROBE: &str = r#"(() => {
 })()"#;
 
 /// The page-to-native mapping is one affine relation for the whole page, so
-/// a page the pointer cannot be measured over is measured at its own visible
-/// point nearest the viewport's centre, where a pointer with no known place
-/// starts its travel. A CDP hover shows there until the first sample moves
-/// the real pointer.
+/// a page the pointer cannot be measured over (it is over a child frame or
+/// the browser's own controls) is measured at its own visible point nearest
+/// the viewport's centre. A CDP hover shows there until the travel's first
+/// sample moves the real pointer.
 async fn calibrate(client: &CdpClient, session: &str) -> Result<NativePointer, String> {
     let read = client
         .send_command(
@@ -151,15 +151,21 @@ fn aim_script(x: f64, y: f64) -> String {
     )
 }
 
-/// Whether the aimed element still receives a press at the point: null when
-/// it does, otherwise what receives it instead ('' when it left the page).
+/// Resolves once the page has begun a frame: Chrome dispatches continuous
+/// native input (a move, a wheel) at the next frame, so by then the page has
+/// taken the pointer's last move. Bounded for a page that draws no frames.
+const NEXT_FRAME: &str = "new Promise(resolve => { requestAnimationFrame(() => resolve(true)); setTimeout(() => resolve(true), 100); })";
+
+/// Whether the aimed element still receives a press at the point, once the
+/// page has taken the travel's last move: null when it does, otherwise what
+/// receives it instead ('' when it left the page).
 fn hit_test_script(x: f64, y: f64) -> String {
     format!(
-        r#"((x, y) => {{
-            const el = globalThis.__ambitAim;
+        r#"{NEXT_FRAME}.then(() => {{
+            const x = {x}, y = {y}, el = globalThis.__ambitAim;
             const blocker = !el || !el.isConnected ? '' : ({blocker})(document, el, x, y);
             return blocker === null ? null : {{ blocker, scrollX, scrollY }};
-        }})({x}, {y})"#,
+        }})"#,
         blocker = crate::native::element::BLOCKER_AT_JS,
     )
 }
@@ -451,12 +457,12 @@ impl NativeMouse {
         Ok(mapping)
     }
 
-    /// Measures the page where the pointer already is: a one-pixel move there,
-    /// too small to see, which the renderer under it reports as a trusted
-    /// event. `None` when the pointer's place is unknown or outside the
-    /// window, or when this page's own document does not receive the move
-    /// (the pointer is over the browser's controls, a child frame or another
-    /// window).
+    /// Measures the page natively: a one-pixel move where the pointer
+    /// already is, too small to see, which the renderer under it reports as
+    /// a trusted event. A pointer with no known place first appears at the
+    /// window's centre and is measured there. `None` when this page's own
+    /// document does not receive the move (the pointer is over the browser's
+    /// controls, a child frame or another window).
     async fn probe(
         &mut self,
         client: &CdpClient,
@@ -467,28 +473,22 @@ impl NativeMouse {
         let (_, left, top, width, height) = window;
         let (left, top) = (f64::from(left), f64::from(top));
         let (right, bottom) = (left + f64::from(width), top + f64::from(height));
-        let Some(pointer) = display
-            .pointer()
-            .filter(|(x, y)| *x >= left + 1.0 && *y >= top && *x < right - 1.0 && *y < bottom)
-        else {
-            return Ok(None);
+        let center = (
+            ((left + right) / 2.0).floor(),
+            ((top + bottom) / 2.0).floor(),
+        );
+        let at = match display.pointer() {
+            Some((x, y)) if x >= left + 1.0 && y >= top && x < right - 1.0 && y < bottom => {
+                (if x < center.0 { x + 1.0 } else { x - 1.0 }, y)
+            }
+            _ => center,
         };
         let Ok(probe) = client.arm_pointer_probe(session).await else {
             return Ok(None);
         };
-        let toward_center = if pointer.0 < (left + right) / 2.0 {
-            1.0
-        } else {
-            -1.0
-        };
         let atomic = display.atomic_input().await;
         self.same_layout(display)?;
-        self.send_move(
-            (pointer.0 + toward_center, pointer.1),
-            self.modifiers,
-            display,
-        )
-        .await?;
+        self.send_move(at, self.modifiers, display).await?;
         drop(atomic);
         Ok(probe.measured(PROBE_WAIT).await)
     }
@@ -556,7 +556,7 @@ impl NativeMouse {
                 "Runtime.evaluate",
                 Some(json!({
                     "expression": hit_test_script(point.0, point.1),
-                    "contextId": aim.context, "returnByValue": true,
+                    "contextId": aim.context, "returnByValue": true, "awaitPromise": true,
                 })),
                 Some(&aim.session),
             )
@@ -944,10 +944,17 @@ impl NativeMouse {
         if !observe {
             return Ok(false);
         }
+        // A move or a wheel is taken at the page's next frame: a hover
+        // promises the page has seen the pointer arrive when it returns.
+        let expression = if matches!(event_type, "mouseMoved" | "mouseWheel") {
+            NEXT_FRAME
+        } else {
+            "true"
+        };
         let observed = client.send_command(
             "Runtime.evaluate",
             Some(json!({
-                "expression": "true", "contextId": mapping.pointer.context,
+                "expression": expression, "contextId": mapping.pointer.context,
                 "awaitPromise": true, "returnByValue": true,
             })),
             Some(session),

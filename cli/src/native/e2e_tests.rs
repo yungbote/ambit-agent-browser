@@ -13766,7 +13766,7 @@ async fn e2e_native_mouse_reaches_iframes_and_refuses_points_outside_the_page() 
         assert_eq!(refused["success"], false, "{refused}");
         let error = refused["error"].as_str().unwrap();
         assert!(error.contains("is outside the visible page"), "{error}");
-        assert!(error.contains("No native input was sent"), "{error}");
+        assert!(error.contains("no input was sent to it"), "{error}");
     }
     // A partly visible element is scrolled until its click point is visible.
     assert_success(

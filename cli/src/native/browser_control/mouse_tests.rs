@@ -272,17 +272,21 @@ fn answer(page: &mut Page, command: &Value) -> Value {
         "Runtime.evaluate" if expression.contains("globalThis.__ambitAim = hit") => {
             json!({"result":{"value":40}})
         }
-        "Runtime.evaluate" if expression.contains("const el = globalThis.__ambitAim") => {
+        "Runtime.evaluate" if expression.contains("el = globalThis.__ambitAim") => {
             let found = page.blocker.as_ref().map_or(
                 Value::Null,
                 |blocker| json!({"blocker":blocker,"scrollX":0,"scrollY":0}),
             );
             json!({"result":{"value":found}})
         }
-        "Runtime.evaluate" if expression == "true" && page.fail_readback => {
+        "Runtime.evaluate"
+            if (expression == "true" || expression == NEXT_FRAME) && page.fail_readback =>
+        {
             return json!({"id":command["id"],"error":{"code":-32000,"message":"Renderer readback timeout after native press"}});
         }
-        "Runtime.evaluate" if expression == "true" => json!({"result":{"value":true}}),
+        "Runtime.evaluate" if expression == "true" || expression == NEXT_FRAME => {
+            json!({"result":{"value":true}})
+        }
         _ => json!({}),
     };
     json!({"id":command["id"],"result":result})
@@ -560,6 +564,29 @@ async fn a_click_far_from_the_pointer_travels_there_before_its_press() {
         "press",
         "the press is published after its travel"
     );
+}
+
+/// A pointer with no known place (the first gesture of a display) appears
+/// at the window's centre and is measured there by its own trusted report:
+/// no CDP hover reaches the page, and the travel starts where it appeared.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_pointer_with_no_known_place_appears_at_the_windows_centre() {
+    let fake = Fake::new().await;
+    let mut control = fake.control();
+    assert_eq!(fake.display.pointer(), None);
+    control
+        .agent_native_mouse(moved(100.0, 100.0), &fake.client, "page", &["page"])
+        .await
+        .unwrap();
+    let inputs = fake.helper_inputs();
+    assert_eq!(
+        (inputs[0].1["x"].as_f64(), inputs[0].1["y"].as_f64()),
+        (Some(1280.0), Some(720.0))
+    );
+    assert!(inputs.len() > 3, "it travelled from there");
+    assert_eq!(fake.page_commands("Input.dispatchMouseEvent"), 0);
+    assert_eq!(fake.display.pointer(), Some(shown(100.0, 100.0)));
 }
 
 /// A takeover stops the travel at its next sample: the press never goes,
