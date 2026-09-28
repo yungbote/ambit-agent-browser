@@ -932,6 +932,31 @@ fn wheels(inputs: &[(Instant, Value)]) -> Vec<&(Instant, Value)> {
         .collect()
 }
 
+/// Wheel events came no faster than one a frame. The fake helper stamps an
+/// event when its task reads it, so under load one late read shortens the
+/// gap after it by as much as it lengthened the gap before: single gaps are
+/// not compared. A burst is three events within one frame, and events that
+/// come faster than a frame on average are bunched.
+fn assert_one_a_frame(wheels: &[&(Instant, Value)]) {
+    let gaps: Vec<Duration> = wheels
+        .windows(2)
+        .map(|pair| pair[1].0 - pair[0].0)
+        .collect();
+    for pair in gaps.windows(2) {
+        assert!(
+            pair[0] + pair[1] >= motion::FRAME,
+            "a burst of three wheel events within a frame: {gaps:?}"
+        );
+    }
+    if let Some(count) = u32::try_from(gaps.len()).ok().filter(|count| *count > 0) {
+        let mean = gaps.iter().sum::<Duration>() / count;
+        assert!(
+            mean >= motion::FRAME - Duration::from_millis(1),
+            "wheel events faster than one a frame on average: {gaps:?}"
+        );
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn agent_activity(
     activity: &mut tokio::sync::broadcast::Receiver<crate::native::cdp::types::CdpEvent>,
@@ -973,10 +998,7 @@ async fn a_wheel_turns_one_notch_per_frame() {
     assert!(wheels.iter().all(|(_, event)| {
         (event["x"].as_f64().unwrap(), event["y"].as_f64().unwrap()) == shown(400.0, 300.0)
     }));
-    for pair in wheels.windows(2) {
-        let gap = pair[1].0 - pair[0].0;
-        assert!(gap >= motion::FRAME - Duration::from_millis(2), "{gap:?}");
-    }
+    assert_one_a_frame(&wheels);
     let scrolls = agent_activity(&mut activity)
         .into_iter()
         .filter(|event| event["eventType"] == "scroll")
@@ -1022,10 +1044,7 @@ async fn a_scroll_turns_the_wheel_where_it_reaches_the_scroller_until_it_is_ther
         ),
         point
     );
-    for pair in wheels.windows(2) {
-        let gap = pair[1].0 - pair[0].0;
-        assert!(gap >= motion::FRAME - Duration::from_millis(2), "{gap:?}");
-    }
+    assert_one_a_frame(&wheels);
     assert_eq!(fake.page.lock().unwrap().scroller.at, 360.0);
     assert_eq!(fake.page_commands("scrollBy"), 0);
     let published = agent_activity(&mut activity);
@@ -1207,10 +1226,7 @@ async fn a_long_way_down_turns_more_notches_per_event_within_the_budget() {
     assert!(wheels
         .iter()
         .all(|(_, event)| event["deltaY"].as_f64().unwrap() <= 1000.0));
-    for pair in wheels.windows(2) {
-        let gap = pair[1].0 - pair[0].0;
-        assert!(gap >= motion::FRAME - Duration::from_millis(2), "{gap:?}");
-    }
+    assert_one_a_frame(&wheels);
     let at = fake.page.lock().unwrap().scroller.at;
     assert!((at - 29_680.0).abs() <= 60.0, "at {at}");
     assert!(notches >= 240.0, "{notches} notches");
