@@ -45,6 +45,7 @@ pub mod screenshot;
 pub(crate) mod selection;
 #[allow(dead_code)]
 pub mod snapshot;
+pub(crate) mod socket;
 #[allow(dead_code)]
 pub mod state;
 #[allow(dead_code)]
