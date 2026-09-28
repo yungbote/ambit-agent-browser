@@ -128,7 +128,7 @@ async fn serve(
         let socket = tokio::select! {
             biased;
             _ = stop.changed() => return Ok(()),
-            accepted = listener.accept() => accepted.map_err(|error| error.to_string())?.0,
+            accepted = crate::native::socket::accept(&listener) => accepted.map_err(|error| error.to_string())?.0,
         };
         let handshake = tokio_tungstenite::accept_hdr_async(
             socket,
