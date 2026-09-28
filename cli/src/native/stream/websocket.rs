@@ -1,11 +1,11 @@
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::stream::SplitStream;
+use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, watch, Mutex, Notify, RwLock};
@@ -13,15 +13,22 @@ use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::WebSocketStream;
 
+use crate::native::audio::{AudioCodec, AudioError, AudioSource};
 use crate::native::browser_control::{custody_active, BrowserControl};
 use crate::native::cdp::client::CdpClient;
 use crate::native::display::DisplayClient;
 #[cfg(test)]
 use crate::native::input::keyboard_params;
+use crate::native::video::Declared;
 
+use super::audio::AudioTrack;
 use super::http::handle_http_request;
 use super::presentation::{Presentation, PresentationConfig};
-use super::{is_allowed_origin, timestamp_ms, IdleActivity, StreamFrame, StreamMedia};
+use super::track::{self, Demand};
+use super::video::{Delivery, Feedback, VideoHub, VideoInbox, VideoTrack};
+use super::{
+    is_allowed_origin, timestamp_ms, Audience, FrameNeeds, IdleActivity, StreamFrame, StreamMedia,
+};
 
 /// Highest per-client frame rate a client may request via the `config` message.
 const MAX_CONFIGURABLE_FPS: u32 = 120;
@@ -56,6 +63,25 @@ struct ClientConfig {
     /// `visible` window (`visible=crop`), so the framebuffer may be a size
     /// class larger than the window.
     crops_visible: bool,
+    /// The audio codec the viewer declared (`audio=<token>`, binary viewers
+    /// only), and its newest subscription request.
+    audio: Option<AudioCodec>,
+    audio_demand: Demand,
+    /// The video codecs the viewer declared (`video=<token>,...`, binary
+    /// viewers only), and its newest subscription request.
+    video: Option<Declared>,
+    video_demand: Demand,
+}
+
+impl ClientConfig {
+    /// What this viewer's declaration asks of the frames it is sent.
+    fn frame_needs(&self) -> FrameNeeds {
+        FrameNeeds {
+            draws_pointer: self.draws_pointer,
+            crops_visible: self.crops_visible,
+            patches: self.patches,
+        }
+    }
 }
 
 impl Default for ClientConfig {
@@ -69,6 +95,10 @@ impl Default for ClientConfig {
             frame_window: 1,
             draws_pointer: false,
             crops_visible: false,
+            audio: None,
+            audio_demand: Demand::default(),
+            video: None,
+            video_demand: Demand::default(),
         }
     }
 }
@@ -273,6 +303,8 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
             "cursor" => cfg.draws_pointer = value == "viewer",
             "visible" => cfg.crops_visible = value == "crop",
             "frames" => cfg.binary = value == "binary",
+            "audio" => cfg.audio = AudioCodec::parse(value),
+            "video" => cfg.video = Declared::parse(value),
             "frameWindow" => {
                 if let Some(window) = value
                     .parse::<usize>()
@@ -284,6 +316,10 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
             }
             _ => {}
         }
+    }
+    if !cfg.binary {
+        cfg.audio = None;
+        cfg.video = None;
     }
     let viewer = request
         .lines()
@@ -345,11 +381,11 @@ pub(super) async fn accept_loop(
     listener: TcpListener,
     frame_tx: broadcast::Sender<String>,
     frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
-    client_count: Arc<Mutex<usize>>,
-    patch_clients: Arc<AtomicUsize>,
     media: Arc<StreamMedia>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<DisplayClient>>>>,
+    audio_source: watch::Receiver<Option<AudioSource>>,
+    video: Arc<VideoHub>,
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
     browser_control: Arc<Mutex<BrowserControl>>,
@@ -384,11 +420,11 @@ pub(super) async fn accept_loop(
                 };
                 let frame_tx = frame_tx.clone();
                 let frame_watch = frame_watch.clone();
-                let client_count = client_count.clone();
-                let patch_clients = patch_clients.clone();
                 let media = media.clone();
                 let client_slot = client_slot.clone();
                 let display_slot = display_slot.clone();
+                let audio_source = audio_source.clone();
+                let video = video.clone();
                 let client_notify = client_notify.clone();
                 let idle_activity = idle_activity.clone();
                 let browser_control = browser_control.clone();
@@ -409,11 +445,11 @@ pub(super) async fn accept_loop(
                         addr,
                         frame_tx,
                         frame_watch,
-                        client_count,
-                        patch_clients,
                         media,
                         client_slot,
                         display_slot,
+                        audio_source,
+                        video,
                         client_notify,
                         idle_activity,
                         browser_control,
@@ -462,11 +498,11 @@ async fn handle_connection(
     addr: SocketAddr,
     frame_tx: broadcast::Sender<String>,
     frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
-    client_count: Arc<Mutex<usize>>,
-    patch_clients: Arc<AtomicUsize>,
     media: Arc<StreamMedia>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<DisplayClient>>>>,
+    audio_source: watch::Receiver<Option<AudioSource>>,
+    video: Arc<VideoHub>,
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
     browser_control: Arc<Mutex<BrowserControl>>,
@@ -497,11 +533,11 @@ async fn handle_connection(
             initial_config,
             frame_rx,
             frame_watch,
-            client_count,
-            patch_clients,
             media,
             client_slot,
             display_slot,
+            audio_source,
+            video,
             client_notify,
             idle_activity,
             browser_control,
@@ -571,11 +607,11 @@ async fn handle_ws_client(
     initial_config: ClientConfig,
     mut broadcast_rx: broadcast::Receiver<String>,
     mut frame_watch: watch::Receiver<Option<Arc<StreamFrame>>>,
-    client_count: Arc<Mutex<usize>>,
-    patch_clients: Arc<AtomicUsize>,
     media: Arc<StreamMedia>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     display_slot: Arc<RwLock<Option<Arc<DisplayClient>>>>,
+    mut audio_source: watch::Receiver<Option<AudioSource>>,
+    video_hub: Arc<VideoHub>,
     client_notify: Arc<Notify>,
     idle_activity: Arc<IdleActivity>,
     browser_control: Arc<Mutex<BrowserControl>>,
@@ -622,14 +658,8 @@ async fn handle_ws_client(
         idle_activity.mark();
     }
 
-    {
-        let mut count = client_count.lock().await;
-        *count += 1;
-        if initial_config.patches {
-            patch_clients.fetch_add(1, Ordering::AcqRel);
-        }
-        media.viewer_joined(initial_config.draws_pointer, initial_config.crops_visible);
-    }
+    // The viewer's place in the roster, left on every path out.
+    let mut seat = media.seat(initial_config.frame_needs());
 
     let (mut ws_tx, ws_rx) = ws_stream.split();
 
@@ -638,6 +668,21 @@ async fn handle_ws_client(
     let (config_tx, mut config_rx) = watch::channel::<ClientConfig>(initial_config);
     let (ack_tx, mut ack_rx) = watch::channel::<u64>(0);
     let (input_error_tx, mut input_error_rx) = watch::channel::<Option<Value>>(None);
+    let mut audio = initial_config.audio.map(AudioTrack::new);
+    let declared_video = initial_config.video.map(|declared| {
+        VideoTrack::new(
+            video_hub.clone(),
+            declared,
+            initial_config.draws_pointer,
+            initial_config.max_fps,
+        )
+    });
+    let (mut video, video_inbox, mut video_feedback) = match declared_video {
+        Some((track, inbox, feedback)) => (Some(track), Some(inbox), Some(feedback)),
+        None => (None, None, None),
+    };
+    let mut video_display = video_hub.display_changes();
+    video_display.borrow_and_update();
     // Spawned before the status, tabs and seed writes below: those are
     // unbounded sends, and a full receive queue would otherwise hold input
     // behind the whole handshake.
@@ -652,6 +697,8 @@ async fn handle_ws_client(
         input_error_tx,
         presentation.clone(),
         connection_id,
+        audio.as_ref().map(AudioTrack::offered),
+        video_inbox,
     )));
 
     if let Some(config) = initial_config.presentation {
@@ -679,6 +726,16 @@ async fn handle_ws_client(
     for message in state.messages().await {
         let _ = ws_tx.send(Message::Text(message)).await;
     }
+    let mut offers = match audio.as_mut() {
+        Some(track) => track.bind(audio_source.borrow_and_update().clone()),
+        None => Vec::new(),
+    };
+    if let Some(track) = video.as_mut() {
+        offers.extend(track.bind(video_hub.display().await));
+    }
+    if !send_records(&mut ws_tx, offers).await {
+        return;
+    }
 
     // Invariant: only a successful send writes `last_sent`. `None` means
     // nothing was delivered, so the cap owes this connection no wait.
@@ -702,15 +759,6 @@ async fn handle_ws_client(
             let message_bytes = message.len();
             if message_bytes > MAX_WINDOW_BYTES {
                 let _ = ws_tx.send(Message::Close(None)).await;
-                drop(reader_task);
-                retire_viewer(
-                    &client_count,
-                    &patch_clients,
-                    &media,
-                    initial_config,
-                    &client_notify,
-                )
-                .await;
                 return;
             }
             if ws_tx.send(message).await.is_ok() {
@@ -734,9 +782,30 @@ async fn handle_ws_client(
         presentation.client_fps(connection_id, initial_config.max_fps, controlled),
     );
     let mut pending_frame = false;
+    // Whether this viewer is sent frames (not video) now.
+    let mut framed = true;
 
     loop {
+        // The viewer is served video while its track holds a subscription,
+        // frames otherwise. Frames resume whole: nothing sent before the video
+        // is a base, and nothing in flight is awaited.
+        let serving_video = video.as_ref().is_some_and(VideoTrack::serving);
+        let audience = if serving_video {
+            Audience::Video
+        } else {
+            Audience::Frames
+        };
+        if seat.serve(audience) {
+            framed = !serving_video;
+            in_flight.clear();
+            byte_blocked = false;
+            delivered_seq = None;
+            pending_frame = false;
+            client_notify.notify_one();
+        }
         tokio::select! {
+            // Apply source/demand changes before queued audio, and audio before an unsent image.
+            biased;
             changed = shutdown_rx.changed() => {
                 if changed.is_err() || *shutdown_rx.borrow() {
                     // Shutdown is an explicit lifecycle event. An unlabelled
@@ -748,6 +817,51 @@ async fn handle_ws_client(
             }
             _ = &mut reader_task.0 => {
                 break;
+            }
+            changed = config_rx.changed() => {
+                if changed.is_err() { break; }
+                let cfg = *config_rx.borrow_and_update();
+                let mut records = audio.as_mut().map(|track| track.request(cfg.audio_demand)).unwrap_or_default();
+                if let Some(track) = video.as_mut() {
+                    track.set_rate(cfg.max_fps);
+                    records.extend(track.request(cfg.video_demand));
+                }
+                if !send_records(&mut ws_tx, records).await { break; }
+                // Loosening the cap pulls the deadline into the past, so a
+                // pending frame goes out at once.
+                next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, cfg.max_fps, controlled));
+                // Leaving ack pacing releases a frame that is still waiting on
+                // an acknowledgement the client will now never send.
+                if !cfg.ack_pacing { in_flight.clear(); byte_blocked = false; }
+            }
+            changed = audio_source.changed(), if audio.is_some() => {
+                if changed.is_err() { break; }
+                let source = audio_source.borrow_and_update().clone();
+                let records = audio.as_mut().map(|track| track.bind(source)).unwrap_or_default();
+                if !send_records(&mut ws_tx, records).await { break; }
+            }
+            changed = video_display.changed(), if video.is_some() => {
+                if changed.is_err() { break; }
+                video_display.borrow_and_update();
+                let display = video_hub.display().await;
+                let records = video.as_mut().map(|track| track.bind(display)).unwrap_or_default();
+                if !send_records(&mut ws_tx, records).await { break; }
+            }
+            packet = next_audio(&mut audio) => {
+                let Some(track) = audio.as_mut() else { continue };
+                // A packet never outlives a newer request or a source
+                // replacement the writer has not applied yet.
+                let fresh = |track: &AudioTrack, demand| track.current(demand) && !audio_source.has_changed().unwrap_or(true);
+                let (records, message) = match packet {
+                    Ok(packet) if fresh(track, config_rx.borrow().audio_demand) => track.deliver(packet),
+                    Ok(_) => continue,
+                    Err(reason) => (track.interrupted(reason), None),
+                };
+                if !send_records(&mut ws_tx, records).await { break; }
+                // Checked again after the `started` write: an already-written
+                // TCP unit is in flight, a queued one is not.
+                let Some(message) = message.filter(|_| fresh(track, config_rx.borrow().audio_demand)) else { continue };
+                if ws_tx.send(message).await.is_err() { break; }
             }
             msg = broadcast_rx.recv() => {
                 match msg {
@@ -776,6 +890,24 @@ async fn handle_ws_client(
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
             }
+            feedback = next_feedback(&mut video_feedback) => {
+                let Some(feedback) = feedback else { break };
+                if let Some(track) = video.as_mut() {
+                    track.feedback(feedback);
+                }
+            }
+            delivery = next_video(&video) => {
+                let Some(track) = video.as_mut() else { continue };
+                // A unit never outlives a newer request or a display
+                // replacement the writer has not applied yet.
+                let fresh = track.current(config_rx.borrow().video_demand)
+                    && !video_display.has_changed().unwrap_or(true);
+                let (records, message) = track.deliver(delivery, fresh);
+                if !send_records(&mut ws_tx, records).await { break; }
+                if let Some(message) = message {
+                    if ws_tx.send(message).await.is_err() { break; }
+                }
+            }
             changed = frame_watch.changed(), if !pending_frame => {
                 if changed.is_err() {
                     break;
@@ -789,23 +921,6 @@ async fn handle_ws_client(
                 presentation_rx.borrow_and_update();
                 next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, config_rx.borrow().max_fps, controlled));
                 if ws_tx.send(Message::Text(presentation.acknowledgment(connection_id, config).to_string())).await.is_err() { break; }
-            }
-            changed = config_rx.changed() => {
-                // The sender lives as long as the reader, so an error here
-                // means the reader ended. Break and let cleanup run.
-                if changed.is_err() {
-                    break;
-                }
-                let cfg = *config_rx.borrow_and_update();
-                // Loosening the cap pulls the deadline into the past, so a
-                // pending frame goes out at once.
-                next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, cfg.max_fps, controlled));
-                // Leaving ack pacing releases a frame that is still waiting on
-                // an acknowledgement the client will now never send.
-                if !cfg.ack_pacing {
-                    in_flight.clear();
-                    byte_blocked = false;
-                }
             }
             changed = custody_rx.changed() => {
                 if changed.is_err() { break; }
@@ -829,7 +944,7 @@ async fn handle_ws_client(
                 in_flight.acknowledge(acked, Instant::now(), true);
                 byte_blocked = false;
             }
-            _ = tokio::time::sleep_until(next_allowed), if pending_frame && !byte_blocked && (!config_rx.borrow().ack_pacing || in_flight.has_slot(config_rx.borrow().frame_window)) => {
+            _ = tokio::time::sleep_until(next_allowed), if framed && pending_frame && !byte_blocked && (!config_rx.borrow().ack_pacing || in_flight.has_slot(config_rx.borrow().frame_window)) => {
                 // Invariant: read at send time, not arrival time. That is what
                 // makes this latest-frame-wins; anything that arrived while the
                 // writer waited is skipped rather than queued.
@@ -873,32 +988,53 @@ async fn handle_ws_client(
     }
 
     drop(reader_task);
-
-    retire_viewer(
-        &client_count,
-        &patch_clients,
-        &media,
-        initial_config,
-        &client_notify,
-    )
-    .await;
 }
 
-async fn retire_viewer(
-    client_count: &Mutex<usize>,
-    patch_clients: &AtomicUsize,
-    media: &StreamMedia,
-    config: ClientConfig,
-    client_notify: &Notify,
-) {
-    let mut count = client_count.lock().await;
-    *count = count.saturating_sub(1);
-    if config.patches {
-        patch_clients.fetch_sub(1, Ordering::AcqRel);
+/// Writes a track's records in order; false when the connection is gone.
+async fn send_records(
+    writer: &mut SplitSink<WebSocketStream<TcpStream>, Message>,
+    records: Vec<Value>,
+) -> bool {
+    for record in records {
+        if writer
+            .send(Message::Text(record.to_string()))
+            .await
+            .is_err()
+        {
+            return false;
+        }
     }
-    media.viewer_left(config.draws_pointer, config.crops_visible);
-    drop(count);
-    client_notify.notify_one();
+    true
+}
+
+/// The declared video track's next delivery; never for an undeclared one.
+async fn next_video(track: &Option<VideoTrack>) -> Delivery {
+    match track {
+        Some(track) => track.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// The viewer's newest feedback on its video track; none once the reader is
+/// gone, never without a track.
+async fn next_feedback(feedback: &mut Option<watch::Receiver<Feedback>>) -> Option<Feedback> {
+    match feedback {
+        Some(feedback) => {
+            feedback.changed().await.ok()?;
+            Some(*feedback.borrow_and_update())
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// The declared audio track's next packet; never for an undeclared one.
+async fn next_audio(
+    track: &mut Option<AudioTrack>,
+) -> Result<crate::native::audio::AudioPacket, AudioError> {
+    match track {
+        Some(track) => track.next().await,
+        None => std::future::pending().await,
+    }
 }
 
 /// Reads client messages and dispatches them without waiting on frame
@@ -916,6 +1052,8 @@ async fn reader_loop(
     input_errors: watch::Sender<Option<Value>>,
     presentation: Arc<Presentation>,
     connection_id: uuid::Uuid,
+    audio_offered: Option<Arc<AtomicBool>>,
+    video: Option<VideoInbox>,
 ) {
     while let Some(msg) = ws_rx.next().await {
         match msg {
@@ -925,6 +1063,33 @@ async fn reader_loop(
                     Err(_) => continue,
                 };
                 let msg_type = parsed.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                if msg_type == "audio" {
+                    // Subscription changes output only; it never touches input.
+                    if let Some((enabled, generation)) =
+                        track::admit(audio_offered.as_deref(), &parsed)
+                    {
+                        if config.send_if_modified(|current| {
+                            current.audio_demand.set(enabled, generation)
+                        }) {
+                            idle_activity.mark();
+                        }
+                    }
+                    continue;
+                }
+                if msg_type == "video" {
+                    // Output only, like audio: it never touches input.
+                    if let Some(video) = &video {
+                        let demand = config.borrow().video_demand;
+                        if let Some((enabled, generation)) = video.receive(&parsed, demand) {
+                            if config.send_if_modified(|current| {
+                                current.video_demand.set(enabled, generation)
+                            }) {
+                                idle_activity.mark();
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if msg_type == "presentation" {
                     let current = *config.borrow();
                     if let Some(next) = updated_presentation(current, &parsed) {
@@ -949,18 +1114,32 @@ async fn reader_loop(
                     continue;
                 }
                 if msg_type == "ack" {
-                    if let Some(seq) = parse_ack_seq(&parsed) {
-                        // send_if_modified keeps the acknowledged id monotonic:
-                        // a late ack for an older frame must not walk it back
-                        // and re-block the writer.
-                        ack.send_if_modified(|current| {
-                            if seq > *current {
-                                *current = seq;
-                                true
-                            } else {
-                                false
+                    // A frame's acknowledgement names no track; a video
+                    // unit's names its track and stream, and never counts as
+                    // frame credit.
+                    match parsed.get("track").and_then(Value::as_str) {
+                        None => {
+                            if let Some(seq) = parse_ack_seq(&parsed) {
+                                // send_if_modified keeps the acknowledged id
+                                // monotonic: a late ack for an older frame
+                                // must not walk it back and re-block the
+                                // writer.
+                                ack.send_if_modified(|current| {
+                                    if seq > *current {
+                                        *current = seq;
+                                        true
+                                    } else {
+                                        false
+                                    }
+                                });
                             }
-                        });
+                        }
+                        Some("video") => {
+                            if let Some(video) = &video {
+                                video.acknowledge(&parsed);
+                            }
+                        }
+                        Some(_) => {}
                     }
                     continue;
                 }
@@ -1010,6 +1189,28 @@ fn is_user_input_message_type(msg_type: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn audio_negotiation_is_fixed_to_a_supported_binary_codec() {
+        for (query, codec) in [
+            ("frames=binary&audio=opus", Some(AudioCodec::Opus)),
+            ("audio=pcm-s16le&frames=binary", Some(AudioCodec::PcmS16le)),
+            ("audio=opus", None),
+            ("frames=binary&audio=unknown", None),
+            ("frames=binary", None),
+        ] {
+            let config = config_from_upgrade(&format!("GET /?{query} HTTP/1.1\r\n"));
+            assert_eq!(config.audio, codec, "{query}");
+            assert_eq!(config.audio_demand, Demand::default());
+            let changed = apply_config(
+                config,
+                &json!({"maxFps":30,"audio":"pcm-s16le","enabled":true}),
+            )
+            .unwrap();
+            assert_eq!(changed.audio, codec);
+            assert_eq!(changed.audio_demand, Demand::default());
+        }
+    }
 
     #[test]
     fn dashboard_input_messages_count_as_user_activity() {

@@ -288,6 +288,12 @@ async fn e2e_audio_two_sessions_page_output_and_sign_in() {
     drop(sub_a);
     drop(sub_b);
     assert_eq!(source_a.observe().subscribers, 0);
+    let stream_port = command(&mut a, json!({"action":"stream_enable","port":0})).await["port"]
+        .as_u64()
+        .unwrap() as u16;
+    let network_pcm = crate::native::stream::audio_e2e::capture(stream_port, 300).await;
+    assert!(power(&network_pcm, 440.0) > 1000.0);
+    save_wave("automation-native-channel-opus", &network_pcm);
     let mut slow = source_a.subscribe(AudioCodec::Opus).unwrap();
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert_eq!(slow.recv().await.unwrap_err(), AudioError::Overrun);
@@ -335,6 +341,12 @@ async fn e2e_audio_two_sessions_page_output_and_sign_in() {
         power(&signed_pcm.0, 440.0)
     );
     drop(signed);
+    let network_signed = crate::native::stream::audio_e2e::capture(stream_port, 300).await;
+    assert!(
+        power(&network_signed, 440.0) > 1000.0,
+        "the production native viewer binding follows sign-in custody"
+    );
+    save_wave("sign-in-native-channel-opus", &network_signed);
     command(&mut a, control("release", &controller)).await;
     assert!(
         a.browser
@@ -348,10 +360,11 @@ async fn e2e_audio_two_sessions_page_output_and_sign_in() {
     let observation = source_a.observe();
     command(&mut a, json!({"action":"close"})).await;
     command(&mut b, json!({"action":"close"})).await;
+    command(&mut a, json!({"action":"stream_disable"})).await;
     assert!(!source_a.observe().ready && !source_b.observe().ready);
     server.abort();
     println!(
         "AUDIO_PROOF {}",
-        json!({"status":"passed","pulse":observation,"launchAMs":launch_a_ms,"signInMs":transition.as_millis(),"aTone":a_own,"aForeignTone":a_other,"bTone":b_own,"bForeignTone":b_other,"opusPrimingSamples":a_pcm.2,"packets":a_pcm.1.len(),"maxOpusBytes":a_pcm.1.iter().map(|p|p.2).max(),"captureAndReferenceDecoderCpuUs":capture_cpu,"captureWallUs":capture_wall,"slowSubscriber":"overrun_closed","lateSubscriber":"fresh_sequence","signIn":"retained_output","shutdown":"retired"})
+        json!({"status":"passed","pulse":observation,"launchAMs":launch_a_ms,"signInMs":transition.as_millis(),"aTone":a_own,"aForeignTone":a_other,"bTone":b_own,"bForeignTone":b_other,"opusPrimingSamples":a_pcm.2,"packets":a_pcm.1.len(),"maxOpusBytes":a_pcm.1.iter().map(|p|p.2).max(),"captureAndReferenceDecoderCpuUs":capture_cpu,"captureWallUs":capture_wall,"slowSubscriber":"overrun_closed","lateSubscriber":"fresh_sequence","signIn":"retained_output","nativeViewer":"automation_and_sign_in_tone_decoded","shutdown":"retired"})
     );
 }

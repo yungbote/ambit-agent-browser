@@ -1,11 +1,107 @@
-//! Negotiated binary image transport. The existing JSON envelope remains the
-//! metadata owner; only JPEG bytes leave its base64 representation on the wire.
+//! Negotiated binary media on the existing viewer connection. Image, audio and
+//! video retain their own envelopes, limits, epochs and sequence and
+//! acknowledgement owners.
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 
+use crate::native::video::VideoCodec;
+
 const MAX_FRAME_BYTES: usize = 12 * 1024 * 1024;
 const MAX_HEADER_BYTES: usize = 64 * 1024;
+pub(super) const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
+/// A video unit's bounds (contract section 2), which every hop checks.
+const MAX_VIDEO_HEADER_BYTES: usize = 4096;
+const MAX_VIDEO_BYTES: usize = 4 * 1024 * 1024;
+const MAX_CODED: u32 = 4096;
+
+/// One video unit: one temporal unit of one picture, in its epoch
+/// (`stream_id`) at `seq`. The header is the contract's closed shape; a key
+/// unit, and only a key unit, names the stream's codec string. None for
+/// anything the contract forbids, which no hop would forward.
+pub(super) fn binary_video(
+    unit: &super::video::Unit,
+    codec: VideoCodec,
+    stream_id: &str,
+    seq: u64,
+) -> Option<Vec<u8>> {
+    let (width, height) = unit.coded;
+    let visible = unit.visible;
+    let inside = |offset: i32, extent: u32, bound: u32| {
+        u32::try_from(offset).is_ok_and(|offset| {
+            extent > 0 && offset.checked_add(extent).is_some_and(|end| end <= bound)
+        })
+    };
+    if seq == 0
+        || seq > MAX_SAFE_INTEGER
+        || unit.ts > MAX_SAFE_INTEGER
+        || unit.input_seq.is_some_and(|input| input > MAX_SAFE_INTEGER)
+        || unit.data.is_empty()
+        || unit.data.len() > MAX_VIDEO_BYTES
+        || !(1..=MAX_CODED).contains(&width)
+        || !(1..=MAX_CODED).contains(&height)
+        || !inside(visible.x, visible.width, width)
+        || !inside(visible.y, visible.height, height)
+        || unit.key != unit.codec_string.is_some()
+    {
+        return None;
+    }
+    let mut header = json!({
+        "type": "media", "track": "video", "codec": codec.token(), "streamId": stream_id,
+        "seq": seq, "ts": unit.ts, "key": unit.key,
+        "coded": {"width": width, "height": height}, "visible": visible, "surface": unit.surface,
+        "quality": unit.quality.label(), "byteLength": unit.data.len(),
+    });
+    if let Some(codec_string) = &unit.codec_string {
+        header["codecString"] = json!(codec_string);
+    }
+    if let Some(input_seq) = unit.input_seq {
+        header["inputSeq"] = json!(input_seq);
+    }
+    let header = serde_json::to_vec(&header).ok()?;
+    if header.len() > MAX_VIDEO_HEADER_BYTES {
+        return None;
+    }
+    let mut message = Vec::with_capacity(4 + header.len() + unit.data.len());
+    message.extend_from_slice(&(header.len() as u32).to_be_bytes());
+    message.extend_from_slice(&header);
+    message.extend_from_slice(&unit.data);
+    Some(message)
+}
+
+/// Audio is one 10 ms unit; it never consumes a JPEG sequence or frame-window slot.
+pub(super) fn binary_audio(packet: &crate::native::audio::AudioPacket) -> Option<Vec<u8>> {
+    use crate::native::audio::{AudioCodec, CHANNELS, FRAME_BYTES, FRAME_SAMPLES, SAMPLE_RATE};
+    let format = &packet.format;
+    if packet.seq == 0
+        || packet.seq > MAX_SAFE_INTEGER
+        || packet.ts > MAX_SAFE_INTEGER
+        || format.sample_rate != SAMPLE_RATE
+        || format.channels != CHANNELS
+        || format.frame_samples != FRAME_SAMPLES
+        || format.priming_samples > SAMPLE_RATE
+        || uuid::Uuid::parse_str(&format.stream_id).is_err()
+        || packet.data.is_empty()
+        || packet.data.len() > 4096
+        || (format.codec == AudioCodec::PcmS16le
+            && (packet.data.len() != FRAME_BYTES || format.priming_samples != 0))
+    {
+        return None;
+    }
+    let header = serde_json::to_vec(&json!({
+        "type":"media", "track":"audio", "codec":format.codec, "streamId":format.stream_id,
+        "seq":packet.seq, "ts":packet.ts, "samples":FRAME_SAMPLES, "byteLength":packet.data.len()
+    }))
+    .ok()?;
+    if header.len() > 1024 {
+        return None;
+    }
+    let mut message = Vec::with_capacity(4 + header.len() + packet.data.len());
+    message.extend_from_slice(&(header.len() as u32).to_be_bytes());
+    message.extend_from_slice(&header);
+    message.extend_from_slice(&packet.data);
+    Some(message)
+}
 
 fn take_image(value: &mut Value) -> Option<Vec<u8>> {
     let object = value.as_object_mut()?;
@@ -66,6 +162,176 @@ pub(super) fn binary_frame(text: &str) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::native::audio::{AudioCodec, AudioFormat, AudioPacket};
+    use std::sync::Arc;
+
+    fn packet(codec: AudioCodec, size: usize) -> AudioPacket {
+        AudioPacket {
+            format: Arc::new(AudioFormat {
+                stream_id: uuid::Uuid::new_v4().to_string(),
+                codec,
+                sample_rate: 48_000,
+                channels: 2,
+                frame_samples: 480,
+                priming_samples: if codec == AudioCodec::Opus { 120 } else { 0 },
+            }),
+            seq: 1,
+            ts: 10_000,
+            data: vec![17; size],
+        }
+    }
+    #[test]
+    fn audio_envelope_keeps_its_track_epoch_and_exact_bounded_payload() {
+        for (codec, size) in [(AudioCodec::Opus, 4096), (AudioCodec::PcmS16le, 1920)] {
+            let source = packet(codec, size);
+            let frame = binary_audio(&source).unwrap();
+            let (metadata, payload) = decode(&frame);
+            assert_eq!(payload, source.data);
+            assert_eq!(
+                metadata,
+                json!({"type":"media","track":"audio","codec":codec,
+                "streamId":source.format.stream_id,"seq":1,"ts":10_000,"samples":480,"byteLength":size})
+            );
+            assert!(frame.len() <= 4 + 1024 + 4096);
+        }
+    }
+    #[test]
+    fn invalid_audio_cannot_enter_the_image_or_audio_wire() {
+        let mut bad = vec![
+            packet(AudioCodec::Opus, 0),
+            packet(AudioCodec::Opus, 4097),
+            packet(AudioCodec::PcmS16le, 1919),
+            packet(AudioCodec::PcmS16le, 1921),
+        ];
+        let mut value = packet(AudioCodec::Opus, 80);
+        value.seq = 0;
+        bad.push(value);
+        let mut value = packet(AudioCodec::Opus, 80);
+        value.ts = MAX_SAFE_INTEGER + 1;
+        bad.push(value);
+        let mut value = packet(AudioCodec::Opus, 80);
+        value.seq = MAX_SAFE_INTEGER + 1;
+        bad.push(value);
+        let mut value = packet(AudioCodec::Opus, 80);
+        Arc::make_mut(&mut value.format).stream_id = "not-an-epoch".into();
+        bad.push(value);
+        let mut value = packet(AudioCodec::Opus, 80);
+        Arc::make_mut(&mut value.format).sample_rate = 44_100;
+        bad.push(value);
+        let mut value = packet(AudioCodec::Opus, 80);
+        Arc::make_mut(&mut value.format).channels = 1;
+        bad.push(value);
+        let mut value = packet(AudioCodec::Opus, 80);
+        Arc::make_mut(&mut value.format).frame_samples = 960;
+        bad.push(value);
+        let mut value = packet(AudioCodec::PcmS16le, 1920);
+        Arc::make_mut(&mut value.format).priming_samples = 1;
+        bad.push(value);
+        for value in bad {
+            assert!(binary_audio(&value).is_none(), "{value:?}");
+        }
+        assert!(
+            binary_frame(r#"{"type":"media","track":"audio","seq":1,"data":"AQID"}"#).is_none()
+        );
+    }
+
+    fn video_unit(key: bool, bytes: usize) -> crate::native::stream::video::Unit {
+        crate::native::stream::video::Unit {
+            data: vec![7; bytes],
+            key,
+            ts: 1_234_567,
+            coded: (2048, 2048),
+            visible: crate::native::display::Rect {
+                x: 0,
+                y: 0,
+                width: 1840,
+                height: 1888,
+            },
+            surface: crate::native::display::Surface::new(2048, 2048),
+            input_seq: Some(4411),
+            quality: crate::native::stream::video::Quality::Motion,
+            codec_string: key.then(|| "av01.1.12M.08".into()),
+        }
+    }
+
+    /// A video unit is the contract's closed header and the exact encoded
+    /// bytes; only a key unit names the codec string.
+    #[test]
+    fn a_video_unit_is_the_contracts_header_and_the_exact_payload() {
+        let stream = uuid::Uuid::new_v4().to_string();
+        let unit = video_unit(true, 10_240);
+        let message = binary_video(&unit, VideoCodec::Av1Full, &stream, 1).unwrap();
+        let (header, payload) = decode(&message);
+        assert_eq!(payload, unit.data.as_slice());
+        assert_eq!(
+            header,
+            json!({"type":"media","track":"video","codec":"av1-444","streamId":stream,
+                "seq":1,"ts":1_234_567,"key":true,"codecString":"av01.1.12M.08",
+                "coded":{"width":2048,"height":2048},
+                "visible":{"x":0,"y":0,"width":1840,"height":1888},
+                "surface":serde_json::to_value(&unit.surface).unwrap(),
+                "inputSeq":4411,"quality":"motion","byteLength":10_240})
+        );
+        assert!(header.to_string().len() <= MAX_VIDEO_HEADER_BYTES);
+        let dependent = video_unit(false, 1);
+        let (header, _) = decode(&binary_video(&dependent, VideoCodec::Av1, &stream, 2).unwrap());
+        assert_eq!(header["key"], false);
+        assert!(header.get("codecString").is_none(), "{header}");
+        let mut untagged = video_unit(false, 1);
+        untagged.input_seq = None;
+        let (header, _) = decode(&binary_video(&untagged, VideoCodec::Av1, &stream, 3).unwrap());
+        assert!(header.get("inputSeq").is_none(), "absent, never null");
+    }
+
+    /// What the contract forbids never becomes a unit: every hop would close
+    /// the channel on it.
+    #[test]
+    fn a_video_unit_outside_the_contract_is_refused() {
+        let stream = uuid::Uuid::new_v4().to_string();
+        let refused = |unit: &crate::native::stream::video::Unit, seq: u64| {
+            binary_video(unit, VideoCodec::Av1Full, &stream, seq).is_none()
+        };
+        assert!(refused(&video_unit(true, 0), 1), "an empty payload");
+        assert!(
+            refused(&video_unit(true, MAX_VIDEO_BYTES + 1), 1),
+            "over 4 MiB"
+        );
+        assert!(
+            !refused(&video_unit(true, MAX_VIDEO_BYTES), 1),
+            "4 MiB exactly"
+        );
+        assert!(refused(&video_unit(true, 8), 0), "sequence 0");
+        assert!(refused(&video_unit(true, 8), MAX_SAFE_INTEGER + 1));
+        let mut unit = video_unit(true, 8);
+        unit.ts = MAX_SAFE_INTEGER + 1;
+        assert!(refused(&unit, 1));
+        let mut unit = video_unit(true, 8);
+        unit.input_seq = Some(MAX_SAFE_INTEGER + 1);
+        assert!(refused(&unit, 1));
+        for coded in [(0, 2048), (2048, 0), (4097, 2048), (2048, 4097)] {
+            let mut unit = video_unit(true, 8);
+            unit.coded = coded;
+            assert!(refused(&unit, 1), "{coded:?}");
+        }
+        let mut unit = video_unit(true, 8);
+        unit.visible.width = 2049;
+        assert!(refused(&unit, 1), "visible wider than coded");
+        let mut unit = video_unit(true, 8);
+        unit.visible.y = 200;
+        assert!(refused(&unit, 1), "visible below coded");
+        let mut unit = video_unit(true, 8);
+        unit.visible.height = 0;
+        assert!(refused(&unit, 1), "an empty window");
+        let mut unit = video_unit(true, 8);
+        unit.visible.x = -1;
+        assert!(refused(&unit, 1), "a window left of the picture");
+        let mut unit = video_unit(true, 8);
+        unit.codec_string = None;
+        assert!(refused(&unit, 1), "a key unit without its codec string");
+        let mut unit = video_unit(false, 8);
+        unit.codec_string = Some("av01.1.12M.08".into());
+        assert!(refused(&unit, 2), "a dependent unit with one");
+    }
 
     fn decode(frame: &[u8]) -> (Value, &[u8]) {
         let end = 4 + u32::from_be_bytes(frame[..4].try_into().unwrap()) as usize;

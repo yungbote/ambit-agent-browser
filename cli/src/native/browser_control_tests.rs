@@ -1049,6 +1049,53 @@ fn acknowledging_display() -> (
     (display, received, frames)
 }
 
+/// Taking control of the owned window keeps its generation: the frame every
+/// viewer already paints is current for the new controller, so its first
+/// input is admitted at once, with no new frame to wait for. The previous
+/// controller is refused by its lease, not by the window.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn taking_control_keeps_the_windows_generation() {
+    let (display, mut ops, _frames) = acknowledging_display();
+    let painted = display.surface().generation;
+    let mut control = BrowserControl::default();
+    control.set_display(Some(display.clone()));
+    let acquired = control
+        .execute(parse(command("acquire", OWNER)), None)
+        .await
+        .unwrap();
+    assert_eq!(ops.recv().await.unwrap()["op"], "reset");
+    assert_eq!(acquired["surface"]["generation"], painted.as_str());
+    assert_eq!(display.surface().generation, painted);
+    let moved = parse(
+        json!({ "action": ACTION, "op": "input", "controllerId": OWNER,
+        "sequence": 1, "expectedSurfaceGeneration": painted,
+        "events": [{ "type": "input_mouse", "eventType": "mouseMoved", "x": 5, "y": 5 }] }),
+    );
+    assert_eq!(
+        control.execute(moved, None).await.unwrap()["status"],
+        "applied"
+    );
+    assert_eq!(ops.recv().await.unwrap()["op"], "input");
+
+    control
+        .execute(parse(command("release", OWNER)), None)
+        .await
+        .unwrap();
+    control
+        .execute(parse(command("acquire", OTHER)), None)
+        .await
+        .unwrap();
+    let stale = parse(
+        json!({ "action": ACTION, "op": "input", "controllerId": OWNER,
+        "sequence": 2, "expectedSurfaceGeneration": painted,
+        "events": [{ "type": "input_mouse", "eventType": "mouseMoved", "x": 6, "y": 6 }] }),
+    );
+    let refused = control.execute(stale, None).await.unwrap_err();
+    assert_eq!(refused.code, "browser_control_stale", "{refused:?}");
+    assert_eq!(display.surface().generation, painted);
+}
+
 #[test]
 fn sign_in_event_shape_is_exact_and_judged_after_the_sequence() {
     for (idle, expected) in [(10_000, 10), (600_000, 600), (3_600_000, 3600)] {

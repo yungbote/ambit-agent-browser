@@ -195,10 +195,9 @@ pub(super) async fn cdp_event_loop(
     presentation: Arc<super::presentation::Presentation>,
     custody: watch::Receiver<Option<Instant>>,
     media: Arc<super::StreamMedia>,
+    cursors: super::cursor_identity::CursorIdentities,
     client_notify: Arc<tokio::sync::Notify>,
     screencasting: Arc<Mutex<bool>>,
-    client_count: Arc<Mutex<usize>>,
-    patch_clients: Arc<std::sync::atomic::AtomicUsize>,
     cdp_session_id: Arc<RwLock<Option<String>>>,
     viewport_width: Arc<Mutex<u32>>,
     viewport_height: Arc<Mutex<u32>>,
@@ -207,12 +206,6 @@ pub(super) async fn cdp_event_loop(
     recording: Arc<Mutex<bool>>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let cursors = super::cursor_identity::CursorIdentities::new(
-        frame_tx.clone(),
-        media.clone(),
-        client_slot.clone(),
-        cdp_session_id.clone(),
-    );
     let sinks = super::window_capture::Sinks {
         cursors: cursors.clone(),
         frame_tx: frame_tx.clone(),
@@ -220,9 +213,10 @@ pub(super) async fn cdp_event_loop(
         presentation: presentation.clone(),
         custody,
         media: media.clone(),
-        client_count: client_count.clone(),
-        patch_clients: patch_clients.clone(),
     };
+    // Who watches decides what runs: nothing without viewers, and the
+    // window's frames only while a viewer is sent frames.
+    let mut roster = media.subscribe_roster();
     // The owned window's frames run beside this loop and outlive its
     // restarts: a restart must never cancel a capture in flight.
     let mut window_capture: Option<super::window_capture::WindowCapture> = None;
@@ -251,9 +245,12 @@ pub(super) async fn cdp_event_loop(
                 }
             }
             _ = client_notify.notified() => {}
+            changed = roster.changed() => {
+                if changed.is_err() { return; }
+            }
         }
 
-        let count = *client_count.lock().await;
+        let viewers = roster.borrow_and_update().viewers();
         let client = client_slot.read().await.clone();
         let display = display_slot.read().await.clone();
         if identity_source.as_deref() != display.as_ref().map(|display| display.identity()) {
@@ -262,22 +259,9 @@ pub(super) async fn cdp_event_loop(
                 .as_ref()
                 .map(|display| display.identity().to_string());
         }
-        match display.as_ref().filter(|_| count > 0) {
-            Some(display) => {
-                if !window_capture
-                    .as_ref()
-                    .is_some_and(|capture| capture.captures(display))
-                {
-                    window_capture = Some(super::window_capture::WindowCapture::start(
-                        display.clone(),
-                        sinks.clone(),
-                    ));
-                }
-            }
-            None => window_capture = None,
-        }
+        follow_frames(&mut window_capture, display.as_ref(), &media, &sinks);
 
-        if count > 0 && (client.is_some() || display.is_some()) {
+        if viewers > 0 && (client.is_some() || display.is_some()) {
             let mut cdp = client
                 .as_ref()
                 .map(|client| (Arc::clone(client), client.subscribe()));
@@ -630,8 +614,23 @@ pub(super) async fn cdp_event_loop(
                             Err(broadcast::error::RecvError::Closed) => break,
                         }
                     }
+                    changed = roster.changed() => {
+                        if changed.is_err() { return; }
+                        let viewers = roster.borrow_and_update().viewers();
+                        if viewers == 0 {
+                            if let Some(client) = &screencast {
+                                let _ = client
+                                    .send_command_no_params("Page.stopScreencast", session_id.as_deref())
+                                    .await;
+                            }
+                            let mut sc = screencasting.lock().await;
+                            *sc = false;
+                            break;
+                        }
+                        follow_frames(&mut window_capture, display.as_ref(), &media, &sinks);
+                    }
                     _ = client_notify.notified() => {
-                        let count = *client_count.lock().await;
+                        let viewers = roster.borrow_and_update().viewers();
                         // A new viewer or a writer that skipped a delta
                         // needs a whole frame. This uses the existing
                         // wakeup without rotating input coordinates.
@@ -639,7 +638,7 @@ pub(super) async fn cdp_event_loop(
                             capture.refresh();
                         }
                         let new_session_id = cdp_session_id.read().await.clone();
-                        if count == 0 {
+                        if viewers == 0 {
                             if let Some(client) = &screencast {
                                 let _ = client
                                     .send_command_no_params("Page.stopScreencast", session_id.as_deref())
@@ -681,6 +680,35 @@ pub(super) async fn cdp_event_loop(
                 }
                 let mut sc = screencasting.lock().await;
                 *sc = false;
+            }
+        }
+    }
+}
+
+/// The owned window's frames run while a viewer is sent frames. Stopped,
+/// they leave no frame behind: a later viewer must not be shown a picture
+/// nobody kept current.
+fn follow_frames(
+    window_capture: &mut Option<super::window_capture::WindowCapture>,
+    display: Option<&Arc<crate::native::display::DisplayClient>>,
+    media: &super::StreamMedia,
+    sinks: &super::window_capture::Sinks,
+) {
+    match display.filter(|_| media.roster().frames > 0) {
+        Some(display) => {
+            if !window_capture
+                .as_ref()
+                .is_some_and(|capture| capture.captures(display))
+            {
+                *window_capture = Some(super::window_capture::WindowCapture::start(
+                    display.clone(),
+                    sinks.clone(),
+                ));
+            }
+        }
+        None => {
+            if window_capture.take().is_some() {
+                sinks.frame_watch.send_replace(None);
             }
         }
     }
@@ -945,6 +973,22 @@ mod tests {
         shutdown: watch::Sender<bool>,
         task: tokio::task::JoinHandle<()>,
         methods: Arc<Mutex<Vec<String>>>,
+        _viewer: super::super::Seat,
+    }
+
+    /// The pointer's identities for a loop's viewers.
+    fn identities(
+        frame_tx: &broadcast::Sender<String>,
+        media: &Arc<super::super::StreamMedia>,
+        client_slot: &Arc<RwLock<Option<Arc<CdpClient>>>>,
+        session: &Arc<RwLock<Option<String>>>,
+    ) -> super::super::cursor_identity::CursorIdentities {
+        super::super::cursor_identity::CursorIdentities::new(
+            frame_tx.clone(),
+            media.clone(),
+            client_slot.clone(),
+            session.clone(),
+        )
     }
 
     async fn start_loop_with_seed_delay(
@@ -976,8 +1020,10 @@ mod tests {
         let (frame_watch, _) = watch::channel(None);
         let client_slot = Arc::new(RwLock::new(Some(client)));
         let client_notify = Arc::new(tokio::sync::Notify::new());
-        let client_count = Arc::new(Mutex::new(1));
+        let media = Arc::new(super::super::StreamMedia::new(Default::default()));
+        let viewer = media.seat(Default::default());
         let cdp_session_id = Arc::new(RwLock::new(active_session.map(String::from)));
+        let cursors = identities(&frame_tx, &media, &client_slot, &cdp_session_id);
         let last_tabs = Arc::new(RwLock::new(vec![
             json!({ "tabId": "t1", "url": "https://active.test/", "active": true }),
             json!({ "tabId": "t2", "url": "https://background.test/", "active": false }),
@@ -991,11 +1037,10 @@ mod tests {
             Arc::new(RwLock::new(None)),
             Arc::new(super::super::presentation::Presentation::new()),
             watch::channel(None).1,
-            Arc::new(super::super::StreamMedia::new(Default::default())),
+            media,
+            cursors,
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
-            client_count,
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             cdp_session_id.clone(),
             Arc::new(Mutex::new(1280)),
             Arc::new(Mutex::new(720)),
@@ -1014,6 +1059,7 @@ mod tests {
             shutdown,
             task,
             methods,
+            _viewer: viewer,
         }
     }
 
@@ -1288,20 +1334,28 @@ mod tests {
         // A closed custody channel ends a display attachment at once, so the
         // test holds its sender like the daemon's browser control does.
         let (_custody, custody) = watch::channel(None);
+        // One viewer, which composites patches.
+        let media = Arc::new(super::super::StreamMedia::new(Default::default()));
+        let _viewer = media.seat(super::super::FrameNeeds {
+            patches: true,
+            ..Default::default()
+        });
+        let client_slot = Arc::new(RwLock::new(Some(client)));
+        let session = Arc::new(RwLock::new(Some("S-ACTIVE".to_string())));
+        let cursors = identities(&frame_tx, &media, &client_slot, &session);
         let task = tokio::spawn(cdp_event_loop(
             frame_tx,
             frame_watch,
             Arc::new(super::super::ScreencastConfig::default()),
-            Arc::new(RwLock::new(Some(client))),
+            client_slot,
             Arc::new(RwLock::new(Some(display))),
             presentation.clone(),
             custody,
-            Arc::new(super::super::StreamMedia::new(Default::default())),
+            media,
+            cursors,
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
-            Arc::new(Mutex::new(1)),
-            Arc::new(std::sync::atomic::AtomicUsize::new(1)),
-            Arc::new(RwLock::new(Some("S-ACTIVE".to_string()))),
+            session,
             Arc::new(Mutex::new(1280)),
             Arc::new(Mutex::new(720)),
             Arc::new(RwLock::new(Vec::new())),
@@ -1435,21 +1489,22 @@ mod tests {
         let applied = Arc::new(super::super::AppliedInput::default());
         // One viewer that does not draw the pointer: frames composite it.
         let media = Arc::new(super::super::StreamMedia::new(applied.clone()));
-        media.viewer_joined(false, false);
+        let _viewer = media.seat(Default::default());
+        let (client_slot, session) = (Arc::new(RwLock::new(None)), Arc::new(RwLock::new(None)));
+        let cursors = identities(&frame_tx, &media, &client_slot, &session);
         let task = tokio::spawn(cdp_event_loop(
             frame_tx,
             frame_watch,
             Arc::new(super::super::ScreencastConfig::default()),
-            Arc::new(RwLock::new(None)),
+            client_slot,
             Arc::new(RwLock::new(Some(display))),
             Arc::new(super::super::presentation::Presentation::new()),
             custody,
             media,
+            cursors,
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
-            Arc::new(Mutex::new(1)),
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            Arc::new(RwLock::new(None)),
+            session,
             Arc::new(Mutex::new(1280)),
             Arc::new(Mutex::new(720)),
             Arc::new(RwLock::new(Vec::new())),
@@ -1520,22 +1575,23 @@ mod tests {
         let (shutdown, shutdown_rx) = watch::channel(false);
         let (_custody, custody) = watch::channel(None);
         let media = Arc::new(super::super::StreamMedia::new(Default::default()));
-        let client_count = Arc::new(Mutex::new(1));
+        let viewer = media.seat(Default::default());
         let display_slot = Arc::new(RwLock::new(Some(display.clone())));
+        let (client_slot, session) = (Arc::new(RwLock::new(None)), Arc::new(RwLock::new(None)));
+        let cursors = identities(&frame_tx, &media, &client_slot, &session);
         let task = tokio::spawn(cdp_event_loop(
             frame_tx,
             frame_watch,
             Arc::new(super::super::ScreencastConfig::default()),
-            Arc::new(RwLock::new(None)),
+            client_slot,
             display_slot.clone(),
             Arc::new(super::super::presentation::Presentation::new()),
             custody,
             media.clone(),
+            cursors,
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
-            client_count.clone(),
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            Arc::new(RwLock::new(None)),
+            session,
             Arc::new(Mutex::new(1280)),
             Arc::new(Mutex::new(720)),
             Arc::new(RwLock::new(Vec::new())),
@@ -1585,13 +1641,11 @@ mod tests {
         .await
         .expect("the identity is kept");
         // The last viewer leaves: the loop stops after its capture answers.
-        *client_count.lock().await = 0;
-        client_notify.notify_one();
+        drop(viewer);
         let second = next(&mut frames).await;
         answer(&mut frames, &second, json!({"changed": false})).await;
         // A viewer returns to the same display: its identity is still known.
-        *client_count.lock().await = 1;
-        client_notify.notify_one();
+        let _returned = media.seat(Default::default());
         let third = next(&mut frames).await;
         assert!(media.cursor().is_some(), "kept across the restart");
         answer(&mut frames, &third, json!({"changed": false})).await;
@@ -1960,20 +2014,24 @@ mod tests {
         let (frame_watch, _) = watch::channel(None);
         let client_notify = Arc::new(tokio::sync::Notify::new());
         let (shutdown, shutdown_rx) = watch::channel(false);
+        let media = Arc::new(super::super::StreamMedia::new(Default::default()));
+        let _viewer = media.seat(Default::default());
+        let client_slot = Arc::new(RwLock::new(Some(client.clone())));
+        let session = Arc::new(RwLock::new(Some("S-ACTIVE".to_string())));
+        let cursors = identities(&frame_tx, &media, &client_slot, &session);
         let task = tokio::spawn(cdp_event_loop(
             frame_tx,
             frame_watch,
             Arc::new(super::super::ScreencastConfig::default()),
-            Arc::new(RwLock::new(Some(client.clone()))),
+            client_slot,
             Arc::new(RwLock::new(None)),
             Arc::new(super::super::presentation::Presentation::new()),
             watch::channel(None).1,
-            Arc::new(super::super::StreamMedia::new(Default::default())),
+            media,
+            cursors,
             client_notify.clone(),
             Arc::new(Mutex::new(false)),
-            Arc::new(Mutex::new(1)),
-            Arc::new(std::sync::atomic::AtomicUsize::new(0)),
-            Arc::new(RwLock::new(Some("S-ACTIVE".to_string()))),
+            session,
             Arc::new(Mutex::new(1280)),
             Arc::new(Mutex::new(720)),
             Arc::new(RwLock::new(Vec::new())),
