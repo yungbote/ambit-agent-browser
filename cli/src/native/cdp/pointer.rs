@@ -61,11 +61,12 @@ pub(super) async fn locate(
                 Some(&current.session),
             )
             .await?;
-        let child_frame = described["node"]["frameId"].as_str().or_else(|| {
-            hit["frameId"]
-                .as_str()
-                .filter(|frame| *frame != current_frame)
-        });
+        // A document (or its root) describes its own frame: only another
+        // frame is a child to descend into.
+        let child_frame = described["node"]["frameId"]
+            .as_str()
+            .or_else(|| hit["frameId"].as_str())
+            .filter(|frame| *frame != current_frame);
         let Some(child_frame) = child_frame else {
             return Ok(current);
         };
@@ -181,6 +182,48 @@ fn unit_point(quad: &Value, point: (f64, f64)) -> Option<(f64, f64)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A point over the page's own background hits its root, whose
+    /// description names the page's own frame: that is no child frame to
+    /// descend into, and the point is measured in this page.
+    #[tokio::test]
+    async fn the_documents_own_frame_is_not_a_child_frame() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(Message::Text(text))) = socket.next().await {
+                let command: Value = serde_json::from_str(&text).unwrap();
+                let result = match command["method"].as_str().unwrap() {
+                    "Runtime.evaluate" => json!({"result":{"value":{"scrollX":0,"scrollY":0}}}),
+                    "DOM.getNodeForLocation" => json!({"backendNodeId":5,"frameId":"main"}),
+                    "DOM.describeNode" => json!({"node":{"nodeName":"HTML","frameId":"main"}}),
+                    _ => json!({}),
+                };
+                let reply = json!({"id":command["id"],"result":result});
+                socket.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+        });
+        let client = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let located = locate(&client, "page", "main", 7, 640.0, 317.0)
+            .await
+            .unwrap();
+        assert_eq!(
+            (
+                located.session.as_str(),
+                located.context,
+                located.x,
+                located.y
+            ),
+            ("page", 7, 640.0, 317.0)
+        );
+        server.abort();
+    }
 
     #[test]
     fn scroll_offsets_are_finite_css_pixels() {

@@ -47,6 +47,69 @@ impl PendingResponse {
 type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
 type PageGenerations = Arc<std::sync::Mutex<HashMap<String, String>>>;
 
+/// A pointer realm armed without a command: the session it was armed in and
+/// where its first trusted pointer event's report goes.
+struct ProbeSlot {
+    session: String,
+    report: oneshot::Sender<Value>,
+}
+
+type PointerProbes = Arc<std::sync::Mutex<HashMap<u64, ProbeSlot>>>;
+
+/// The first trusted pointer event of one armed realm: native input, not
+/// this connection, produces it (`CdpClient::arm_pointer_probe`).
+pub(crate) struct PointerProbe {
+    token: u64,
+    context: i64,
+    generation: String,
+    report: oneshot::Receiver<Value>,
+    probes: PointerProbes,
+    /// One armed token per connection at a time, as for pointer commands.
+    _order: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl PointerProbe {
+    /// Where the first trusted pointer event after arming landed, in page
+    /// and screen coordinates, if one arrives within `wait`.
+    pub(crate) async fn measured(
+        mut self,
+        wait: std::time::Duration,
+    ) -> Option<activity::NativePointer> {
+        let payload = tokio::time::timeout(wait, &mut self.report)
+            .await
+            .ok()?
+            .ok()?;
+        let coordinate = |field: &str, limit: f64| {
+            payload[field]
+                .as_f64()
+                .filter(|value| value.is_finite() && value.abs() <= limit)
+        };
+        let geometry = payload["geometry"].clone();
+        geometry["scale"]
+            .as_f64()
+            .filter(|scale| scale.is_finite() && *scale > 0.0)?;
+        Some(activity::NativePointer {
+            context: self.context,
+            page_generation: self.generation.clone(),
+            client_x: coordinate("clientX", 1e6)?,
+            client_y: coordinate("clientY", 1e6)?,
+            screen_x: coordinate("screenX", 32768.0)?,
+            screen_y: coordinate("screenY", 32768.0)?,
+            geometry,
+            source_page: None,
+        })
+    }
+}
+
+impl Drop for PointerProbe {
+    fn drop(&mut self) {
+        self.probes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&self.token);
+    }
+}
+
 fn page_generation(pages: &PageGenerations, session: &str) -> String {
     pages
         .lock()
@@ -173,6 +236,7 @@ pub struct CdpClient {
     target_sessions: Arc<std::sync::Mutex<HashMap<String, String>>>,
     native_pointer_enabled: Arc<AtomicBool>,
     native_pointer_lock: Arc<Mutex<()>>,
+    pointer_probes: PointerProbes,
     activity_owner: std::sync::OnceLock<ActivityOwner>,
     /// Becomes true, or loses its sender, once the reader has stopped.
     closed: tokio::sync::watch::Receiver<bool>,
@@ -347,6 +411,8 @@ impl CdpClient {
 
         let page_generations: PageGenerations = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let pages_clone = page_generations.clone();
+        let pointer_probes: PointerProbes = Arc::default();
+        let probes_clone = pointer_probes.clone();
         let pending_clone = pending.clone();
         let event_tx_clone = event_tx.clone();
         let raw_tx_clone = raw_tx.clone();
@@ -496,6 +562,20 @@ impl CdpClient {
                                                     false
                                                 }
                                             } else {
+                                                // A realm armed without a
+                                                // command reports its first
+                                                // trusted event, from its own
+                                                // session only.
+                                                let mut probes = probes_clone
+                                                    .lock()
+                                                    .unwrap_or_else(|error| error.into_inner());
+                                                if probes
+                                                    .get(&token)
+                                                    .is_some_and(|slot| slot.session == session)
+                                                {
+                                                    let slot = probes.remove(&token).unwrap();
+                                                    let _ = slot.report.send(payload.clone());
+                                                }
                                                 false
                                             };
                                             if complete {
@@ -611,6 +691,7 @@ impl CdpClient {
             target_sessions,
             native_pointer_enabled: Arc::new(AtomicBool::new(false)),
             native_pointer_lock: Arc::new(Mutex::new(())),
+            pointer_probes,
             activity_owner: std::sync::OnceLock::new(),
             closed,
             _reader_handle: reader_handle,
@@ -807,6 +888,123 @@ impl CdpClient {
         self.native_pointer_enabled.store(true, Ordering::Release);
     }
 
+    /// The pointer realm of `session`'s main frame: an isolated world the
+    /// page's own scripts cannot reach. Returns its frame and context.
+    async fn pointer_realm(&self, session: &str) -> Result<(String, i64), String> {
+        let tree = self
+            .send_command_no_params("Page.getFrameTree", Some(session))
+            .await?;
+        let frame = tree["frameTree"]["frame"]["id"]
+            .as_str()
+            .ok_or("Page frame is unavailable")?;
+        let world = self
+            .send_command(
+                "Page.createIsolatedWorld",
+                Some(serde_json::json!({
+                    "frameId": frame, "worldName": activity::POINTER_WORLD,
+                })),
+                Some(session),
+            )
+            .await?;
+        let context = world["executionContextId"]
+            .as_i64()
+            .ok_or("Pointer observation realm is unavailable")?;
+        Ok((frame.into(), context))
+    }
+
+    /// Arms the pointer realm of `session`'s main frame: the first trusted
+    /// pointer event there after this returns reports where it landed, in
+    /// page and screen coordinates, to the probe. Nothing is dispatched;
+    /// native input produces the event.
+    pub(crate) async fn arm_pointer_probe(&self, session: &str) -> Result<PointerProbe, String> {
+        let order = self.native_pointer_lock.clone().lock_owned().await;
+        let token = self.reserve_command_id();
+        let (report_to, report) = oneshot::channel();
+        self.pointer_probes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(
+                token,
+                ProbeSlot {
+                    session: session.into(),
+                    report: report_to,
+                },
+            );
+        let mut probe = PointerProbe {
+            token,
+            context: 0,
+            generation: self.page_generation(session),
+            report,
+            probes: self.pointer_probes.clone(),
+            _order: order,
+        };
+        probe.context = tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            let (_, context) = self.pointer_realm(session).await?;
+            if self.listen_for_pointer(session, context, token).await? {
+                Ok(context)
+            } else {
+                Err("The page's pointer realm could not be armed.".to_string())
+            }
+        })
+        .await
+        .map_err(|_| "The page's pointer realm did not answer in time.".to_string())??;
+        Ok(probe)
+    }
+
+    /// Reports each trusted pointer event of `context` (in `session`) with
+    /// `token`. The listener survives a document replacement only by being
+    /// installed again; installing it again rebinds the same handlers.
+    async fn listen_for_pointer(
+        &self,
+        session: &str,
+        context: i64,
+        token: u64,
+    ) -> Result<bool, String> {
+        self.send_command(
+            "Runtime.addBinding",
+            Some(serde_json::json!({
+                "name": activity::POINTER_BINDING, "executionContextName": activity::POINTER_WORLD,
+            })),
+            Some(session),
+        )
+        .await?;
+        let token = serde_json::to_string(&token.to_string()).map_err(|error| error.to_string())?;
+        let expression = format!(
+            r#"(() => {{
+            globalThis.__ambitPointerToken = {token};
+            if (typeof globalThis.__ambitWindowPointer !== 'function') return false;
+            const handlers = globalThis.__ambitPointerHandlers ||= Object.create(null);
+            for (const [name, eventType] of [['pointermove','move'],['pointerdown','press'],['pointerup','release'],['wheel','scroll']]) {{
+                const handler = handlers[name] ||= event => {{
+                    if (!event.isTrusted) return;
+                    globalThis.__ambitWindowPointer(JSON.stringify({{
+                        token: globalThis.__ambitPointerToken, eventType,
+                        clientX: event.clientX, clientY: event.clientY,
+                        screenX: event.screenX, screenY: event.screenY,
+                        geometry: {{scale:devicePixelRatio*(visualViewport?.scale??1),width:innerWidth,height:innerHeight,offsetX:visualViewport?.offsetLeft??0,offsetY:visualViewport?.offsetTop??0}},
+                    }}));
+                }};
+                // Document replacement can discard listeners while this
+                // isolated realm survives. Rebind the same function;
+                // a remembered installation flag is not observation.
+                removeEventListener(name, handler, true);
+                addEventListener(name, handler, {{capture:true, passive:true}});
+            }}
+            return true;
+        }})()"#
+        );
+        let value = self
+            .send_command(
+                "Runtime.evaluate",
+                Some(serde_json::json!({
+                    "expression": expression, "contextId": context, "returnByValue": true,
+                })),
+                Some(session),
+            )
+            .await?;
+        Ok(value["result"]["value"] == true)
+    }
+
     async fn prepare_native_pointer(
         &self,
         session: &str,
@@ -814,29 +1012,12 @@ impl CdpClient {
         params: Option<&Value>,
     ) -> Option<(i64, Option<(activity::NativePointerFrame, Value)>)> {
         let prepare = async {
-            let tree = self
-                .send_command_no_params("Page.getFrameTree", Some(session))
-                .await?;
-            let frame = tree["frameTree"]["frame"]["id"]
-                .as_str()
-                .ok_or("Page frame is unavailable")?;
-            let world = self
-                .send_command(
-                    "Page.createIsolatedWorld",
-                    Some(serde_json::json!({
-                        "frameId": frame, "worldName": activity::POINTER_WORLD,
-                    })),
-                    Some(session),
-                )
-                .await?;
-            let context = world["executionContextId"]
-                .as_i64()
-                .ok_or("Pointer observation realm is unavailable")?;
+            let (frame, context) = self.pointer_realm(session).await?;
             let params = params.ok_or("Pointer coordinates are unavailable")?;
             let source = super::pointer::locate(
                 self,
                 session,
-                frame,
+                &frame,
                 context,
                 params["x"].as_f64().ok_or("Pointer x is unavailable")?,
                 params["y"].as_f64().ok_or("Pointer y is unavailable")?,
@@ -862,47 +1043,10 @@ impl CdpClient {
             } else {
                 None
             };
-            self.send_command("Runtime.addBinding", Some(serde_json::json!({
-                "name": activity::POINTER_BINDING, "executionContextName": activity::POINTER_WORLD,
-            })), Some(&source_session)).await?;
-            let token =
-                serde_json::to_string(&token.to_string()).map_err(|error| error.to_string())?;
-            let expression = format!(
-                r#"(() => {{
-                globalThis.__ambitPointerToken = {token};
-                if (typeof globalThis.__ambitWindowPointer !== 'function') return false;
-                const handlers = globalThis.__ambitPointerHandlers ||= Object.create(null);
-                for (const [name, eventType] of [['pointermove','move'],['pointerdown','press'],['pointerup','release'],['wheel','scroll']]) {{
-                    const handler = handlers[name] ||= event => {{
-                        if (!event.isTrusted) return;
-                        globalThis.__ambitWindowPointer(JSON.stringify({{
-                            token: globalThis.__ambitPointerToken, eventType,
-                            clientX: event.clientX, clientY: event.clientY,
-                            screenX: event.screenX, screenY: event.screenY,
-                            geometry: {{scale:devicePixelRatio*(visualViewport?.scale??1),width:innerWidth,height:innerHeight,offsetX:visualViewport?.offsetLeft??0,offsetY:visualViewport?.offsetTop??0}},
-                        }}));
-                    }};
-                    // Document replacement can discard listeners while this
-                    // isolated realm survives. Rebind the same function;
-                    // a remembered installation flag is not observation.
-                    removeEventListener(name, handler, true);
-                    addEventListener(name, handler, {{capture:true, passive:true}});
-                }}
-                return true;
-            }})()"#
-            );
-            let value = self
-                .send_command(
-                    "Runtime.evaluate",
-                    Some(serde_json::json!({
-                        "expression": expression, "contextId": source_context, "returnByValue": true,
-                    })),
-                    Some(&source_session),
-                )
+            let listening = self
+                .listen_for_pointer(&source_session, source_context, token)
                 .await?;
-            Ok::<_, String>(
-                (value["result"]["value"] == true).then_some((context, frame_observation)),
-            )
+            Ok::<_, String>(listening.then_some((context, frame_observation)))
         };
         tokio::time::timeout(std::time::Duration::from_millis(500), prepare)
             .await

@@ -13,6 +13,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_tungstenite::tungstenite::Message;
 
+use crate::native::browser_control::motion::KEY_INTERVAL;
 use crate::native::browser_control::BrowserControl;
 use crate::native::cdp::client::CdpClient;
 
@@ -375,12 +376,9 @@ async fn native_input(
         }
         match method {
             "Input.dispatchMouseEvent" => {
-                // A new unheld gesture remeasures its page/window mapping;
-                // held gestures keep the native owner's established mapping.
-                control.begin_agent_command();
                 control.agent_native_mouse(native_mouse_params(&params), client, session, &[session]).await?;
             }
-            "Input.insertText" => control.agent_native_keys(&[json!({ "type": "input_keyboard", "eventType": "insertText", "text": params["text"] })]).await?,
+            "Input.insertText" => control.agent_native_keys(&[json!({ "type": "input_keyboard", "eventType": "insertText", "text": params["text"] })], KEY_INTERVAL, client, session).await?,
             "Input.dispatchKeyEvent" => {
                 let event = native_keyboard_event(&params);
                 // CDP commands are browser editing commands, not key names.
@@ -388,7 +386,7 @@ async fn native_input(
                 if params.get("commands").is_some_and(|commands| commands.as_array().is_some_and(|values| !values.is_empty())) {
                     client.send_command(method, Some(params), Some(session)).await?;
                 } else {
-                    control.agent_native_keys(&[event]).await?;
+                    control.agent_native_keys(&[event], KEY_INTERVAL, client, session).await?;
                 }
             }
             _ => unreachable!(),
@@ -578,7 +576,7 @@ mod tests {
     /// A program's coordinates are page geometry it read earlier. A layout
     /// that lands while the program runs (a person dragging the dock) is not
     /// proven until the next command, so each later tunnel mouse event is
-    /// refused before any pre-hover or native input, instead of starting
+    /// refused before any measurement or native input, instead of starting
     /// under the new layout; once proven, the same event goes through.
     #[cfg(target_os = "linux")]
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -618,7 +616,6 @@ mod tests {
         control.lock().await.set_display(Some(display.clone()));
         // The run_playwright command proved the page before the program.
         display.record_proof(display.layout_epoch(), false);
-        control.lock().await.begin_agent_command();
 
         let owner = display.clone();
         let resized = tokio::spawn(async move {
@@ -654,7 +651,9 @@ mod tests {
         assert!(quiet.is_err(), "no native input was sent: {line}");
 
         // The next command's proof lets the same event through: it measures
-        // the page (the helper's window info, then a CDP pre-hover).
+        // the page (the helper's window info, then the page's pointer realm,
+        // which this page refuses, then its own visible centre), and no
+        // synthetic input reaches the page.
         display.record_proof(display.layout_epoch(), false);
         let helper_side = async {
             line.clear();
@@ -672,7 +671,11 @@ mod tests {
         };
         let (measured, ()) = tokio::join!(native_input(&moved, &client, &control), helper_side);
         assert!(!measured.unwrap_err().contains("was resized"));
-        assert_eq!(page.recv().await.unwrap(), "Input.dispatchMouseEvent");
+        let mut reached = Vec::new();
+        while let Ok(method) = page.try_recv() {
+            reached.push(method);
+        }
+        assert_eq!(reached, ["Page.getFrameTree", "Runtime.evaluate"]);
         server.abort();
     }
 

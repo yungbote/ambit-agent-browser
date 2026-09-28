@@ -8,6 +8,7 @@
 use std::collections::VecDeque;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use super::actions::CommandError;
 use super::activity::InputSource;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -16,7 +17,11 @@ use super::cdp::client::{CdpClient, PendingCommand};
 use super::input::{input_command, stream_event, HeldInputs};
 use tokio::sync::watch;
 
+mod interrupts;
+pub(crate) mod motion;
 mod mouse;
+
+pub(crate) use interrupts::{InterruptReason, Interruption, Interrupts};
 
 pub(crate) const ACTION: &str = "ambit_browser_control";
 const MAX_LEASE_MS: u64 = 30_000;
@@ -30,6 +35,7 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_SIGN_IN_IDLE_MS: u64 = 10_000;
 const MAX_SIGN_IN_IDLE_MS: u64 = 3_600_000;
 const SIGN_IN_MESSAGE: &str = "A person is signing in to a site in this browser. The agent can act again after they hand back control; do not retry this action until then.";
+const TAKEOVER_MESSAGE: &str = "The user is taking control of this browser. Wait until they release control before continuing.";
 
 #[derive(Debug)]
 pub(crate) struct ControlError {
@@ -392,6 +398,12 @@ pub(crate) struct BrowserControl {
     /// lease or before its first input), recorded after the helper
     /// acknowledged that input. A capture that began later shows it.
     applied_input: std::sync::Arc<crate::native::stream::AppliedInput>,
+    /// The daemon's pending interruptions. A person's takeover raises one
+    /// before it waits for command custody; the agent's paced input stops
+    /// at its next sample or key without that custody being needed.
+    interrupts: Interrupts,
+    /// When the agent's last key press went, which paces the next one.
+    key_sent_at: Option<Instant>,
 }
 
 impl Default for BrowserControl {
@@ -407,6 +419,8 @@ impl Default for BrowserControl {
             native_mouse: mouse::NativeMouse::default(),
             custody: watch::channel(None).0,
             applied_input: Default::default(),
+            interrupts: Interrupts::default(),
+            key_sent_at: None,
         }
     }
 }
@@ -414,6 +428,36 @@ impl Default for BrowserControl {
 /// Whether a published lease deadline still grants a human custody now.
 pub(crate) fn custody_active(deadline: Option<Instant>) -> bool {
     deadline.is_some_and(|deadline| deadline > Instant::now())
+}
+
+/// What a pending interruption makes of typing: stopped before its first
+/// stroke, nothing was sent; stopped later, it was interrupted after an
+/// exact number of characters, and nothing is held between strokes.
+fn typing_stopped(
+    reason: InterruptReason,
+    started: bool,
+    typed: usize,
+    total: usize,
+) -> CommandError {
+    let human = reason == InterruptReason::HumanControl;
+    if !started && human {
+        return format!("browser_controlled_by_user: {TAKEOVER_MESSAGE}").into();
+    }
+    let who = if human {
+        "The user took control of this browser"
+    } else {
+        "The browser owner stopped this input"
+    };
+    let mut data = json!({
+        "executionStopped": true, "effectsMayHaveOccurred": started, "charactersTyped": typed,
+    });
+    if human {
+        data["interruptedBy"] = json!("human");
+    }
+    CommandError::with_data(
+        format!("browser_operation_interrupted: {who} after {typed} of {total} characters were typed. Inspect the page before continuing; do not replay the text."),
+        data,
+    )
 }
 
 /// Where one human input batch goes: the owned window's native devices, or
@@ -469,14 +513,6 @@ impl BrowserControl {
         self.display = display;
     }
 
-    /// An agent command, or one Playwright mouse event, starts a new unheld
-    /// gesture's page/window measurement. Its pointer input is sent only
-    /// under a layout the agent's page was proven at, which a person's
-    /// resize during the command or program ends.
-    pub(crate) fn begin_agent_command(&mut self) {
-        self.native_mouse.begin_command();
-    }
-
     /// Observe lease deadlines without holding this gate. Frame pacing and
     /// pointer compositing follow it; input custody never does.
     pub(crate) fn custody(&self) -> watch::Receiver<Option<Instant>> {
@@ -486,6 +522,11 @@ impl BrowserControl {
     /// The lease's applied input over the media clock, for frames' `inputSeq`.
     pub(crate) fn applied_input(&self) -> std::sync::Arc<crate::native::stream::AppliedInput> {
         self.applied_input.clone()
+    }
+
+    /// The interruptions this gate's agent input obeys, raised without it.
+    pub(crate) fn interrupts(&self) -> Interrupts {
+        self.interrupts.clone()
     }
 
     fn publish_custody(&self) {
@@ -509,34 +550,88 @@ impl BrowserControl {
         self.display.is_some()
     }
 
-    /// Agent keyboard through the owned display. Each batch is one ordered
-    /// native sequence at the helper; a batch that may have started leaves
-    /// an uncertain outcome and releases whatever the helper still holds.
-    pub(crate) async fn agent_native_keys(&mut self, events: &[Value]) -> Result<(), String> {
+    /// Agent keyboard through the owned display, one stroke at a time: a key
+    /// press goes `interval` after the previous one and a paste is one
+    /// stroke, so text appears key by key (`motion::strokes`). Each stroke
+    /// that enters or deletes text is published to `session`'s viewers as
+    /// typing once the helper acknowledged it. A pending interruption stops
+    /// typing before the next press, and the report says exactly how many
+    /// characters went in. A stroke that may have started leaves an
+    /// uncertain outcome and releases whatever the helper holds.
+    pub(crate) async fn agent_native_keys(
+        &mut self,
+        events: &[Value],
+        interval: Duration,
+        client: &CdpClient,
+        session: &str,
+    ) -> Result<(), CommandError> {
         if let Some(error) = self.agent_error() {
-            return Err(format!("{}: {}", error.code, error.message));
+            return Err(format!("{}: {}", error.code, error.message).into());
         }
         self.native_mouse
             .require_known()
             .map_err(|error| error.replace("mouse input", "keyboard input"))?;
-        let display = self.display.as_ref().ok_or("No owned browser display")?;
-        for batch in events.chunks(MAX_EVENTS) {
-            if let Err(error) = display.input(batch).await {
+        let display = self.display.clone().ok_or("No owned browser display")?;
+        let strokes = motion::strokes(events);
+        let total = strokes.iter().map(|stroke| stroke.characters).sum();
+        let mut raised = self.interrupts.subscribe();
+        let mut typed = 0;
+        for (index, stroke) in strokes.iter().enumerate() {
+            if stroke.paced {
+                let due = motion::key_due(self.key_sent_at, Instant::now(), interval);
+                loop {
+                    if let Some(reason) = self.interrupts.pending() {
+                        return Err(typing_stopped(reason, index > 0, typed, total));
+                    }
+                    if Instant::now() >= due {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(tokio::time::Instant::from_std(due)) => {}
+                        _ = raised.changed() => {}
+                    }
+                }
+                self.key_sent_at = Some(Instant::now());
+            }
+            let typing = events[stroke.events.clone()]
+                .iter()
+                .find_map(super::activity::from_native_keyboard)
+                .map(|activity| {
+                    client.observe_activity(
+                        activity,
+                        session,
+                        client.page_generation(session),
+                        InputSource::Agent,
+                    )
+                });
+            for batch in events[stroke.events.clone()].chunks(MAX_EVENTS) {
+                let Err(error) = display.input(batch).await else {
+                    continue;
+                };
                 if error.operation_performed == Some(json!(false)) {
-                    return Err(format!(
-                        "The native browser window did not accept this keyboard input ({error})."
-                    ));
+                    return Err(if index == 0 {
+                        format!("The native browser window did not accept this keyboard input ({error}).").into()
+                    } else {
+                        CommandError::with_data(
+                            format!("The native browser window did not accept this keyboard input after {typed} of {total} characters were typed ({error}). Inspect the page before continuing."),
+                            json!({ "charactersTyped": typed }),
+                        )
+                    });
                 }
                 self.needs_observation = true;
                 let mut message = format!(
                     "browser_control_outcome_unknown: Native keyboard input may have executed ({error}). Inspect the page before retrying; do not replay the text."
                 );
-                if let Err(release) = self.native_mouse.release(display).await {
+                if let Err(release) = self.native_mouse.release(&display).await {
                     message.push(' ');
                     message.push_str(&release);
                 }
-                return Err(message);
+                return Err(message.into());
             }
+            if let Some(typing) = typing {
+                typing.acknowledged();
+            }
+            typed += stroke.characters;
         }
         Ok(())
     }
@@ -579,26 +674,29 @@ impl BrowserControl {
         self.finish_native_dialog().await
     }
 
-    fn observe_native_result(&mut self, result: &Result<bool, String>) {
-        if result
-            .as_ref()
-            .is_err_and(|error| error.starts_with("browser_control_outcome_unknown: "))
-        {
+    fn observe_native_result<T>(&mut self, result: &Result<T, CommandError>) {
+        if result.as_ref().is_err_and(|failure| {
+            failure
+                .error
+                .starts_with("browser_control_outcome_unknown: ")
+        }) {
             self.needs_observation = true;
         }
     }
 
-    /// Returns a dialog observation separately from the real helper receipt.
-    /// Callers must never retry through CDP after entering this transport.
+    /// The agent's pointer input through the owned display, with the travel
+    /// that brings the pointer there (`mouse::NativeMouse`). Returns a dialog
+    /// observation separately from the real helper receipt. Callers must
+    /// never retry through CDP after entering this transport.
     pub(crate) async fn agent_native_mouse(
         &mut self,
         params: Value,
         client: &CdpClient,
         session: &str,
         dialog_sessions: &[&str],
-    ) -> Result<bool, String> {
+    ) -> Result<bool, CommandError> {
         if let Some(error) = self.agent_error() {
-            return Err(format!("{}: {}", error.code, error.message));
+            return Err(format!("{}: {}", error.code, error.message).into());
         }
         let result = self
             .native_mouse
@@ -609,6 +707,7 @@ impl BrowserControl {
                 self.display.as_ref().ok_or("No owned browser display")?,
                 dialog_sessions,
                 false,
+                &self.interrupts,
             )
             .await;
         self.observe_native_result(&result);
@@ -621,9 +720,9 @@ impl BrowserControl {
         page_session: &str,
         source: (&str, f64, f64),
         target: (&str, f64, f64),
-    ) -> Result<bool, String> {
+    ) -> Result<bool, CommandError> {
         if let Some(error) = self.agent_error() {
-            return Err(format!("{}: {}", error.code, error.message));
+            return Err(format!("{}: {}", error.code, error.message).into());
         }
         let result = self
             .native_mouse
@@ -633,6 +732,41 @@ impl BrowserControl {
                 page_session,
                 source,
                 target,
+                &self.interrupts,
+            )
+            .await;
+        self.observe_native_result(&result);
+        result
+    }
+
+    /// The agent's scroll through the owned display: the wheel turned where
+    /// it reaches the scroller, until the scroller moved by `delta` CSS
+    /// pixels as far as it can go (`mouse_scroll.rs`). `scroller` is an
+    /// element's object id and its session; `None` scrolls the page itself.
+    pub(crate) async fn agent_native_scroll(
+        &mut self,
+        client: &CdpClient,
+        page_session: &str,
+        scroller: Option<(&str, &str)>,
+        delta: (f64, f64),
+    ) -> Result<(), CommandError> {
+        if let Some(error) = self.agent_error() {
+            return Err(format!("{}: {}", error.code, error.message).into());
+        }
+        let (object, session) = match scroller {
+            Some((object, session)) => (Some(object), session),
+            None => (None, page_session),
+        };
+        let result = self
+            .native_mouse
+            .scroll(
+                client,
+                self.display.as_ref().ok_or("No owned browser display")?,
+                page_session,
+                session,
+                object,
+                delta,
+                &self.interrupts,
             )
             .await;
         self.observe_native_result(&result);
@@ -654,17 +788,25 @@ impl BrowserControl {
         params: Value,
         client: &CdpClient,
         session_id: &str,
-    ) -> Result<(), String> {
+    ) -> Result<(), CommandError> {
         self.drain_stream()
             .await
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
         if let Some(error) = self.agent_error() {
-            return Err(format!("{}: {}", error.code, error.message));
+            return Err(format!("{}: {}", error.code, error.message).into());
         }
         if let ("input_mouse", Some(display)) = (kind, self.display.as_ref()) {
             let result = self
                 .native_mouse
-                .dispatch(params, client, session_id, display, &[session_id], true)
+                .dispatch(
+                    params,
+                    client,
+                    session_id,
+                    display,
+                    &[session_id],
+                    true,
+                    &self.interrupts,
+                )
                 .await;
             self.observe_native_result(&result);
             return result.map(|_| ());
@@ -674,7 +816,7 @@ impl BrowserControl {
             .stream_held
             .accepts(std::iter::once((session_id, &event)))
         {
-            return Err("At most 256 inputs may be held at once.".to_string());
+            return Err("At most 256 inputs may be held at once.".into());
         }
         let (method, params) = self
             .stream_held
@@ -690,7 +832,7 @@ impl BrowserControl {
             .map_err(|_| format!("CDP command timed out: {}", method))??;
         self.stream_outcome_unknown = false;
         if let Some(error) = response.error {
-            return Err(format!("CDP error ({}): {}", method, error));
+            return Err(format!("CDP error ({}): {}", method, error).into());
         }
         self.stream_held.acknowledged(session_id, &event);
         Ok(())
@@ -745,13 +887,20 @@ impl BrowserControl {
         lease.outcome_unknown = was_unknown;
         Ok(())
     }
+    /// Why the agent may not act now: a person holds the browser, or has
+    /// asked for it and waits only for the agent's current step to stop.
     pub(crate) fn agent_error(&self) -> Option<ControlError> {
-        self.lease.as_ref().filter(|lease| lease.holds_custody(Instant::now())).map(|lease| {
+        let held = self.lease.as_ref().filter(|lease| lease.holds_custody(Instant::now())).map(|lease| {
             if lease.sign_in.is_some() {
                 ControlError::new("browser_controlled_by_user", SIGN_IN_MESSAGE)
             } else if lease.outcome_unknown { ControlError::unknown() } else {
                 ControlError::new("browser_controlled_by_user", "The user is controlling this browser. Wait until they release control before continuing.")
             }
+        });
+        held.or_else(|| {
+            self.interrupts
+                .takeover()
+                .then(|| ControlError::new("browser_controlled_by_user", TAKEOVER_MESSAGE))
         })
     }
 

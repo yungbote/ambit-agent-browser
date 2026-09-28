@@ -211,6 +211,18 @@ pub(crate) fn reset(session: &str, generation: &str) -> CdpEvent {
     }
 }
 
+/// The activity a display-helper keyboard event publishes once the helper
+/// acknowledged it: the same one its DevTools command publishes.
+pub(crate) fn from_native_keyboard(event: &Value) -> Option<Value> {
+    match event["eventType"].as_str()? {
+        "insertText" => from_command("Input.insertText", &json!({ "text": event["text"] })),
+        kind => from_command(
+            "Input.dispatchKeyEvent",
+            &json!({ "type": kind, "text": event["text"], "key": event["key"] }),
+        ),
+    }
+}
+
 pub(crate) fn from_command(method: &str, params: &Value) -> Option<Value> {
     match method {
         "Input.dispatchMouseEvent" => {

@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
+use super::actions::CommandError;
 use super::browser_control::BrowserControl;
 use super::cdp::client::CdpClient;
 use super::cdp::types::*;
@@ -37,7 +38,7 @@ pub async fn click(
     button: &str,
     click_count: i32,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<ClickResult, String> {
+) -> Result<ClickResult, CommandError> {
     let (x, y, effective_session_id) = resolve_element_center(
         client,
         session_id,
@@ -88,7 +89,7 @@ pub async fn dblclick(
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<ClickResult, String> {
+) -> Result<ClickResult, CommandError> {
     click(
         client,
         control,
@@ -109,7 +110,7 @@ pub async fn hover(
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<(), String> {
+) -> Result<(), CommandError> {
     let (x, y, effective_session_id) = resolve_element_center(
         client,
         session_id,
@@ -215,6 +216,326 @@ pub async fn fill(
         .await?;
 
     Ok(())
+}
+
+/// A field's state as its page reports it: whether it holds keyboard focus,
+/// what text it holds and whether that equals `expected`. A secret field
+/// (a password, a one-time code, a card number) never reports its text.
+const FIELD_STATE: &str = r#"function(expected) {
+    let active = document.activeElement;
+    while (active && active.shadowRoot && active.shadowRoot.activeElement) active = active.shadowRoot.activeElement;
+    let focused = false;
+    for (let node = active; node; node = node.parentNode || node.host || null) {
+        if (node === this) { focused = true; break; }
+    }
+    const text = typeof this.value === 'string' ? this.value
+        : this.isContentEditable ? this.innerText : (this.textContent ?? '');
+    const kind = String(this.type || '').toLowerCase();
+    const autocomplete = String(this.autocomplete || '').toLowerCase();
+    const secret = kind === 'password'
+        || /(^|\s)(one-time-code|current-password|new-password|cc-number|cc-csc|cc-exp)(\s|$)/.test(autocomplete);
+    return { focused, empty: text.length === 0, multiline: this.tagName === 'TEXTAREA' || this.isContentEditable,
+        matches: text === expected, value: secret ? null : text };
+}"#;
+
+/// A field's state, from `FIELD_STATE`.
+pub struct FieldState {
+    pub focused: bool,
+    pub empty: bool,
+    pub multiline: bool,
+    /// Whether the field holds exactly the text the caller entered.
+    pub matches: bool,
+    /// The text it holds; `None` for a secret field.
+    pub value: Option<String>,
+}
+
+/// How long a field is read again while the page catches up with native
+/// input: key and pointer events reach the renderer on their own path, not
+/// behind the DevTools command that reads it.
+const FIELD_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+const FIELD_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Reads the field until `settled` holds for its state or `FIELD_SETTLE`
+/// passes, and returns the last state read.
+async fn field_state(
+    client: &CdpClient,
+    session_id: &str,
+    object_id: &str,
+    expected: &str,
+    settled: impl Fn(&FieldState) -> bool,
+) -> Result<FieldState, String> {
+    let deadline = tokio::time::Instant::now() + FIELD_SETTLE;
+    loop {
+        let read = client
+            .send_command(
+                "Runtime.callFunctionOn",
+                Some(json!({
+                    "objectId": object_id, "functionDeclaration": FIELD_STATE,
+                    "arguments": [{ "value": expected }], "returnByValue": true,
+                })),
+                Some(session_id),
+            )
+            .await?;
+        let value = &read["result"]["value"];
+        if read.get("exceptionDetails").is_some() || !value.is_object() {
+            return Err("The field could not be read.".into());
+        }
+        let state = FieldState {
+            focused: value["focused"] == true,
+            empty: value["empty"] == true,
+            multiline: value["multiline"] == true,
+            matches: value["matches"] == true,
+            value: value["value"].as_str().map(str::to_owned),
+        };
+        if settled(&state) || tokio::time::Instant::now() >= deadline {
+            return Ok(state);
+        }
+        tokio::time::sleep(FIELD_POLL).await;
+    }
+}
+
+/// A field the pointer clicked, ready for keys.
+struct ClickedField {
+    object_id: String,
+    session_id: String,
+    state: FieldState,
+}
+
+enum Clicked {
+    /// The click opened a JavaScript dialog; nothing was typed.
+    Dialog(ClickResult),
+    Field(ClickedField),
+}
+
+/// Clicks the field `selector_or_ref` names as a person does before typing
+/// into it: the pointer travels to its centre and presses. The field must
+/// then hold keyboard focus, or nothing is typed.
+async fn click_field(
+    client: &CdpClient,
+    control: &Mutex<BrowserControl>,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector_or_ref: &str,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<Clicked, CommandError> {
+    let (object_id, effective_session_id) = resolve_element_object_id(
+        client,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        iframe_sessions,
+    )
+    .await?;
+    let (x, y) = super::element::resolve_object_center(
+        client,
+        &effective_session_id,
+        &object_id,
+        selector_or_ref,
+    )
+    .await?;
+    let click = dispatch_click(
+        client,
+        control,
+        &effective_session_id,
+        &[effective_session_id.as_str(), session_id],
+        x,
+        y,
+        "left",
+        1,
+    )
+    .await?;
+    if click.dialog_opened {
+        return Ok(Clicked::Dialog(click));
+    }
+    let state = field_state(client, &effective_session_id, &object_id, "", |state| {
+        state.focused
+    })
+    .await?;
+    if !state.focused {
+        return Err(format!("'{selector_or_ref}' did not take keyboard focus when it was clicked, so nothing was typed. Choose the editable field itself.").into());
+    }
+    Ok(Clicked::Field(ClickedField {
+        object_id,
+        session_id: effective_session_id,
+        state,
+    }))
+}
+
+/// Keys that go after the field was clicked. Typing a person's takeover
+/// stopped before its first key is interrupted, not refused: the click
+/// happened.
+async fn type_after_click(
+    control: &Mutex<BrowserControl>,
+    client: &CdpClient,
+    session_id: &str,
+    events: &[Value],
+    interval: std::time::Duration,
+) -> Result<(), CommandError> {
+    let typed = control
+        .lock()
+        .await
+        .agent_native_keys(events, interval, client, session_id)
+        .await;
+    typed.map_err(|error| {
+        if error.error.starts_with("browser_controlled_by_user: ") {
+            CommandError::with_data(
+                "browser_operation_interrupted: The user took control of this browser after the field was clicked and before any text was typed. Inspect the page before continuing; do not replay the text.",
+                json!({"interruptedBy":"human","executionStopped":true,"effectsMayHaveOccurred":true,"charactersTyped":0}),
+            )
+        } else {
+            error
+        }
+    })
+}
+
+/// What a native fill left: the click's dialog, if one opened, or the
+/// field's state read back after the value went in.
+pub struct NativeFill {
+    pub click: ClickResult,
+    pub field: Option<FieldState>,
+}
+
+/// Fills a field as a person does in the owned window: the pointer travels
+/// to it and clicks it, a select-all chord takes what it held, and the value
+/// goes in key by key (a value over `motion::PASTE_ABOVE_CHARS` characters
+/// as one visible paste). The field is read back, never rewritten: a page
+/// that reformats, completes or refuses input shows in the result.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn native_fill(
+    client: &CdpClient,
+    control: &Mutex<BrowserControl>,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector_or_ref: &str,
+    value: &str,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<NativeFill, CommandError> {
+    use super::browser_control::motion::{KEY_INTERVAL, PASTE_ABOVE_CHARS};
+    let field = match click_field(
+        client,
+        control,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        iframe_sessions,
+    )
+    .await?
+    {
+        Clicked::Dialog(click) => return Ok(NativeFill { click, field: None }),
+        Clicked::Field(field) => field,
+    };
+    if !field.state.empty {
+        type_after_click(
+            control,
+            client,
+            session_id,
+            &native_key_chord_events("a", Some(2)),
+            KEY_INTERVAL,
+        )
+        .await?;
+        if value.is_empty() {
+            type_after_click(
+                control,
+                client,
+                session_id,
+                &native_key_chord_events("Backspace", None),
+                KEY_INTERVAL,
+            )
+            .await?;
+        }
+    }
+    if !value.is_empty() {
+        let events = if value.chars().count() > PASTE_ABOVE_CHARS {
+            native_paste_events(value)
+        } else {
+            native_text_events(value)
+        };
+        type_after_click(control, client, session_id, &events, KEY_INTERVAL).await?;
+    }
+    let state = field_state(
+        client,
+        &field.session_id,
+        &field.object_id,
+        value,
+        |state| state.matches,
+    )
+    .await?;
+    Ok(NativeFill {
+        click: ClickResult::default(),
+        field: Some(state),
+    })
+}
+
+/// Types into a field as a person does in the owned window: the pointer
+/// travels to it and clicks it; with `clear`, a select-all chord and
+/// Backspace empty it, otherwise End (Control+End in a multi-line field)
+/// puts the caret after what it holds; then the text goes key by key, one
+/// key per `interval`.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn native_type_into(
+    client: &CdpClient,
+    control: &Mutex<BrowserControl>,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector_or_ref: &str,
+    text: &str,
+    clear: bool,
+    interval: std::time::Duration,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<ClickResult, CommandError> {
+    use super::browser_control::motion::KEY_INTERVAL;
+    let field = match click_field(
+        client,
+        control,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        iframe_sessions,
+    )
+    .await?
+    {
+        Clicked::Dialog(click) => return Ok(click),
+        Clicked::Field(field) => field,
+    };
+    if !field.state.empty {
+        if clear {
+            type_after_click(
+                control,
+                client,
+                session_id,
+                &native_key_chord_events("a", Some(2)),
+                KEY_INTERVAL,
+            )
+            .await?;
+            type_after_click(
+                control,
+                client,
+                session_id,
+                &native_key_chord_events("Backspace", None),
+                KEY_INTERVAL,
+            )
+            .await?;
+        } else {
+            let modifiers = field.state.multiline.then_some(2);
+            type_after_click(
+                control,
+                client,
+                session_id,
+                &native_key_chord_events("End", modifiers),
+                KEY_INTERVAL,
+            )
+            .await?;
+        }
+    }
+    type_after_click(
+        control,
+        client,
+        session_id,
+        &native_text_events(text),
+        interval,
+    )
+    .await?;
+    Ok(ClickResult::default())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -430,6 +751,10 @@ pub async fn press_key_with_modifiers(
     Ok(())
 }
 
+/// Scrolls by script, published on the tab's page as `scrolling`: the view
+/// moves with no pointer path. Headless and DevTools-only browsers scroll
+/// this way; the owned window's wheel (`BrowserControl::agent_native_scroll`)
+/// falls back to it where no wheel moves the scroller.
 pub async fn scroll(
     client: &CdpClient,
     session_id: &str,
@@ -439,52 +764,78 @@ pub async fn scroll(
     delta_y: f64,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<(), String> {
+    if let Some(sel) = selector_or_ref {
+        let (object_id, effective_session_id) =
+            resolve_element_object_id(client, session_id, ref_map, sel, iframe_sessions).await?;
+        return scroll_by(
+            client,
+            session_id,
+            &effective_session_id,
+            &object_id,
+            delta_x,
+            delta_y,
+        )
+        .await;
+    }
     let observation = client.observe_activity(
         serde_json::json!({ "type": "activity", "kind": "scrolling" }),
         session_id,
         client.page_generation(session_id),
         super::activity::InputSource::Agent,
     );
-    if let Some(sel) = selector_or_ref {
-        let (object_id, effective_session_id) =
-            resolve_element_object_id(client, session_id, ref_map, sel, iframe_sessions).await?;
-        let js = "function(dx, dy) { this.scrollBy(dx, dy); }".to_string();
-        client
-            .send_command_typed::<_, Value>(
-                "Runtime.callFunctionOn",
-                &CallFunctionOnParams {
-                    function_declaration: js,
-                    object_id: Some(object_id),
-                    arguments: Some(vec![
-                        CallArgument {
-                            value: Some(serde_json::json!(delta_x)),
-                            object_id: None,
-                        },
-                        CallArgument {
-                            value: Some(serde_json::json!(delta_y)),
-                            object_id: None,
-                        },
-                    ]),
-                    return_by_value: Some(true),
-                    await_promise: Some(false),
-                },
-                Some(&effective_session_id),
-            )
-            .await?;
-    } else {
-        let js = format!("window.scrollBy({}, {})", delta_x, delta_y);
-        client
-            .send_command_typed::<_, Value>(
-                "Runtime.evaluate",
-                &EvaluateParams {
-                    expression: js,
-                    return_by_value: Some(true),
-                    await_promise: Some(false),
-                },
-                Some(session_id),
-            )
-            .await?;
-    }
+    client
+        .send_command_typed::<_, Value>(
+            "Runtime.evaluate",
+            &EvaluateParams {
+                expression: format!("window.scrollBy({}, {})", delta_x, delta_y),
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(session_id),
+        )
+        .await?;
+    observation.acknowledged();
+    Ok(())
+}
+
+/// Scrolls `object_id` (a scroller in `session_id`) by script, published on
+/// the tab's page (`page_session`) as `scrolling`.
+pub(crate) async fn scroll_by(
+    client: &CdpClient,
+    page_session: &str,
+    session_id: &str,
+    object_id: &str,
+    delta_x: f64,
+    delta_y: f64,
+) -> Result<(), String> {
+    let observation = client.observe_activity(
+        serde_json::json!({ "type": "activity", "kind": "scrolling" }),
+        page_session,
+        client.page_generation(page_session),
+        super::activity::InputSource::Agent,
+    );
+    client
+        .send_command_typed::<_, Value>(
+            "Runtime.callFunctionOn",
+            &CallFunctionOnParams {
+                function_declaration: "function(dx, dy) { this.scrollBy(dx, dy); }".into(),
+                object_id: Some(object_id.into()),
+                arguments: Some(vec![
+                    CallArgument {
+                        value: Some(serde_json::json!(delta_x)),
+                        object_id: None,
+                    },
+                    CallArgument {
+                        value: Some(serde_json::json!(delta_y)),
+                        object_id: None,
+                    },
+                ]),
+                return_by_value: Some(true),
+                await_promise: Some(false),
+            },
+            Some(session_id),
+        )
+        .await?;
     observation.acknowledged();
     Ok(())
 }
@@ -585,7 +936,7 @@ pub async fn check(
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<CheckResult, String> {
+) -> Result<CheckResult, CommandError> {
     set_checked(
         client,
         control,
@@ -605,7 +956,7 @@ pub async fn uncheck(
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
-) -> Result<CheckResult, String> {
+) -> Result<CheckResult, CommandError> {
     set_checked(
         client,
         control,
@@ -629,7 +980,7 @@ async fn set_checked(
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
     desired: bool,
-) -> Result<CheckResult, String> {
+) -> Result<CheckResult, CommandError> {
     let (object_id, effective_session_id) = resolve_element_object_id(
         client,
         session_id,
@@ -1030,7 +1381,7 @@ async fn dispatch_mouse_or_dialog(
     session_id: &str,
     accept_sessions: &[&str],
     params: &DispatchMouseEventParams,
-) -> Result<bool, String> {
+) -> Result<bool, CommandError> {
     use tokio::sync::broadcast::error::RecvError;
 
     if control.lock().await.has_native_display() {
@@ -1094,7 +1445,7 @@ async fn dispatch_click(
     y: f64,
     button: &str,
     click_count: i32,
-) -> Result<ClickResult, String> {
+) -> Result<ClickResult, CommandError> {
     // Move
     if dispatch_mouse_or_dialog(
         client,
@@ -1299,33 +1650,29 @@ fn key_text(key_name: &str) -> Option<String> {
 }
 
 /// Keyboard events for the owned native window, in the shape the display
-/// helper accepts. Characters a US keymap types are sent as key presses with
-/// their text; any other run of characters becomes one explicit text
-/// insertion, which the helper performs as a single native paste.
+/// helper accepts, one character at a time. Characters a US keymap types are
+/// key presses with their text; any other character is an explicit text
+/// insertion of its own, which the helper performs as a native paste.
 pub(crate) fn native_text_events(text: &str) -> Vec<Value> {
     let mut events = Vec::new();
-    let mut pending_insert = String::new();
-    let flush = |pending: &mut String, events: &mut Vec<Value>| {
-        if !pending.is_empty() {
-            events.push(json!({
-                "type": "input_keyboard", "eventType": "insertText", "text": std::mem::take(pending),
-            }));
-        }
-    };
     for ch in text.chars() {
         // A US keymap types every ASCII graphic character; the helper
         // resolves the native key and level from the character itself.
-        let typed_natively = matches!(ch, '\n' | '\r' | '\t' | ' ') || ch.is_ascii_graphic();
-        if !typed_natively {
-            pending_insert.push(ch);
-            continue;
+        if matches!(ch, '\n' | '\r' | '\t' | ' ') || ch.is_ascii_graphic() {
+            let (key, code, _) = char_to_key_info(ch);
+            events.extend(native_key_events(&key, &code, 0));
+        } else {
+            events.push(json!({
+                "type": "input_keyboard", "eventType": "insertText", "text": ch.to_string(),
+            }));
         }
-        flush(&mut pending_insert, &mut events);
-        let (key, code, _) = char_to_key_info(ch);
-        events.extend(native_key_events(&key, &code, 0));
     }
-    flush(&mut pending_insert, &mut events);
     events
+}
+
+/// The events of one visible paste of `text`, as a person pastes a value.
+pub(crate) fn native_paste_events(text: &str) -> Vec<Value> {
+    vec![json!({ "type": "input_keyboard", "eventType": "insertText", "text": text })]
 }
 
 /// A single key press through the owned native window, with the CDP
@@ -1388,7 +1735,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn native_text_types_keymap_characters_and_pastes_the_rest() {
+    fn native_text_types_keymap_characters_and_pastes_the_rest_one_at_a_time() {
         let events = native_text_events("a1.\né漢字!");
         let kinds: Vec<(String, String)> = events
             .iter()
@@ -1414,7 +1761,9 @@ mod tests {
                 ("keyUp", "."),
                 ("keyDown", "Enter"),
                 ("keyUp", "Enter"),
-                ("insertText", "é漢字"),
+                ("insertText", "é"),
+                ("insertText", "漢"),
+                ("insertText", "字"),
                 ("keyDown", "!"),
                 ("keyUp", "!"),
             ]

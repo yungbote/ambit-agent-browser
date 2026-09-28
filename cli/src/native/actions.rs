@@ -798,6 +798,9 @@ impl DaemonState {
             .ok()
             .flatten()
             .is_some_and(|b| b.pinned);
+        let browser_control = BrowserControl::default();
+        let playwright_operations =
+            super::playwright::Operations::new(browser_control.interrupts());
         Self {
             browser: None,
             sign_in: None,
@@ -864,8 +867,8 @@ impl DaemonState {
             stream_client: None,
             stream_server: None,
             idle_activity: Arc::new(IdleActivity::new()),
-            browser_control: Arc::new(tokio::sync::Mutex::new(BrowserControl::default())),
-            playwright_operations: super::playwright::Operations::default(),
+            browser_control: Arc::new(tokio::sync::Mutex::new(browser_control)),
+            playwright_operations,
             launch_configuration: None,
             retained_profile: None,
             effective_ca_cert: None,
@@ -933,7 +936,10 @@ impl DaemonState {
             s.request_tracking = true;
         }
         if let Some(server) = stream_server.as_ref() {
+            // One custody gate and one set of interruptions: a takeover that
+            // stops programs stops the gate's paced input too.
             s.browser_control = server.browser_control.clone();
+            s.playwright_operations = super::playwright::Operations::new(server.interrupts.clone());
         }
         s.stream_client = stream_client;
         s.stream_server = stream_server;
@@ -2942,8 +2948,6 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         }
     }
 
-    state.browser_control.lock().await.begin_agent_command();
-
     if let Err(err) = validate_restore_config_from_command(cmd) {
         return error_response(&id, &err);
     }
@@ -3283,27 +3287,20 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         "title" => handle_title(state).await,
         "content" => handle_content(state).await,
         "evaluate" => handle_evaluate(cmd, state).await,
-        "run_playwright" => {
-            super::playwright::run(cmd, state)
-                .await
-                .map_err(|CommandError { error, data }| {
-                    failure_data = data;
-                    error
-                })
-        }
+        "run_playwright" => stating(super::playwright::run(cmd, state).await, &mut failure_data),
         "close" => handle_close(state).await,
         "snapshot" => handle_snapshot(cmd, state).await,
         "screenshot" => handle_screenshot(cmd, state).await,
-        "click" => handle_click(cmd, state).await,
-        "dblclick" => handle_dblclick(cmd, state).await,
-        "fill" => handle_fill(cmd, state).await,
-        "type" => handle_type(cmd, state).await,
-        "press" => handle_press(cmd, state).await,
-        "hover" => handle_hover(cmd, state).await,
-        "scroll" => handle_scroll(cmd, state).await,
+        "click" => stating(handle_click(cmd, state).await, &mut failure_data),
+        "dblclick" => stating(handle_dblclick(cmd, state).await, &mut failure_data),
+        "fill" => stating(handle_fill(cmd, state).await, &mut failure_data),
+        "type" => stating(handle_type(cmd, state).await, &mut failure_data),
+        "press" => stating(handle_press(cmd, state).await, &mut failure_data),
+        "hover" => stating(handle_hover(cmd, state).await, &mut failure_data),
+        "scroll" => stating(handle_scroll(cmd, state).await, &mut failure_data),
         "select" => handle_select(cmd, state).await,
-        "check" => handle_check(cmd, state).await,
-        "uncheck" => handle_uncheck(cmd, state).await,
+        "check" => stating(handle_check(cmd, state).await, &mut failure_data),
+        "uncheck" => stating(handle_uncheck(cmd, state).await, &mut failure_data),
         "wait" => handle_wait(cmd, state).await,
         "gettext" => handle_gettext(cmd, state).await,
         "getattribute" => handle_getattribute(cmd, state).await,
@@ -3353,15 +3350,15 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         "credentials_get" => handle_credentials_get(cmd).await,
         "credentials_delete" => handle_credentials_delete(cmd).await,
         "credentials_list" => handle_credentials_list().await,
-        "mouse" => handle_mouse(cmd, state).await,
-        "keyboard" => handle_keyboard(cmd, state).await,
+        "mouse" => stating(handle_mouse(cmd, state).await, &mut failure_data),
+        "keyboard" => stating(handle_keyboard(cmd, state).await, &mut failure_data),
         "focus" => handle_focus(cmd, state).await,
         "clear" => handle_clear(cmd, state).await,
         "selectall" => handle_selectall(cmd, state).await,
         "scrollintoview" => handle_scrollintoview(cmd, state).await,
         "dispatch" => handle_dispatch(cmd, state).await,
         "highlight" => handle_highlight(cmd, state).await,
-        "tap" => handle_tap(cmd, state).await,
+        "tap" => stating(handle_tap(cmd, state).await, &mut failure_data),
         "boundingbox" => handle_boundingbox(cmd, state).await,
         "innertext" => handle_innertext(cmd, state).await,
         "innerhtml" => handle_innerhtml(cmd, state).await,
@@ -3389,7 +3386,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         "a11y" => handle_a11y(cmd, state).await,
         "pushstate" => handle_pushstate(cmd, state).await,
         "clipboard" => handle_clipboard(cmd, state).await,
-        "wheel" => handle_wheel(cmd, state).await,
+        "wheel" => stating(handle_wheel(cmd, state).await, &mut failure_data),
         "device" => handle_device(cmd, state).await,
         "screencast_start" => handle_screencast_start(cmd, state).await,
         "screencast_stop" => handle_screencast_stop(state).await,
@@ -3415,7 +3412,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         "nth" => handle_nth(cmd, state).await,
         "find" => handle_find(cmd, state).await,
         "evalhandle" => handle_evalhandle(cmd, state).await,
-        "drag" => handle_drag(cmd, state).await,
+        "drag" => stating(handle_drag(cmd, state).await, &mut failure_data),
         "expose" => handle_expose(cmd, state).await,
         "pause" => handle_pause(state).await,
         "multiselect" => handle_multiselect(cmd, state).await,
@@ -3442,15 +3439,15 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         "deny" => handle_deny(cmd, state).await,
         "swipe" => handle_swipe(cmd, state).await,
         "device_list" => handle_device_list().await,
-        "input_mouse" => handle_input_mouse(cmd, state).await,
+        "input_mouse" => stating(handle_input_mouse(cmd, state).await, &mut failure_data),
         "input_keyboard" => handle_input_keyboard(cmd, state).await,
         "input_touch" => handle_input_touch(cmd, state).await,
         "keydown" => handle_keydown(cmd, state).await,
         "keyup" => handle_keyup(cmd, state).await,
         "inserttext" => handle_inserttext(cmd, state).await,
-        "mousemove" => handle_mousemove(cmd, state).await,
-        "mousedown" => handle_mousedown(cmd, state).await,
-        "mouseup" => handle_mouseup(cmd, state).await,
+        "mousemove" => stating(handle_mousemove(cmd, state).await, &mut failure_data),
+        "mousedown" => stating(handle_mousedown(cmd, state).await, &mut failure_data),
+        "mouseup" => stating(handle_mouseup(cmd, state).await, &mut failure_data),
         _ => Err(format!("Not yet implemented: {}", action)),
     };
 
@@ -6160,7 +6157,7 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
     Ok(response)
 }
 
-async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
@@ -6271,7 +6268,7 @@ async fn handle_click(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     Ok(json!({ "clicked": selector }))
 }
 
-async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
@@ -6295,7 +6292,7 @@ async fn handle_dblclick(cmd: &Value, state: &mut DaemonState) -> Result<Value, 
     Ok(json!({ "clicked": selector }))
 }
 
-async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let selector = cmd
         .get("selector")
         .and_then(|v| v.as_str())
@@ -6311,12 +6308,34 @@ async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
             return Ok(json!({ "filled": selector }));
         }
     }
+    fill_field(state, selector, value).await
+}
 
+/// Fills a field: in the owned window as a person does (pointer, click,
+/// select-all, keys; `interaction::native_fill`), reporting a field that
+/// ended up holding other text than `value`; otherwise through DevTools.
+async fn fill_field(
+    state: &mut DaemonState,
+    selector: &str,
+    value: &str,
+) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
-
-    interaction::fill(
+    if !state.browser_control.lock().await.has_native_display() {
+        interaction::fill(
+            &mgr.client,
+            &session_id,
+            &state.ref_map,
+            selector,
+            value,
+            &state.iframe_sessions,
+        )
+        .await?;
+        return Ok(json!({ "filled": selector }));
+    }
+    let filled = interaction::native_fill(
         &mgr.client,
+        &state.browser_control,
         &session_id,
         &state.ref_map,
         selector,
@@ -6324,10 +6343,23 @@ async fn handle_fill(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
         &state.iframe_sessions,
     )
     .await?;
-    Ok(json!({ "filled": selector }))
+    let Some(field) = filled.field else {
+        state.pending_pointer_release = filled.click.pending_release;
+        return Ok(json!({ "filled": selector, "dialogOpened": true }));
+    };
+    let mut response = json!({ "filled": selector });
+    // The page's own handlers took every key; what they left is reported,
+    // never rewritten (a mask, a maximum length, an autocompletion).
+    if !field.matches {
+        response["valueMatches"] = json!(false);
+        if let Some(actual) = field.value {
+            response["value"] = json!(actual);
+        }
+    }
+    Ok(response)
 }
 
-async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
@@ -6342,16 +6374,22 @@ async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     let delay = cmd.get("delay").and_then(|v| v.as_u64());
 
     if state.browser_control.lock().await.has_native_display() {
-        interaction::focus_for_typing(
+        let clicked = interaction::native_type_into(
             &mgr.client,
+            &state.browser_control,
             &session_id,
             &state.ref_map,
             selector,
+            text,
             clear,
+            key_interval(delay),
             &state.iframe_sessions,
         )
         .await?;
-        native_type(state, text, delay).await?;
+        if clicked.dialog_opened {
+            state.pending_pointer_release = clicked.pending_release;
+            return Ok(json!({ "typed": text, "dialogOpened": true }));
+        }
         return Ok(json!({ "typed": text }));
     }
 
@@ -6369,34 +6407,38 @@ async fn handle_type(cmd: &Value, state: &mut DaemonState) -> Result<Value, Stri
     Ok(json!({ "typed": text }))
 }
 
-/// Keystrokes through the owned native window. A per-key delay keeps the
-/// requested cadence by sending one character per batch.
-async fn native_type(state: &DaemonState, text: &str, delay_ms: Option<u64>) -> Result<(), String> {
-    match delay_ms.filter(|delay| *delay > 0) {
-        None => {
-            state
-                .browser_control
-                .lock()
-                .await
-                .agent_native_keys(&interaction::native_text_events(text))
-                .await
-        }
-        Some(delay) => {
-            for ch in text.chars() {
-                state
-                    .browser_control
-                    .lock()
-                    .await
-                    .agent_native_keys(&interaction::native_text_events(&ch.to_string()))
-                    .await?;
-                tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
-            }
-            Ok(())
-        }
-    }
+/// The time between two keys in the owned window: the motion layer's
+/// cadence, or a longer delay the caller asked for.
+fn key_interval(delay_ms: Option<u64>) -> std::time::Duration {
+    delay_ms
+        .map(std::time::Duration::from_millis)
+        .unwrap_or_default()
+        .max(super::browser_control::motion::KEY_INTERVAL)
 }
 
-async fn handle_press(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+/// Keystrokes to whatever has focus in the owned native window, one key
+/// per interval.
+async fn native_type(
+    state: &DaemonState,
+    text: &str,
+    delay_ms: Option<u64>,
+) -> Result<(), CommandError> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?;
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_native_keys(
+            &interaction::native_text_events(text),
+            key_interval(delay_ms),
+            &mgr.client,
+            session_id,
+        )
+        .await
+}
+
+async fn handle_press(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let key = cmd
@@ -6412,10 +6454,12 @@ async fn handle_press(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
             .browser_control
             .lock()
             .await
-            .agent_native_keys(&interaction::native_key_chord_events(
-                &actual_key,
-                modifiers,
-            ))
+            .agent_native_keys(
+                &interaction::native_key_chord_events(&actual_key, modifiers),
+                super::browser_control::motion::KEY_INTERVAL,
+                &mgr.client,
+                &session_id,
+            )
             .await?;
         return Ok(json!({ "pressed": key }));
     }
@@ -6464,7 +6508,7 @@ fn parse_key_chord(input: &str) -> (String, Option<i32>) {
     (actual_key, Some(modifiers))
 }
 
-async fn handle_hover(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_hover(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
@@ -6484,7 +6528,7 @@ async fn handle_hover(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     Ok(json!({ "hovered": selector }))
 }
 
-async fn handle_scroll(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_scroll(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd.get("selector").and_then(|v| v.as_str());
@@ -6505,6 +6549,35 @@ async fn handle_scroll(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         }
     }
 
+    if state.browser_control.lock().await.has_native_display() {
+        let scroller = match selector {
+            Some(selector) => Some(
+                super::element::resolve_element_object_id(
+                    &mgr.client,
+                    &session_id,
+                    &state.ref_map,
+                    selector,
+                    &state.iframe_sessions,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        state
+            .browser_control
+            .lock()
+            .await
+            .agent_native_scroll(
+                &mgr.client,
+                &session_id,
+                scroller
+                    .as_ref()
+                    .map(|(object, session)| (object.as_str(), session.as_str())),
+                (dx, dy),
+            )
+            .await?;
+        return Ok(json!({ "scrolled": true }));
+    }
     interaction::scroll(
         &mgr.client,
         &session_id,
@@ -6551,7 +6624,7 @@ async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
     Ok(json!({ "selected": values }))
 }
 
-async fn handle_check(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_check(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
@@ -6575,7 +6648,7 @@ async fn handle_check(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     Ok(json!({ "checked": selector, "method":clicked.method }))
 }
 
-async fn handle_uncheck(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_uncheck(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
@@ -7460,7 +7533,7 @@ async fn handle_auth_show(cmd: &Value) -> Result<Value, String> {
     auth::auth_show(name)
 }
 
-async fn handle_mouse(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_mouse(cmd: &Value, state: &DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
 
@@ -7494,7 +7567,7 @@ async fn handle_mouse(cmd: &Value, state: &DaemonState) -> Result<Value, String>
     Ok(json!({ "dispatched": event_type }))
 }
 
-async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let native = state.browser_control.lock().await.has_native_display();
@@ -7523,9 +7596,12 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
                     .browser_control
                     .lock()
                     .await
-                    .agent_native_keys(&[json!({
-                        "type": "input_keyboard", "eventType": "insertText", "text": text,
-                    })])
+                    .agent_native_keys(
+                        &interaction::native_paste_events(text),
+                        super::browser_control::motion::KEY_INTERVAL,
+                        &mgr.client,
+                        &session_id,
+                    )
                     .await?;
                 return Ok(json!({ "inserted": true }));
             }
@@ -7573,7 +7649,12 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Stri
             .browser_control
             .lock()
             .await
-            .agent_native_keys(&[event])
+            .agent_native_keys(
+                &[event],
+                super::browser_control::motion::KEY_INTERVAL,
+                &mgr.client,
+                &session_id,
+            )
             .await?;
         return Ok(json!({ "dispatched": event_type }));
     }
@@ -8456,7 +8537,7 @@ async fn handle_highlight(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     Ok(json!({ "highlighted": selector }))
 }
 
-async fn handle_tap(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_tap(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let selector = cmd.get("selector").and_then(|v| v.as_str());
 
     // Route through Appium for iOS/WebDriver using coordinate-based tap
@@ -9285,30 +9366,36 @@ async fn handle_clipboard(cmd: &Value, state: &DaemonState) -> Result<Value, Str
     }
 }
 
-async fn handle_wheel(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+/// A wheel turns at its coordinates, or where the pointer is when it has
+/// none: the owned window's real pointer, or the last point the agent's
+/// DevTools mouse input went to.
+async fn handle_wheel(cmd: &Value, state: &DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
-    let x = cmd.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
-    let y = cmd.get("y").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let delta_x = cmd.get("deltaX").and_then(|v| v.as_f64()).unwrap_or(0.0);
     let delta_y = cmd.get("deltaY").and_then(|v| v.as_f64()).unwrap_or(0.0);
-
-    state
-        .browser_control
-        .lock()
-        .await
-        .agent_input(
-            "input_mouse",
-            json!({
-                "type": "mouseWheel",
-                "x": x,
-                "y": y,
-                "deltaX": delta_x,
-                "deltaY": delta_y,
-            }),
-            &mgr.client,
-            &session_id,
-        )
+    let point = match (
+        cmd.get("x").and_then(Value::as_f64),
+        cmd.get("y").and_then(Value::as_f64),
+    ) {
+        (Some(x), Some(y)) => Some((x, y)),
+        (None, None) => None,
+        _ => {
+            return Err(
+                "A wheel takes both x and y, or neither to turn where the pointer is.".into(),
+            )
+        }
+    };
+    let mut control = state.browser_control.lock().await;
+    let mut params = json!({ "type": "mouseWheel", "deltaX": delta_x, "deltaY": delta_y });
+    if let Some((x, y)) = point.or_else(|| {
+        (!control.has_native_display()).then_some((state.mouse_state.x, state.mouse_state.y))
+    }) {
+        params["x"] = json!(x);
+        params["y"] = json!(y);
+    }
+    control
+        .agent_input("input_mouse", params, &mgr.client, &session_id)
         .await?;
 
     Ok(json!({ "scrolled": true, "deltaX": delta_x, "deltaY": delta_y }))
@@ -10190,16 +10277,8 @@ async fn execute_subaction(
                 .get("value")
                 .and_then(|v| v.as_str())
                 .ok_or("Missing 'value' for fill subaction")?;
-            interaction::fill(
-                &mgr.client,
-                &session_id,
-                &state.ref_map,
-                selector,
-                value,
-                &state.iframe_sessions,
-            )
-            .await?;
-            Ok(json!({ "filled": selector }))
+            let selector = selector.to_owned();
+            Ok(fill_field(state, &selector, value).await?)
         }
         "check" => {
             let clicked = interaction::check(
@@ -10914,7 +10993,7 @@ async fn handle_evalhandle(cmd: &Value, state: &DaemonState) -> Result<Value, St
 // Advanced interaction handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_drag(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let source = cmd
@@ -12958,7 +13037,7 @@ fn build_mouse_event_params(
     }
 }
 
-async fn handle_input_mouse(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_input_mouse(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let event_type = cmd
@@ -13108,7 +13187,7 @@ async fn handle_inserttext(cmd: &Value, state: &DaemonState) -> Result<Value, St
     Ok(json!({ "inserted": true }))
 }
 
-async fn handle_mousemove(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_mousemove(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let x = cmd.get("x").and_then(|v| v.as_f64()).unwrap_or(0.0);
@@ -13140,44 +13219,31 @@ async fn handle_mousemove(cmd: &Value, state: &mut DaemonState) -> Result<Value,
     Ok(json!({ "moved": true }))
 }
 
-async fn handle_mousedown(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+async fn handle_mousedown(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
-    let params = build_mouse_event_params(
-        &mut state.mouse_state,
-        "mousePressed",
-        None,
-        None,
-        Some(button),
-        None,
-        Some(1),
-        None,
-        None,
-        None,
-    );
-
-    state
-        .browser_control
-        .lock()
-        .await
-        .agent_input(
-            "input_mouse",
-            serde_json::to_value(&params).map_err(|error| error.to_string())?,
-            &mgr.client,
-            &session_id,
-        )
-        .await?;
+    button_in_place(state, "mousePressed", button).await?;
     Ok(json!({ "pressed": true }))
 }
 
-async fn handle_mouseup(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_mouseup(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
+    let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
+    button_in_place(state, "mouseReleased", button).await?;
+    Ok(json!({ "released": true }))
+}
+
+/// A button pressed or released in place: in the owned window where its
+/// real pointer is (the event carries no coordinates), otherwise at the last
+/// point the agent's DevTools mouse input went to.
+async fn button_in_place(
+    state: &mut DaemonState,
+    event_type: &str,
+    button: &str,
+) -> Result<(), CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
-    let button = cmd.get("button").and_then(|v| v.as_str()).unwrap_or("left");
     let params = build_mouse_event_params(
         &mut state.mouse_state,
-        "mouseReleased",
+        event_type,
         None,
         None,
         Some(button),
@@ -13187,19 +13253,17 @@ async fn handle_mouseup(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
         None,
         None,
     );
-
-    state
-        .browser_control
-        .lock()
+    let mut params = serde_json::to_value(&params).map_err(|error| error.to_string())?;
+    let mut control = state.browser_control.lock().await;
+    if control.has_native_display() {
+        if let Some(fields) = params.as_object_mut() {
+            fields.remove("x");
+            fields.remove("y");
+        }
+    }
+    control
+        .agent_input("input_mouse", params, &mgr.client, &session_id)
         .await
-        .agent_input(
-            "input_mouse",
-            serde_json::to_value(&params).map_err(|error| error.to_string())?,
-            &mgr.client,
-            &session_id,
-        )
-        .await?;
-    Ok(json!({ "released": true }))
 }
 
 // ---------------------------------------------------------------------------
@@ -13368,6 +13432,26 @@ impl From<String> for CommandError {
 impl From<&str> for CommandError {
     fn from(error: &str) -> Self {
         error.to_string().into()
+    }
+}
+
+/// A handler's outcome as the response states it: the failure's message,
+/// with the facts its handler stated moved to `facts` for the response.
+fn stating(
+    result: Result<Value, CommandError>,
+    facts: &mut Option<Value>,
+) -> Result<Value, String> {
+    result.map_err(|CommandError { error, data }| {
+        *facts = data;
+        error
+    })
+}
+
+/// A caller that reports only a message keeps the failure's coded message;
+/// the facts stated with it are not carried.
+impl From<CommandError> for String {
+    fn from(error: CommandError) -> Self {
+        error.error
     }
 }
 

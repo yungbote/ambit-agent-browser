@@ -40,6 +40,19 @@ impl FramePacing {
     pub(crate) fn period(self) -> Duration {
         Duration::from_micros(1_000_000 / u64::from(self.fps))
     }
+
+    /// The time to the next capture after one that sent damage patches
+    /// (`patch`) or a whole frame. While native input is on screen (an
+    /// agent's pointer travel or keys, and a moment after), a presented
+    /// view follows patches at the interactive rate, so the motion is shown
+    /// as smoothly as it is sent; whole-window damage keeps its tier's rate.
+    pub(crate) fn after(self, patch: bool, input_shown: bool) -> Duration {
+        if patch && input_shown && self == Self::PRESENTED {
+            Self::CONTROLLED.period()
+        } else {
+            self.period()
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -526,6 +539,27 @@ mod tests {
         state.configure(secondary, config);
         assert_eq!(state.client_fps(primary, 20, false), 15);
         assert_eq!(state.client_fps(secondary, 40, false), 30);
+    }
+
+    /// Input on screen raises a presented view's rate for patches only: a
+    /// whole frame, a person's control and a passive view keep their rates.
+    #[test]
+    fn input_on_screen_paces_presented_patches_at_the_interactive_rate() {
+        let presented = FramePacing::PRESENTED;
+        assert_eq!(
+            presented.after(true, true),
+            FramePacing::CONTROLLED.period()
+        );
+        assert_eq!(presented.after(false, true), presented.period());
+        assert_eq!(presented.after(true, false), presented.period());
+        assert_eq!(
+            FramePacing::PASSIVE.after(true, true),
+            FramePacing::PASSIVE.period()
+        );
+        assert_eq!(
+            FramePacing::CONTROLLED.after(true, true),
+            FramePacing::CONTROLLED.period()
+        );
     }
 
     /// A human lease raises the rate for the controlling presenter only, and

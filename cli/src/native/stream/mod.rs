@@ -433,6 +433,9 @@ impl Default for FrameMetadata {
 
 pub struct StreamServer {
     pub(crate) browser_control: Arc<Mutex<BrowserControl>>,
+    /// The interruptions `browser_control`'s agent input obeys, reachable
+    /// without its gate (`BrowserControl::interrupts`).
+    pub(crate) interrupts: super::browser_control::Interrupts,
     pub(crate) presentation: Arc<presentation::Presentation>,
     port: u16,
     session_name: String,
@@ -628,12 +631,13 @@ impl StreamServer {
         let (audio_source, audio_accept) = watch::channel(None);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let display_slot_accept = display_slot.clone();
-        let (custody_bg, custody_layout, media) = {
+        let (custody_bg, custody_layout, media, interrupts) = {
             let control = browser_control.lock().await;
             (
                 control.custody(),
                 control.custody(),
                 Arc::new(StreamMedia::new(control.applied_input())),
+                control.interrupts(),
             )
         };
         let layout_task = tokio::spawn(layout::follow_presentation(
@@ -751,6 +755,7 @@ impl StreamServer {
         Ok((
             Self {
                 browser_control,
+                interrupts,
                 presentation,
                 port,
                 session_name: session_id,
