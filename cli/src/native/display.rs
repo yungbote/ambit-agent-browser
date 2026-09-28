@@ -361,7 +361,15 @@ mod platform {
         /// it. `None` before the first, and after one whose outcome is
         /// unknown. The helper reports no pointer; this is what it was told.
         pointer: std::sync::Mutex<Option<(f64, f64)>>,
+        /// Until when native input is on screen: `INPUT_SHOWN` after the
+        /// last acknowledged input batch. Frame pacing follows it.
+        input_shown: tokio::sync::watch::Sender<Option<std::time::Instant>>,
     }
+
+    /// How long frames keep following input after the last input batch, so
+    /// the page's response to it (a hover, a smooth scroll) is shown at the
+    /// same rate as the input itself.
+    const INPUT_SHOWN: Duration = Duration::from_millis(250);
 
     /// Exclusive custody of the window geometry for one layout.
     pub(crate) struct LayoutGuard<'a>(#[allow(dead_code)] tokio::sync::RwLockWriteGuard<'a, ()>);
@@ -446,7 +454,17 @@ mod platform {
                 next_gesture: AtomicU64::new(1),
                 overridden_gesture: AtomicU64::new(0),
                 pointer: std::sync::Mutex::new(None),
+                input_shown: tokio::sync::watch::channel(None).0,
             }))
+        }
+
+        /// Until when native input is on screen. Receivers are woken when
+        /// input starts to show, not on every batch; they read the moment
+        /// when they pace.
+        pub(crate) fn input_shown(
+            &self,
+        ) -> tokio::sync::watch::Receiver<Option<std::time::Instant>> {
+            self.input_shown.subscribe()
         }
 
         fn pointer_slot(&self) -> std::sync::MutexGuard<'_, Option<(f64, f64)>> {
@@ -856,6 +874,14 @@ mod platform {
                     Err(error) if error.operation_performed == Some(json!(false)) => {}
                     Err(_) => *self.pointer_slot() = None,
                 }
+            }
+            if result.is_ok() {
+                let now = std::time::Instant::now();
+                self.input_shown.send_if_modified(|until| {
+                    let showing = until.is_some_and(|until| until > now);
+                    *until = Some(now + INPUT_SHOWN);
+                    !showing
+                });
             }
             result.map(|_| ())
         }
@@ -1608,6 +1634,9 @@ impl DisplayClient {
         match *self {}
     }
     pub(crate) fn pointer(&self) -> Option<(f64, f64)> {
+        match *self {}
+    }
+    pub(crate) fn input_shown(&self) -> tokio::sync::watch::Receiver<Option<std::time::Instant>> {
         match *self {}
     }
     pub(crate) fn layout_epoch(&self) -> u64 {

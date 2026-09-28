@@ -116,6 +116,7 @@ async fn run(
     let identity = display.has("cursorIdentity");
     let mut presentation = sinks.presentation.subscribe();
     let mut custody = sinks.custody.clone();
+    let mut input_shown = display.input_shown();
     let mut published = Published::default();
     let mut next = tokio::time::Instant::now();
     loop {
@@ -133,12 +134,19 @@ async fn run(
             changed = custody.changed() => {
                 if changed.is_err() { return; }
             }
+            // Input began to show: patches follow it at once.
+            changed = input_shown.changed() => {
+                if changed.is_err() { return; }
+            }
         }
         if *stop.borrow() {
             return;
         }
         let controlled = custody_active(*custody.borrow_and_update());
         let pacing = sinks.presentation.capture_pacing(controlled);
+        let shown = input_shown
+            .borrow_and_update()
+            .is_some_and(|until| until > Instant::now());
         let viewers = *sinks.client_count.lock().await;
         // Patches amend a whole frame every viewer holds; one viewer that
         // does not composite them makes the next frame whole for everyone.
@@ -182,11 +190,12 @@ async fn run(
                 }
                 next = match captured.frame {
                     Some((capture, surface)) => {
+                        let patch = capture.data.is_none();
                         publish(&sinks, &mut published, capture, surface, ts);
-                        started + Duration::from_micros(waited) + pacing.period()
+                        started + Duration::from_micros(waited) + pacing.after(patch, shown)
                     }
                     None if waits => started + IDLE_SPACING,
-                    None => started + pacing.period(),
+                    None => started + pacing.after(true, shown),
                 };
             }
             Err(error) if error.is_transient() => {
@@ -265,14 +274,39 @@ mod tests {
         applied: Arc<super::super::AppliedInput>,
         media: Arc<StreamMedia>,
         sinks: Sinks,
-        _control: UnixStream,
         _custody: watch::Sender<Option<Instant>>,
+    }
+
+    /// Acknowledges every control request (input, reset) of a test display.
+    fn acknowledge_control(control: UnixStream) {
+        tokio::spawn(async move {
+            let mut control = BufReader::new(control);
+            let mut line = String::new();
+            while control
+                .read_line(&mut line)
+                .await
+                .is_ok_and(|read| read > 0)
+            {
+                let request: Value = serde_json::from_str(&line).unwrap();
+                line.clear();
+                let reply = json!({"id": request["id"], "success": true, "data": {}}).to_string();
+                if control
+                    .get_mut()
+                    .write_all(format!("{reply}\n").as_bytes())
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
     }
 
     /// One viewer that composites neither patches nor the pointer, and no
     /// presenter: passive pacing (15 fps, a 66 ms period).
     fn harness(features: &[&str]) -> Harness {
         let (display, control, frames) = DisplayClient::test_channel();
+        acknowledge_control(control);
         display.advertise(features);
         let (frame_tx, messages) = broadcast::channel(64);
         let (frame_watch, published) = watch::channel(None);
@@ -303,7 +337,6 @@ mod tests {
             applied,
             media,
             sinks,
-            _control: control,
             _custody: custody_sender,
         }
     }
@@ -497,6 +530,71 @@ mod tests {
             "nothing published after stopping"
         );
         assert!(h.display.available());
+    }
+
+    fn patch() -> Value {
+        json!({"changed":true,"width":2560,"height":1440,"encoding":"jpeg","cursorIncluded":true,
+            "quality":75,"patches":[{"x":16,"y":32,"width":160,"height":48,"data":"AA=="}]})
+    }
+
+    /// Request-to-request gaps of four patch frames in a row, after one that
+    /// answers whatever capture was already waiting in the helper.
+    async fn patch_gaps(h: &mut Harness) -> Vec<Duration> {
+        let waiting = h.request().await;
+        h.answer(&waiting, patch()).await;
+        h.frame().await;
+        let mut asked = h.request().await;
+        let mut gaps = Vec::new();
+        for _ in 0..4 {
+            let at = std::time::Instant::now();
+            h.answer(&asked, patch()).await;
+            h.frame().await;
+            asked = h.request().await;
+            gaps.push(at.elapsed());
+        }
+        h.answer(&asked, json!({"changed": false})).await;
+        gaps
+    }
+
+    /// While native input is on screen (an agent's travel, its keys), a
+    /// presented view's patches follow at the interactive rate; once it has
+    /// stopped showing, they keep the presented rate again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn patches_follow_native_input_at_the_interactive_rate() {
+        use super::super::presentation::{FramePacing, PresentationConfig};
+        let mut h = harness(&["captureWait"]);
+        h.sinks.patch_clients.store(1, Ordering::Release);
+        h.sinks.presentation.configure(
+            uuid::Uuid::new_v4(),
+            PresentationConfig {
+                viewer: uuid::Uuid::new_v4(),
+                width: 780,
+                height: 600,
+                crops: false,
+            },
+        );
+        let _capture = WindowCapture::start(h.display.clone(), h.sinks.clone());
+        let first = h.request().await;
+        h.answer(&first, whole(0)).await;
+        h.frame().await;
+        let presented = FramePacing::PRESENTED.period();
+        let idle = patch_gaps(&mut h).await;
+        assert!(idle.iter().all(|gap| *gap >= presented * 4 / 5), "{idle:?}");
+        h.display
+            .input(&[json!({"type":"input_mouse","eventType":"mouseMoved","x":5,"y":5})])
+            .await
+            .unwrap();
+        let moving = patch_gaps(&mut h).await;
+        assert!(
+            moving.iter().all(|gap| *gap < presented * 3 / 4),
+            "{moving:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let settled = patch_gaps(&mut h).await;
+        assert!(
+            settled.iter().all(|gap| *gap >= presented * 4 / 5),
+            "{settled:?}"
+        );
     }
 
     /// A new viewer needs a whole frame without waiting for the pacing.
