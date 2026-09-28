@@ -1715,7 +1715,7 @@ In an owned window (AGENT_BROWSER_WINDOW_STREAM=1) the pointer travels
 to the field and clicks it, any text in it is selected, and the value
 is typed one key per 25 ms (over 64 characters, pasted at once). A
 field whose own handlers left other text reports valueMatches: false
-with its value; nothing rewrites it.
+with its value (never a password's); nothing rewrites it.
 
 Global Options:
   --json               Output as JSON
