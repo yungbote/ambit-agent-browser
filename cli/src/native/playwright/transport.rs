@@ -651,8 +651,9 @@ mod tests {
         assert!(quiet.is_err(), "no native input was sent: {line}");
 
         // The next command's proof lets the same event through: it measures
-        // the page (the helper's window info, then the page itself; with no
-        // known pointer to measure natively, its own visible centre).
+        // the page (the helper's window info, then the page's pointer realm,
+        // which this page refuses, then its own visible centre), and no
+        // synthetic input reaches the page.
         display.record_proof(display.layout_epoch(), false);
         let helper_side = async {
             line.clear();
@@ -670,7 +671,11 @@ mod tests {
         };
         let (measured, ()) = tokio::join!(native_input(&moved, &client, &control), helper_side);
         assert!(!measured.unwrap_err().contains("was resized"));
-        assert_eq!(page.recv().await.unwrap(), "Runtime.evaluate");
+        let mut reached = Vec::new();
+        while let Ok(method) = page.try_recv() {
+            reached.push(method);
+        }
+        assert_eq!(reached, ["Page.getFrameTree", "Runtime.evaluate"]);
         server.abort();
     }
 
