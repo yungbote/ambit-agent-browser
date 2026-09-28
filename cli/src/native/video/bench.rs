@@ -13,8 +13,8 @@
 //! production encoder (`aom`); quality is measured on RGB against the source
 //! pixels through libaom's own decoder and the inverse matrix.
 
-use super::convert::{to_rgb, Planar};
 use super::aom::AomEncoder;
+use super::convert::{to_rgb, Planar};
 use super::{open, Chroma, EncodeRequest, VideoCodec, VideoEncoder};
 use serde_json::json;
 use std::time::Instant;
@@ -46,10 +46,17 @@ impl Page {
 
     /// A WIDTH x HEIGHT window of the page at `top`, as BGRX rows.
     fn window(&self, top: usize) -> Vec<u8> {
-        assert!(top + HEIGHT <= self.height && WIDTH <= self.width, "page too small");
+        assert!(
+            top + HEIGHT <= self.height && WIDTH <= self.width,
+            "page too small"
+        );
         let stride = self.width * 4;
         (top..top + HEIGHT)
-            .flat_map(|row| self.bgrx[row * stride..row * stride + WIDTH * 4].iter().copied())
+            .flat_map(|row| {
+                self.bgrx[row * stride..row * stride + WIDTH * 4]
+                    .iter()
+                    .copied()
+            })
             .collect()
     }
 }
@@ -104,8 +111,16 @@ fn crop(picture: &Planar, path: &std::path::Path) {
     for y in 0..height {
         for x in 0..width {
             let (px, py) = (left + x, top + y);
-            let (cx, cy) = if subsampled { (px / 2, py / 2) } else { (px, py) };
-            let rgb = to_rgb(planes[0].0[py * WIDTH + px], planes[1].0[cy * chroma_width + cx], planes[2].0[cy * chroma_width + cx]);
+            let (cx, cy) = if subsampled {
+                (px / 2, py / 2)
+            } else {
+                (px, py)
+            };
+            let rgb = to_rgb(
+                planes[0].0[py * WIDTH + px],
+                planes[1].0[cy * chroma_width + cx],
+                planes[2].0[cy * chroma_width + cx],
+            );
             image.put_pixel(x as u32, y as u32, image::Rgb(rgb));
         }
     }
@@ -118,7 +133,11 @@ fn crop_source(source: &[u8], path: &std::path::Path) {
     for y in 0..height {
         for x in 0..width {
             let at = ((top + y) * WIDTH + left + x) * 4;
-            image.put_pixel(x as u32, y as u32, image::Rgb([source[at + 2], source[at + 1], source[at]]));
+            image.put_pixel(
+                x as u32,
+                y as u32,
+                image::Rgb([source[at + 2], source[at + 1], source[at]]),
+            );
         }
     }
     image.save(path).unwrap();
@@ -135,9 +154,15 @@ fn decode(decoder: &mut super::aom::tests::Decoder, data: &[u8], chroma: Chroma)
 /// The production encoder plus `VIDEO_BENCH_CONTROLS` (`id=value,...`).
 fn tuned(codec: VideoCodec, threads: u32) -> AomEncoder {
     let mut encoder = AomEncoder::new(codec, WIDTH as u32, HEIGHT as u32, threads).unwrap();
-    for pair in std::env::var("VIDEO_BENCH_CONTROLS").unwrap_or_default().split(',').filter(|pair| !pair.is_empty()) {
+    for pair in std::env::var("VIDEO_BENCH_CONTROLS")
+        .unwrap_or_default()
+        .split(',')
+        .filter(|pair| !pair.is_empty())
+    {
         let (id, value) = pair.split_once('=').unwrap();
-        encoder.tune(id.parse().unwrap(), value.parse().unwrap()).unwrap();
+        encoder
+            .tune(id.parse().unwrap(), value.parse().unwrap())
+            .unwrap();
     }
     encoder
 }
@@ -163,14 +188,33 @@ fn a_whole_page_change() {
             let mut encoder = tuned(codec, 4);
             let mut picture = Planar::new(codec.chroma(), WIDTH as u32, HEIGHT as u32);
             let mut times = Vec::new();
-            for (index, page) in [&page_b, &page_a, &page_b, &page_a, &page_b].into_iter().enumerate() {
+            for (index, page) in [&page_b, &page_a, &page_b, &page_a, &page_b]
+                .into_iter()
+                .enumerate()
+            {
                 assert!(picture.convert(&page.window(0), WIDTH * 4, (WIDTH, HEIGHT), (0, HEIGHT)));
                 let started = Instant::now();
-                let unit = encoder.encode(&picture.picture(), EncodeRequest { key: index == 0, quantizer }).unwrap();
+                let unit = encoder
+                    .encode(
+                        &picture.picture(),
+                        EncodeRequest {
+                            key: index == 0,
+                            quantizer,
+                        },
+                    )
+                    .unwrap();
                 times.push((started.elapsed().as_secs_f64() * 1000.0, unit.data.len()));
             }
-            println!("PAGE_CHANGE q{quantizer} controls[{}] key {:.0}ms {}KB, changes {:?}", std::env::var("VIDEO_BENCH_CONTROLS").unwrap_or_default(),
-                times[0].0, times[0].1 / 1024, times[1..].iter().map(|(ms, bytes)| format!("{ms:.0}ms {}KB", bytes / 1024)).collect::<Vec<_>>());
+            println!(
+                "PAGE_CHANGE q{quantizer} controls[{}] key {:.0}ms {}KB, changes {:?}",
+                std::env::var("VIDEO_BENCH_CONTROLS").unwrap_or_default(),
+                times[0].0,
+                times[0].1 / 1024,
+                times[1..]
+                    .iter()
+                    .map(|(ms, bytes)| format!("{ms:.0}ms {}KB", bytes / 1024))
+                    .collect::<Vec<_>>()
+            );
         }
     }
 }
@@ -279,7 +323,13 @@ fn encoder_on_screen_content_at_the_probe_surface() {
         for quantizer in [16u8, 24, 32, 40, 48] {
             let mut encoder = open(codec, WIDTH as u32, HEIGHT as u32, 4).unwrap();
             let unit = encoder
-                .encode(&planar.picture(), EncodeRequest { key: true, quantizer })
+                .encode(
+                    &planar.picture(),
+                    EncodeRequest {
+                        key: true,
+                        quantizer,
+                    },
+                )
                 .unwrap();
             let decoded = decode(&mut decoder, &unit.data, chroma);
             let entry = json!({"codec": codec.token(), "kind": "key", "quantizer": quantizer,
@@ -293,27 +343,53 @@ fn encoder_on_screen_content_at_the_probe_surface() {
             let mut decoder = super::aom::tests::Decoder::new();
             let mut encoder = open(codec, WIDTH as u32, HEIGHT as u32, 4).unwrap();
             let mut before = Planar::new(chroma, WIDTH as u32, HEIGHT as u32);
-            assert!(before.convert(&page_a.window(2000 - STEP), WIDTH * 4, (WIDTH, HEIGHT), (0, HEIGHT)));
+            assert!(before.convert(
+                &page_a.window(2000 - STEP),
+                WIDTH * 4,
+                (WIDTH, HEIGHT),
+                (0, HEIGHT)
+            ));
             let unit = encoder
-                .encode(&before.picture(), EncodeRequest { key: true, quantizer: ladder[0] })
+                .encode(
+                    &before.picture(),
+                    EncodeRequest {
+                        key: true,
+                        quantizer: ladder[0],
+                    },
+                )
                 .unwrap();
             decoder.decode(&unit.data);
             let mut steps = Vec::new();
             for (step, quantizer) in ladder.iter().enumerate() {
                 let started = Instant::now();
                 let unit = encoder
-                    .encode(&planar.picture(), EncodeRequest { key: false, quantizer: *quantizer })
+                    .encode(
+                        &planar.picture(),
+                        EncodeRequest {
+                            key: false,
+                            quantizer: *quantizer,
+                        },
+                    )
                     .unwrap();
                 let encode_ms = started.elapsed().as_secs_f64() * 1000.0;
                 let decoded = decode(&mut decoder, &unit.data, chroma);
-                steps.push(json!({"step": step, "quantizer": quantizer, "bytes": unit.data.len(),
-                    "encodeMs": encode_ms, "psnrRgb": rgb_psnr(&still, &decoded)}));
+                steps.push(
+                    json!({"step": step, "quantizer": quantizer, "bytes": unit.data.len(),
+                    "encodeMs": encode_ms, "psnrRgb": rgb_psnr(&still, &decoded)}),
+                );
                 if let Some(directory) = std::env::var_os("VIDEO_BENCH_CROPS") {
-                    crop(&decoded, &std::path::Path::new(&directory)
-                        .join(format!("{}-ladder{}-q{quantizer}.png", codec.token(), ladder.map(|q| q.to_string()).join("-"))));
+                    crop(
+                        &decoded,
+                        &std::path::Path::new(&directory).join(format!(
+                            "{}-ladder{}-q{quantizer}.png",
+                            codec.token(),
+                            ladder.map(|q| q.to_string()).join("-")
+                        )),
+                    );
                 }
             }
-            let entry = json!({"codec": codec.token(), "kind": "refine", "ladder": ladder, "steps": steps});
+            let entry =
+                json!({"codec": codec.token(), "kind": "refine", "ladder": ladder, "steps": steps});
             println!("VIDEO_BENCH {entry}");
             results.push(entry);
         }

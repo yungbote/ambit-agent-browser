@@ -212,7 +212,8 @@ type Encode = unsafe extern "C" fn(*mut Context, *const Image, i64, c_ulong, c_l
 type GetPacket = unsafe extern "C" fn(*mut Context, *mut *const c_void) -> *const Packet;
 type Destroy = unsafe extern "C" fn(*mut Context) -> c_int;
 type Describe = unsafe extern "C" fn(*const Context) -> *const c_char;
-type ImageWrap = unsafe extern "C" fn(*mut Image, c_uint, c_uint, c_uint, c_uint, *mut u8) -> *mut Image;
+type ImageWrap =
+    unsafe extern "C" fn(*mut Image, c_uint, c_uint, c_uint, c_uint, *mut u8) -> *mut Image;
 
 /// The functions this encoder calls, resolved once per process.
 struct Api {
@@ -255,7 +256,11 @@ impl Api {
             (!pointer.is_null())
                 // SAFETY: libaom returns NUL-terminated static or
                 // context-owned strings, copied at once.
-                .then(|| unsafe { CStr::from_ptr(pointer) }.to_string_lossy().into_owned())
+                .then(|| {
+                    unsafe { CStr::from_ptr(pointer) }
+                        .to_string_lossy()
+                        .into_owned()
+                })
         };
         // SAFETY: the context is initialized or zeroed; both accept these.
         let (error, detail) = unsafe { ((self.error)(context), (self.error_detail)(context)) };
@@ -475,10 +480,6 @@ impl Drop for AomEncoder {
 }
 
 impl VideoEncoder for AomEncoder {
-    fn codec(&self) -> VideoCodec {
-        self.codec
-    }
-
     fn coded(&self) -> (u32, u32) {
         (self.width, self.height)
     }

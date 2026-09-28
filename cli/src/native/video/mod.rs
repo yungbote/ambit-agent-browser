@@ -15,6 +15,10 @@ pub(crate) mod convert;
 #[cfg(target_os = "linux")]
 mod library;
 
+/// libaom's own decoder, for proofs that decode what the producer sent.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use aom::tests::{Decoded, Decoder};
+
 /// The closed vocabulary a viewer declares (`video=<token>,...`), in the
 /// producer's own order of preference: full chroma first, since text in
 /// colour survives it.
@@ -49,26 +53,41 @@ impl VideoCodec {
         }
     }
 
-    /// The viewer's declaration (`av1-444,av1`): distinct known tokens in
-    /// its order. Anything else declares nothing.
-    pub(crate) fn declaration(value: &str) -> Vec<Self> {
-        let mut codecs = Vec::new();
+    const fn bit(self) -> u8 {
+        1 << self as u8
+    }
+}
+
+/// The codecs a viewer declared (`video=<token>,...`). The producer's order,
+/// not the viewer's, chooses among them (contract section 1), so only the
+/// set is kept.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Declared(u8);
+
+impl Declared {
+    /// Distinct known tokens, or no declaration at all.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        let mut codecs = 0;
         for token in value.split(',') {
-            match Self::parse(token) {
-                Some(codec) if !codecs.contains(&codec) => codecs.push(codec),
-                _ => return Vec::new(),
+            let bit = VideoCodec::parse(token)?.bit();
+            if codecs & bit != 0 {
+                return None;
             }
+            codecs |= bit;
         }
-        codecs
+        Some(Self(codecs))
     }
 
-    /// The codec to offer a viewer that declared `declared`: the first in
-    /// the producer's order that the viewer listed and this process can
-    /// encode.
-    pub(crate) fn negotiate(declared: &[Self]) -> Option<Self> {
-        Self::ALL
+    pub(crate) const fn contains(self, codec: VideoCodec) -> bool {
+        self.0 & codec.bit() != 0
+    }
+
+    /// The codec to offer: the first in the producer's order that the
+    /// viewer declared and this process can encode.
+    pub(crate) fn negotiate(self) -> Option<VideoCodec> {
+        VideoCodec::ALL
             .into_iter()
-            .find(|codec| declared.contains(codec) && encodes(*codec))
+            .find(|codec| self.contains(*codec) && encodes(*codec))
     }
 }
 
@@ -157,7 +176,6 @@ impl std::fmt::Display for VideoError {
 /// One stream's encoder: one picture in, exactly one temporal unit out, in
 /// the same call. No lookahead, no reordering, no frame delay.
 pub(crate) trait VideoEncoder: Send {
-    fn codec(&self) -> VideoCodec;
     /// The encoded picture size.
     fn coded(&self) -> (u32, u32);
     /// The WebCodecs codec string of this stream.
@@ -204,7 +222,9 @@ pub(crate) fn open(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (codec, width, height, threads);
-        Err(VideoError::Unavailable("no video encoder on this platform".into()))
+        Err(VideoError::Unavailable(
+            "no video encoder on this platform".into(),
+        ))
     }
 }
 
@@ -214,16 +234,33 @@ mod tests {
 
     #[test]
     fn a_declaration_is_distinct_known_tokens_or_nothing() {
-        assert_eq!(
-            VideoCodec::declaration("av1-444,av1,vp9"),
-            vec![VideoCodec::Av1Full, VideoCodec::Av1, VideoCodec::Vp9]
-        );
+        let declared = Declared::parse("vp9,av1,av1-444").unwrap();
+        for (codec, listed) in [
+            (VideoCodec::Av1Full, true),
+            (VideoCodec::Av1, true),
+            (VideoCodec::Vp9Full, false),
+            (VideoCodec::Vp9, true),
+        ] {
+            assert_eq!(declared.contains(codec), listed, "{codec:?}");
+        }
         for invalid in ["", "h264", "av1,av1", "av1,,vp9", "AV1", "av1 ,vp9"] {
-            assert!(VideoCodec::declaration(invalid).is_empty(), "{invalid}");
+            assert_eq!(Declared::parse(invalid), None, "{invalid}");
         }
         for codec in VideoCodec::ALL {
             assert_eq!(VideoCodec::parse(codec.token()), Some(codec));
         }
+    }
+
+    /// The producer's order decides, and only a codec it can encode is
+    /// offered: VP9 never is, whatever the viewer prefers.
+    #[test]
+    fn negotiation_follows_the_producers_order_among_what_it_encodes() {
+        let aom = encodes(VideoCodec::Av1);
+        assert_eq!(aom, encodes(VideoCodec::Av1Full));
+        let offer = |value: &str| Declared::parse(value).unwrap().negotiate();
+        assert_eq!(offer("av1,av1-444"), aom.then_some(VideoCodec::Av1Full));
+        assert_eq!(offer("vp9,av1"), aom.then_some(VideoCodec::Av1));
+        assert_eq!(offer("vp9-444,vp9"), None);
     }
 
     #[test]
@@ -248,7 +285,10 @@ mod tests {
             data: &full,
         };
         assert_eq!(
-            picture.planes().unwrap().map(|(plane, stride)| (plane.len(), stride)),
+            picture
+                .planes()
+                .unwrap()
+                .map(|(plane, stride)| (plane.len(), stride)),
             [(8, 4), (8, 4), (8, 4)]
         );
         for (chroma, width, height, bytes) in [

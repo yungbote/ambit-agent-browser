@@ -63,7 +63,11 @@ fn every_field_sits_where_the_pinned_headers_put_it() {
 fn the_level_is_the_smallest_that_holds_the_stream_at_sixty_pictures() {
     assert_eq!(level(64, 64), 8);
     assert_eq!(level(1280, 720), 8);
-    assert_eq!(level(1920, 1080), 9, "124.4 M samples/s exceed 4.0's 70.8 M");
+    assert_eq!(
+        level(1920, 1080),
+        9,
+        "124.4 M samples/s exceed 4.0's 70.8 M"
+    );
     assert_eq!(level(2048, 2048), 12);
     assert_eq!(level(4096, 2176), 13);
     assert_eq!(level(4096, 4096), 16);
@@ -104,17 +108,35 @@ fn a_picture_of_another_size_chroma_or_quantizer_fails_that_picture_only() {
     let right = Planar::new(Chroma::Full, 64, 64);
     for picture in [wrong_size.picture(), wrong_chroma.picture()] {
         assert!(matches!(
-            encoder.encode(&picture, EncodeRequest { key: true, quantizer: 20 }),
+            encoder.encode(
+                &picture,
+                EncodeRequest {
+                    key: true,
+                    quantizer: 20
+                }
+            ),
             Err(VideoError::Failed(_))
         ));
     }
     assert!(matches!(
-        encoder.encode(&right.picture(), EncodeRequest { key: true, quantizer: 64 }),
+        encoder.encode(
+            &right.picture(),
+            EncodeRequest {
+                key: true,
+                quantizer: 64
+            }
+        ),
         Err(VideoError::Failed(_))
     ));
     // The encoder is intact: the refused pictures never reached libaom.
     let unit = encoder
-        .encode(&right.picture(), EncodeRequest { key: true, quantizer: 20 })
+        .encode(
+            &right.picture(),
+            EncodeRequest {
+                key: true,
+                quantizer: 20,
+            },
+        )
         .unwrap();
     assert!(unit.key);
 }
@@ -159,7 +181,13 @@ fn the_sequence_header_signals_the_codec_string_and_colour_description() {
         let mut encoder = AomEncoder::new(codec, width, height, 2).unwrap();
         let picture = Planar::new(codec.chroma(), width, height);
         let unit = encoder
-            .encode(&picture.picture(), EncodeRequest { key: true, quantizer: 40 })
+            .encode(
+                &picture.picture(),
+                EncodeRequest {
+                    key: true,
+                    quantizer: 40,
+                },
+            )
             .unwrap();
         let header = sequence_header(&unit.data).expect("a key unit carries its sequence header");
         let profile = u8::from(codec.chroma() == Chroma::Full);
@@ -171,7 +199,12 @@ fn the_sequence_header_signals_the_codec_string_and_colour_description() {
         assert_eq!(header.level, level(width, height));
         assert_eq!(header.tier, 0);
         assert_eq!(
-            (header.primaries, header.transfer, header.matrix, header.full_range),
+            (
+                header.primaries,
+                header.transfer,
+                header.matrix,
+                header.full_range
+            ),
             (Some(1), Some(13), Some(1), true)
         );
         assert_eq!(
@@ -183,7 +216,11 @@ fn the_sequence_header_signals_the_codec_string_and_colour_description() {
         );
     }
     let encoder = AomEncoder::new(VideoCodec::Av1Full, 2048, 2048, 1).unwrap();
-    assert_eq!(encoder.codec_string(), "av01.1.12M.08", "the contract's probe string");
+    assert_eq!(
+        encoder.codec_string(),
+        "av01.1.12M.08",
+        "the contract's probe string"
+    );
 }
 
 /// A screen of text (1 px strokes, grey antialiasing, coloured links) and
@@ -205,7 +242,13 @@ fn text_and_colour_bars_survive_convert_encode_decode_and_the_inverse_matrix() {
         ));
         let mut encoder = AomEncoder::new(codec, width, height, 2).unwrap();
         let unit = encoder
-            .encode(&picture.picture(), EncodeRequest { key: true, quantizer: 8 })
+            .encode(
+                &picture.picture(),
+                EncodeRequest {
+                    key: true,
+                    quantizer: 8,
+                },
+            )
             .unwrap();
         let decoded = Decoder::new().decode(&unit.data);
         assert_eq!((decoded.width, decoded.height), (width, height));
@@ -216,7 +259,10 @@ fn text_and_colour_bars_survive_convert_encode_decode_and_the_inverse_matrix() {
             Chroma::Full => 44.0,
             Chroma::Subsampled => 30.0,
         };
-        assert!(psnr >= floor, "{codec:?}: RGB PSNR {psnr:.1} dB below {floor}");
+        assert!(
+            psnr >= floor,
+            "{codec:?}: RGB PSNR {psnr:.1} dB below {floor}"
+        );
         // The bars (the bottom 32 rows) keep their hue: every channel within
         // a few code values of the source, never a tint.
         let bar = width as usize / 8;
@@ -271,9 +317,8 @@ fn text_fixture(width: usize, height: usize) -> Vec<u8> {
                     let weight = if step == 0 || step == 5 { 128u16 } else { 255 };
                     for (channel, value) in [(2, ink[0]), (1, ink[1]), (0, ink[2])] {
                         let background = u16::from(pixels[offset + channel]);
-                        pixels[offset + channel] = ((u16::from(value) * weight
-                            + background * (255 - weight))
-                            / 255) as u8;
+                        pixels[offset + channel] =
+                            ((u16::from(value) * weight + background * (255 - weight)) / 255) as u8;
                     }
                 }
             }
@@ -312,7 +357,7 @@ fn psnr(source: &[u8], rgb: &[u8], width: usize, height: usize) -> f64 {
     10.0 * (255.0 * 255.0 / mse.max(1e-9)).log10()
 }
 
-pub(in crate::native::video) struct Decoded {
+pub(crate) struct Decoded {
     pub chroma: Chroma,
     pub width: u32,
     pub height: u32,
@@ -322,7 +367,7 @@ pub(in crate::native::video) struct Decoded {
 impl Decoded {
     /// RGB, four bytes per pixel (the fourth unused), through the exact
     /// inverse of the stream's matrix and range.
-    fn rgb(&self) -> Vec<u8> {
+    pub(crate) fn rgb(&self) -> Vec<u8> {
         let (width, height) = (self.width as usize, self.height as usize);
         let chroma_width = match self.chroma {
             Chroma::Full => width,
@@ -348,7 +393,7 @@ impl Decoded {
 }
 
 /// libaom's own AV1 decoder, through the same library, for proofs only.
-pub(in crate::native::video) struct Decoder {
+pub(crate) struct Decoder {
     _library: Library,
     context: Box<Context>,
     decode: unsafe extern "C" fn(*mut Context, *const u8, usize, *mut c_void) -> c_int,
@@ -357,7 +402,7 @@ pub(in crate::native::video) struct Decoder {
 }
 
 impl Decoder {
-    pub(in crate::native::video) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         #[repr(C)]
         struct DecoderConfig {
             threads: c_uint,
@@ -396,10 +441,15 @@ impl Decoder {
         }
     }
 
-    pub(in crate::native::video) fn decode(&mut self, data: &[u8]) -> Decoded {
+    pub(crate) fn decode(&mut self, data: &[u8]) -> Decoded {
         // SAFETY: an initialized decoder and a unit it may read.
         let status = unsafe {
-            (self.decode)(&mut *self.context, data.as_ptr(), data.len(), std::ptr::null_mut())
+            (self.decode)(
+                &mut *self.context,
+                data.as_ptr(),
+                data.len(),
+                std::ptr::null_mut(),
+            )
         };
         assert_eq!(status, CODEC_OK);
         let mut iterator: *const c_void = std::ptr::null();
@@ -419,7 +469,10 @@ impl Decoder {
                     // SAFETY: the decoder's plane holds plane_height rows of
                     // at least plane_width bytes, stride bytes apart.
                     unsafe {
-                        std::slice::from_raw_parts(image.planes[index].add(row * stride), plane_width)
+                        std::slice::from_raw_parts(
+                            image.planes[index].add(row * stride),
+                            plane_width,
+                        )
                     }
                     .to_vec()
                 })
@@ -551,7 +604,11 @@ fn sequence_header(unit: &[u8]) -> Option<SequenceHeader> {
             for _ in 0..points {
                 bits.read(12);
                 let point_level = bits.read(5) as u8;
-                let point_tier = if point_level > 7 { bits.read(1) as u8 } else { 0 };
+                let point_tier = if point_level > 7 {
+                    bits.read(1) as u8
+                } else {
+                    0
+                };
                 if decoder_model && bits.read(1) == 1 {
                     bits.read(buffer_delay_length);
                     bits.read(buffer_delay_length);

@@ -28,7 +28,9 @@ fn luma(r: i32, g: i32, b: i32) -> u8 {
 /// Chroma of `r`, `g`, `b` summed over `2^extra` pixels.
 #[inline(always)]
 fn chroma(coefficients: [i32; 3], r: i32, g: i32, b: i32, extra: u32) -> u8 {
-    let value = (coefficients[0] * r + coefficients[1] * g + coefficients[2] * b
+    let value = (coefficients[0] * r
+        + coefficients[1] * g
+        + coefficients[2] * b
         + (CHROMA_ZERO << extra)
         + (HALF << extra))
         >> (SHIFT + extra);
@@ -186,7 +188,11 @@ fn convert_full(source: &[u8], luma_row: &mut [u8], cb_row: &mut [u8], cr_row: &
         .zip(cb_row.iter_mut())
         .zip(cr_row.iter_mut())
     {
-        let (b, g, r) = (i32::from(pixel[0]), i32::from(pixel[1]), i32::from(pixel[2]));
+        let (b, g, r) = (
+            i32::from(pixel[0]),
+            i32::from(pixel[1]),
+            i32::from(pixel[2]),
+        );
         *y = luma(r, g, b);
         *cb = chroma(CB, r, g, b, 0);
         *cr = chroma(CR, r, g, b, 0);
@@ -342,7 +348,15 @@ mod tests {
         assert!(picture.convert(&source, 8, (2, 3), (1, 2)));
         let planes = picture.picture().planes().unwrap();
         let luma: Vec<&[u8]> = planes[0].0.chunks(4).collect();
-        assert_eq!(luma, [&[0, 0, 0, 0], &[255, 255, 0, 0], &[0, 0, 0, 0], &[0, 0, 0, 0]]);
+        assert_eq!(
+            luma,
+            [
+                &[0, 0, 0, 0],
+                &[255, 255, 0, 0],
+                &[0, 0, 0, 0],
+                &[0, 0, 0, 0]
+            ]
+        );
         // A source row beyond what the buffer holds is refused, not read.
         assert!(!picture.convert(&source[..20], 8, (2, 3), (0, 3)));
         assert!(picture.convert(&source, 8, (2, 3), (0, 3)));

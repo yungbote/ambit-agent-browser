@@ -103,9 +103,10 @@ impl PictureReply {
     }
 }
 
-/// What one request returned: the picture, when the screen changed (seen
-/// through the caller's `read`), and the cursor identity, when it changed.
+/// What one request returned: the picture (seen through the caller's
+/// `read`), and the cursor identity, when it changed.
 pub(crate) struct Answer<T> {
+    /// None only before the slot ever held a picture.
     pub picture: Option<T>,
     pub cursor: Option<Value>,
 }
@@ -161,6 +162,8 @@ impl Drop for Mapping {
 struct Wire {
     reader: BufReader<UnixStream>,
     writer: UnixStream,
+    /// The last picture the helper wrote: the slot holds it until the next.
+    last: Option<PictureReply>,
 }
 
 pub(crate) struct PictureChannel {
@@ -201,6 +204,7 @@ impl PictureChannel {
                 wire: Mutex::new(Wire {
                     reader: BufReader::new(ours.try_clone()?),
                     writer: ours.try_clone()?,
+                    last: None,
                 }),
                 abort: ours,
                 pixels,
@@ -224,9 +228,10 @@ impl PictureChannel {
     }
 
     /// One picture. `read` sees the reply and the slot while no other
-    /// request can rewrite it, and runs only when the screen changed. Any
-    /// broken or incoherent answer ends the channel: the helper is not
-    /// trusted to be half-working.
+    /// request can rewrite it. When the screen did not change, the slot
+    /// still holds the previous picture, which is then the screen now:
+    /// `read` sees it again with no rows written. Any broken or incoherent
+    /// answer ends the channel: the helper is not trusted to be half-working.
     pub(crate) fn picture<T>(
         &self,
         request: PictureRequest,
@@ -267,10 +272,15 @@ impl PictureChannel {
             .and_then(|data| data.remove("cursor"))
             .filter(Value::is_object);
         if data["changed"] == false {
-            return Ok(Answer {
-                picture: None,
-                cursor,
+            let picture = wire.last.as_ref().map(|last| {
+                let unchanged = PictureReply {
+                    rows: Vec::new(),
+                    timings: None,
+                    ..last.clone()
+                };
+                read(&unchanged, self.slot(&unchanged))
             });
+            return Ok(Answer { picture, cursor });
         }
         let reply: PictureReply = match serde_json::from_value(data) {
             Ok(reply) if PictureReply::coherent(&reply, request) => reply,
@@ -279,11 +289,17 @@ impl PictureChannel {
                 return Err(DisplayError::unavailable());
             }
         };
-        let pixels = &self.pixels.bytes()[..reply.stride as usize * reply.height as usize];
+        let picture = read(&reply, self.slot(&reply));
+        wire.last = Some(reply);
         Ok(Answer {
-            picture: Some(read(&reply, pixels)),
+            picture: Some(picture),
             cursor,
         })
+    }
+
+    /// The slot's bytes of a coherent picture.
+    fn slot(&self, reply: &PictureReply) -> &[u8] {
+        &self.pixels.bytes()[..reply.stride as usize * reply.height as usize]
     }
 
     fn exchange(&self, wire: &mut Wire, command: &Value, wait_ms: u32) -> std::io::Result<Value> {
@@ -338,9 +354,16 @@ pub(crate) mod fake {
 
         /// The next request.
         pub(crate) fn request(&mut self) -> Value {
+            self.next_request().expect("a picture request")
+        }
+
+        /// The next request, or none once the driver closed the channel.
+        pub(crate) fn next_request(&mut self) -> Option<Value> {
             let mut line = String::new();
-            self.socket.read_line(&mut line).unwrap();
-            serde_json::from_str(&line).unwrap()
+            match self.socket.read_line(&mut line) {
+                Ok(0) | Err(_) => None,
+                Ok(_) => Some(serde_json::from_str(&line).unwrap()),
+            }
         }
 
         /// Paints rows `[top, bottom)` of a `width`-wide framebuffer one
@@ -386,17 +409,24 @@ mod tests {
     }
 
     /// A picture's reader sees exactly the rows the helper wrote, and an
-    /// unchanged answer still carries a new cursor identity.
+    /// unchanged answer still carries a new cursor identity. Unchanged, the
+    /// slot still holds the previous picture, which the reader sees again
+    /// with no rows written; before any picture there is nothing to see.
     #[test]
     fn a_picture_reads_the_shared_rows_the_helper_named() {
         let handover = PictureChannel::create().unwrap();
         let mut helper = FakeHelper::from(&handover);
         let channel = handover.channel;
         let peer = std::thread::spawn(move || {
+            let empty = helper.request();
+            helper.answer(
+                &empty,
+                json!({"changed":false,"cursor":{"serial":2,"css":"default"}}),
+            );
             let first = helper.request();
             assert_eq!(
                 first,
-                json!({"id":1,"op":"picture","cursor":false,"waitMs":100,"cursorIdentity":true})
+                json!({"id":2,"op":"picture","cursor":false,"waitMs":100,"cursorIdentity":true})
             );
             helper.paint(8, 2, 4, [1, 2, 3, 0]);
             helper.answer(
@@ -408,18 +438,35 @@ mod tests {
             helper.answer(&second, json!({"changed":false}));
             helper
         });
+        let nothing = channel.picture(request(), |_, _| ()).unwrap();
+        assert!(nothing.picture.is_none(), "no picture in the slot yet");
+        assert_eq!(nothing.cursor.unwrap()["serial"], 2);
         let answer = channel
             .picture(request(), |reply, pixels| {
                 assert_eq!(reply.rows, vec![[2, 4]]);
                 assert_eq!(reply.wait_us(), 42);
-                assert_eq!(reply.window(), Rect { x: 0, y: 0, width: 8, height: 6 });
+                assert_eq!(
+                    reply.window(),
+                    Rect {
+                        x: 0,
+                        y: 0,
+                        width: 8,
+                        height: 6
+                    }
+                );
                 pixels[2 * 32..4 * 32].to_vec()
             })
             .unwrap();
         assert_eq!(answer.picture.unwrap(), [1, 2, 3, 0].repeat(16));
         assert_eq!(answer.cursor.unwrap()["css"], "text");
-        let unchanged = channel.picture(request(), |_, _| ()).unwrap();
-        assert!(unchanged.picture.is_none());
+        let unchanged = channel
+            .picture(request(), |reply, pixels| {
+                assert!(reply.rows.is_empty(), "nothing new was written");
+                assert_eq!((reply.width, reply.height, reply.stride), (8, 6, 32));
+                pixels[2 * 32..4 * 32].to_vec()
+            })
+            .unwrap();
+        assert_eq!(unchanged.picture.unwrap(), [1, 2, 3, 0].repeat(16));
         peer.join().unwrap();
     }
 
@@ -463,8 +510,10 @@ mod tests {
             ..request()
         };
         let reply = |rows: Value| -> PictureReply {
-            serde_json::from_value(json!({"width":8,"height":6,"stride":32,"rows":rows,"cursorIncluded":false}))
-                .unwrap()
+            serde_json::from_value(
+                json!({"width":8,"height":6,"stride":32,"rows":rows,"cursorIncluded":false}),
+            )
+            .unwrap()
         };
         assert!(reply(json!([[0, 6]])).coherent(forced));
         assert!(!reply(json!([[0, 4]])).coherent(forced));

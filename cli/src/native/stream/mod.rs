@@ -10,6 +10,7 @@ mod http;
 pub(crate) mod layout;
 pub(crate) mod presentation;
 mod track;
+mod video;
 mod websocket;
 mod window_capture;
 mod wire;

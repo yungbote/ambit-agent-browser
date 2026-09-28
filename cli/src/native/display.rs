@@ -914,10 +914,22 @@ mod platform {
             let mut inherited = vec![(frame_channel.as_raw_fd(), FRAME_CHANNEL_FD)];
             if let Some(handover) = &pictures {
                 command
-                    .env("BROWSER_DISPLAY_PICTURE_FD", super::pictures::CHANNEL_FD.to_string())
-                    .env("BROWSER_DISPLAY_PIXELS_FD", super::pictures::PIXELS_FD.to_string());
-                inherited.push((handover.helper_socket.as_raw_fd(), super::pictures::CHANNEL_FD));
-                inherited.push((handover.helper_pixels.as_raw_fd(), super::pictures::PIXELS_FD));
+                    .env(
+                        "BROWSER_DISPLAY_PICTURE_FD",
+                        super::pictures::CHANNEL_FD.to_string(),
+                    )
+                    .env(
+                        "BROWSER_DISPLAY_PIXELS_FD",
+                        super::pictures::PIXELS_FD.to_string(),
+                    );
+                inherited.push((
+                    handover.helper_socket.as_raw_fd(),
+                    super::pictures::CHANNEL_FD,
+                ));
+                inherited.push((
+                    handover.helper_pixels.as_raw_fd(),
+                    super::pictures::PIXELS_FD,
+                ));
             }
             // SAFETY: fcntl and dup2 are async-signal-safe and the only work
             // done between fork and exec. Every source first moves above the

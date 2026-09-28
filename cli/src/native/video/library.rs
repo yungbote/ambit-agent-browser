@@ -65,7 +65,9 @@ mod tests {
 
     #[test]
     fn a_missing_library_and_symbol_are_errors_not_crashes() {
-        let missing = Library::open(c"libambit-does-not-exist.so.0").err().unwrap();
+        let missing = Library::open(c"libambit-does-not-exist.so.0")
+            .err()
+            .unwrap();
         assert!(missing.contains("libambit-does-not-exist"), "{missing}");
         let libc = Library::open(c"libc.so.6").unwrap();
         type Getpid = unsafe extern "C" fn() -> libc::pid_t;
