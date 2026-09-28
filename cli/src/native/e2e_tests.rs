@@ -13926,7 +13926,7 @@ async fn e2e_native_motion_proof() {
     env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
     env.set("DISPLAY", "");
     let mut state = DaemonState::new();
-    let html = r#"<!doctype html><style>body{margin:0;height:20000px;font:16px sans-serif}#field{position:absolute;left:80px;top:80px;width:420px;font-size:20px}#go{position:absolute;left:880px;top:420px;width:120px;height:40px}#src{position:absolute;left:120px;top:300px;width:60px;height:60px;background:#48f}#dst{position:absolute;left:620px;top:300px;width:90px;height:90px;background:#4a4}#box{position:absolute;left:560px;top:110px;width:300px;height:160px;overflow:auto}#box div{height:2000px}#far{position:absolute;left:600px;top:15000px;width:160px;height:48px}</style><input id=field><button id=go>Go</button><div id=src></div><div id=dst></div><div id=box><div></div></div><button id=far>Far</button><script>window.log=[];for(const type of ['pointermove','pointerdown','pointerup','click','keydown','scroll','wheel'])addEventListener(type,e=>log.push({type,t:performance.now(),trusted:e.isTrusted,buttons:e.buttons||0,x:e.clientX||0,y:e.clientY||0,key:e.key||'',scrollY,id:(e.target&&e.target.id)||''}),{capture:true,passive:true});src.onpointerdown=e=>src.setPointerCapture(e.pointerId)</script>"#;
+    let html = r#"<!doctype html><style>body{margin:0;height:20000px;font:16px sans-serif}#field{position:absolute;left:80px;top:80px;width:420px;font-size:20px}#go{position:absolute;left:880px;top:420px;width:120px;height:40px}#src{position:absolute;left:120px;top:300px;width:60px;height:60px;background:#48f}#dst{position:absolute;left:620px;top:300px;width:90px;height:90px;background:#4a4}#box{position:absolute;left:560px;top:110px;width:300px;height:160px;overflow:auto}#box div{height:2000px}#far{position:absolute;left:600px;top:15000px;width:160px;height:48px}</style><input id=field><button id=go>Go</button><div id=src></div><div id=dst></div><div id=box><div></div></div><button id=far>Far</button><script>window.log=[];for(const type of ['pointermove','pointerdown','pointerup','click','keydown','scroll','wheel'])addEventListener(type,e=>log.push({type,t:performance.now(),trusted:e.isTrusted,buttons:e.buttons||0,x:e.clientX||0,y:e.clientY||0,key:e.key||'',scrollY,id:(e.target&&e.target.id)||'',shift:!!e.shiftKey}),{capture:true,passive:true});src.onpointerdown=e=>src.setPointerCapture(e.pointerId)</script>"#;
     assert_success(
         &control_test_command(
             &json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}),
@@ -14501,7 +14501,69 @@ async fn e2e_native_motion_proof() {
         "wheel_events": back_activity.iter().filter(|event| event["eventType"] == "scroll").count(),
     });
 
+    // Keys held and inserted: Shift held down across a click reaches the
+    // page as a shift-click, and `inserttext` types short text key by key
+    // and pastes long text.
+    page_log(&mut state).await;
+    for command in [
+        json!({"action":"keydown","key":"Shift"}),
+        json!({"action":"click","selector":"#go"}),
+        json!({"action":"keyup","key":"Shift"}),
+    ] {
+        assert_success(&control_test_command(&command, &mut state).await);
+    }
+    let held_page = page_log(&mut state).await;
+    let shift_click = held_page
+        .iter()
+        .find(|event| event["type"] == "click" && event["id"] == "go")
+        .expect("the click reached the page");
+    assert_eq!(shift_click["shift"], true, "{shift_click}");
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#field"}), &mut state).await,
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"evaluate","script":"field.value=''; log.splice(0); 0"}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"inserttext","text":"hello"}), &mut state).await,
+    );
+    let short_keys = page_log(&mut state)
+        .await
+        .iter()
+        .filter(|event| event["type"] == "keydown" && event["trusted"] == true)
+        .count();
+    let pasted = "p".repeat(70);
+    assert_success(
+        &control_test_command(&json!({"action":"inserttext","text":pasted}), &mut state).await,
+    );
+    // A paste is the helper's own Control+V with the text on the clipboard.
+    let long_keys: Vec<String> = page_log(&mut state)
+        .await
+        .iter()
+        .filter(|event| event["type"] == "keydown")
+        .map(|event| event["key"].as_str().unwrap_or_default().to_owned())
+        .collect();
+    let inserted = control_test_command(
+        &json!({"action":"evaluate","script":"field.value"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(short_keys, 5, "short text is typed key by key");
+    assert_eq!(long_keys, ["Control", "v"], "long text is pasted");
+    assert_eq!(inserted["data"]["result"], format!("hello{pasted}"));
+    let keys = json!({
+        "shift_click": shift_click["shift"],
+        "inserttext_short_keydowns": short_keys,
+        "inserttext_long_keydowns": long_keys,
+        "inserttext_long_chars": 70,
+    });
+
     let proof = json!({
+        "keys": keys,
         "far_click": far_click,
         "scrollintoview": into_view,
         "click": click,

@@ -604,8 +604,20 @@ impl BrowserControl {
                         InputSource::Agent,
                     )
                 });
-            for batch in events[stroke.events.clone()].chunks(MAX_EVENTS) {
+            // Held keys' modifiers ride on every event: the helper sets the
+            // modifier keys to each event's mask.
+            let held = self.native_mouse.held_modifiers();
+            let stroke_events: Vec<Value> = events[stroke.events.clone()]
+                .iter()
+                .map(|event| {
+                    let mut event = event.clone();
+                    event["modifiers"] = json!(event["modifiers"].as_i64().unwrap_or(0) | held);
+                    event
+                })
+                .collect();
+            for batch in stroke_events.chunks(MAX_EVENTS) {
                 let Err(error) = display.input(batch).await else {
+                    self.native_mouse.keys_acknowledged(batch);
                     continue;
                 };
                 if error.operation_performed == Some(json!(false)) {

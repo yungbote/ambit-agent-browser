@@ -3439,11 +3439,11 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         "swipe" => handle_swipe(cmd, state).await,
         "device_list" => handle_device_list().await,
         "input_mouse" => stating(handle_input_mouse(cmd, state).await, &mut failure_data),
-        "input_keyboard" => handle_input_keyboard(cmd, state).await,
+        "input_keyboard" => stating(handle_input_keyboard(cmd, state).await, &mut failure_data),
         "input_touch" => handle_input_touch(cmd, state).await,
-        "keydown" => handle_keydown(cmd, state).await,
-        "keyup" => handle_keyup(cmd, state).await,
-        "inserttext" => handle_inserttext(cmd, state).await,
+        "keydown" => stating(handle_keydown(cmd, state).await, &mut failure_data),
+        "keyup" => stating(handle_keyup(cmd, state).await, &mut failure_data),
+        "inserttext" => stating(handle_inserttext(cmd, state).await, &mut failure_data),
         "mousemove" => stating(handle_mousemove(cmd, state).await, &mut failure_data),
         "mousedown" => stating(handle_mousedown(cmd, state).await, &mut failure_data),
         "mouseup" => stating(handle_mouseup(cmd, state).await, &mut failure_data),
@@ -6415,6 +6415,24 @@ fn key_interval(delay_ms: Option<u64>) -> std::time::Duration {
         .max(super::browser_control::motion::KEY_INTERVAL)
 }
 
+/// Keyboard events to whatever has focus in the owned native window, one
+/// key per interval, with the held keys the native owner tracks.
+async fn native_keys(state: &DaemonState, events: &[Value]) -> Result<(), CommandError> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?;
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_native_keys(
+            events,
+            super::browser_control::motion::KEY_INTERVAL,
+            &mgr.client,
+            session_id,
+        )
+        .await
+}
+
 /// Keystrokes to whatever has focus in the owned native window, one key
 /// per interval.
 async fn native_type(
@@ -7596,7 +7614,7 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Comm
                     .lock()
                     .await
                     .agent_native_keys(
-                        &interaction::native_paste_events(text),
+                        &interaction::native_inserted_events(text),
                         super::browser_control::motion::KEY_INTERVAL,
                         &mgr.client,
                         &session_id,
@@ -13127,7 +13145,7 @@ async fn handle_input_mouse(cmd: &Value, state: &mut DaemonState) -> Result<Valu
     Ok(json!({ "dispatched": event_type }))
 }
 
-async fn handle_input_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_input_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let event_type = cmd
@@ -13142,6 +13160,14 @@ async fn handle_input_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value
         }
     }
 
+    if state.browser_control.lock().await.has_native_display() {
+        let mut event = params.clone();
+        event["type"] = json!("input_keyboard");
+        event["eventType"] = json!(event_type);
+        event["modifiers"] = json!(cmd.get("modifiers").and_then(Value::as_i64).unwrap_or(0));
+        native_keys(state, &[event]).await?;
+        return Ok(json!({ "dispatched": event_type }));
+    }
     state
         .browser_control
         .lock()
@@ -13175,7 +13201,7 @@ async fn handle_input_touch(cmd: &Value, state: &DaemonState) -> Result<Value, S
     Ok(json!({ "dispatched": event_type }))
 }
 
-async fn handle_keydown(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_keydown(cmd: &Value, state: &DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let key = cmd
@@ -13183,6 +13209,10 @@ async fn handle_keydown(cmd: &Value, state: &DaemonState) -> Result<Value, Strin
         .and_then(|v| v.as_str())
         .ok_or("Missing 'key' parameter")?;
 
+    if state.browser_control.lock().await.has_native_display() {
+        native_keys(state, &[interaction::native_key_transition(key, "keyDown")]).await?;
+        return Ok(json!({ "keydown": key }));
+    }
     state
         .browser_control
         .lock()
@@ -13197,7 +13227,7 @@ async fn handle_keydown(cmd: &Value, state: &DaemonState) -> Result<Value, Strin
     Ok(json!({ "keydown": key }))
 }
 
-async fn handle_keyup(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_keyup(cmd: &Value, state: &DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let key = cmd
@@ -13205,6 +13235,10 @@ async fn handle_keyup(cmd: &Value, state: &DaemonState) -> Result<Value, String>
         .and_then(|v| v.as_str())
         .ok_or("Missing 'key' parameter")?;
 
+    if state.browser_control.lock().await.has_native_display() {
+        native_keys(state, &[interaction::native_key_transition(key, "keyUp")]).await?;
+        return Ok(json!({ "keyup": key }));
+    }
     state
         .browser_control
         .lock()
@@ -13219,7 +13253,7 @@ async fn handle_keyup(cmd: &Value, state: &DaemonState) -> Result<Value, String>
     Ok(json!({ "keyup": key }))
 }
 
-async fn handle_inserttext(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
+async fn handle_inserttext(cmd: &Value, state: &DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let text = cmd
@@ -13227,6 +13261,10 @@ async fn handle_inserttext(cmd: &Value, state: &DaemonState) -> Result<Value, St
         .and_then(|v| v.as_str())
         .ok_or("Missing 'text' parameter")?;
 
+    if state.browser_control.lock().await.has_native_display() {
+        native_keys(state, &interaction::native_inserted_events(text)).await?;
+        return Ok(json!({ "inserted": true }));
+    }
     mgr.client
         .send_command(
             "Input.insertText",

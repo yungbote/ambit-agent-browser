@@ -471,7 +471,7 @@ pub(crate) async fn native_fill(
     value: &str,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<NativeFill, CommandError> {
-    use super::browser_control::motion::{KEY_INTERVAL, PASTE_ABOVE_CHARS};
+    use super::browser_control::motion::KEY_INTERVAL;
     let field = match click_field(
         client,
         control,
@@ -506,11 +506,7 @@ pub(crate) async fn native_fill(
         }
     }
     if !value.is_empty() {
-        let events = if value.chars().count() > PASTE_ABOVE_CHARS {
-            native_paste_events(value)
-        } else {
-            native_text_events(value)
-        };
+        let events = native_inserted_events(value);
         type_after_click(control, client, session_id, &events, KEY_INTERVAL).await?;
     }
     let state = field_state(
@@ -1776,6 +1772,16 @@ pub(crate) fn native_text_events(text: &str) -> Vec<Value> {
 }
 
 /// The events of one visible paste of `text`, as a person pastes a value.
+/// Text inserted as a person enters it: typed key by key, or one visible
+/// paste above `motion::PASTE_ABOVE_CHARS` characters.
+pub(crate) fn native_inserted_events(text: &str) -> Vec<Value> {
+    if text.chars().count() > super::browser_control::motion::PASTE_ABOVE_CHARS {
+        native_paste_events(text)
+    } else {
+        native_text_events(text)
+    }
+}
+
 pub(crate) fn native_paste_events(text: &str) -> Vec<Value> {
     vec![json!({ "type": "input_keyboard", "eventType": "insertText", "text": text })]
 }
@@ -1808,8 +1814,29 @@ fn native_key_events(key: &str, code: &str, modifiers: i32) -> Vec<Value> {
     ]
 }
 
+/// One key going down or up in the owned window, as `keydown` and `keyup`
+/// send it: its physical key, and the text a printable key types as it goes
+/// down.
+pub(crate) fn native_key_transition(key: &str, event_type: &str) -> Value {
+    let (key_name, code, _) = named_key_info(key);
+    let mut event = serde_json::json!({
+        "type": "input_keyboard", "eventType": event_type, "key": key_name, "code": code,
+        "modifiers": 0,
+    });
+    if event_type != "keyUp" {
+        if let Some(text) = key_text(&key_name).filter(|text| text != "\r" && text != "\t") {
+            event["text"] = serde_json::json!(text);
+        }
+    }
+    event
+}
+
 fn named_key_info(key: &str) -> (String, String, i32) {
     match key.to_lowercase().as_str() {
+        "shift" => ("Shift".to_string(), "ShiftLeft".to_string(), 16),
+        "control" | "ctrl" => ("Control".to_string(), "ControlLeft".to_string(), 17),
+        "alt" | "option" => ("Alt".to_string(), "AltLeft".to_string(), 18),
+        "meta" | "command" | "cmd" => ("Meta".to_string(), "MetaLeft".to_string(), 91),
         "enter" | "return" => ("Enter".to_string(), "Enter".to_string(), 13),
         "tab" => ("Tab".to_string(), "Tab".to_string(), 9),
         "escape" | "esc" => ("Escape".to_string(), "Escape".to_string(), 27),
@@ -1838,6 +1865,47 @@ fn named_key_info(key: &str) -> (String, String, i32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `inserttext` in the owned window: up to 64 characters are typed key
+    /// by key, longer text is one visible paste.
+    #[test]
+    fn inserted_text_is_typed_up_to_the_paste_threshold() {
+        let short = native_inserted_events("hi");
+        assert!(short.iter().all(|event| event["eventType"] != "insertText"));
+        assert_eq!(
+            short
+                .iter()
+                .filter(|event| event["eventType"] == "keyDown")
+                .count(),
+            2
+        );
+        let long = "x".repeat(65);
+        assert_eq!(
+            native_inserted_events(&long),
+            [serde_json::json!({"type":"input_keyboard","eventType":"insertText","text":long})]
+        );
+    }
+
+    /// `keydown` and `keyup` name the physical key the helper knows, and a
+    /// printable key types its text only as it goes down.
+    #[test]
+    fn a_key_transition_names_its_physical_key() {
+        let shift = native_key_transition("Shift", "keyDown");
+        assert_eq!(
+            (shift["key"].as_str(), shift["code"].as_str()),
+            (Some("Shift"), Some("ShiftLeft"))
+        );
+        assert!(shift.get("text").is_none());
+        assert_eq!(
+            native_key_transition("ctrl", "keyUp")["code"],
+            "ControlLeft"
+        );
+        assert_eq!(native_key_transition("a", "keyDown")["text"], "a");
+        assert!(native_key_transition("a", "keyUp").get("text").is_none());
+        assert!(native_key_transition("Enter", "keyDown")
+            .get("text")
+            .is_none());
+    }
 
     #[test]
     fn native_text_types_keymap_characters_and_pastes_the_rest_one_at_a_time() {

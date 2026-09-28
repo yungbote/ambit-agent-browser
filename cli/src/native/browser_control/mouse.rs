@@ -16,7 +16,7 @@
 //! hit test at the end of travel refuses a press the aimed element no longer
 //! receives. Only the display helper sends buttons.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
@@ -450,6 +450,37 @@ fn coordinates(params: &Value) -> Result<Option<(f64, f64)>, String> {
     Ok(Some((x, y)))
 }
 
+/// The modifier bit (Alt 1, Control 2, Meta 4, Shift 8) a key event's key
+/// is, or 0 for any other key.
+fn modifier_bit(event: &Value) -> i64 {
+    let code = event["code"].as_str().unwrap_or_default();
+    let key = event["key"].as_str().unwrap_or_default();
+    let name = code
+        .strip_suffix("Left")
+        .or_else(|| code.strip_suffix("Right"))
+        .unwrap_or(key);
+    match name {
+        "Alt" => 1,
+        "Control" => 2,
+        "Meta" => 4,
+        "Shift" => 8,
+        _ => 0,
+    }
+}
+
+/// The helper's identity of a key: its physical code, or its key when it
+/// names none.
+fn key_identity(event: &Value) -> Option<String> {
+    event["code"]
+        .as_str()
+        .filter(|code| !code.is_empty() && *code != "Unidentified")
+        .or_else(|| event["key"].as_str())
+        .map(str::to_owned)
+}
+
+/// The agent's native input held through the display helper: pointer
+/// mappings and aim, the buttons and modifiers its mouse events hold, and
+/// the keys it pressed without releasing (a `keydown`).
 #[derive(Default)]
 pub(super) struct NativeMouse {
     /// Measured page-to-display mappings by page session, kept while each
@@ -458,6 +489,10 @@ pub(super) struct NativeMouse {
     aim: Option<Aim>,
     buttons: i64,
     modifiers: i64,
+    /// Keys held down, by identity, with the modifier bit each is. Every
+    /// native event carries the held modifiers, so the helper, which sets
+    /// modifier keys to each event's mask, never lets one go early.
+    keys: BTreeMap<String, i64>,
     /// Set before the helper can perform input. Cancellation cannot clear it.
     unknown: bool,
 }
@@ -487,7 +522,36 @@ impl NativeMouse {
     }
 
     pub(super) fn needs_release(&self) -> bool {
-        self.buttons != 0 || self.modifiers != 0 || self.unknown
+        self.buttons != 0 || self.modifiers != 0 || !self.keys.is_empty() || self.unknown
+    }
+
+    /// The modifiers the held keys are.
+    pub(super) fn held_modifiers(&self) -> i64 {
+        self.keys.values().fold(0, |held, bit| held | bit)
+    }
+
+    /// A native event's modifier mask: the one it asks for, and those held.
+    fn holding(&self, requested: i64) -> i64 {
+        requested | self.held_modifiers()
+    }
+
+    /// Keyboard events the helper acknowledged: a press holds its key until
+    /// its release.
+    pub(super) fn keys_acknowledged(&mut self, events: &[Value]) {
+        for event in events {
+            let Some(identity) = key_identity(event) else {
+                continue;
+            };
+            match event["eventType"].as_str() {
+                Some("keyDown" | "rawKeyDown") => {
+                    self.keys.insert(identity, modifier_bit(event));
+                }
+                Some("keyUp") => {
+                    self.keys.remove(&identity);
+                }
+                _ => {}
+            }
+        }
     }
 
     /// Cleanup has its own real acknowledgement. It never turns an earlier
@@ -757,6 +821,7 @@ impl NativeMouse {
         modifiers: i64,
         display: &DisplayClient,
     ) -> Result<(), String> {
+        let modifiers = self.holding(modifiers);
         let event = json!({
             "type": "input_mouse", "eventType": "mouseMoved", "x": point.0, "y": point.1,
             "buttons": self.buttons, "modifiers": modifiers,
@@ -1126,16 +1191,18 @@ impl NativeMouse {
             "mouseReleased" => self.buttons & !button,
             _ => self.buttons,
         };
-        let modifiers = params["modifiers"].as_i64().unwrap_or(0);
+        let modifiers = self.holding(params["modifiers"].as_i64().unwrap_or(0));
         let surface = display.surface();
         let mut event = crate::native::input::stream_event("input_mouse", params);
         event["x"] = json!(point.0);
         event["y"] = json!(point.1);
         event["buttons"] = json!(buttons);
+        event["modifiers"] = json!(modifiers);
         let mut activity =
             crate::native::activity::from_command("Input.dispatchMouseEvent", params)
                 .ok_or("Invalid mouse activity")?;
         activity["buttons"] = json!(buttons);
+        activity["modifiers"] = json!(modifiers);
         activity["screenX"] = json!(point.0 / f64::from(surface.device_scale_factor));
         activity["screenY"] = json!(point.1 / f64::from(surface.device_scale_factor));
         let observation = client.observe_activity(
