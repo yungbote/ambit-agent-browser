@@ -13908,3 +13908,407 @@ async fn e2e_reused_launch_reconciles_theme_without_replacing_the_page() {
     }
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
+
+/// The motion lane's proof on a real Chrome, display helper and X server: a
+/// click, a 20-character fill, a drag and a scroll, then a person taking
+/// control during a travel, during typing and during a scroll. The numbers
+/// come from what the page received (its own trusted event times) and from
+/// the agent activity viewers receive (`ts`, stamped at the helper's
+/// acknowledgement). Prints `MOTION <json>` and writes it to
+/// `$AMBIT_MOTION_PROOF` when set. Timings are this machine's measurements;
+/// the assertions hold the contract, not a latency guarantee.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_native_motion_proof() {
+    use crate::native::browser_control::{motion, InterruptReason};
+    use std::time::{Duration, Instant};
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<!doctype html><style>body{margin:0;height:6000px;font:16px sans-serif}#field{position:absolute;left:80px;top:80px;width:420px;font-size:20px}#go{position:absolute;left:880px;top:420px;width:120px;height:40px}#src{position:absolute;left:120px;top:300px;width:60px;height:60px;background:#48f}#dst{position:absolute;left:620px;top:300px;width:90px;height:90px;background:#4a4}</style><input id=field><button id=go>Go</button><div id=src></div><div id=dst></div><script>window.log=[];for(const type of ['pointermove','pointerdown','pointerup','click','keydown','scroll','wheel'])addEventListener(type,e=>log.push({type,t:performance.now(),trusted:e.isTrusted,buttons:e.buttons||0,x:e.clientX||0,y:e.clientY||0,key:e.key||'',scrollY}),{capture:true,passive:true});src.onpointerdown=e=>src.setPointerCapture(e.pointerId)</script>"#;
+    assert_success(
+        &control_test_command(
+            &json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}),
+            &mut state,
+        )
+        .await,
+    );
+    assert!(state.browser_control.lock().await.has_native_display());
+    let client = state.browser.as_ref().unwrap().client.clone();
+    let display = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .display_client()
+        .expect("owned display");
+    let interrupts = state.browser_control.lock().await.interrupts();
+    let mut activity = client.subscribe();
+
+    fn stats(values: &[f64]) -> Value {
+        if values.is_empty() {
+            return json!({"n": 0});
+        }
+        let mut sorted = values.to_vec();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let at = |share: usize| sorted[(sorted.len() * share / 100).min(sorted.len() - 1)];
+        json!({"n": sorted.len(), "min": sorted[0], "p50": at(50), "p95": at(95), "max": sorted[sorted.len() - 1]})
+    }
+    fn gaps(times: &[f64]) -> Vec<f64> {
+        times.windows(2).map(|pair| pair[1] - pair[0]).collect()
+    }
+    fn agent(
+        activity: &mut tokio::sync::broadcast::Receiver<crate::native::cdp::types::CdpEvent>,
+    ) -> Vec<Value> {
+        let mut events = Vec::new();
+        while let Ok(event) = activity.try_recv() {
+            if event.method == crate::native::activity::EVENT && event.params["source"] == "agent" {
+                events.push(event.params);
+            }
+        }
+        events
+    }
+    let ts_ms = |event: &Value| event["ts"].as_u64().unwrap() as f64 / 1000.0;
+    async fn page_log(state: &mut DaemonState) -> Vec<Value> {
+        let log = control_test_command(
+            &json!({"action":"evaluate","script":"log.splice(0)"}),
+            state,
+        )
+        .await;
+        assert_success(&log);
+        log["data"]["result"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+    }
+    let ms = |started: Instant| started.elapsed().as_secs_f64() * 1000.0;
+
+    // Start far from every target.
+    assert_success(
+        &control_test_command(&json!({"action":"mousemove","x":20,"y":600}), &mut state).await,
+    );
+    agent(&mut activity);
+    page_log(&mut state).await;
+
+    // One click, far from the pointer.
+    let started = Instant::now();
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#go"}), &mut state).await,
+    );
+    let click_ms = ms(started);
+    let click_activity = agent(&mut activity);
+    let press = click_activity
+        .iter()
+        .position(|event| event["eventType"] == "press")
+        .expect("the press was published");
+    let moves: Vec<f64> = click_activity[..press]
+        .iter()
+        .filter(|event| event["eventType"] == "move")
+        .map(ts_ms)
+        .collect();
+    let click_page = page_log(&mut state).await;
+    let down = click_page
+        .iter()
+        .position(|event| event["type"] == "pointerdown")
+        .expect("the page received the press");
+    let page_moves = click_page[..down]
+        .iter()
+        .filter(|event| event["type"] == "pointermove")
+        .count();
+    assert!(click_page.iter().all(|event| event["trusted"] == true));
+    assert!(click_page.iter().any(|event| event["type"] == "click"));
+    assert!(moves.len() >= 6, "{} moves before the press", moves.len());
+    assert!(page_moves >= 6, "{page_moves} page moves before the press");
+    let click = json!({
+        "command_ms": click_ms,
+        "moves_before_press": moves.len(),
+        "page_pointermoves_before_pointerdown": page_moves,
+        "travel_ms": ts_ms(&click_activity[press]) - moves[0],
+        "sample_interval_ms": stats(&gaps(&moves)),
+    });
+
+    // One 20-character fill.
+    let text = "The quick brown fox!";
+    assert_eq!(text.chars().count(), 20);
+    let started = Instant::now();
+    let filled = control_test_command(
+        &json!({"action":"fill","selector":"#field","value":text}),
+        &mut state,
+    )
+    .await;
+    let fill_ms = ms(started);
+    assert_success(&filled);
+    // A field that holds what was typed is reported with no mismatch.
+    assert!(filled["data"].get("valueMatches").is_none(), "{filled}");
+    let fill_page = page_log(&mut state).await;
+    let field = control_test_command(
+        &json!({"action":"evaluate","script":"field.value"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(field["data"]["result"], text);
+    let keys: Vec<f64> = fill_page
+        .iter()
+        .filter(|event| {
+            event["type"] == "keydown" && event["trusted"] == true && event["key"] != "Shift"
+        })
+        .map(|event| event["t"].as_f64().unwrap())
+        .collect();
+    assert_eq!(keys.len(), 20, "one trusted keydown per character");
+    let key_gaps = gaps(&keys);
+    let key_stats = stats(&key_gaps);
+    let p50 = key_stats["p50"].as_f64().unwrap();
+    assert!((20.0..=40.0).contains(&p50), "key interval p50 {p50} ms");
+    agent(&mut activity);
+    let fill = json!({
+        "command_ms": fill_ms,
+        "characters": 20,
+        "field_value": field["data"]["result"],
+        "key_interval_ms": key_stats,
+    });
+
+    // One drag: the button is held along the whole travel.
+    let started = Instant::now();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"drag","source":"#src","target":"#dst"}),
+            &mut state,
+        )
+        .await,
+    );
+    let drag_ms = ms(started);
+    let drag_activity = agent(&mut activity);
+    let held: Vec<f64> = drag_activity
+        .iter()
+        .skip_while(|event| event["eventType"] != "press")
+        .take_while(|event| event["eventType"] != "release")
+        .filter(|event| event["eventType"] == "move" && event["buttons"] == 1)
+        .map(ts_ms)
+        .collect();
+    let drag_page = page_log(&mut state).await;
+    let page_held = drag_page
+        .iter()
+        .filter(|event| event["type"] == "pointermove" && event["buttons"] == 1)
+        .count();
+    let up = drag_page
+        .iter()
+        .find(|event| event["type"] == "pointerup")
+        .expect("the page received the release");
+    assert_eq!(
+        (up["x"].as_f64(), up["y"].as_f64()),
+        (Some(665.0), Some(345.0))
+    );
+    assert!(held.len() >= 6, "{} held moves", held.len());
+    assert!(page_held >= 6, "{page_held} held page moves");
+    let drag = json!({
+        "command_ms": drag_ms,
+        "held_moves": held.len(),
+        "page_pointermoves_with_button_held": page_held,
+        "held_travel_ms": held.last().unwrap() - held[0],
+        "sample_interval_ms": stats(&gaps(&held)),
+    });
+
+    // One scroll: notches at the pointer, one per frame.
+    let started = Instant::now();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"scroll","direction":"down","amount":600}),
+            &mut state,
+        )
+        .await,
+    );
+    let scroll_ms = ms(started);
+    let scroll_activity = agent(&mut activity);
+    let notches: Vec<f64> = scroll_activity
+        .iter()
+        .filter(|event| event["eventType"] == "scroll")
+        .map(ts_ms)
+        .collect();
+    let by_script = scroll_activity
+        .iter()
+        .any(|event| event["kind"] == "scrolling");
+    let scroll_page = page_log(&mut state).await;
+    let scroll_y = scroll_page
+        .iter()
+        .rev()
+        .find(|event| event["type"] == "scroll")
+        .and_then(|event| event["scrollY"].as_f64())
+        .unwrap_or(0.0);
+    let first_wheel = scroll_page
+        .iter()
+        .find(|event| event["type"] == "wheel")
+        .and_then(|event| event["t"].as_f64());
+    let first_scroll = scroll_page
+        .iter()
+        .find(|event| event["type"] == "scroll")
+        .and_then(|event| event["t"].as_f64());
+    assert!(!by_script, "the wheel moved the page");
+    assert!(notches.len() >= 4, "{} notches", notches.len());
+    assert!(
+        gaps(&notches)
+            .iter()
+            .all(|gap| *gap >= motion::FRAME.as_secs_f64() * 1000.0 - 2.0),
+        "one notch per frame: {:?}",
+        gaps(&notches)
+    );
+    assert!(
+        (540.0..=660.0).contains(&scroll_y),
+        "scrolled to {scroll_y}"
+    );
+    let scroll = json!({
+        "command_ms": scroll_ms,
+        "requested_px": 600,
+        "scrolled_to_px": scroll_y,
+        "notches": notches.len(),
+        "notch_interval_ms": stats(&gaps(&notches)),
+        "by_script": by_script,
+        "page_wheel_events": scroll_page.iter().filter(|event| event["type"] == "wheel").count(),
+        "page_scroll_events": scroll_page.iter().filter(|event| event["type"] == "scroll").count(),
+        "first_wheel_to_first_scroll_ms": first_wheel.zip(first_scroll).map(|(wheel, scroll)| scroll - wheel),
+    });
+
+    // The per-move cost: the helper input call each travel sample makes.
+    let mut helper_move = Vec::new();
+    for index in 0..100u32 {
+        let started = Instant::now();
+        display
+            .input(&[json!({"type":"input_mouse","eventType":"mouseMoved","x":400 + index,"y":900,"modifiers":0})])
+            .await
+            .unwrap();
+        helper_move.push(ms(started));
+    }
+
+    // A person takes control during a travel.
+    let (glide_stop, glide) = {
+        assert_success(
+            &control_test_command(&json!({"action":"mousemove","x":20,"y":20}), &mut state).await,
+        );
+        agent(&mut activity);
+        let mut watch = client.subscribe();
+        let click = json!({"action":"click","selector":"#go"});
+        let command = control_test_command(&click, &mut state);
+        let takeover = async {
+            let mut seen = 0;
+            while seen < 2 {
+                if let Ok(event) = watch.recv().await {
+                    if event.method == crate::native::activity::EVENT
+                        && event.params["eventType"] == "move"
+                    {
+                        seen += 1;
+                    }
+                }
+            }
+            let raised_ts = crate::native::stream::monotonic_us();
+            (
+                interrupts.raise(InterruptReason::HumanControl),
+                Instant::now(),
+                raised_ts,
+            )
+        };
+        let (response, (guard, raised, raised_ts)) = tokio::join!(command, takeover);
+        let stopped = ms(raised);
+        drop(guard);
+        assert_error_code(&response, "browser_controlled_by_user");
+        let after = agent(&mut activity)
+            .iter()
+            .filter(|event| event["ts"].as_u64().unwrap() > raised_ts)
+            .count();
+        assert!(after <= 1, "{after} inputs after the takeover");
+        assert!(stopped <= 40.0, "stopped {stopped} ms after the takeover");
+        (
+            stopped,
+            json!({"stopped_ms": stopped, "inputs_after_takeover": after}),
+        )
+    };
+
+    // A person takes control during typing.
+    let typing = {
+        let long = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ01234567";
+        let fill = json!({"action":"fill","selector":"#field","value":long});
+        let command = control_test_command(&fill, &mut state);
+        let takeover = async {
+            tokio::time::sleep(Duration::from_millis(400)).await;
+            (
+                interrupts.raise(InterruptReason::HumanControl),
+                Instant::now(),
+            )
+        };
+        let (response, (guard, raised)) = tokio::join!(command, takeover);
+        let stopped = ms(raised);
+        drop(guard);
+        assert_error_code(&response, "browser_operation_interrupted");
+        let typed = response["data"]["charactersTyped"].as_u64().unwrap();
+        let value = control_test_command(
+            &json!({"action":"evaluate","script":"field.value"}),
+            &mut state,
+        )
+        .await;
+        assert_success(&value);
+        let value = value["data"]["result"].as_str().unwrap().to_owned();
+        assert_eq!(
+            value,
+            long[..typed as usize],
+            "the report counts what went in"
+        );
+        assert!(stopped <= 40.0, "stopped {stopped} ms after the takeover");
+        json!({"stopped_ms": stopped, "charactersTyped": typed, "field_value_length": value.len(), "of": long.len()})
+    };
+    page_log(&mut state).await;
+
+    // A person takes control during a scroll.
+    let scroll_takeover = {
+        agent(&mut activity);
+        let mut watch = client.subscribe();
+        let scroll = json!({"action":"scroll","direction":"down","amount":3000});
+        let command = control_test_command(&scroll, &mut state);
+        let takeover = async {
+            let mut seen = 0;
+            while seen < 3 {
+                if let Ok(event) = watch.recv().await {
+                    if event.method == crate::native::activity::EVENT
+                        && event.params["eventType"] == "scroll"
+                    {
+                        seen += 1;
+                    }
+                }
+            }
+            let raised_ts = crate::native::stream::monotonic_us();
+            (
+                interrupts.raise(InterruptReason::HumanControl),
+                Instant::now(),
+                raised_ts,
+            )
+        };
+        let (response, (guard, raised, raised_ts)) = tokio::join!(command, takeover);
+        let stopped = ms(raised);
+        drop(guard);
+        assert_error_code(&response, "browser_operation_interrupted");
+        let events = agent(&mut activity);
+        let notches = events
+            .iter()
+            .filter(|event| event["eventType"] == "scroll")
+            .count();
+        let after = events
+            .iter()
+            .filter(|event| event["ts"].as_u64().unwrap() > raised_ts)
+            .count();
+        assert!(after <= 1, "{after} inputs after the takeover");
+        assert!(stopped <= 40.0, "stopped {stopped} ms after the takeover");
+        json!({"stopped_ms": stopped, "notches": notches, "inputs_after_takeover": after})
+    };
+
+    let proof = json!({
+        "click": click,
+        "fill": fill,
+        "drag": drag,
+        "scroll": scroll,
+        "helper_move_rpc_ms": stats(&helper_move),
+        "takeover": {"glide": glide, "typing": typing, "scroll": scroll_takeover},
+        "glide_stop_ms": glide_stop,
+    });
+    println!("MOTION {proof}");
+    if let Ok(path) = std::env::var("AMBIT_MOTION_PROOF") {
+        std::fs::write(path, serde_json::to_vec_pretty(&proof).unwrap()).unwrap();
+    }
+    let _ = close_current_browser(&mut state).await;
+}
