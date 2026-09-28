@@ -13926,7 +13926,7 @@ async fn e2e_native_motion_proof() {
     env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
     env.set("DISPLAY", "");
     let mut state = DaemonState::new();
-    let html = r#"<!doctype html><style>body{margin:0;height:6000px;font:16px sans-serif}#field{position:absolute;left:80px;top:80px;width:420px;font-size:20px}#go{position:absolute;left:880px;top:420px;width:120px;height:40px}#src{position:absolute;left:120px;top:300px;width:60px;height:60px;background:#48f}#dst{position:absolute;left:620px;top:300px;width:90px;height:90px;background:#4a4}</style><input id=field><button id=go>Go</button><div id=src></div><div id=dst></div><script>window.log=[];for(const type of ['pointermove','pointerdown','pointerup','click','keydown','scroll','wheel'])addEventListener(type,e=>log.push({type,t:performance.now(),trusted:e.isTrusted,buttons:e.buttons||0,x:e.clientX||0,y:e.clientY||0,key:e.key||'',scrollY}),{capture:true,passive:true});src.onpointerdown=e=>src.setPointerCapture(e.pointerId)</script>"#;
+    let html = r#"<!doctype html><style>body{margin:0;height:6000px;font:16px sans-serif}#field{position:absolute;left:80px;top:80px;width:420px;font-size:20px}#go{position:absolute;left:880px;top:420px;width:120px;height:40px}#src{position:absolute;left:120px;top:300px;width:60px;height:60px;background:#48f}#dst{position:absolute;left:620px;top:300px;width:90px;height:90px;background:#4a4}#box{position:absolute;left:560px;top:110px;width:300px;height:160px;overflow:auto}#box div{height:2000px}</style><input id=field><button id=go>Go</button><div id=src></div><div id=dst></div><div id=box><div></div></div><script>window.log=[];for(const type of ['pointermove','pointerdown','pointerup','click','keydown','scroll','wheel'])addEventListener(type,e=>log.push({type,t:performance.now(),trusted:e.isTrusted,buttons:e.buttons||0,x:e.clientX||0,y:e.clientY||0,key:e.key||'',scrollY}),{capture:true,passive:true});src.onpointerdown=e=>src.setPointerCapture(e.pointerId)</script>"#;
     assert_success(
         &control_test_command(
             &json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}),
@@ -14108,6 +14108,55 @@ async fn e2e_native_motion_proof() {
         "sample_interval_ms": stats(&gaps(&held)),
     });
 
+    // A scroll of a nested scroller: the pointer goes where the wheel
+    // reaches it, and only it scrolls.
+    let started = Instant::now();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"scroll","direction":"down","amount":300,"selector":"#box"}),
+            &mut state,
+        )
+        .await,
+    );
+    let box_ms = ms(started);
+    let box_activity = agent(&mut activity);
+    let box_notches: Vec<&Value> = box_activity
+        .iter()
+        .filter(|event| event["eventType"] == "scroll")
+        .collect();
+    let offsets = control_test_command(
+        &json!({"action":"evaluate","script":"[box.scrollTop, scrollY]"}),
+        &mut state,
+    )
+    .await;
+    let (box_top, page_top) = (
+        offsets["data"]["result"][0].as_f64().unwrap(),
+        offsets["data"]["result"][1].as_f64().unwrap(),
+    );
+    assert!(
+        !box_activity
+            .iter()
+            .any(|event| event["kind"] == "scrolling"),
+        "the wheel moved the box"
+    );
+    assert!(
+        (240.0..=360.0).contains(&box_top),
+        "box scrolled to {box_top}"
+    );
+    assert_eq!(page_top, 0.0, "the page did not scroll");
+    assert!(box_notches.iter().all(|event| {
+        let (x, y) = (event["x"].as_f64().unwrap(), event["y"].as_f64().unwrap());
+        (560.0..860.0).contains(&x) && (110.0..270.0).contains(&y)
+    }));
+    let nested = json!({
+        "command_ms": box_ms,
+        "requested_px": 300,
+        "scrolled_to_px": box_top,
+        "page_scrollY": page_top,
+        "notches": box_notches.len(),
+    });
+    page_log(&mut state).await;
+
     // One scroll: notches at the pointer, one per frame.
     let started = Instant::now();
     assert_success(
@@ -14165,6 +14214,53 @@ async fn e2e_native_motion_proof() {
         "page_wheel_events": scroll_page.iter().filter(|event| event["type"] == "wheel").count(),
         "page_scroll_events": scroll_page.iter().filter(|event| event["type"] == "scroll").count(),
         "first_wheel_to_first_scroll_ms": first_wheel.zip(first_scroll).map(|(wheel, scroll)| scroll - wheel),
+    });
+
+    // A wheel without coordinates turns where the pointer is, one notch
+    // per frame.
+    let started = Instant::now();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"wheel","deltaX":0,"deltaY":300}),
+            &mut state,
+        )
+        .await,
+    );
+    let wheel_ms = ms(started);
+    let wheel_activity = agent(&mut activity);
+    let turned: Vec<&Value> = wheel_activity
+        .iter()
+        .filter(|event| event["eventType"] == "scroll")
+        .collect();
+    let wheel_page = page_log(&mut state).await;
+    let page_wheels: Vec<&Value> = wheel_page
+        .iter()
+        .filter(|event| event["type"] == "wheel")
+        .collect();
+    assert_eq!(turned.len(), 3, "{wheel_activity:?}");
+    assert!(
+        wheel_activity
+            .iter()
+            .all(|event| event["eventType"] == "scroll"),
+        "no travel: {wheel_activity:?}"
+    );
+    assert!(turned
+        .windows(2)
+        .all(|pair| pair[0]["x"] == pair[1]["x"] && pair[0]["y"] == pair[1]["y"]));
+    let wheel_gaps = gaps(&turned.iter().map(|event| ts_ms(event)).collect::<Vec<_>>());
+    assert!(
+        wheel_gaps
+            .iter()
+            .all(|gap| *gap >= motion::FRAME.as_secs_f64() * 1000.0 - 2.0),
+        "{wheel_gaps:?}"
+    );
+    assert_eq!(page_wheels.len(), 3);
+    let wheel = json!({
+        "command_ms": wheel_ms,
+        "notches": turned.len(),
+        "at": [turned[0]["x"], turned[0]["y"]],
+        "notch_interval_ms": stats(&wheel_gaps),
+        "page_wheel_events": page_wheels.len(),
     });
 
     // The per-move cost: the helper input call each travel sample makes.
@@ -14302,6 +14398,8 @@ async fn e2e_native_motion_proof() {
         "fill": fill,
         "drag": drag,
         "scroll": scroll,
+        "nested_scroll": nested,
+        "wheel_at_pointer": wheel,
         "helper_move_rpc_ms": stats(&helper_move),
         "takeover": {"glide": glide, "typing": typing, "scroll": scroll_takeover},
         "glide_stop_ms": glide_stop,
