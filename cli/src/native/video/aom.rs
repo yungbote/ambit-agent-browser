@@ -43,6 +43,15 @@ const CONTENT_SCREEN: c_int = 1;
 const SUPERBLOCK_128: c_int = 1;
 /// The cost tables' update frequency "off": each superblock row reuses them.
 const COST_UPDATE_OFF: c_int = 3;
+/// Encoder speed for pictures of motion: measured on the node, 9, 10 and 11
+/// cost the same (encoder-decision.md).
+const MOTION_SPEED: c_int = 10;
+/// Encoder speed for a refinement. At speed 10 a refinement after a scroll
+/// of more than a few pictures stops near 44.5 dB RGB PSNR on dense text
+/// whatever the quantizer (a second pass adds nothing); at 8 it reaches
+/// 49.1-49.4 dB in one pass for about the same bytes and time
+/// (media-producer/refinement-speed.md).
+const REFINE_SPEED: c_int = 8;
 
 /// Encoder controls (`aomcx.h` ids) this encoder sets.
 mod control {
@@ -328,8 +337,10 @@ pub(super) struct AomEncoder {
     width: u32,
     height: u32,
     level: u8,
-    /// The quantizer the encoder holds; set only when a request differs.
+    /// The quantizer and speed the encoder holds; set only when a request
+    /// differs.
     quantizer: Option<u8>,
+    speed: c_int,
     pictures: i64,
 }
 
@@ -420,6 +431,7 @@ impl AomEncoder {
             height,
             level: level(width, height),
             quantizer: None,
+            speed: MOTION_SPEED,
             pictures: 0,
         };
         // Measured on screen content at the probe's surface (evidence:
@@ -428,7 +440,7 @@ impl AomEncoder {
         // superblocks, no CDEF and frozen cost tables cut 10-20% of the CPU
         // for 1% more bytes. Speeds 9, 10 and 11 cost the same here.
         for (id, value) in [
-            (control::CPU_USED, 10),
+            (control::CPU_USED, MOTION_SPEED),
             (control::TUNE_CONTENT, CONTENT_SCREEN),
             (control::ENABLE_PALETTE, 1),
             (control::SUPERBLOCK_SIZE, SUPERBLOCK_128),
@@ -525,6 +537,16 @@ impl VideoEncoder for AomEncoder {
             self.control(control::QUANTIZER_ONE_PASS, c_int::from(request.quantizer))
                 .map_err(VideoError::Failed)?;
             self.quantizer = Some(request.quantizer);
+        }
+        let speed = if request.refine {
+            REFINE_SPEED
+        } else {
+            MOTION_SPEED
+        };
+        if self.speed != speed {
+            self.control(control::CPU_USED, speed)
+                .map_err(VideoError::Failed)?;
+            self.speed = speed;
         }
         let format = match self.codec.chroma() {
             Chroma::Subsampled => IMG_FMT_I420,

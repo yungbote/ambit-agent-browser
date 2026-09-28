@@ -141,12 +141,15 @@ impl<'a> Picture<'a> {
 }
 
 /// What one encode is asked for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct EncodeRequest {
     /// A key unit: decodable without references.
     pub key: bool,
     /// The quantizer, 0 (best) to 63.
     pub quantizer: u8,
+    /// A refinement of the picture just encoded, unchanged: it happens once
+    /// per stop, so it may take more effort than a picture of motion.
+    pub refine: bool,
 }
 
 /// One temporal unit of one frame.

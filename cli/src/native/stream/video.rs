@@ -36,6 +36,8 @@ use crate::native::display::DisplayClient;
 use crate::native::video::{Declared, VideoCodec, VideoError};
 #[cfg(test)]
 pub(super) use policy::Quality;
+#[cfg(all(test, target_os = "linux"))]
+pub(super) use producer::measured;
 use producer::{Producer, Subscription};
 use subscription::Flow;
 pub(super) use subscription::{Delivery, Unit};

@@ -112,7 +112,8 @@ fn a_picture_of_another_size_chroma_or_quantizer_fails_that_picture_only() {
                 &picture,
                 EncodeRequest {
                     key: true,
-                    quantizer: 20
+                    quantizer: 20,
+                    ..Default::default()
                 }
             ),
             Err(VideoError::Failed(_))
@@ -123,7 +124,8 @@ fn a_picture_of_another_size_chroma_or_quantizer_fails_that_picture_only() {
             &right.picture(),
             EncodeRequest {
                 key: true,
-                quantizer: 64
+                quantizer: 64,
+                ..Default::default()
             }
         ),
         Err(VideoError::Failed(_))
@@ -135,6 +137,7 @@ fn a_picture_of_another_size_chroma_or_quantizer_fails_that_picture_only() {
             EncodeRequest {
                 key: true,
                 quantizer: 20,
+                ..Default::default()
             },
         )
         .unwrap();
@@ -160,7 +163,14 @@ fn one_picture_in_one_unit_out_with_key_units_only_where_asked() {
         assert!(picture.convert(&source, 1024, (256, 128), (0, 128)));
         let key = index == 7;
         let unit = encoder
-            .encode(&picture.picture(), EncodeRequest { key, quantizer: 30 })
+            .encode(
+                &picture.picture(),
+                EncodeRequest {
+                    key,
+                    quantizer: 30,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert!(!unit.data.is_empty());
         keys.push(unit.key);
@@ -186,6 +196,7 @@ fn the_sequence_header_signals_the_codec_string_and_colour_description() {
                 EncodeRequest {
                     key: true,
                     quantizer: 40,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -247,6 +258,7 @@ fn text_and_colour_bars_survive_convert_encode_decode_and_the_inverse_matrix() {
                 EncodeRequest {
                     key: true,
                     quantizer: 8,
+                    ..Default::default()
                 },
             )
             .unwrap();
@@ -280,6 +292,33 @@ fn text_and_colour_bars_survive_convert_encode_decode_and_the_inverse_matrix() {
             }
         }
     }
+}
+
+/// A refinement is encoded at the refinement speed, and the next picture of
+/// motion at the motion speed again; the speed is set only when it changes.
+#[test]
+fn a_refinement_takes_its_own_speed_and_motion_returns_to_its_own() {
+    let mut encoder = AomEncoder::new(VideoCodec::Av1Full, 64, 64, 1).unwrap();
+    let picture = Planar::new(Chroma::Full, 64, 64);
+    let mut speeds = Vec::new();
+    for (key, quantizer, refine) in [
+        (true, 32, false),
+        (false, 8, true),
+        (false, 8, true),
+        (false, 32, false),
+    ] {
+        let request = EncodeRequest {
+            key,
+            quantizer,
+            refine,
+        };
+        encoder.encode(&picture.picture(), request).unwrap();
+        speeds.push(encoder.speed);
+    }
+    assert_eq!(
+        speeds,
+        [MOTION_SPEED, REFINE_SPEED, REFINE_SPEED, MOTION_SPEED]
+    );
 }
 
 // ---------------------------------------------------------------------------
