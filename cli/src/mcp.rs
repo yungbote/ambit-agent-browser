@@ -30,7 +30,7 @@
 //! Owned Windows Chrome uses the same private headless desktop and Job Object
 //! lifetime through MCP; headed and external-connection semantics are unchanged.
 
-mod host_bound;
+pub(crate) mod host_bound;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
@@ -763,9 +763,8 @@ fn initialize_result(params: Option<&Value>, config: &McpConfig) -> Value {
         )
     });
     if config.host.is_some() {
-        let mut descriptor = host_bound::descriptor();
-        descriptor.as_object_mut().unwrap().remove("tools");
-        result["capabilities"]["experimental"] = json!({ "io.ambit/browser": descriptor });
+        result["capabilities"]["experimental"] =
+            json!({ "io.ambit/browser": host_bound::catalog_identity() });
         result["instructions"] = json!("Use the typed browser tools in the host-assigned browser session. Each operation returns its outcome and a current viewport capture when available. Coordinates use viewport CSS pixels. Owned-window mouse tools move the native cursor through the display input owner. Human control temporarily prevents agent operations.");
     }
     result
