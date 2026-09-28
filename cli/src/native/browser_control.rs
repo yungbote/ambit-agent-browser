@@ -16,7 +16,10 @@ use super::cdp::client::{CdpClient, PendingCommand};
 use super::input::{input_command, stream_event, HeldInputs};
 use tokio::sync::watch;
 
+mod interrupts;
 mod mouse;
+
+pub(crate) use interrupts::{InterruptReason, Interruption, Interrupts};
 
 pub(crate) const ACTION: &str = "ambit_browser_control";
 const MAX_LEASE_MS: u64 = 30_000;
@@ -30,6 +33,7 @@ const ACK_TIMEOUT: Duration = Duration::from_secs(5);
 const MIN_SIGN_IN_IDLE_MS: u64 = 10_000;
 const MAX_SIGN_IN_IDLE_MS: u64 = 3_600_000;
 const SIGN_IN_MESSAGE: &str = "A person is signing in to a site in this browser. The agent can act again after they hand back control; do not retry this action until then.";
+const TAKEOVER_MESSAGE: &str = "The user is taking control of this browser. Wait until they release control before continuing.";
 
 #[derive(Debug)]
 pub(crate) struct ControlError {
@@ -392,6 +396,10 @@ pub(crate) struct BrowserControl {
     /// lease or before its first input), recorded after the helper
     /// acknowledged that input. A capture that began later shows it.
     applied_input: std::sync::Arc<crate::native::stream::AppliedInput>,
+    /// The daemon's pending interruptions. A person's takeover raises one
+    /// before it waits for command custody; the agent's paced input stops
+    /// at its next sample or key without that custody being needed.
+    interrupts: Interrupts,
 }
 
 impl Default for BrowserControl {
@@ -407,6 +415,7 @@ impl Default for BrowserControl {
             native_mouse: mouse::NativeMouse::default(),
             custody: watch::channel(None).0,
             applied_input: Default::default(),
+            interrupts: Interrupts::default(),
         }
     }
 }
@@ -486,6 +495,11 @@ impl BrowserControl {
     /// The lease's applied input over the media clock, for frames' `inputSeq`.
     pub(crate) fn applied_input(&self) -> std::sync::Arc<crate::native::stream::AppliedInput> {
         self.applied_input.clone()
+    }
+
+    /// The interruptions this gate's agent input obeys, raised without it.
+    pub(crate) fn interrupts(&self) -> Interrupts {
+        self.interrupts.clone()
     }
 
     fn publish_custody(&self) {
@@ -745,13 +759,20 @@ impl BrowserControl {
         lease.outcome_unknown = was_unknown;
         Ok(())
     }
+    /// Why the agent may not act now: a person holds the browser, or has
+    /// asked for it and waits only for the agent's current step to stop.
     pub(crate) fn agent_error(&self) -> Option<ControlError> {
-        self.lease.as_ref().filter(|lease| lease.holds_custody(Instant::now())).map(|lease| {
+        let held = self.lease.as_ref().filter(|lease| lease.holds_custody(Instant::now())).map(|lease| {
             if lease.sign_in.is_some() {
                 ControlError::new("browser_controlled_by_user", SIGN_IN_MESSAGE)
             } else if lease.outcome_unknown { ControlError::unknown() } else {
                 ControlError::new("browser_controlled_by_user", "The user is controlling this browser. Wait until they release control before continuing.")
             }
+        });
+        held.or_else(|| {
+            self.interrupts
+                .takeover()
+                .then(|| ControlError::new("browser_controlled_by_user", TAKEOVER_MESSAGE))
         })
     }
 

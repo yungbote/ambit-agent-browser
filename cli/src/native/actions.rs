@@ -798,6 +798,9 @@ impl DaemonState {
             .ok()
             .flatten()
             .is_some_and(|b| b.pinned);
+        let browser_control = BrowserControl::default();
+        let playwright_operations =
+            super::playwright::Operations::new(browser_control.interrupts());
         Self {
             browser: None,
             sign_in: None,
@@ -864,8 +867,8 @@ impl DaemonState {
             stream_client: None,
             stream_server: None,
             idle_activity: Arc::new(IdleActivity::new()),
-            browser_control: Arc::new(tokio::sync::Mutex::new(BrowserControl::default())),
-            playwright_operations: super::playwright::Operations::default(),
+            browser_control: Arc::new(tokio::sync::Mutex::new(browser_control)),
+            playwright_operations,
             launch_configuration: None,
             retained_profile: None,
             effective_ca_cert: None,
@@ -933,7 +936,10 @@ impl DaemonState {
             s.request_tracking = true;
         }
         if let Some(server) = stream_server.as_ref() {
+            // One custody gate and one set of interruptions: a takeover that
+            // stops programs stops the gate's paced input too.
             s.browser_control = server.browser_control.clone();
+            s.playwright_operations = super::playwright::Operations::new(server.interrupts.clone());
         }
         s.stream_client = stream_client;
         s.stream_server = stream_server;

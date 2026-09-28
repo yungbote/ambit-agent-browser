@@ -65,12 +65,7 @@ impl ProgramEnvironment {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum InterruptReason {
-    HumanControl,
-    CallerDisconnected,
-    Shutdown,
-}
+use super::browser_control::{InterruptReason, Interruption, Interrupts};
 
 impl InterruptReason {
     fn message(self) -> &'static str {
@@ -107,28 +102,20 @@ impl InterruptReason {
 #[derive(Default)]
 struct OperationState {
     active: Option<watch::Sender<Option<InterruptReason>>>,
-    /// Pending custody transfers, one entry per outstanding interruption.
-    interruptions: Vec<InterruptReason>,
 }
 
-#[derive(Clone, Default)]
+/// The program slot. Its interruptions are the daemon's, which the native
+/// input owner obeys too (`BrowserControl::interrupts`).
+#[derive(Clone)]
 pub(crate) struct Operations {
+    interrupts: Interrupts,
     state: Arc<Mutex<OperationState>>,
     finished: Arc<Notify>,
 }
 
-pub(crate) struct Interruption(Operations, InterruptReason);
-
-impl Drop for Interruption {
-    fn drop(&mut self) {
-        let mut state = self.0.state.lock().unwrap();
-        if let Some(index) = state
-            .interruptions
-            .iter()
-            .position(|reason| *reason == self.1)
-        {
-            state.interruptions.swap_remove(index);
-        }
+impl Default for Operations {
+    fn default() -> Self {
+        Self::new(Interrupts::default())
     }
 }
 
@@ -145,28 +132,33 @@ impl Drop for Operation {
 }
 
 impl Operations {
+    pub(crate) fn new(interrupts: Interrupts) -> Self {
+        Self {
+            interrupts,
+            state: Arc::default(),
+            finished: Arc::default(),
+        }
+    }
+
     /// Called before waiting for command custody. A queued program cannot
-    /// start between the cancellation request and control acquisition.
+    /// start between the cancellation request and control acquisition, and
+    /// the agent's paced input stops at its next sample or key.
     pub(crate) fn interrupt(&self, reason: InterruptReason) -> Interruption {
-        let mut state = self.state.lock().unwrap();
-        state.interruptions.push(reason);
+        // Raised under the slot so no program begins between the raise and
+        // its cancellation.
+        let state = self.state.lock().unwrap();
+        let interruption = self.interrupts.raise(reason);
         if let Some(active) = &state.active {
             active.send_replace(Some(reason));
         }
-        Interruption(self.clone(), reason)
+        interruption
     }
 
     fn begin(&self) -> Result<Operation, String> {
         let mut state = self.state.lock().unwrap();
         // A queued program refused for a human takeover reports that
         // takeover, as a program stopped before its start would.
-        let pending = state
-            .interruptions
-            .iter()
-            .copied()
-            .find(|reason| *reason == InterruptReason::HumanControl)
-            .or_else(|| state.interruptions.first().copied());
-        if let Some(reason) = pending {
+        if let Some(reason) = self.interrupts.pending() {
             return Err(reason.before_start());
         }
         if state.active.is_some() {

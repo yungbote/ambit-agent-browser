@@ -16,9 +16,9 @@ use super::actions::{
     auto_save_restore_state, close_all_browser_backends, close_current_browser,
     execute_command_received, maybe_autosave_restore_state, DaemonState,
 };
-use super::browser_control::{serve_window_input, BrowserControl};
+use super::browser_control::{serve_window_input, BrowserControl, InterruptReason};
 use super::cdp::client::CdpClient;
-use super::playwright::{InterruptReason, Operations};
+use super::playwright::Operations;
 use super::state;
 use super::stream::{IdleActivity, StreamServer};
 use crate::connection::{DaemonSession, INTERNAL_DAEMON_SHUTDOWN_ACTION};
@@ -753,6 +753,67 @@ mod tests {
             .await
             .agent_error()
             .is_none());
+    }
+
+    /// A person's takeover holds the agent back from the moment it asks,
+    /// while it still waits for the agent's command in flight: the custody
+    /// gate's agent input and the program slot obey one interruption, in a
+    /// daemon with or without a stream server.
+    #[tokio::test]
+    async fn a_takeover_waiting_for_command_custody_already_holds_the_agent_back() {
+        let (stream, _slot) = StreamServer::start_without_client(
+            0,
+            "takeover-wiring".into(),
+            true,
+            Arc::new(IdleActivity::new()),
+        )
+        .await
+        .unwrap();
+        let states = [
+            DaemonState::new(),
+            DaemonState::new_with_stream(
+                None,
+                Some(Arc::new(stream)),
+                Arc::new(IdleActivity::new()),
+            ),
+        ];
+        for state in states {
+            let state = Arc::new(tokio::sync::Mutex::new(state));
+            let (control, operations) = {
+                let state = state.lock().await;
+                (
+                    state.browser_control.clone(),
+                    state.playwright_operations.clone(),
+                )
+            };
+            // An agent command holds command custody.
+            let held = state.lock().await;
+            let acquire = serde_json::json!({
+                "action": super::super::browser_control::ACTION, "op": "acquire",
+                "controllerId": "aabbccdd-1111-4222-8333-123456789abc",
+                "expiresAt": crate::native::stream::timestamp_ms() + 20_000,
+            });
+            let waiting = tokio::spawn({
+                let state = state.clone();
+                async move { command_state(&state, &acquire, &operations).await.is_ok() }
+            });
+            tokio::time::timeout(Duration::from_secs(1), async {
+                while control.lock().await.agent_error().is_none() {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
+            .await
+            .expect("the agent is held back while the takeover waits");
+            assert_eq!(
+                control.lock().await.agent_error().unwrap().code,
+                "browser_controlled_by_user"
+            );
+            drop(held);
+            assert!(waiting.await.unwrap(), "the takeover gets command custody");
+            // Nothing was acquired here: the waiting request's hold ends with
+            // its wait, and the acquisition itself decides custody after it.
+            assert!(control.lock().await.agent_error().is_none());
+        }
     }
 
     #[tokio::test]
