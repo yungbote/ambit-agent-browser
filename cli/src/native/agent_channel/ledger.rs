@@ -10,6 +10,7 @@
 //! an answer that can never change.
 
 use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -24,8 +25,8 @@ pub(crate) const ENTRIES: usize = 256;
 pub(crate) const BYTES: usize = 16 << 20;
 /// Actions whose highest owner generation the daemon remembers.
 pub(crate) const FENCES: usize = 4096;
-/// Ended channels whose last received id is remembered.
-const ENDED_CHANNELS: usize = 1024;
+/// Stopped channels whose last received id is remembered.
+const STOPPED_CHANNELS: usize = 1024;
 
 pub(crate) struct Ledger {
     state: Mutex<State>,
@@ -49,6 +50,8 @@ struct Entry {
     channel: ChannelId,
     id: FrameId,
     action: Option<ActionId>,
+    /// The Action's directory, where results that leave a line are written.
+    directory: Option<PathBuf>,
     state: EntryState,
     bytes: usize,
 }
@@ -67,11 +70,16 @@ impl Entry {
         matches!(self.state, EntryState::Settled(_) | EntryState::NotStarted)
     }
 
-    fn status(&self) -> Status {
-        match &self.state {
-            EntryState::Queued | EntryState::Running => Status::Running,
-            EntryState::Settled(result) => Status::Settled(result.clone()),
-            EntryState::NotStarted => Status::NotStarted,
+    fn held(&self) -> Held {
+        Held {
+            channel: self.channel,
+            id: self.id,
+            status: match &self.state {
+                EntryState::Queued | EntryState::Running => Status::Running,
+                EntryState::Settled(result) => Status::Settled(result.clone()),
+                EntryState::NotStarted => Status::NotStarted,
+            },
+            directory: self.directory.clone(),
         }
     }
 }
@@ -87,6 +95,16 @@ struct Channel {
 struct Fence {
     generation: u64,
     touched: u64,
+}
+
+/// How a frame arrived.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Arrival {
+    /// A `hello` or an `op_status`: only its id is recorded.
+    Other,
+    /// A `sequence`: its entry starts now, waiting its turn, or not started
+    /// when it was `refused` on arrival.
+    Sequence { owner: Option<Owner>, refused: bool },
 }
 
 /// What became of one frame, as `op_status` answers it.
@@ -112,6 +130,16 @@ impl Status {
             Status::Unknown => json!({ "state": "unknown" }),
         }
     }
+}
+
+/// One frame's outcome as the ledger answers for it.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Held {
+    pub(crate) channel: ChannelId,
+    pub(crate) id: FrameId,
+    pub(crate) status: Status,
+    /// Where its results that leave a line are written.
+    pub(crate) directory: Option<PathBuf>,
 }
 
 /// A frame of an owner older than one the daemon has seen for its Action.
@@ -170,21 +198,14 @@ impl Ledger {
     }
 
     /// Records the arrival of frame `id` on `channel`, before anything of it
-    /// runs. A `sequence` (`queued`) gets its entry now: waiting its turn,
-    /// or, when `refused` on arrival, not started.
-    pub(crate) fn receive(
-        &self,
-        channel: ChannelId,
-        id: FrameId,
-        queued: Option<Option<Owner>>,
-        refused: bool,
-    ) {
+    /// runs.
+    pub(crate) fn receive(&self, channel: ChannelId, id: FrameId, arrival: Arrival) {
         self.update(|state| {
             let Some(record) = state.channels.get_mut(&channel) else {
                 return;
             };
             record.last_received = record.last_received.max(id);
-            if let Some(owner) = queued {
+            if let Arrival::Sequence { owner, refused } = arrival {
                 let entry_state = if refused || record.stopped {
                     EntryState::NotStarted
                 } else {
@@ -248,9 +269,15 @@ impl Ledger {
         })
     }
 
-    /// Starts frame `id`: true when it may run. On a channel that stopped it
-    /// is recorded not started instead.
-    pub(crate) fn start(&self, channel: ChannelId, id: FrameId, owner: Option<Owner>) -> bool {
+    /// Starts frame `id`, whose large results go to `directory`: true when
+    /// it may run. On a channel that stopped it is recorded not started.
+    pub(crate) fn start(
+        &self,
+        channel: ChannelId,
+        id: FrameId,
+        owner: Option<Owner>,
+        directory: Option<PathBuf>,
+    ) -> bool {
         self.update(|state| {
             let running = state
                 .channels
@@ -262,6 +289,9 @@ impl Ledger {
                 EntryState::NotStarted
             };
             state.put(channel, id, owner, entry_state);
+            if let Some(entry) = state.entry_mut(channel, id) {
+                entry.directory = directory;
+            }
             running
         })
     }
@@ -278,12 +308,24 @@ impl Ledger {
 
     /// Records what a frame did: `{success, steps, browser}`.
     pub(crate) fn settle(&self, channel: ChannelId, id: FrameId, result: Value) {
+        self.update(|state| state.set_result(channel, id, result))
+    }
+
+    /// Keeps `reference` in place of step `step`'s result of a settled
+    /// frame, once that result was written to its file to fit an answer.
+    pub(crate) fn retain(&self, channel: ChannelId, id: FrameId, step: usize, reference: Value) {
         self.update(|state| {
-            let bytes = result.to_string().len();
-            if let Some(entry) = state.entry_mut(channel, id) {
-                entry.state = EntryState::Settled(result);
-                let previous = std::mem::replace(&mut entry.bytes, bytes);
-                state.bytes = state.bytes - previous + bytes;
+            let Some(Entry {
+                state: EntryState::Settled(result),
+                ..
+            }) = state.entry(channel, id)
+            else {
+                return;
+            };
+            let mut result = result.clone();
+            if let Some(slot) = result.pointer_mut(&format!("/steps/{step}/result")) {
+                *slot = reference;
+                state.set_result(channel, id, result);
             }
         })
     }
@@ -303,28 +345,33 @@ impl Ledger {
         &self,
         action: ActionId,
         (channel, id): (ChannelId, FrameId),
-    ) -> Result<Status, OtherAction> {
+    ) -> Result<Held, OtherAction> {
         self.read(|state| match state.entry(channel, id) {
             Some(entry) if entry.action != Some(action) => Err(OtherAction),
-            Some(entry) => Ok(entry.status()),
-            None => Ok(match state.channels.get(&channel) {
-                // Received and not held: evicted, or not a sequence.
-                Some(record) if id <= record.last_received => Status::Unknown,
-                Some(record) if record.stopped => Status::NotStarted,
-                Some(_) => Status::Running,
-                None => Status::Unknown,
+            Some(entry) => Ok(entry.held()),
+            None => Ok(Held {
+                channel,
+                id,
+                status: match state.channels.get(&channel) {
+                    // Received and not held: evicted, or not a sequence.
+                    Some(record) if id <= record.last_received => Status::Unknown,
+                    Some(record) if record.stopped => Status::NotStarted,
+                    Some(_) => Status::Running,
+                    None => Status::Unknown,
+                },
+                directory: None,
             }),
         })
     }
 
     /// Every entry the ledger holds for `action`, in the order received.
-    pub(crate) fn entries(&self, action: ActionId) -> Vec<(ChannelId, FrameId, Status)> {
+    pub(crate) fn entries(&self, action: ActionId) -> Vec<Held> {
         self.read(|state| {
             state
                 .entries
                 .iter()
                 .filter(|entry| entry.action == Some(action))
-                .map(|entry| (entry.channel, entry.id, entry.status()))
+                .map(Entry::held)
                 .collect()
         })
     }
@@ -335,33 +382,24 @@ impl Ledger {
         action: ActionId,
         of: (ChannelId, FrameId),
         wait: Duration,
-    ) -> Result<Status, OtherAction> {
+    ) -> Result<Held, OtherAction> {
         self.within(
             wait,
             || self.status(action, of),
-            |status| {
-                status
-                    .as_ref()
-                    .is_ok_and(|status| *status == Status::Running)
+            |held| {
+                held.as_ref()
+                    .is_ok_and(|held| held.status == Status::Running)
             },
         )
         .await
     }
 
     /// `entries`, held while any of them is `running` for at most `wait`.
-    pub(crate) async fn entries_within(
-        &self,
-        action: ActionId,
-        wait: Duration,
-    ) -> Vec<(ChannelId, FrameId, Status)> {
+    pub(crate) async fn entries_within(&self, action: ActionId, wait: Duration) -> Vec<Held> {
         self.within(
             wait,
             || self.entries(action),
-            |entries| {
-                entries
-                    .iter()
-                    .any(|(_, _, status)| *status == Status::Running)
-            },
+            |entries| entries.iter().any(|held| held.status == Status::Running),
         )
         .await
     }
@@ -413,9 +451,19 @@ impl State {
             channel,
             id,
             action: owner.map(|owner| owner.action),
+            directory: None,
             state,
             bytes: 0,
         });
+    }
+
+    fn set_result(&mut self, channel: ChannelId, id: FrameId, result: Value) {
+        let bytes = result.to_string().len();
+        if let Some(entry) = self.entry_mut(channel, id) {
+            entry.state = EntryState::Settled(result);
+            let previous = std::mem::replace(&mut entry.bytes, bytes);
+            self.bytes = self.bytes - previous + bytes;
+        }
     }
 
     /// Stops `channel`: its frames waiting their turn will never start.
@@ -446,7 +494,7 @@ impl State {
             let entry = self.entries.remove(oldest).unwrap();
             self.bytes -= entry.bytes;
         }
-        while self.stopped.len() > ENDED_CHANNELS {
+        while self.stopped.len() > STOPPED_CHANNELS {
             let channel = self.stopped.pop_front().unwrap();
             self.channels.remove(&channel);
         }
@@ -472,13 +520,16 @@ mod tests {
 
     fn owner(action: u16, generation: u64) -> Owner {
         Owner {
-            action: action_id(action),
+            action: ActionId::for_test(action),
             generation,
         }
     }
 
-    fn action_id(n: u16) -> ActionId {
-        ActionId::for_test(n)
+    fn sequence(owner: Owner) -> Arrival {
+        Arrival::Sequence {
+            owner: Some(owner),
+            refused: false,
+        }
     }
 
     fn result(success: bool) -> Value {
@@ -486,22 +537,38 @@ mod tests {
             "capture": { "status": "not_requested" } } })
     }
 
+    /// The status the ledger answers for frame `id` of `owner`'s Action.
+    fn status(
+        ledger: &Ledger,
+        owner: Owner,
+        of: (ChannelId, FrameId),
+    ) -> Result<Status, OtherAction> {
+        ledger.status(owner.action, of).map(|held| held.status)
+    }
+
+    fn statuses(ledger: &Ledger, owner: Owner) -> Vec<(ChannelId, FrameId, Status)> {
+        ledger
+            .entries(owner.action)
+            .into_iter()
+            .map(|held| (held.channel, held.id, held.status))
+            .collect()
+    }
+
     #[test]
     fn a_frame_is_running_until_it_settles_and_then_keeps_its_result() {
         let ledger = Ledger::default();
         let (c, a) = (channel(1), owner(1, 41));
         assert!(ledger.open(c));
-        ledger.receive(c, 7, Some(Some(a)), false);
-        assert_eq!(ledger.status(a.action, (c, 7)), Ok(Status::Running));
-        assert!(ledger.start(c, 7, Some(a)));
-        assert_eq!(ledger.status(a.action, (c, 7)), Ok(Status::Running));
+        ledger.receive(c, 7, sequence(a));
+        assert_eq!(status(&ledger, a, (c, 7)), Ok(Status::Running));
+        assert!(ledger.start(c, 7, Some(a), Some("/actions/a".into())));
+        assert_eq!(status(&ledger, a, (c, 7)), Ok(Status::Running));
         ledger.settle(c, 7, result(true));
+        let held = ledger.status(a.action, (c, 7)).unwrap();
+        assert_eq!(held.status, Status::Settled(result(true)));
+        assert_eq!(held.directory, Some("/actions/a".into()));
         assert_eq!(
-            ledger.status(a.action, (c, 7)),
-            Ok(Status::Settled(result(true)))
-        );
-        assert_eq!(
-            ledger.entries(a.action),
+            statuses(&ledger, a),
             vec![(c, 7, Status::Settled(result(true)))]
         );
         assert_eq!(
@@ -515,17 +582,14 @@ mod tests {
         let ledger = Ledger::default();
         let (c, a) = (channel(1), owner(1, 41));
         ledger.open(c);
-        ledger.receive(c, 3, None, false);
-        assert_eq!(ledger.status(a.action, (c, 9)), Ok(Status::Running));
+        ledger.receive(c, 3, Arrival::Other);
+        assert_eq!(status(&ledger, a, (c, 9)), Ok(Status::Running));
         ledger.end(c);
-        assert_eq!(ledger.status(a.action, (c, 9)), Ok(Status::NotStarted));
+        assert_eq!(status(&ledger, a, (c, 9)), Ok(Status::NotStarted));
         // Received and not a sequence (or evicted): nothing can be said.
-        assert_eq!(ledger.status(a.action, (c, 3)), Ok(Status::Unknown));
+        assert_eq!(status(&ledger, a, (c, 3)), Ok(Status::Unknown));
         // A channel this process never saw: it restarted, or the id is wrong.
-        assert_eq!(
-            ledger.status(a.action, (channel(9), 1)),
-            Ok(Status::Unknown)
-        );
+        assert_eq!(status(&ledger, a, (channel(9), 1)), Ok(Status::Unknown));
     }
 
     #[test]
@@ -533,18 +597,18 @@ mod tests {
         let ledger = Ledger::default();
         let (c, a) = (channel(1), owner(1, 41));
         ledger.open(c);
-        ledger.receive(c, 7, Some(Some(a)), false);
-        assert!(ledger.start(c, 7, Some(a)));
-        ledger.receive(c, 8, Some(Some(a)), false);
+        ledger.receive(c, 7, sequence(a));
+        assert!(ledger.start(c, 7, Some(a), None));
+        ledger.receive(c, 8, sequence(a));
         ledger.end(c);
         // The running frame completes and is recorded; the queued one is not.
         assert!(!ledger.may_continue(c));
         ledger.settle(c, 7, result(true));
-        assert_eq!(ledger.status(a.action, (c, 8)), Ok(Status::NotStarted));
-        assert!(!ledger.start(c, 8, Some(a)));
-        assert_eq!(ledger.status(a.action, (c, 8)), Ok(Status::NotStarted));
+        assert_eq!(status(&ledger, a, (c, 8)), Ok(Status::NotStarted));
+        assert!(!ledger.start(c, 8, Some(a), None));
+        assert_eq!(status(&ledger, a, (c, 8)), Ok(Status::NotStarted));
         assert_eq!(
-            ledger.status(a.action, (c, 7)),
+            status(&ledger, a, (c, 7)),
             Ok(Status::Settled(result(true)))
         );
     }
@@ -554,11 +618,18 @@ mod tests {
         let ledger = Ledger::default();
         let (c, a) = (channel(1), owner(1, 41));
         ledger.open(c);
-        ledger.receive(c, 7, Some(Some(a)), false);
-        ledger.receive(c, 8, Some(Some(a)), true);
-        assert_eq!(ledger.status(a.action, (c, 8)), Ok(Status::NotStarted));
+        ledger.receive(c, 7, sequence(a));
+        ledger.receive(
+            c,
+            8,
+            Arrival::Sequence {
+                owner: Some(a),
+                refused: true,
+            },
+        );
+        assert_eq!(status(&ledger, a, (c, 8)), Ok(Status::NotStarted));
         ledger.not_started(c, 7, Some(a));
-        assert_eq!(ledger.status(a.action, (c, 7)), Ok(Status::NotStarted));
+        assert_eq!(status(&ledger, a, (c, 7)), Ok(Status::NotStarted));
     }
 
     #[test]
@@ -579,9 +650,9 @@ mod tests {
         }
         assert_eq!(ledger.register(old, owner(1, 41)), Ok(()));
         assert_eq!(ledger.register(other, owner(2, 5)), Ok(()));
-        ledger.receive(old, 7, Some(Some(owner(1, 41))), false);
-        assert!(ledger.start(old, 7, Some(owner(1, 41))));
-        ledger.receive(old, 8, Some(Some(owner(1, 41))), false);
+        ledger.receive(old, 7, sequence(owner(1, 41)));
+        assert!(ledger.start(old, 7, Some(owner(1, 41)), None));
+        ledger.receive(old, 8, sequence(owner(1, 41)));
         // The same generation again is the same owner.
         assert_eq!(ledger.register(old, owner(1, 41)), Ok(()));
         assert!(ledger.may_continue(old));
@@ -594,12 +665,12 @@ mod tests {
         // What the old channel had queued never starts; its running frame
         // still settles.
         assert_eq!(
-            ledger.status(owner(1, 42).action, (old, 8)),
+            status(&ledger, owner(1, 42), (old, 8)),
             Ok(Status::NotStarted)
         );
         ledger.settle(old, 7, result(true));
         assert_eq!(
-            ledger.status(owner(1, 42).action, (old, 7)),
+            status(&ledger, owner(1, 42), (old, 7)),
             Ok(Status::Settled(result(true)))
         );
         // The old owner is refused from now on, on any channel.
@@ -617,15 +688,41 @@ mod tests {
         let ledger = Ledger::default();
         let c = channel(1);
         ledger.open(c);
-        ledger.receive(c, 7, Some(Some(owner(1, 41))), false);
-        ledger.receive(c, 8, Some(None), false);
-        assert_eq!(ledger.status(owner(2, 1).action, (c, 7)), Err(OtherAction));
-        assert_eq!(ledger.status(owner(1, 41).action, (c, 8)), Err(OtherAction));
-        assert_eq!(ledger.entries(owner(2, 1).action), vec![]);
+        ledger.receive(c, 7, sequence(owner(1, 41)));
+        ledger.receive(
+            c,
+            8,
+            Arrival::Sequence {
+                owner: None,
+                refused: false,
+            },
+        );
+        assert_eq!(status(&ledger, owner(2, 1), (c, 7)), Err(OtherAction));
+        assert_eq!(status(&ledger, owner(1, 41), (c, 8)), Err(OtherAction));
+        assert_eq!(statuses(&ledger, owner(2, 1)), vec![]);
         assert_eq!(
-            ledger.entries(owner(1, 41).action),
+            statuses(&ledger, owner(1, 41)),
             vec![(c, 7, Status::Running)]
         );
+    }
+
+    #[test]
+    fn a_result_written_away_is_kept_as_its_reference() {
+        let ledger = Ledger::default();
+        let (c, a) = (channel(1), owner(1, 41));
+        ledger.open(c);
+        ledger.start(c, 7, Some(a), None);
+        let inline = json!({ "success": true, "steps": [{ "op": "o", "result": { "isError": false,
+            "content": [{ "type": "text", "text": "x".repeat(1000) }] } }], "browser": {} });
+        ledger.settle(c, 7, inline);
+        let reference = json!({ "complete": false, "sizeBytes": 1057,
+            "contentDigest": "sha256:00", "readWith": "workspace_file", "format": "json" });
+        ledger.retain(c, 7, 0, reference.clone());
+        let Status::Settled(kept) = status(&ledger, a, (c, 7)).unwrap() else {
+            panic!("not settled");
+        };
+        assert_eq!(kept["steps"][0]["result"], reference);
+        assert_eq!(kept["steps"][0]["op"], "o");
     }
 
     #[test]
@@ -634,19 +731,19 @@ mod tests {
         let (c, a) = (channel(1), owner(1, 41));
         ledger.open(c);
         // The oldest frame is still running: it is never evicted.
-        ledger.receive(c, 1, Some(Some(a)), false);
-        ledger.start(c, 1, Some(a));
+        ledger.receive(c, 1, sequence(a));
+        ledger.start(c, 1, Some(a), None);
         for id in 2..=(ENTRIES as u64 + 5) {
-            ledger.receive(c, id, Some(Some(a)), false);
-            ledger.start(c, id, Some(a));
+            ledger.receive(c, id, sequence(a));
+            ledger.start(c, id, Some(a), None);
             ledger.settle(c, id, result(true));
         }
-        let held = ledger.entries(a.action);
+        let held = statuses(&ledger, a);
         assert_eq!(held.len(), ENTRIES);
         assert_eq!(held[0], (c, 1, Status::Running));
         assert_eq!(held[1].1, 7);
-        assert_eq!(ledger.status(a.action, (c, 2)), Ok(Status::Unknown));
-        assert_eq!(ledger.status(a.action, (c, 6)), Ok(Status::Unknown));
+        assert_eq!(status(&ledger, a, (c, 2)), Ok(Status::Unknown));
+        assert_eq!(status(&ledger, a, (c, 6)), Ok(Status::Unknown));
 
         // The byte bound: large outcomes push the old ones out.
         let big = json!({ "success": true, "steps": [], "browser": {},
@@ -654,14 +751,14 @@ mod tests {
         let bytes = Ledger::default();
         bytes.open(c);
         for id in 1..=6 {
-            bytes.receive(c, id, Some(Some(a)), false);
-            bytes.start(c, id, Some(a));
+            bytes.receive(c, id, sequence(a));
+            bytes.start(c, id, Some(a), None);
             bytes.settle(c, id, big.clone());
         }
-        let held = bytes.entries(a.action);
+        let held = statuses(&bytes, a);
         assert!(held.len() * (3 << 20) <= BYTES, "{}", held.len());
         assert_eq!(held.last().unwrap().1, 6);
-        assert_eq!(bytes.status(a.action, (c, 1)), Ok(Status::Unknown));
+        assert_eq!(status(&bytes, a, (c, 1)), Ok(Status::Unknown));
     }
 
     #[test]
@@ -686,8 +783,8 @@ mod tests {
         let ledger = std::sync::Arc::new(Ledger::default());
         let (c, a) = (channel(1), owner(1, 41));
         ledger.open(c);
-        ledger.receive(c, 7, Some(Some(a)), false);
-        ledger.start(c, 7, Some(a));
+        ledger.receive(c, 7, sequence(a));
+        ledger.start(c, 7, Some(a), None);
         let started = std::time::Instant::now();
         let waiting = tokio::spawn({
             let ledger = ledger.clone();
@@ -695,6 +792,7 @@ mod tests {
                 ledger
                     .status_within(a.action, (c, 7), Duration::from_secs(10))
                     .await
+                    .map(|held| held.status)
             }
         });
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -702,12 +800,13 @@ mod tests {
         assert_eq!(waiting.await.unwrap(), Ok(Status::Settled(result(false))));
         assert!(started.elapsed() < Duration::from_secs(5));
         // Still running at the end of its wait: running.
-        ledger.receive(c, 8, Some(Some(a)), false);
+        ledger.receive(c, 8, sequence(a));
         let started = std::time::Instant::now();
         assert_eq!(
             ledger
                 .status_within(a.action, (c, 8), Duration::from_millis(60))
-                .await,
+                .await
+                .map(|held| held.status),
             Ok(Status::Running)
         );
         assert!(started.elapsed() >= Duration::from_millis(60));

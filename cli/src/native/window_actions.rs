@@ -284,7 +284,7 @@ impl DaemonState {
     /// single tab is the active page, the refusal also lists the open tabs
     /// (`data`, see `BrowserManager::tab_roster`): the caller can select one
     /// explicitly without a `tab_list` round. Nothing is selected for it.
-    pub(super) fn window_refusal(&self, id: &Value, code: &str, message: &str) -> Value {
+    pub(crate) fn window_refusal(&self, id: &Value, code: &str, message: &str) -> Value {
         let mut refusal = json!({ "id": id, "success": false, "code": code, "error": message });
         if code == ACTIVE_PAGE_AMBIGUOUS {
             if let Some(browser) = self.browser.as_ref() {

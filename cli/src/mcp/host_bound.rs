@@ -81,7 +81,7 @@ pub(super) fn allows(name: &str) -> bool {
     )
 }
 
-pub(super) fn tools() -> Vec<Value> {
+pub(crate) fn tools() -> Vec<Value> {
     catalog().to_vec()
 }
 

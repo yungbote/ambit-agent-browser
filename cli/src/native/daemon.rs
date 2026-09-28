@@ -16,6 +16,7 @@ use super::actions::{
     auto_save_restore_state, close_all_browser_backends, close_current_browser,
     execute_command_received, maybe_autosave_restore_state, DaemonState,
 };
+use super::agent_channel::{self, AgentChannels};
 use super::browser_control::{serve_window_input, BrowserControl, InterruptReason};
 use super::cdp::client::CdpClient;
 use super::playwright::Operations;
@@ -225,6 +226,7 @@ async fn run_socket_server(
             state.browser_control.clone(),
         )
     };
+    let agents = AgentChannels::new(session, state.clone());
 
     // Notifier used by handle_connection to signal the daemon loop to exit
     // after a "close" command, instead of calling process::exit() which skips
@@ -250,8 +252,9 @@ async fn run_socket_server(
                         let cn = close_notify.clone();
                         let operations = playwright_operations.clone();
                         let control = browser_control.clone();
+                        let agents = agents.clone();
                         tasks.spawn(async move {
-                            handle_connection(stream, state, control, idle_activity, sf, cn, operations).await;
+                            handle_connection(stream, state, control, idle_activity, sf, cn, operations, agents).await;
                         });
                     }
                     Err(e) => {
@@ -392,6 +395,7 @@ async fn maintain_browser(state: Arc<tokio::sync::Mutex<DaemonState>>, autosave_
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection<S>(
     stream: S,
     state: std::sync::Arc<tokio::sync::Mutex<DaemonState>>,
@@ -400,6 +404,7 @@ async fn handle_connection<S>(
     stream_file_cleanup: Option<PathBuf>,
     close_notify: Arc<Notify>,
     playwright_operations: Operations,
+    agents: Arc<AgentChannels>,
 ) where
     S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
 {
@@ -461,6 +466,24 @@ async fn handle_connection<S>(
                     .and_then(|v| v.as_str())
                     .unwrap_or_default()
                     .to_string();
+
+                // The agent principal: the connection belongs to its channel
+                // from its first agent frame until it ends. No control
+                // operation is accepted on it, nor an agent frame on the
+                // control action.
+                if action == agent_channel::ACTION {
+                    agents
+                        .serve(
+                            &idle_activity,
+                            std::mem::take(&mut line),
+                            &mut buf_reader,
+                            &mut writer,
+                            &mut queued,
+                            &mut partial,
+                        )
+                        .await;
+                    return;
+                }
 
                 // A person's window input never waits for command custody.
                 if let Some(response) =
@@ -856,6 +879,7 @@ mod tests {
             None,
             Arc::new(Notify::new()),
             operations,
+            AgentChannels::new("default", state.clone()),
         ));
         client
             .write_all(
@@ -883,6 +907,7 @@ mod tests {
     ) {
         let (mut client, server) = tokio::io::duplex(64 << 10);
         let activity = Arc::new(IdleActivity::new());
+        let agents = AgentChannels::new("default", state.clone());
         let task = tokio::spawn(handle_connection(
             server,
             state,
@@ -891,6 +916,7 @@ mod tests {
             None,
             Arc::new(Notify::new()),
             operations,
+            agents,
         ));
         client
             .write_all(format!("{command}\n").as_bytes())

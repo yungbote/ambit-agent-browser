@@ -4766,7 +4766,8 @@ async fn apply_launch_mutator_plugins(
     Ok(())
 }
 
-fn require_sandbox_from_env() -> bool {
+/// The daemon's launch policy: whether it launches Chrome only sandboxed.
+pub(crate) fn require_sandbox_from_env() -> bool {
     matches!(
         env::var("AGENT_BROWSER_REQUIRE_SANDBOX").as_deref(),
         Ok("1" | "true")

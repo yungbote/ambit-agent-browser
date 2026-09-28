@@ -169,6 +169,33 @@ async fn observe(state: &DaemonState) -> Result<Observation, &'static str> {
     })
 }
 
+/// The active page's identity and geometry digest, as a capture records
+/// them: `{targetId, loaderId, pageGeneration, url, title}`.
+pub(crate) async fn page_identity(
+    state: &DaemonState,
+) -> Result<(ObservationId, Value), &'static str> {
+    match tokio::time::timeout(CAPTURE_TIMEOUT, observe(state)).await {
+        Ok(Ok(observation)) => Ok((observation.id, observation.page)),
+        Ok(Err(code)) => Err(code),
+        Err(_) => Err("capture_timeout"),
+    }
+}
+
+/// A capture for `request` of the active page, under the same checks as a
+/// host-bound command's: the feedback object, or the code that stands for
+/// it being unavailable.
+pub(crate) async fn capture_for(request: &FeedbackRequest, state: &DaemonState) -> Value {
+    let browser = match tokio::time::timeout(CAPTURE_TIMEOUT, capture(request, state)).await {
+        Ok(Ok(browser)) => browser,
+        Ok(Err(code)) => request.unavailable(code),
+        Err(_) => request.unavailable("capture_timeout"),
+    };
+    if browser["capture"].get("path").is_some() {
+        state.browser_control.lock().await.observed();
+    }
+    browser
+}
+
 pub(crate) async fn matches_expected(request: &FeedbackRequest, state: &DaemonState) -> bool {
     let Some(expected) = request.expected_observation.as_ref() else {
         return true;

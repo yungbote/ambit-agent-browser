@@ -156,9 +156,14 @@ pub(crate) struct Invalid {
     pub(crate) message: String,
 }
 
+/// A line's frame id, whatever else it carries.
+pub(crate) fn id_of(line: &Value) -> Option<FrameId> {
+    frame_id(&line["id"])
+}
+
 /// The id and type of a line, read before anything else in it.
 pub(crate) fn envelope(line: &Value) -> Result<(FrameId, &str), Invalid> {
-    let id = frame_id(&line["id"]).ok_or_else(|| Invalid {
+    let id = id_of(line).ok_or_else(|| Invalid {
         id: None,
         message: "An agent frame needs an integer id from 1 to 2^53-1.".into(),
     })?;
@@ -209,6 +214,15 @@ impl Frame {
         };
         Ok((id, frame))
     }
+}
+
+/// The owner a line names, if it names a valid one, whatever else it
+/// carries: a frame refused as invalid is still recorded under its Action.
+pub(crate) fn lenient_owner(line: &Value) -> Option<Owner> {
+    let text = |key: &str| line[key].as_str().map(str::to_string);
+    owner(text("actionId"), text("ownerGeneration"))
+        .ok()
+        .flatten()
 }
 
 fn frame_id(value: &Value) -> Option<FrameId> {
