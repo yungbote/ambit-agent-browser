@@ -1,5 +1,5 @@
 use super::*;
-use crate::native::video::convert::{to_rgb, Planar};
+use crate::native::video::convert::{to_rgb, Colour, Planar};
 use std::mem::{offset_of, size_of};
 
 /// The layout this FFI relies on, against the values `offsetof` measured
@@ -39,6 +39,7 @@ fn every_field_sits_where_the_pinned_headers_put_it() {
         (offset_of!(EncoderConfig, keyframe_max_distance), 192),
         (offset_of!(Image, format), 0),
         (offset_of!(Image, primaries), 4),
+        (offset_of!(Image, transfer), 8),
         (offset_of!(Image, matrix), 12),
         (offset_of!(Image, range), 24),
         (offset_of!(Image, width), 28),
@@ -180,8 +181,8 @@ fn one_picture_in_one_unit_out_with_key_units_only_where_asked() {
 }
 
 /// The key unit's sequence header says what the codec string and the
-/// pictures claim: profile, level, and BT.709 primaries and matrix, the sRGB
-/// transfer and full range.
+/// pictures claim: profile, level, and the contract's colour (section 2, rev
+/// 3), BT.709 primaries (1), transfer (1) and matrix (1) at limited range.
 #[test]
 fn the_sequence_header_signals_the_codec_string_and_colour_description() {
     for (codec, width, height) in [
@@ -216,7 +217,7 @@ fn the_sequence_header_signals_the_codec_string_and_colour_description() {
                 header.matrix,
                 header.full_range
             ),
-            (Some(1), Some(13), Some(1), true)
+            (Some(1), Some(1), Some(1), false)
         );
         assert_eq!(
             header.subsampling,
@@ -234,62 +235,43 @@ fn the_sequence_header_signals_the_codec_string_and_colour_description() {
     );
 }
 
-/// A screen of text (1 px strokes, grey antialiasing, coloured links) and
-/// colour bars go through the conversion, the encoder at the still target,
-/// a real AV1 decoder (libaom's own) and the inverse matrix: the pixels
-/// come back as they were drawn. A wrong stride, matrix or range fails this
-/// by tens of dB or a visible tint.
+/// A screen of text (1 px strokes, grey antialiasing, coloured links) on a
+/// white page and on a black one, with colour bars, goes through the
+/// conversion, the encoder at the still target, a real AV1 decoder
+/// (libaom's own) that reads the colour the bitstream signals, and the
+/// inverse at that range, as the viewer's decoder paints it. The decoder
+/// reads BT.709 at limited range, inside the bars it returns the very
+/// samples the encoder was given, and the picture is painted as it was
+/// drawn (`check_painted`). A wrong stride, matrix or range fails this by
+/// tens of dB, a tint, or a page that is not white or black.
 #[test]
 fn text_and_colour_bars_survive_convert_encode_decode_and_the_inverse_matrix() {
-    let (width, height) = (320u32, 192u32);
-    let source = text_fixture(width as usize, height as usize);
-    for codec in [VideoCodec::Av1Full, VideoCodec::Av1] {
-        let mut picture = Planar::new(codec.chroma(), width, height);
-        assert!(picture.convert(
-            &source,
-            width as usize * 4,
-            (width as usize, height as usize),
-            (0, height as usize)
-        ));
-        let mut encoder = AomEncoder::new(codec, width, height, 2).unwrap();
-        let unit = encoder
-            .encode(
-                &picture.picture(),
-                EncodeRequest {
-                    key: true,
-                    quantizer: 8,
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        let decoded = Decoder::new().decode(&unit.data);
-        assert_eq!((decoded.width, decoded.height), (width, height));
-        assert_eq!(decoded.chroma, codec.chroma());
-        let rgb = decoded.rgb();
-        let psnr = psnr(&source, &rgb, width as usize, height as usize);
-        let floor = match codec.chroma() {
-            Chroma::Full => 44.0,
-            Chroma::Subsampled => 30.0,
-        };
-        assert!(
-            psnr >= floor,
-            "{codec:?}: RGB PSNR {psnr:.1} dB below {floor}"
-        );
-        // The bars (the bottom 32 rows) keep their hue: every channel within
-        // a few code values of the source, never a tint.
-        let bar = width as usize / 8;
-        for y in height as usize - 24..height as usize - 8 {
-            for x in (0..width as usize).filter(|x| (4..bar - 4).contains(&(x % bar))) {
-                let at = (y * width as usize + x) * 4;
-                let expected = [source[at + 2], source[at + 1], source[at]];
-                let got = &rgb[at..at + 3];
-                for channel in 0..3 {
-                    assert!(
-                        got[channel].abs_diff(expected[channel]) <= 6,
-                        "{codec:?} bar pixel {x},{y}: {expected:?} came back {got:?}"
+    let (width, height) = FIXTURE;
+    for scheme in [LIGHT, DARK] {
+        let source = text_fixture(scheme);
+        for codec in [VideoCodec::Av1Full, VideoCodec::Av1] {
+            let case = format!("{codec:?} on {:?}", scheme.page);
+            let (picture, unit, _) = still_unit(codec, &source);
+            let decoded = Decoder::new().decode(&unit.data);
+            assert_eq!(
+                (decoded.width, decoded.height, decoded.chroma),
+                (width as u32, height as u32, codec.chroma())
+            );
+            assert_eq!(decoded.colour, COLOUR, "{case}: the signalled colour");
+            let given = picture.picture().planes().unwrap();
+            for (x, y) in bar_insides() {
+                let chroma = match codec.chroma() {
+                    Chroma::Full => y * width + x,
+                    Chroma::Subsampled => (y / 2) * given[1].1 + x / 2,
+                };
+                for (plane, at) in [y * width + x, chroma, chroma].into_iter().enumerate() {
+                    assert_eq!(
+                        decoded.planes[plane][at], given[plane].0[at],
+                        "{case}: bar sample {plane} at {x},{y}"
                     );
                 }
             }
+            check_painted(&case, scheme, codec.chroma(), &source, &decoded.rgb(), 1);
         }
     }
 }
@@ -322,11 +304,57 @@ fn a_refinement_takes_its_own_speed_and_motion_returns_to_its_own() {
 }
 
 // ---------------------------------------------------------------------------
-// Fixtures: a text screen, a real decoder and a sequence header reader.
+// Fixtures: text pages over colour bars and what they must look like once
+// painted, a real decoder and a sequence header reader.
 
-/// Text-like content: glyph cells of 1 px dark strokes on white with grey
-/// antialiased edges, blue link runs, then colour bars (the bottom 32 rows).
-fn text_fixture(width: usize, height: usize) -> Vec<u8> {
+/// The text fixture's size: text inside a margin of bare page, over colour
+/// bars.
+pub(crate) const FIXTURE: (usize, usize) = (320, 192);
+/// The bare page around the text, as a page's margins.
+const MARGIN: usize = 32;
+/// The colour bars along the bottom: white, the six saturated primaries and
+/// secondaries, and black.
+const BARS: [[u8; 3]; 8] = [
+    [255, 255, 255],
+    [255, 255, 0],
+    [0, 255, 255],
+    [0, 255, 0],
+    [255, 0, 255],
+    [255, 0, 0],
+    [0, 0, 255],
+    [0, 0, 0],
+];
+const BARS_HEIGHT: usize = 32;
+/// The distance from any edge beyond which the page must be exact: more
+/// than twice as far as the codec's ringing reaches at the still target
+/// (measured: 3 px).
+const RINGING: usize = 8;
+
+/// A page's colours: its background, its text and its links.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Scheme {
+    pub page: [u8; 3],
+    pub ink: [u8; 3],
+    pub link: [u8; 3],
+}
+
+pub(crate) const LIGHT: Scheme = Scheme {
+    page: [255; 3],
+    ink: [29, 29, 31],
+    link: [10, 102, 194],
+};
+
+pub(crate) const DARK: Scheme = Scheme {
+    page: [0; 3],
+    ink: [232, 234, 237],
+    link: [138, 180, 248],
+};
+
+/// The text fixture on the page of `scheme`, as BGRX rows: glyph cells of
+/// 1 px strokes with antialiased edges and link runs inside a margin of bare
+/// page, then the colour bars.
+pub(crate) fn text_fixture(scheme: Scheme) -> Vec<u8> {
+    let (width, height) = FIXTURE;
     let mut seed = 0x2545_f491u32;
     let mut random = move || {
         seed ^= seed << 13;
@@ -334,12 +362,15 @@ fn text_fixture(width: usize, height: usize) -> Vec<u8> {
         seed ^= seed << 5;
         seed
     };
-    let mut pixels = vec![255u8; width * height * 4];
-    let text_rows = height - 32;
-    for cell_y in (0..text_rows).step_by(16) {
-        for cell_x in (0..width).step_by(8) {
+    let [red, green, blue] = scheme.page;
+    let mut pixels: Vec<u8> = (0..width * height)
+        .flat_map(|_| [blue, green, red, 0])
+        .collect();
+    let text_rows = height - BARS_HEIGHT;
+    for cell_y in (MARGIN..text_rows - MARGIN).step_by(16) {
+        for cell_x in (MARGIN..width - MARGIN).step_by(8) {
             let link = cell_x % 96 < 32 && cell_y % 48 == 16;
-            let ink: [u8; 3] = if link { [10, 102, 194] } else { [29, 29, 31] };
+            let ink = if link { scheme.link } else { scheme.ink };
             for stroke in 0..4 {
                 let horizontal = random() % 2 == 0;
                 let at = random() as usize;
@@ -349,9 +380,6 @@ fn text_fixture(width: usize, height: usize) -> Vec<u8> {
                     } else {
                         (cell_x + 1 + at % 6, cell_y + 3 + step + stroke)
                     };
-                    if x >= width || y >= text_rows {
-                        continue;
-                    }
                     let offset = (y * width + x) * 4;
                     let weight = if step == 0 || step == 5 { 128u16 } else { 255 };
                     for (channel, value) in [(2, ink[0]), (1, ink[1]), (0, ink[2])] {
@@ -363,19 +391,9 @@ fn text_fixture(width: usize, height: usize) -> Vec<u8> {
             }
         }
     }
-    let bars: [[u8; 3]; 8] = [
-        [255, 255, 255],
-        [255, 255, 0],
-        [0, 255, 255],
-        [0, 255, 0],
-        [255, 0, 255],
-        [255, 0, 0],
-        [0, 0, 255],
-        [10, 102, 194],
-    ];
     for y in text_rows..height {
         for x in 0..width {
-            let [r, g, b] = bars[x * bars.len() / width];
+            let [r, g, b] = BARS[x * BARS.len() / width];
             let offset = (y * width + x) * 4;
             pixels[offset..offset + 4].copy_from_slice(&[b, g, r, 0]);
         }
@@ -383,21 +401,118 @@ fn text_fixture(width: usize, height: usize) -> Vec<u8> {
     pixels
 }
 
-fn psnr(source: &[u8], rgb: &[u8], width: usize, height: usize) -> f64 {
-    let mut error = 0f64;
-    for pixel in 0..width * height {
-        let at = pixel * 4;
-        for (channel, rgb_channel) in [(2, 0), (1, 1), (0, 2)] {
-            let difference = f64::from(source[at + channel]) - f64::from(rgb[at + rgb_channel]);
-            error += difference * difference;
+/// A fixture converted for `codec` and encoded as one key unit at the still
+/// target (quantizer 8), with the stream's codec string.
+pub(crate) fn still_unit(codec: VideoCodec, source: &[u8]) -> (Planar, EncodedUnit, String) {
+    let (width, height) = FIXTURE;
+    let mut picture = Planar::new(codec.chroma(), width as u32, height as u32);
+    assert!(picture.convert(source, width * 4, FIXTURE, (0, height)));
+    let mut encoder = AomEncoder::new(codec, width as u32, height as u32, 2).unwrap();
+    let request = EncodeRequest {
+        key: true,
+        quantizer: 8,
+        ..Default::default()
+    };
+    let unit = encoder.encode(&picture.picture(), request).unwrap();
+    (picture, unit, encoder.codec_string())
+}
+
+/// The pixels inside the bars, 4 px from their sides and 8 px from their
+/// top and bottom: flat colour with no edge near for the codec to ring from.
+fn bar_insides() -> impl Iterator<Item = (usize, usize)> {
+    let (width, height) = FIXTURE;
+    let bar = width / BARS.len();
+    (height - BARS_HEIGHT + 8..height - 8).flat_map(move |y| {
+        (0..width)
+            .filter(move |x| (4..bar - 4).contains(&(x % bar)))
+            .map(move |x| (x, y))
+    })
+}
+
+/// How a painted fixture measured against what was drawn.
+#[derive(Debug)]
+pub(crate) struct Painted {
+    /// RGB PSNR over the text block.
+    pub psnr: f64,
+    /// Each bar's largest channel error inside it.
+    pub bars: [u8; 8],
+}
+
+/// Checks a painted fixture (`painted`: four bytes a pixel, red first)
+/// against the drawn one in `scheme` (`source`, BGRX): the bare page exactly
+/// white or black, the white and black bars exact, every other bar within
+/// `saturated` code values (1 for a painter that inverts exactly: limited
+/// range's own rounding), and the text block at least 44 dB RGB PSNR at
+/// 4:4:4 and 30 at 4:2:0, where a wrong stride, matrix or range costs tens
+/// of dB.
+pub(crate) fn check_painted(
+    case: &str,
+    scheme: Scheme,
+    chroma: Chroma,
+    source: &[u8],
+    painted: &[u8],
+    saturated: u8,
+) -> Painted {
+    let (width, height) = FIXTURE;
+    let drawn_at = |x: usize, y: usize| {
+        let at = (y * width + x) * 4;
+        [source[at + 2], source[at + 1], source[at]]
+    };
+    let painted_at = |x: usize, y: usize| {
+        let at = (y * width + x) * 4;
+        [painted[at], painted[at + 1], painted[at + 2]]
+    };
+    let text_rows = height - BARS_HEIGHT;
+    let (right, bottom) = (width - MARGIN, text_rows - MARGIN);
+    for y in 0..=text_rows - RINGING {
+        for x in 0..width {
+            let dx = MARGIN.saturating_sub(x).max((x + 1).saturating_sub(right));
+            let dy = MARGIN.saturating_sub(y).max((y + 1).saturating_sub(bottom));
+            if dx.max(dy) >= RINGING {
+                assert_eq!(painted_at(x, y), scheme.page, "{case}: page at {x},{y}");
+            }
         }
     }
-    let mse = error / (width * height * 3) as f64;
-    10.0 * (255.0 * 255.0 / mse.max(1e-9)).log10()
+    let mut bars = [0u8; 8];
+    for (x, y) in bar_insides() {
+        let (drawn, got) = (drawn_at(x, y), painted_at(x, y));
+        let error = (0..3)
+            .map(|channel| got[channel].abs_diff(drawn[channel]))
+            .max()
+            .unwrap();
+        let allowed = if drawn == [255; 3] || drawn == [0; 3] {
+            0
+        } else {
+            saturated
+        };
+        assert!(error <= allowed, "{case}: bar {drawn:?} painted {got:?}");
+        let bar = &mut bars[x * BARS.len() / width];
+        *bar = (*bar).max(error);
+    }
+    let (mut error, mut samples) = (0f64, 0f64);
+    for (x, y) in (MARGIN..bottom).flat_map(|y| (MARGIN..right).map(move |x| (x, y))) {
+        let (drawn, got) = (drawn_at(x, y), painted_at(x, y));
+        for channel in 0..3 {
+            error += (f64::from(drawn[channel]) - f64::from(got[channel])).powi(2);
+            samples += 1.0;
+        }
+    }
+    let psnr = 10.0 * (255.0 * 255.0 / (error / samples).max(1e-9)).log10();
+    let floor = match chroma {
+        Chroma::Full => 44.0,
+        Chroma::Subsampled => 30.0,
+    };
+    assert!(
+        psnr >= floor,
+        "{case}: text RGB PSNR {psnr:.2} dB below {floor}"
+    );
+    Painted { psnr, bars }
 }
 
 pub(crate) struct Decoded {
     pub chroma: Chroma,
+    /// The colour the bitstream signals, as the decoder read it.
+    pub colour: Colour,
     pub width: u32,
     pub height: u32,
     pub planes: [Vec<u8>; 3],
@@ -405,7 +520,8 @@ pub(crate) struct Decoded {
 
 impl Decoded {
     /// RGB, four bytes per pixel (the fourth unused), through the exact
-    /// inverse of the stream's matrix and range.
+    /// inverse of the matrix and range the bitstream signals, as a decoder
+    /// that honours the signal paints it.
     pub(crate) fn rgb(&self) -> Vec<u8> {
         let (width, height) = (self.width as usize, self.height as usize);
         let chroma_width = match self.chroma {
@@ -420,6 +536,7 @@ impl Decoded {
                     Chroma::Subsampled => (x / 2, y / 2),
                 };
                 let [r, g, b] = to_rgb(
+                    self.colour,
                     self.planes[0][y * width + x],
                     self.planes[1][cy * chroma_width + cx],
                     self.planes[2][cy * chroma_width + cx],
@@ -521,8 +638,15 @@ impl Decoder {
             Chroma::Full => (width as usize, height as usize),
             Chroma::Subsampled => (width as usize / 2, height as usize / 2),
         };
+        let code = |value: c_uint| u8::try_from(value).expect("an H.273 code point");
         Decoded {
             chroma,
+            colour: Colour {
+                primaries: code(image.primaries),
+                transfer: code(image.transfer),
+                matrix: code(image.matrix),
+                full_range: image.range == 1,
+            },
             width,
             height,
             planes: [

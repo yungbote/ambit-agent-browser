@@ -14,6 +14,8 @@ mod bench;
 pub(crate) mod convert;
 #[cfg(target_os = "linux")]
 mod library;
+#[cfg(all(test, target_os = "linux"))]
+mod webcodecs_e2e;
 
 /// libaom's own decoder, for proofs that decode what the producer sent.
 #[cfg(all(test, target_os = "linux"))]
@@ -111,8 +113,8 @@ impl Chroma {
     }
 }
 
-/// One picture in planar Y′CbCr (BT.709 matrix, full range), rows tightly
-/// packed: Y, then Cb, then Cr.
+/// One picture in planar Y′CbCr (BT.709 at limited range, `convert::COLOUR`),
+/// rows tightly packed: Y, then Cb, then Cr.
 pub(crate) struct Picture<'a> {
     pub chroma: Chroma,
     pub width: u32,

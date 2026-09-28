@@ -1,28 +1,54 @@
 //! Screen pixels to encoder pictures: rows of BGRX (the X server's 32-bit
 //! little-endian layout, which the display helper hands over unchanged) into
-//! planar Y′CbCr with the BT.709 matrix at full range, the colour description
-//! every stream signals. Fixed point with 14 fractional bits; each
-//! coefficient row sums to exactly one (Y) or zero (Cb, Cr), so a grey maps
-//! to itself with Cb = Cr = 128 and white stays 255. 4:2:0 averages each 2×2
-//! block before converting its chroma.
+//! planar Y′CbCr in `COLOUR`, the BT.709 matrix at limited (video) range:
+//! luma 16-235, chroma 16-240. Fixed point with 14 fractional bits; each
+//! chroma row sums to exactly zero, so a grey keeps Cb = Cr = 128, and every
+//! grey's luma is its nearest code (white 235, black 16). 4:2:0 averages each
+//! 2×2 block before converting its chroma.
 //!
 //! Only rows that changed are converted: a picture is kept between frames
 //! and updated in place.
 
 use super::{Chroma, Picture};
 
+/// How samples map to colour, as the ITU-T H.273 code points a bitstream
+/// signals.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Colour {
+    pub primaries: u8,
+    pub transfer: u8,
+    pub matrix: u8,
+    pub full_range: bool,
+}
+
+/// The colour of every picture this module converts, and so what every
+/// encoder signals (contract section 2, rev 3): BT.709 primaries, transfer
+/// and matrix at limited range. Limited range is also how a decoder paints
+/// a picture whose signal it lost.
+pub(crate) const COLOUR: Colour = Colour {
+    primaries: 1,
+    transfer: 1,
+    matrix: 1,
+    full_range: false,
+};
+
 const BYTES_PER_PIXEL: usize = 4;
 const SHIFT: u32 = 14;
 const HALF: i32 = 1 << (SHIFT - 1);
-const CHROMA_ZERO: i32 = 128 << SHIFT;
-// BT.709: Kr = 0.2126, Kb = 0.0722; Cb = (B - Y) / 1.8556, Cr = (R - Y) / 1.5748.
-const Y: [i32; 3] = [3483, 11718, 1183];
-const CB: [i32; 3] = [-1877, -6315, 8192];
-const CR: [i32; 3] = [8192, -7441, -751];
+/// Black's luma and every grey's chroma at limited range.
+const BLACK: u8 = 16;
+const NEUTRAL: u8 = 128;
+const LUMA_ZERO: i32 = (BLACK as i32) << SHIFT;
+const CHROMA_ZERO: i32 = (NEUTRAL as i32) << SHIFT;
+// BT.709 (Kr = 0.2126, Kb = 0.0722; Cb = (B - Y) / 1.8556, Cr = (R - Y) /
+// 1.5748), luma scaled by 219/255 and chroma by 224/255 to limited range.
+const Y: [i32; 3] = [2991, 10064, 1016];
+const CB: [i32; 3] = [-1649, -5547, 7196];
+const CR: [i32; 3] = [7196, -6536, -660];
 
 #[inline(always)]
 fn luma(r: i32, g: i32, b: i32) -> u8 {
-    ((Y[0] * r + Y[1] * g + Y[2] * b + HALF) >> SHIFT) as u8
+    ((Y[0] * r + Y[1] * g + Y[2] * b + LUMA_ZERO + HALF) >> SHIFT) as u8
 }
 
 /// Chroma of `r`, `g`, `b` summed over `2^extra` pixels.
@@ -51,8 +77,8 @@ impl Planar {
     pub(crate) fn new(chroma: Chroma, width: u32, height: u32) -> Self {
         let (width, height) = (width as usize, height as usize);
         let luma = width * height;
-        let mut data = vec![128u8; chroma.picture_bytes(width, height)];
-        data[..luma].fill(0);
+        let mut data = vec![NEUTRAL; chroma.picture_bytes(width, height)];
+        data[..luma].fill(BLACK);
         Self {
             chroma,
             width,
@@ -168,7 +194,7 @@ impl Planar {
         let (luma_plane, chroma_planes) = self.data.split_at_mut(luma_size);
         for (index, row) in luma_plane.chunks_exact_mut(self.width).enumerate() {
             let kept = if index < height { width } else { 0 };
-            row[kept..].fill(0);
+            row[kept..].fill(BLACK);
         }
         for (index, row) in chroma_planes.chunks_exact_mut(chroma_width).enumerate() {
             let kept = if index % chroma_height < chroma_height_kept {
@@ -176,7 +202,7 @@ impl Planar {
             } else {
                 0
             };
-            row[kept..].fill(128);
+            row[kept..].fill(NEUTRAL);
         }
     }
 }
@@ -247,10 +273,23 @@ fn convert_subsampled(
     }
 }
 
-/// BT.709 full-range Y′CbCr back to RGB, for proofs of the round trip.
+/// Y′CbCr back to RGB through the exact inverse of the BT.709 matrix at the
+/// range `colour` signals, as a decoder that honours the signal paints it:
+/// for proofs of the round trip.
 #[cfg(test)]
-pub(crate) fn to_rgb(y: u8, cb: u8, cr: u8) -> [u8; 3] {
-    let (y, cb, cr) = (f64::from(y), f64::from(cb) - 128.0, f64::from(cr) - 128.0);
+pub(crate) fn to_rgb(colour: Colour, y: u8, cb: u8, cr: u8) -> [u8; 3] {
+    assert_eq!(
+        colour.matrix, COLOUR.matrix,
+        "the proofs invert BT.709 only"
+    );
+    let (black, luma_scale, chroma_scale) = if colour.full_range {
+        (0.0, 1.0, 1.0)
+    } else {
+        (f64::from(BLACK), 255.0 / 219.0, 255.0 / 224.0)
+    };
+    let y = (f64::from(y) - black) * luma_scale;
+    let cb = (f64::from(cb) - f64::from(NEUTRAL)) * chroma_scale;
+    let cr = (f64::from(cr) - f64::from(NEUTRAL)) * chroma_scale;
     let r = y + 1.5748 * cr;
     let g = y - 0.187_324 * cb - 0.468_124 * cr;
     let b = y + 1.8556 * cb;
@@ -268,22 +307,59 @@ mod tests {
             .collect()
     }
 
+    /// Every coefficient is the nearest fixed-point value of BT.709 at
+    /// limited range, and each of the 256 greys lands on its nearest
+    /// limited-range code with neutral chroma: white 235, black 16.
     #[test]
-    fn coefficients_keep_grey_neutral_and_the_range_full() {
-        assert_eq!(Y.iter().sum::<i32>(), 1 << SHIFT);
+    fn coefficients_are_bt709_at_limited_range_and_every_grey_stays_neutral() {
+        let (kr, kb) = (0.2126, 0.0722);
+        let kg = 1.0 - kr - kb;
+        let unit = f64::from(1 << SHIFT);
+        let (luma_scale, chroma_scale) = (219.0 / 255.0 * unit, 224.0 / 255.0 * unit);
+        let exact = [
+            [kr, kg, kb].map(|k| k * luma_scale),
+            [-kr, -kg, 1.0 - kb].map(|k| k / (2.0 * (1.0 - kb)) * chroma_scale),
+            [1.0 - kr, -kg, -kb].map(|k| k / (2.0 * (1.0 - kr)) * chroma_scale),
+        ];
+        for (row, exact) in [Y, CB, CR].iter().zip(exact) {
+            for (coefficient, exact) in row.iter().zip(exact) {
+                assert!(
+                    (f64::from(*coefficient) - exact).abs() <= 0.5,
+                    "{coefficient} for {exact}"
+                );
+            }
+        }
         assert_eq!(CB.iter().sum::<i32>(), 0);
         assert_eq!(CR.iter().sum::<i32>(), 0);
-        for grey in [0u8, 1, 17, 128, 200, 254, 255] {
+        for grey in 0..=255u8 {
             let value = i32::from(grey);
-            assert_eq!(luma(value, value, value), grey);
-            assert_eq!(chroma(CB, value, value, value, 0), 128);
-            assert_eq!(chroma(CR, value, value, value, 0), 128);
+            let nearest = 16 + (219 * u32::from(grey) + 127) / 255;
+            assert_eq!(u32::from(luma(value, value, value)), nearest, "{grey}");
+            for (coefficients, sum, extra) in [(CB, value, 0), (CR, value, 0), (CB, 4 * value, 2)] {
+                assert_eq!(chroma(coefficients, sum, sum, sum, extra), NEUTRAL);
+            }
         }
+        assert_eq!((luma(255, 255, 255), luma(0, 0, 0)), (235, BLACK));
     }
 
-    /// Colour bars through the conversion and the exact inverse land within
-    /// one code value of where they started: the matrix and range are the
-    /// ones the stream signals, not washed or tinted.
+    /// The inverse reads the samples at the range the signal names: a
+    /// limited-range white and black read as full range would paint the
+    /// greys 235 and 16, the washed picture a misread signal gives.
+    #[test]
+    fn the_inverse_honours_the_signalled_range() {
+        let full = Colour {
+            full_range: true,
+            ..COLOUR
+        };
+        assert_eq!(to_rgb(COLOUR, 235, 128, 128), [255; 3]);
+        assert_eq!(to_rgb(COLOUR, 16, 128, 128), [0; 3]);
+        assert_eq!(to_rgb(full, 235, 128, 128), [235; 3]);
+        assert_eq!(to_rgb(full, 16, 128, 128), [16; 3]);
+    }
+
+    /// Colour bars through the conversion and the exact inverse: white and
+    /// black exactly, every other colour within one code value (limited
+    /// range has 220 luma codes for 256 levels), never washed or tinted.
     #[test]
     fn colour_bars_round_trip_within_one_code_value() {
         let bars = [
@@ -302,8 +378,17 @@ mod tests {
         let source = bgrx(&bars);
         assert!(picture.convert(&source, source.len(), (bars.len(), 1), (0, 1)));
         let planes = picture.picture().planes().unwrap();
-        for (index, expected) in bars.iter().enumerate() {
-            let back = to_rgb(planes[0].0[index], planes[1].0[index], planes[2].0[index]);
+        let back: Vec<[u8; 3]> = (0..bars.len())
+            .map(|index| {
+                to_rgb(
+                    COLOUR,
+                    planes[0].0[index],
+                    planes[1].0[index],
+                    planes[2].0[index],
+                )
+            })
+            .collect();
+        for (index, (expected, back)) in bars.iter().zip(&back).enumerate() {
             for channel in 0..3 {
                 assert!(
                     back[channel].abs_diff(expected[channel]) <= 1,
@@ -311,10 +396,11 @@ mod tests {
                 );
             }
         }
-        // Reference values of BT.709 full range for pure red.
+        assert_eq!((back[0], back[7]), ([255; 3], [0; 3]), "white and black");
+        // Reference values of BT.709 limited range for pure red.
         assert_eq!(
             (planes[0].0[5], planes[1].0[5], planes[2].0[5]),
-            (54, 99, 255)
+            (63, 102, 240)
         );
     }
 
@@ -329,12 +415,12 @@ mod tests {
         let mut picture = Planar::new(Chroma::Subsampled, 4, 2);
         assert!(picture.convert(&source, 16, (4, 2), (0, 2)));
         let planes = picture.picture().planes().unwrap();
-        assert_eq!(&planes[0].0[..4], &[54, 18, 255, 255]);
+        assert_eq!(&planes[0].0[..4], &[63, 32, 235, 235]);
         // Two red and two blue pixels: their summed colour, averaged.
         assert_eq!(planes[1].0[0], chroma(CB, 510, 0, 510, 2));
         assert_eq!(planes[2].0[0], chroma(CR, 510, 0, 510, 2));
-        // BT.709 full range of (127.5, 0, 127.5): Cb 177.14, Cr 185.9.
-        assert_eq!((planes[1].0[0], planes[2].0[0]), (177, 186));
+        // BT.709 limited range of (127.5, 0, 127.5): Cb 171.2, Cr 178.9.
+        assert_eq!((planes[1].0[0], planes[2].0[0]), (171, 179));
         assert_eq!((planes[1].0[1], planes[2].0[1]), (128, 128));
     }
 
@@ -351,10 +437,10 @@ mod tests {
         assert_eq!(
             luma,
             [
-                &[0, 0, 0, 0],
-                &[255, 255, 0, 0],
-                &[0, 0, 0, 0],
-                &[0, 0, 0, 0]
+                &[16, 16, 16, 16],
+                &[235, 235, 16, 16],
+                &[16, 16, 16, 16],
+                &[16, 16, 16, 16]
             ]
         );
         // A source row beyond what the buffer holds is refused, not read.
@@ -362,8 +448,8 @@ mod tests {
         assert!(picture.convert(&source, 8, (2, 3), (0, 3)));
         picture.clear_outside(1, 1);
         let planes = picture.picture().planes().unwrap();
-        assert_eq!(&planes[0].0[..4], &[255, 0, 0, 0]);
-        assert!(planes[0].0[4..].iter().all(|value| *value == 0));
-        assert!(planes[1].0[1..].iter().all(|value| *value == 128));
+        assert_eq!(&planes[0].0[..4], &[235, 16, 16, 16]);
+        assert!(planes[0].0[4..].iter().all(|value| *value == BLACK));
+        assert!(planes[1].0[1..].iter().all(|value| *value == NEUTRAL));
     }
 }

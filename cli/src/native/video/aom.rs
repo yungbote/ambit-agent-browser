@@ -13,6 +13,7 @@
 use std::ffi::{c_char, c_int, c_long, c_uint, c_ulong, c_void, CStr};
 use std::sync::OnceLock;
 
+use super::convert::COLOUR;
 use super::library::Library;
 use super::{Chroma, EncodeRequest, EncodedUnit, Picture, VideoCodec, VideoEncoder, VideoError};
 
@@ -32,13 +33,6 @@ const Q: c_uint = 3;
 const KF_DISABLED: c_uint = 0;
 const BITS_8: c_uint = 8;
 
-/// CICP code points the sequence header carries: BT.709 primaries, the sRGB
-/// transfer the screen was drawn in, the BT.709 matrix and full range. The
-/// pictures are converted with exactly this matrix and range (`convert`).
-const CICP_PRIMARIES_BT709: c_int = 1;
-const CICP_TRANSFER_SRGB: c_int = 13;
-const CICP_MATRIX_BT709: c_int = 1;
-const COLOR_RANGE_FULL: c_int = 1;
 const CONTENT_SCREEN: c_int = 1;
 const SUPERBLOCK_128: c_int = 1;
 /// The cost tables' update frequency "off": each superblock row reuses them.
@@ -455,10 +449,15 @@ impl AomEncoder {
             (control::DELTAQ_MODE, 0),
             (control::ENABLE_ORDER_HINT, 0),
             (control::AQ_MODE, 0),
-            (control::COLOR_PRIMARIES, CICP_PRIMARIES_BT709),
-            (control::TRANSFER_CHARACTERISTICS, CICP_TRANSFER_SRGB),
-            (control::MATRIX_COEFFICIENTS, CICP_MATRIX_BT709),
-            (control::COLOR_RANGE, COLOR_RANGE_FULL),
+            // The sequence header says what the pictures are (`COLOUR`);
+            // libaom's range is 0 for limited, 1 for full.
+            (control::COLOR_PRIMARIES, c_int::from(COLOUR.primaries)),
+            (
+                control::TRANSFER_CHARACTERISTICS,
+                c_int::from(COLOUR.transfer),
+            ),
+            (control::MATRIX_COEFFICIENTS, c_int::from(COLOUR.matrix)),
+            (control::COLOR_RANGE, c_int::from(COLOUR.full_range)),
             (control::TARGET_SEQ_LEVEL_IDX, c_int::from(encoder.level)),
         ] {
             encoder
@@ -571,10 +570,10 @@ impl VideoEncoder for AomEncoder {
             self.image.planes[index] = plane.as_ptr().cast_mut();
             self.image.strides[index] = *stride as c_int;
         }
-        self.image.primaries = CICP_PRIMARIES_BT709 as c_uint;
-        self.image.transfer = CICP_TRANSFER_SRGB as c_uint;
-        self.image.matrix = CICP_MATRIX_BT709 as c_uint;
-        self.image.range = COLOR_RANGE_FULL as c_uint;
+        self.image.primaries = c_uint::from(COLOUR.primaries);
+        self.image.transfer = c_uint::from(COLOUR.transfer);
+        self.image.matrix = c_uint::from(COLOUR.matrix);
+        self.image.range = c_uint::from(COLOUR.full_range);
         let flags = if request.key { EFLAG_FORCE_KF } else { 0 };
         let pts = self.pictures;
         self.pictures += 1;

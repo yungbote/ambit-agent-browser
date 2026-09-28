@@ -138,6 +138,7 @@ impl Viewer {
             Chroma::Subsampled => (x / 2, y / 2, shown.width as usize / 2),
         };
         to_rgb(
+            shown.colour,
             shown.planes[0][y * shown.width as usize + x],
             shown.planes[1][cy * chroma_width + cx],
             shown.planes[2][cy * chroma_width + cx],

@@ -14,7 +14,7 @@
 //! pixels through libaom's own decoder and the inverse matrix.
 
 use super::aom::AomEncoder;
-use super::convert::{to_rgb, Planar};
+use super::convert::{to_rgb, Planar, COLOUR};
 use super::{open, Chroma, EncodeRequest, VideoCodec, VideoEncoder};
 use serde_json::json;
 use std::time::Instant;
@@ -84,6 +84,7 @@ fn rgb_psnr(source: &[u8], picture: &Planar) -> f64 {
         for x in 0..WIDTH {
             let (cx, cy) = if subsampled { (x / 2, y / 2) } else { (x, y) };
             let rgb = to_rgb(
+                COLOUR,
                 planes[0].0[y * WIDTH + x],
                 planes[1].0[cy * chroma_width + cx],
                 planes[2].0[cy * chroma_width + cx],
@@ -117,6 +118,7 @@ fn crop(picture: &Planar, path: &std::path::Path) {
                 (px, py)
             };
             let rgb = to_rgb(
+                COLOUR,
                 planes[0].0[py * WIDTH + px],
                 planes[1].0[cy * chroma_width + cx],
                 planes[2].0[cy * chroma_width + cx],
