@@ -13,6 +13,8 @@
 // The producer's half exists on Linux only.
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
+#[cfg(all(test, target_os = "linux"))]
+mod cpu_bench;
 mod policy;
 #[cfg(target_os = "linux")]
 mod producer;
