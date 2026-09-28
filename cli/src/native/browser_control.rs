@@ -552,14 +552,18 @@ impl BrowserControl {
 
     /// Agent keyboard through the owned display, one stroke at a time: a key
     /// press goes `interval` after the previous one and a paste is one
-    /// stroke, so text appears key by key (`motion::strokes`). A pending
-    /// interruption stops typing before the next press, and the report says
-    /// exactly how many characters went in. A stroke that may have started
-    /// leaves an uncertain outcome and releases whatever the helper holds.
+    /// stroke, so text appears key by key (`motion::strokes`). Each stroke
+    /// that enters or deletes text is published to `session`'s viewers as
+    /// typing once the helper acknowledged it. A pending interruption stops
+    /// typing before the next press, and the report says exactly how many
+    /// characters went in. A stroke that may have started leaves an
+    /// uncertain outcome and releases whatever the helper holds.
     pub(crate) async fn agent_native_keys(
         &mut self,
         events: &[Value],
         interval: Duration,
+        client: &CdpClient,
+        session: &str,
     ) -> Result<(), CommandError> {
         if let Some(error) = self.agent_error() {
             return Err(format!("{}: {}", error.code, error.message).into());
@@ -589,6 +593,17 @@ impl BrowserControl {
                 }
                 self.key_sent_at = Some(Instant::now());
             }
+            let typing = events[stroke.events.clone()]
+                .iter()
+                .find_map(super::activity::from_native_keyboard)
+                .map(|activity| {
+                    client.observe_activity(
+                        activity,
+                        session,
+                        client.page_generation(session),
+                        InputSource::Agent,
+                    )
+                });
             for batch in events[stroke.events.clone()].chunks(MAX_EVENTS) {
                 let Err(error) = display.input(batch).await else {
                     continue;
@@ -612,6 +627,9 @@ impl BrowserControl {
                     message.push_str(&release);
                 }
                 return Err(message.into());
+            }
+            if let Some(typing) = typing {
+                typing.acknowledged();
             }
             typed += stroke.characters;
         }

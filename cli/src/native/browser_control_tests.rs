@@ -1513,11 +1513,15 @@ async fn taking_control_ends_the_agents_held_gesture_for_layouts() {
 }
 
 /// Text goes in key by key: one helper request per key, each press one
-/// `KEY_INTERVAL` after the one before, a paste as one stroke.
+/// `KEY_INTERVAL` after the one before, a paste as one stroke. Each
+/// acknowledged stroke reaches the page's viewers as typing, as the same
+/// text sent through DevTools does.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn typing_sends_one_key_per_interval() {
     let (display, mut ops, _frames) = acknowledging_display();
+    let browser = Browser::new().await;
+    let mut activity = browser.client.subscribe();
     let mut control = BrowserControl {
         display: Some(display),
         ..BrowserControl::default()
@@ -1527,16 +1531,30 @@ async fn typing_sends_one_key_per_interval() {
     events.extend(super::super::interaction::native_paste_events(
         "pasted as a person pastes",
     ));
+    events.extend(super::super::interaction::native_key_chord_events(
+        "Enter", None,
+    ));
     control
-        .agent_native_keys(&events, motion::KEY_INTERVAL)
+        .agent_native_keys(&events, motion::KEY_INTERVAL, &browser.client, "page")
         .await
         .unwrap();
+    let mut typing = 0;
+    while let Ok(event) = activity.try_recv() {
+        if event.method == crate::native::activity::EVENT {
+            assert_eq!(event.params["kind"], "typing");
+            assert_eq!(event.params["source"], "agent");
+            assert_eq!(event.session_id.as_deref(), Some("page"));
+            typing += 1;
+        }
+    }
+    // Every character and the paste; Enter enters no text.
+    assert_eq!(typing, text.chars().count() + 1);
     let mut arrivals = Vec::new();
     while let Ok(request) = ops.try_recv() {
         arrivals.push(request);
     }
-    // One request per character, and one for the paste.
-    assert_eq!(arrivals.len(), text.chars().count() + 1);
+    // One request per character, one for the paste and one for Enter.
+    assert_eq!(arrivals.len(), text.chars().count() + 2);
     let presses: Vec<_> = arrivals
         .iter()
         .map(|request| {
@@ -1547,7 +1565,7 @@ async fn typing_sends_one_key_per_interval() {
         })
         .collect();
     assert!(presses[..text.len()].iter().all(|kind| kind == "keyDown"));
-    assert_eq!(presses.last().unwrap(), "insertText");
+    assert_eq!(presses[text.len()], "insertText");
     assert!(arrivals[..text.len()]
         .iter()
         .all(|request| request["events"].as_array().unwrap().len() == 2));
@@ -1585,8 +1603,9 @@ async fn key_presses_keep_their_interval() {
         ..BrowserControl::default()
     };
     let events = super::super::interaction::native_text_events("twenty characters ok");
+    let browser = Browser::new().await;
     control
-        .agent_native_keys(&events, motion::KEY_INTERVAL)
+        .agent_native_keys(&events, motion::KEY_INTERVAL, &browser.client, "page")
         .await
         .unwrap();
     let arrivals = arrivals.lock().unwrap().clone();
@@ -1613,9 +1632,10 @@ async fn a_takeover_stops_typing_after_the_current_key_and_counts_it() {
         ..BrowserControl::default()
     };
     let interrupts = control.interrupts();
+    let browser = Browser::new().await;
     let text = "exactly counted text";
     let events = super::super::interaction::native_text_events(text);
-    let typing = control.agent_native_keys(&events, motion::KEY_INTERVAL);
+    let typing = control.agent_native_keys(&events, motion::KEY_INTERVAL, &browser.client, "page");
     let takeover = async {
         for _ in 0..6 {
             ops.recv().await.unwrap();
@@ -1654,7 +1674,7 @@ async fn a_takeover_stops_typing_after_the_current_key_and_counts_it() {
     // the browser.
     let takeover = interrupts.raise(InterruptReason::HumanControl);
     let refused = control
-        .agent_native_keys(&events, motion::KEY_INTERVAL)
+        .agent_native_keys(&events, motion::KEY_INTERVAL, &browser.client, "page")
         .await
         .unwrap_err();
     drop(takeover);

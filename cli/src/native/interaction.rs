@@ -366,13 +366,15 @@ async fn click_field(
 /// happened.
 async fn type_after_click(
     control: &Mutex<BrowserControl>,
+    client: &CdpClient,
+    session_id: &str,
     events: &[Value],
     interval: std::time::Duration,
 ) -> Result<(), CommandError> {
     let typed = control
         .lock()
         .await
-        .agent_native_keys(events, interval)
+        .agent_native_keys(events, interval, client, session_id)
         .await;
     typed.map_err(|error| {
         if error.error.starts_with("browser_controlled_by_user: ") {
@@ -425,6 +427,8 @@ pub(crate) async fn native_fill(
     if !field.state.empty {
         type_after_click(
             control,
+            client,
+            session_id,
             &native_key_chord_events("a", Some(2)),
             KEY_INTERVAL,
         )
@@ -432,6 +436,8 @@ pub(crate) async fn native_fill(
         if value.is_empty() {
             type_after_click(
                 control,
+                client,
+                session_id,
                 &native_key_chord_events("Backspace", None),
                 KEY_INTERVAL,
             )
@@ -444,7 +450,7 @@ pub(crate) async fn native_fill(
         } else {
             native_text_events(value)
         };
-        type_after_click(control, &events, KEY_INTERVAL).await?;
+        type_after_click(control, client, session_id, &events, KEY_INTERVAL).await?;
     }
     let state = field_state(
         client,
@@ -495,12 +501,16 @@ pub(crate) async fn native_type_into(
         if clear {
             type_after_click(
                 control,
+                client,
+                session_id,
                 &native_key_chord_events("a", Some(2)),
                 KEY_INTERVAL,
             )
             .await?;
             type_after_click(
                 control,
+                client,
+                session_id,
                 &native_key_chord_events("Backspace", None),
                 KEY_INTERVAL,
             )
@@ -509,13 +519,22 @@ pub(crate) async fn native_type_into(
             let modifiers = field.state.multiline.then_some(2);
             type_after_click(
                 control,
+                client,
+                session_id,
                 &native_key_chord_events("End", modifiers),
                 KEY_INTERVAL,
             )
             .await?;
         }
     }
-    type_after_click(control, &native_text_events(text), interval).await?;
+    type_after_click(
+        control,
+        client,
+        session_id,
+        &native_text_events(text),
+        interval,
+    )
+    .await?;
     Ok(ClickResult::default())
 }
 

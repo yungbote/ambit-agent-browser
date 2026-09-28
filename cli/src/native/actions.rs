@@ -6422,6 +6422,8 @@ async fn native_type(
     text: &str,
     delay_ms: Option<u64>,
 ) -> Result<(), CommandError> {
+    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
+    let session_id = mgr.active_session_id()?;
     state
         .browser_control
         .lock()
@@ -6429,6 +6431,8 @@ async fn native_type(
         .agent_native_keys(
             &interaction::native_text_events(text),
             key_interval(delay_ms),
+            &mgr.client,
+            session_id,
         )
         .await
 }
@@ -6452,6 +6456,8 @@ async fn handle_press(cmd: &Value, state: &mut DaemonState) -> Result<Value, Com
             .agent_native_keys(
                 &interaction::native_key_chord_events(&actual_key, modifiers),
                 super::browser_control::motion::KEY_INTERVAL,
+                &mgr.client,
+                &session_id,
             )
             .await?;
         return Ok(json!({ "pressed": key }));
@@ -7592,6 +7598,8 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Comm
                     .agent_native_keys(
                         &interaction::native_paste_events(text),
                         super::browser_control::motion::KEY_INTERVAL,
+                        &mgr.client,
+                        &session_id,
                     )
                     .await?;
                 return Ok(json!({ "inserted": true }));
@@ -7640,7 +7648,12 @@ async fn handle_keyboard(cmd: &Value, state: &DaemonState) -> Result<Value, Comm
             .browser_control
             .lock()
             .await
-            .agent_native_keys(&[event], super::browser_control::motion::KEY_INTERVAL)
+            .agent_native_keys(
+                &[event],
+                super::browser_control::motion::KEY_INTERVAL,
+                &mgr.client,
+                &session_id,
+            )
             .await?;
         return Ok(json!({ "dispatched": event_type }));
     }

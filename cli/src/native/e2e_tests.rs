@@ -14059,10 +14059,15 @@ async fn e2e_native_motion_proof() {
     let key_stats = stats(&key_gaps);
     let p50 = key_stats["p50"].as_f64().unwrap();
     assert!((20.0..=40.0).contains(&p50), "key interval p50 {p50} ms");
-    agent(&mut activity);
+    let typed = agent(&mut activity)
+        .iter()
+        .filter(|event| event["kind"] == "typing")
+        .count();
+    assert_eq!(typed, 20, "one typing activity per acknowledged key");
     let fill = json!({
         "command_ms": fill_ms,
         "characters": 20,
+        "typing_activities": typed,
         "field_value": field["data"]["result"],
         "key_interval_ms": key_stats,
     });
