@@ -18,6 +18,8 @@ mod cpu_bench;
 mod policy;
 #[cfg(target_os = "linux")]
 mod producer;
+#[cfg(target_os = "linux")]
+pub(crate) mod snapshot;
 mod subscription;
 #[cfg(all(test, target_os = "linux"))]
 pub(super) mod testing;
