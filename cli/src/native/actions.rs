@@ -18058,6 +18058,68 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         assert_eq!(fenced.asked, 1);
     }
 
+    /// A command the host path reads the page for before it acts (a field it
+    /// names, or the focused field before a key that may type:
+    /// `secret_fields`) is refused while the active page is between
+    /// documents, whatever its fence reads; a key that cannot type reaches
+    /// its fence.
+    #[tokio::test]
+    async fn a_command_whose_field_is_read_first_is_refused_between_documents() {
+        use super::super::cdp::types::CdpEvent;
+        let mut state = DaemonState::new();
+        state.browser = Some(
+            super::super::browser::tests::test_manager(vec![super::super::browser::PageInfo {
+                tab_id: 1,
+                label: None,
+                target_id: "T1".into(),
+                session_id: "S1".into(),
+                url: "https://shop.example/".into(),
+                title: String::new(),
+                target_type: "page".into(),
+            }])
+            .await,
+        );
+        let (events, receiver) = tokio::sync::broadcast::channel(16);
+        state.event_rx = Some(receiver);
+        events
+            .send(CdpEvent {
+                method: "Page.frameStartedNavigating".into(),
+                params: json!({ "frameId": "T1", "navigationType": "differentDocument" }),
+                session_id: Some("S1".into()),
+            })
+            .unwrap();
+        let request = super::super::feedback::FeedbackRequest {
+            namespace: String::new(),
+            session: state.session_id.clone(),
+            capture_directory: "/".into(),
+            timeout_ms: 1_000,
+            expected_observation: None,
+            launch: None,
+        };
+        let now = std::time::Instant::now;
+        let mut blind = RefusingFence {
+            points: false,
+            reads: false,
+            asked: 0,
+        };
+        let request_field = super::super::feedback::REQUEST_FIELD;
+        for mut command in [
+            json!({ "id": "f", "action": "fill", "selector": "#pw", "value": "x" }),
+            json!({ "id": "g", "action": "inputvalue", "selector": "#pw" }),
+            json!({ "id": "p", "action": "press", "key": "a" }),
+            json!({ "id": "k", "action": "keyboard", "subaction": "type", "text": "x" }),
+        ] {
+            command[request_field] = json!({});
+            let refused = run_host_command(&command, &request, &mut state, now(), &mut blind).await;
+            assert_eq!(refused["code"], "browser_navigation_pending", "{refused}");
+        }
+        assert_eq!(blind.asked, 0);
+        let tab = json!({ "id": "t", "action": "press", "key": "Tab", request_field: {} });
+        let fenced = run_host_command(&tab, &request, &mut state, now(), &mut blind).await;
+        assert_eq!(fenced["error"], "fenced", "{fenced}");
+        assert_eq!(blind.asked, 1);
+    }
+
     /// A command whose fence reads the page before acting is refused while
     /// the active page is between documents, before its fence is asked: not
     /// performed. One whose fence does not read the page reaches its fence,
