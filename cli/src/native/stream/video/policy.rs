@@ -136,9 +136,15 @@ impl Refinement {
         self.still_since = Some(read);
     }
 
-    /// When the current picture is due for its refinement, if it owes one.
-    pub(super) fn due(&self) -> Option<Instant> {
-        self.still_since.map(|still| still + STILL_AFTER)
+    /// When the current picture is due for its refinement, if it owes one:
+    /// once the screen and the window's geometry have both held for
+    /// `STILL_AFTER`. `geometry` is when the window was last laid out (now
+    /// while a layout is in flight), so during a drag, whose layouts replace
+    /// each picture's size within a frame or two, no picture is refined; the
+    /// last one is, once the drag stops.
+    pub(super) fn due(&self, geometry: Instant) -> Option<Instant> {
+        self.still_since
+            .map(|still| still.max(geometry) + STILL_AFTER)
     }
 
     /// The refinement was encoded.
@@ -272,21 +278,50 @@ mod tests {
     #[test]
     fn a_still_picture_is_refined_once_and_new_damage_owes_it_again() {
         let origin = Instant::now();
+        let laid_out = origin - Duration::from_secs(1);
         let mut refinement = Refinement::default();
-        assert_eq!(refinement.due(), None, "a stream starts refined");
+        assert_eq!(refinement.due(laid_out), None, "a stream starts refined");
         refinement.moved(origin);
         let later = origin + Duration::from_millis(16);
         refinement.moved(later);
         assert_eq!(
-            refinement.due(),
+            refinement.due(laid_out),
             Some(later + STILL_AFTER),
             "the newest motion counts"
         );
         refinement.refined();
-        assert_eq!(refinement.due(), None);
+        assert_eq!(refinement.due(laid_out), None);
         const {
             assert!(Quality::Motion.quantizer() > Quality::Final.quantizer());
         }
+    }
+
+    /// A drag lays the window out again within a frame or two of each
+    /// picture: the picture of a size about to be replaced is not refined.
+    /// The refinement waits until both the screen and the window's geometry
+    /// have held for `STILL_AFTER`, and a layout in flight (the display
+    /// reports now) keeps moving it on.
+    #[test]
+    fn a_refinement_waits_for_the_window_geometry_to_hold_too() {
+        let read = Instant::now();
+        let ms = Duration::from_millis;
+        let mut refinement = Refinement::default();
+        refinement.moved(read);
+        assert_eq!(
+            refinement.due(read - ms(500)),
+            Some(read + STILL_AFTER),
+            "laid out long before: the picture's read counts"
+        );
+        assert_eq!(
+            refinement.due(read + ms(12)),
+            Some(read + ms(12) + STILL_AFTER),
+            "laid out after the read: the layout counts"
+        );
+        let in_flight = read + ms(40);
+        assert!(
+            refinement.due(in_flight) > Some(in_flight),
+            "a layout in flight is never waited out"
+        );
     }
 
     #[test]

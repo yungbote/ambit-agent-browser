@@ -387,8 +387,12 @@ mod platform {
 
     struct SurfaceState {
         value: Surface,
+        /// When the window's geometry last changed: a layout began or was
+        /// answered.
         changed_at: std::time::Instant,
         ready: bool,
+        /// A layout was sent and not yet answered.
+        laying_out: bool,
         /// The browser window's size in display pixels: the whole surface,
         /// or the top-left part of a size-class framebuffer.
         window: (u32, u32),
@@ -465,6 +469,7 @@ mod platform {
                     value: surface,
                     changed_at: std::time::Instant::now(),
                     ready,
+                    laying_out: false,
                     layout_epoch: 0,
                     proof: None,
                 }),
@@ -658,6 +663,17 @@ mod platform {
             self.surface.read().unwrap().changed_at > received_at
         }
 
+        /// Since when the window's geometry has held: the start or the
+        /// answer of its last layout, or now while one is in flight.
+        pub(crate) fn geometry_since(&self) -> std::time::Instant {
+            let surface = self.surface.read().unwrap();
+            if surface.laying_out {
+                std::time::Instant::now()
+            } else {
+                surface.changed_at
+            }
+        }
+
         pub(crate) fn available(&self) -> bool {
             !self.failed.load(Ordering::Acquire)
         }
@@ -772,6 +788,7 @@ mod platform {
                 let mut surface = self.surface.write().unwrap();
                 surface.changed_at = std::time::Instant::now();
                 surface.ready = false;
+                surface.laying_out = true;
             }
             let mut request = json!({ "op": "resize", "width": width, "height": height, "windowId": window_id.unwrap_or(0) });
             if size_class {
@@ -781,6 +798,7 @@ mod platform {
                 surface.layout_epoch += 1;
                 surface.changed_at = std::time::Instant::now();
                 surface.ready = true;
+                surface.laying_out = false;
             };
             let reply = match self.command(&mut wire, request).await {
                 Ok(reply) => reply,
