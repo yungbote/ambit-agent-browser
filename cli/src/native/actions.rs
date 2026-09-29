@@ -603,6 +603,9 @@ pub struct DaemonState {
     browser_restarting: bool,
     /// Why the view's last browser closed.
     browser_closed: ClosedReason,
+    /// The launch a person's `restart` repeats, kept when the browser closed
+    /// without being asked to.
+    restart_from: Option<sign_in::Relaunch>,
     pub appium: Option<AppiumManager>,
     pub safari_driver: Option<safari::SafariDriverProcess>,
     pub webdriver_backend: Option<super::webdriver::backend::WebDriverBackend>,
@@ -838,6 +841,7 @@ impl DaemonState {
             sign_in: None,
             browser_restarting: false,
             browser_closed: ClosedReason::Closed,
+            restart_from: None,
             appium: None,
             safari_driver: None,
             webdriver_backend: None,
@@ -1286,11 +1290,18 @@ impl DaemonState {
     /// What the stream's sources cannot say about the view's browser. A
     /// successor being started counts only while no browser is attached.
     fn browser_note(&self) -> BrowserNote {
+        let running = self.browser.is_some() || self.sign_in.is_some();
         BrowserNote {
-            restarting: self.browser_restarting && self.browser.is_none() && self.sign_in.is_none(),
+            restarting: self.browser_restarting && !running,
             closed: self.browser_closed,
-            restartable: false,
+            restartable: !running && self.restartable(),
         }
+    }
+
+    /// Whether a person's `restart` can relaunch the closed browser: it
+    /// closed without being asked to, and its launch is kept.
+    pub(crate) fn restartable(&self) -> bool {
+        self.restart_from.is_some() && self.launch_configuration.is_some()
     }
 
     /// Tells every viewer what the view's browser is doing without changing
@@ -2565,19 +2576,25 @@ async fn close_active_provider_session(state: &mut DaemonState) {
 }
 
 /// Closes the view's browser, whichever is running (automation or sign-in),
-/// and tells every viewer why (`reason`); a reason other than an intended
-/// close also goes to the session log.
+/// and tells every viewer why (`reason`). A browser that closed without
+/// being asked to keeps its launch, which a person's `restart` or the
+/// agent's next action repeats, and its reason goes to the session log.
 pub(crate) async fn close_current_browser(
     state: &mut DaemonState,
     reason: ClosedReason,
 ) -> Result<(), String> {
     state.browser_closed = reason;
     state.browser_restarting = false;
-    if reason != ClosedReason::Closed {
+    if reason == ClosedReason::Closed {
+        state.restart_from = None;
+    } else {
         session_log(
             &state.session_id,
             &format!("browser closed: {}", reason.token()),
         );
+        if let Some(relaunch) = sign_in::Relaunch::of_view(state) {
+            state.restart_from = Some(relaunch);
+        }
     }
     let close_error = if let Some(mut mgr) = state.browser.take() {
         mgr.close().await.err()
@@ -2589,7 +2606,9 @@ pub(crate) async fn close_current_browser(
     }
 
     close_active_provider_session(state).await;
-    state.launch_configuration = None;
+    if reason == ClosedReason::Closed {
+        state.launch_configuration = None;
+    }
     state.webmcp_enabled = false;
     forget_browser_session(state);
     state.update_stream_client().await;
@@ -3009,6 +3028,22 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         };
         // The sign-in watchdog runs before any controller operation too.
         sign_in::maintain(state).await;
+        if request.restarts() {
+            let result = sign_in::restart(state, &request).await;
+            if let (Some(server), Some(display)) =
+                (state.stream_server.as_ref(), state.window_display())
+            {
+                server
+                    .presentation
+                    .update_surface(&display.surface(), display.window());
+            }
+            state.last_command_finished = Some(std::time::Instant::now());
+            return match result {
+                Ok(data) => success_response(&id, data),
+                Err(refused) => json!({ "id": id, "success": false, "code": refused.error.code,
+                    "error": refused.error.message, "reason": refused.reason.token() }),
+            };
+        }
         if let Some(event) = request.sign_in() {
             let result = sign_in::enter(state, &request, event).await;
             if let (Some(server), Some(display)) =

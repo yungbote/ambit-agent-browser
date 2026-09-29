@@ -96,6 +96,8 @@ enum Operation {
     Acquire,
     Renew,
     Release,
+    /// A person restarts the view's closed browser; served by the daemon.
+    Restart,
     Input,
     Copy,
     Files,
@@ -120,7 +122,7 @@ impl ControlRequest {
             Operation::Acquire | Operation::Renew => {
                 &["id", "action", "op", "controllerId", "expiresAt"]
             }
-            Operation::Release | Operation::Copy | Operation::Files => {
+            Operation::Release | Operation::Restart | Operation::Copy | Operation::Files => {
                 &["id", "action", "op", "controllerId"]
             }
             Operation::Drop => &[
@@ -201,13 +203,13 @@ impl ControlRequest {
                     ));
                 }
             }
-            Operation::Release | Operation::Copy | Operation::Files => {
+            Operation::Release | Operation::Restart | Operation::Copy | Operation::Files => {
                 if request.expires_at.is_some()
                     || request.sequence.is_some()
                     || request.events.is_some()
                 {
                     return Err(ControlError::invalid(
-                        "Release and copy require only controllerId.",
+                        "Release, restart and copy require only controllerId.",
                     ));
                 }
             }
@@ -307,6 +309,11 @@ impl ControlRequest {
 
     pub(crate) fn releases(&self) -> bool {
         self.op == Operation::Release
+    }
+
+    /// A restart of the view's closed browser, served by the daemon.
+    pub(crate) fn restarts(&self) -> bool {
+        self.op == Operation::Restart
     }
 
     /// A read-only file or download observation, served by `observe_files`.
@@ -883,6 +890,19 @@ impl BrowserControl {
     pub(crate) fn needs_observation(&self) -> bool {
         self.needs_observation
     }
+
+    /// A person restarted the view's browser: the agent observes the new
+    /// browser before acting on what it knew of the old one.
+    pub(crate) fn restarted(&mut self) {
+        self.needs_observation = true;
+    }
+
+    /// Whether a controller other than `controller_id` holds custody now.
+    pub(crate) fn controlled_by_another(&self, controller_id: &str, now: Instant) -> bool {
+        self.lease
+            .as_ref()
+            .is_some_and(|lease| lease.controller_id != controller_id && lease.holds_custody(now))
+    }
     pub(crate) fn observed(&mut self) {
         self.needs_observation = false;
     }
@@ -1300,6 +1320,9 @@ impl BrowserControl {
             // Their page work runs outside this gate; see `observe_files`.
             Operation::Downloads | Operation::Files => Err(ControlError::invalid(
                 "File observations are served by observe_files.",
+            )),
+            Operation::Restart => Err(ControlError::invalid(
+                "A restart is served by the daemon, which owns the browser.",
             )),
             Operation::Acquire => {
                 self.expire(browser).await?;
