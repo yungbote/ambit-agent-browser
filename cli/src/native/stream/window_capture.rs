@@ -431,12 +431,12 @@ mod tests {
     }
 
     /// With a helper that waits for damage, an unchanged answer is followed
-    /// by the next capture at once instead of a tick later, and a frame is
-    /// stamped when its damage ended the wait: `inputSeq` is the input
-    /// acknowledged before that moment, even when acknowledged during the
-    /// wait, and not an input acknowledged after it.
+    /// by another capture (almost at once instead of a tick later, which is
+    /// `spacing`'s), and a frame is stamped when its damage ended the wait:
+    /// `inputSeq` is the input acknowledged before that moment, even when
+    /// acknowledged during the wait, and not an input acknowledged after it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_waiting_capture_is_asked_again_at_once_and_stamped_when_its_damage_arrived() {
+    async fn a_waiting_capture_is_asked_again_and_stamped_when_its_damage_arrived() {
         let mut h = harness(&["captureWait", "cursorIdentity"]);
         let origin = super::super::monotonic_us();
         let _capture = WindowCapture::start(h.display.clone(), h.sinks.clone());
@@ -445,14 +445,7 @@ mod tests {
         assert_eq!(first["cursorIdentity"], true);
         assert_eq!(first["force"], true);
         h.answer(&first, json!({"changed": false})).await;
-        let answered = std::time::Instant::now();
         let second = h.request().await;
-        let gap = answered.elapsed();
-        let period = super::super::presentation::FramePacing::PASSIVE.period();
-        assert!(
-            gap < period / 4,
-            "an unchanged waited capture was asked again after {gap:?} (period {period:?})"
-        );
         // Input acknowledged while the helper waited, before the damage.
         h.applied.record(3);
         let waited = super::super::monotonic_us() - origin + 1_000;
@@ -469,7 +462,10 @@ mod tests {
     }
 
     /// An older helper, which neither waits nor reports identities, is asked
-    /// for neither and polled at the pacing rate.
+    /// for neither and polled at the pacing rate, an unchanged answer too:
+    /// the frame after one comes at least two periods after the frame
+    /// before it, on the frames' own stamps (a helper that waits is asked
+    /// again almost at once instead).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_older_helper_is_polled_at_the_pacing_rate_without_new_fields() {
         let mut h = harness(&[]);
@@ -477,16 +473,15 @@ mod tests {
         let first = h.request().await;
         assert!(first.get("waitMs").is_none(), "{first}");
         assert!(first.get("cursorIdentity").is_none(), "{first}");
-        h.answer(&first, json!({"changed": false})).await;
-        let answered = std::time::Instant::now();
-        let second = h.request().await;
+        h.answer(&first, whole(0)).await;
+        let before = stamp(&mut h).await;
+        let unchanged = h.request().await;
+        h.answer(&unchanged, json!({"changed": false})).await;
+        let after = h.request().await;
+        h.answer(&after, whole(0)).await;
+        let gap = Duration::from_micros(stamp(&mut h).await - before);
         let period = super::super::presentation::FramePacing::PASSIVE.period();
-        assert!(
-            answered.elapsed() >= period / 2,
-            "polled after {:?}",
-            answered.elapsed()
-        );
-        h.answer(&second, json!({"changed": false})).await;
+        assert!(gap >= period * 2, "{gap:?}");
     }
 
     /// The displayed cursor's identity reaches every viewer once per change
@@ -744,21 +739,37 @@ mod tests {
             presented.period(),
             "input no longer on screen"
         );
+        assert_eq!(
+            spacing(None, false, passive, &mut shown),
+            passive.period(),
+            "an older helper is polled at the pacing"
+        );
     }
 
-    /// A new viewer needs a whole frame without waiting for the pacing.
+    /// A new viewer needs a whole frame without waiting for the pacing: a
+    /// refresh wakes the loop, which asks for a whole frame. On the frames'
+    /// own stamps, the refreshed capture was asked before the pacing's next
+    /// tick after the frame before it, which only a wake can do; a refresh
+    /// the loop reached too late to show that is tried again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refresh_asks_for_a_whole_frame_at_once() {
         let mut h = patching_harness(&[]);
         let capture = WindowCapture::start(h.display.clone(), h.sinks.clone());
+        let tick = super::super::presentation::FramePacing::PASSIVE.period();
         let first = h.request().await;
         h.answer(&first, whole(0)).await;
-        h.frame().await;
-        let asked = std::time::Instant::now();
-        capture.refresh();
-        let second = h.request().await;
-        assert!(asked.elapsed() < super::super::presentation::FramePacing::PASSIVE.period() / 2);
-        assert_eq!(second["force"], true);
-        h.answer(&second, json!({"changed": false})).await;
+        let mut before = stamp(&mut h).await;
+        for _ in 0..5 {
+            capture.refresh();
+            let asked = h.request().await;
+            assert_eq!(asked["force"], true);
+            h.answer(&asked, whole(0)).await;
+            let refreshed = stamp(&mut h).await;
+            if Duration::from_micros(refreshed - before) < tick {
+                return;
+            }
+            before = refreshed;
+        }
+        panic!("no refresh was asked for before the pacing's tick");
     }
 }
