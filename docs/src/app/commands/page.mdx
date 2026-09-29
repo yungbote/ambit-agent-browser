@@ -45,6 +45,8 @@ agent-browser mcp                     # Start an MCP stdio server
 
 Successful `open <url>` and `navigate` commands advertise when WebMCP tools are available. With `--json`, the navigation response includes `data.webmcp.toolCount`.
 
+In an owned window (`AGENT_BROWSER_WINDOW_STREAM=1`), open/navigate use Chrome's address bar and back, forward and reload use native keyboard shortcuts. They share the existing custody and interruption rules, and wait for the requested main-frame navigation. A busy or password-focused page does not block browser controls; ordinary page typing keeps its secret-field checks. Headless and external CDP browsers keep their existing adapter.
+
 ## Playwright in the current browser
 
 `window new` opens a window in its own cookie context; closing that window's last tab discards the context, as closing a private window does. `window new --shared`, or MCP `agent_browser_window_new` with `shared: true`, opens one in the persistent profile instead. A Playwright client with context adoption represents each tab's real context; the stock 1.62.1 client cannot, so it refuses to attach while an isolated window is open. Native tools work in every window; closing an isolated window admits the stock client again. Existing windows and credentials are never moved or copied.

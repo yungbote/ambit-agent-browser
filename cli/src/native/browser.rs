@@ -397,6 +397,49 @@ fn lifecycle_timeout(wait_until: WaitUntil) -> String {
     }
 }
 
+enum NativeNavigationStart {
+    Loader(String),
+    WithinDocument,
+    TimedOut,
+}
+
+/// Chrome reports the requested URL before redirects and the loader that
+/// follows them. Old-page and child-frame events cannot admit this wait.
+async fn native_navigation_start(
+    session: &str,
+    frame: &str,
+    requested: &str,
+    rx: &mut broadcast::Receiver<CdpEvent>,
+    timeout: tokio::time::Duration,
+) -> Result<NativeNavigationStart, String> {
+    let observed = tokio::time::timeout(timeout, async {
+        loop {
+            let event = match rx.recv().await {
+                Ok(event) => event,
+                Err(broadcast::error::RecvError::Lagged(_)) => return Err("Browser navigation observation was interrupted; inspect the page before retrying".into()),
+                Err(broadcast::error::RecvError::Closed) => return Err("Browser navigation event stream closed".into()),
+            };
+            if event.session_id.as_deref() != Some(session) {
+                continue;
+            }
+            let params = &event.params;
+            if params["frameId"] != frame || params["url"] != requested {
+                continue;
+            }
+            match event.method.as_str() {
+                "Page.navigatedWithinDocument" => return Ok(NativeNavigationStart::WithinDocument),
+                "Page.frameStartedNavigating" if !matches!(params["navigationType"].as_str(), Some("sameDocument" | "historySameDocument")) => {
+                    if let Some(loader) = params["loaderId"].as_str().filter(|id| !id.is_empty()) {
+                        return Ok(NativeNavigationStart::Loader(loader.into()));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }).await;
+    observed.unwrap_or(Ok(NativeNavigationStart::TimedOut))
+}
+
 /// Waits on `rx` until the page of `session_id` reaches `wait_until` for the
 /// navigation of `loader_id`, and reports how far it got within `timeout`.
 async fn lifecycle(
@@ -406,7 +449,23 @@ async fn lifecycle(
     rx: &mut broadcast::Receiver<CdpEvent>,
     timeout: tokio::time::Duration,
 ) -> Result<LifecycleWait, String> {
-    let mut commit = loader_id.map(CommitWatch::new);
+    lifecycle_for_commit(
+        wait_until,
+        session_id,
+        loader_id.map(CommitWatch::new),
+        rx,
+        timeout,
+    )
+    .await
+}
+
+async fn lifecycle_for_commit(
+    wait_until: WaitUntil,
+    session_id: &str,
+    mut commit: Option<CommitWatch<'_>>,
+    rx: &mut broadcast::Receiver<CdpEvent>,
+    timeout: tokio::time::Duration,
+) -> Result<LifecycleWait, String> {
     let event_name = match wait_until {
         WaitUntil::Load => "Page.loadEventFired",
         WaitUntil::DomContentLoaded => "Page.domContentEventFired",
@@ -415,6 +474,9 @@ async fn lifecycle(
             let reached = poll_network_idle(session_id, rx, timeout, commit.as_mut())
                 .await
                 .is_ok();
+            if let Some(error) = commit.as_ref().and_then(|watch| watch.failure.as_ref()) {
+                return Err(format!("Navigation failed: {error}"));
+            }
             return Ok(LifecycleWait::conclude(reached, commit));
         }
         WaitUntil::None => return Ok(LifecycleWait::Reached),
@@ -427,11 +489,18 @@ async fn lifecycle(
                     if event.session_id.as_deref() != Some(session_id) {
                         continue;
                     }
+                    let mut restored = false;
                     if let Some(watch) = commit.as_mut() {
-                        watch.observe(&event);
+                        restored = watch.observe(&event);
+                        if let Some(error) = &watch.failure {
+                            return Err(format!("Navigation failed: {error}"));
+                        }
                     }
-                    if event.method == event_name
-                        && commit.as_ref().is_none_or(CommitWatch::committed)
+                    // A restored history document is already loaded and does
+                    // not fire another page load/DOMContentLoaded event.
+                    if (event.method == event_name
+                        && commit.as_ref().is_none_or(CommitWatch::committed))
+                        || (restored && commit.as_ref().is_some_and(CommitWatch::committed))
                     {
                         return Ok(());
                     }
@@ -464,29 +533,70 @@ fn load_wait(wait_until: WaitUntil, timeout_ms: u64) -> String {
 /// identifier before the commit; the commit is the main-frame
 /// `Page.frameNavigated` that carries the same identifier, and a renderer
 /// busy with the previous page's script holds it back for as long as that
-/// script runs.
+/// script runs. Native input observes that same loader at
+/// `Page.frameStartedNavigating`; document request failures stay bound to it.
 struct CommitWatch<'a> {
     loader_id: &'a str,
+    restore_url: Option<&'a str>,
     committed_url: Option<String>,
+    request_id: Option<String>,
+    failure: Option<String>,
 }
 
 impl<'a> CommitWatch<'a> {
     fn new(loader_id: &'a str) -> Self {
         Self {
             loader_id,
+            restore_url: None,
             committed_url: None,
+            request_id: None,
+            failure: None,
         }
     }
 
-    fn observe(&mut self, event: &CdpEvent) {
+    /// A native history request can restore an already-loaded cached document
+    /// under its old loader. Only its explicit main-frame URL admits that
+    /// restore; an unrelated document or late load never does.
+    fn native(loader_id: &'a str, restore_url: &'a str) -> Self {
+        Self {
+            restore_url: Some(restore_url),
+            ..Self::new(loader_id)
+        }
+    }
+
+    fn observe(&mut self, event: &CdpEvent) -> bool {
+        if event.method == "Network.requestWillBeSent"
+            && event.params["loaderId"] == self.loader_id
+            && event.params["type"] == "Document"
+        {
+            self.request_id = event.params["requestId"].as_str().map(String::from);
+        }
+        if self.committed_url.is_none()
+            && event.method == "Network.loadingFailed"
+            && self
+                .request_id
+                .as_deref()
+                .is_some_and(|id| event.params["requestId"] == id)
+        {
+            self.failure = event.params["errorText"].as_str().map(String::from);
+        }
         if self.committed_url.is_some() || event.method != "Page.frameNavigated" {
-            return;
+            return false;
         }
         let frame = &event.params["frame"];
         let main_frame = frame["parentId"].as_str().is_none_or(str::is_empty);
-        if main_frame && frame["loaderId"].as_str() == Some(self.loader_id) {
-            self.committed_url = Some(frame["url"].as_str().unwrap_or_default().to_string());
+        let url = format!(
+            "{}{}",
+            frame["url"].as_str().unwrap_or_default(),
+            frame["urlFragment"].as_str().unwrap_or_default()
+        );
+        let restored = event.params["type"] == "BackForwardCacheRestore"
+            && self.restore_url == Some(url.as_str());
+        if main_frame && (frame["loaderId"].as_str() == Some(self.loader_id) || restored) {
+            self.committed_url = Some(url);
+            return event.params["type"] == "BackForwardCacheRestore";
         }
+        false
     }
 
     fn committed(&self) -> bool {
@@ -1443,7 +1553,56 @@ impl BrowserManager {
     /// has happened yet: a renderer busy with the previous page's script
     /// holds the commit back, and the deadline is then the strict failure.
     pub async fn open(&mut self, url: &str, wait_until: WaitUntil) -> Result<Value, String> {
-        match self.navigate_and_wait(url, wait_until).await? {
+        let outcome = self.navigate_and_wait(url, wait_until).await?;
+        self.describe_open(url, wait_until, outcome).await
+    }
+
+    /// An owned window navigates through Chrome's UI. Observe before the
+    /// input, bind the wait to the main frame's actual requested loader, and
+    /// reuse the same document/lifecycle result as the CDP adapter.
+    pub(crate) async fn open_native(
+        &mut self,
+        url: &str,
+        wait_until: WaitUntil,
+        input: impl Future<Output = Result<(), String>>,
+    ) -> Result<Value, String> {
+        let requested = url::Url::parse(url).map_err(|error| format!("Invalid URL: {error}"))?;
+        if url.chars().any(char::is_control) {
+            return Err("A browser URL cannot contain control characters".into());
+        }
+        let session = self.active_session_id()?.to_string();
+        let frame = self.active_target_id()?.to_string();
+        let mut rx = self.client.subscribe();
+        input.await?;
+        let timeout = tokio::time::Duration::from_millis(self.default_timeout_ms);
+        let deadline = tokio::time::Instant::now() + timeout;
+        let outcome =
+            match native_navigation_start(&session, &frame, requested.as_str(), &mut rx, timeout)
+                .await?
+            {
+                NativeNavigationStart::WithinDocument => LifecycleWait::Reached,
+                NativeNavigationStart::Loader(loader) => {
+                    lifecycle_for_commit(
+                        wait_until,
+                        &session,
+                        Some(CommitWatch::native(&loader, requested.as_str())),
+                        &mut rx,
+                        deadline.saturating_duration_since(tokio::time::Instant::now()),
+                    )
+                    .await?
+                }
+                NativeNavigationStart::TimedOut => LifecycleWait::TimedOut,
+            };
+        self.describe_open(url, wait_until, outcome).await
+    }
+
+    async fn describe_open(
+        &mut self,
+        url: &str,
+        wait_until: WaitUntil,
+        outcome: LifecycleWait,
+    ) -> Result<Value, String> {
+        match outcome {
             LifecycleWait::Reached => Ok(self.record_navigated_page(url).await),
             LifecycleWait::Committed { url: page_url } => {
                 // The renderer may still be busy loading the document; the
@@ -2906,6 +3065,9 @@ async fn poll_network_idle(
                 Ok(Ok(event)) if event.session_id.as_deref() == Some(session_id) => {
                     if let Some(watch) = commit.as_deref_mut() {
                         watch.observe(&event);
+                        if let Some(error) = &watch.failure {
+                            return Err(format!("Navigation failed: {error}"));
+                        }
                     }
                     let mut p = pending.lock().await;
                     match event.method.as_str() {
@@ -3181,6 +3343,208 @@ pub(crate) mod tests {
     fn test_format_tab_id() {
         assert_eq!(format_tab_id(1), "t1");
         assert_eq!(format_tab_id(42), "t42");
+    }
+
+    #[tokio::test]
+    async fn native_navigation_binds_only_its_session_main_frame_and_requested_url() {
+        let (tx, mut rx) = broadcast::channel(16);
+        for (session, frame, url, kind, loader) in [
+            (
+                "other",
+                "main",
+                "https://next/",
+                "differentDocument",
+                "other",
+            ),
+            (
+                "page",
+                "child",
+                "https://next/",
+                "differentDocument",
+                "child",
+            ),
+            ("page", "main", "https://old/", "differentDocument", "old"),
+            ("page", "main", "https://next/", "sameDocument", "old"),
+            ("page", "main", "https://next/", "differentDocument", "next"),
+        ] {
+            tx.send(CdpEvent {
+                method: "Page.frameStartedNavigating".into(),
+                session_id: Some(session.into()),
+                params: json!({"frameId":frame,"url":url,"navigationType":kind,"loaderId":loader}),
+            })
+            .unwrap();
+        }
+        let NativeNavigationStart::Loader(loader) = native_navigation_start(
+            "page",
+            "main",
+            "https://next/",
+            &mut rx,
+            Duration::from_millis(50),
+        )
+        .await
+        .unwrap() else {
+            panic!("must bind its actual loader")
+        };
+        assert_eq!(loader, "next");
+    }
+
+    #[tokio::test]
+    async fn native_navigation_validates_the_whole_address_before_typing() {
+        let mut manager = test_manager(vec![]).await;
+        for url in [
+            "not-a-url",
+            "https://example.test/\nother",
+            "https://example.test/\tother",
+        ] {
+            let typed = std::cell::Cell::new(false);
+            let result = manager
+                .open_native(url, WaitUntil::Load, async {
+                    typed.set(true);
+                    Ok(())
+                })
+                .await;
+            assert!(result.is_err(), "{url:?}");
+            assert!(
+                !typed.get(),
+                "no partial address or shortcut reached Chrome"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn native_fragment_navigation_requires_its_actual_same_document_event() {
+        let (tx, mut rx) = broadcast::channel(8);
+        for frame in ["child", "main"] {
+            tx.send(CdpEvent {
+                method: "Page.navigatedWithinDocument".into(),
+                session_id: Some("page".into()),
+                params: json!({"frameId":frame,"url":"https://next/#part"}),
+            })
+            .unwrap();
+        }
+        assert!(matches!(
+            native_navigation_start(
+                "page",
+                "main",
+                "https://next/#part",
+                &mut rx,
+                Duration::from_millis(50)
+            )
+            .await
+            .unwrap(),
+            NativeNavigationStart::WithinDocument
+        ));
+        assert!(matches!(
+            native_navigation_start(
+                "page",
+                "main",
+                "https://next/#part",
+                &mut rx,
+                Duration::from_millis(1)
+            )
+            .await
+            .unwrap(),
+            NativeNavigationStart::TimedOut
+        ));
+    }
+
+    #[test]
+    fn navigation_failure_is_bound_to_its_document_request() {
+        let mut watch = CommitWatch::new("requested");
+        let event = |method: &str, params| CdpEvent {
+            method: method.into(),
+            session_id: Some("page".into()),
+            params,
+        };
+        watch.observe(&event(
+            "Network.requestWillBeSent",
+            json!({"loaderId":"requested","requestId":"child","type":"Script"}),
+        ));
+        watch.observe(&event(
+            "Network.loadingFailed",
+            json!({"requestId":"child","errorText":"ignored"}),
+        ));
+        assert!(watch.failure.is_none());
+        watch.observe(&event(
+            "Network.requestWillBeSent",
+            json!({"loaderId":"requested","requestId":"main","type":"Document"}),
+        ));
+        watch.observe(&event(
+            "Network.loadingFailed",
+            json!({"requestId":"other","errorText":"ignored"}),
+        ));
+        assert!(watch.failure.is_none());
+        watch.observe(&event(
+            "Network.loadingFailed",
+            json!({"requestId":"main","errorText":"net::ERR_CONNECTION_REFUSED"}),
+        ));
+        assert_eq!(
+            watch.failure.as_deref(),
+            Some("net::ERR_CONNECTION_REFUSED")
+        );
+        let mut committed = CommitWatch::new("requested");
+        committed.observe(&event(
+            "Network.requestWillBeSent",
+            json!({"loaderId":"requested","requestId":"main","type":"Document"}),
+        ));
+        committed.observe(&frame_navigated(
+            json!({"id":"main","loaderId":"requested","url":"https://next/"}),
+        ));
+        committed.observe(&event(
+            "Network.loadingFailed",
+            json!({"requestId":"main","errorText":"net::ERR_CONTENT_LENGTH_MISMATCH"}),
+        ));
+        assert!(
+            committed.failure.is_none(),
+            "a committed page retains the existing inspect/load-wait behavior"
+        );
+    }
+
+    #[tokio::test]
+    async fn restored_history_document_is_loaded_only_after_its_own_commit() {
+        let (tx, mut rx) = broadcast::channel(8);
+        tx.send(CdpEvent {
+            method: "Page.loadEventFired".into(),
+            params: json!({}),
+            session_id: Some("page".into()),
+        })
+        .unwrap();
+        let mut unrelated = frame_navigated(
+            json!({"id":"child","parentId":"main","loaderId":"requested","url":"https://child/"}),
+        );
+        unrelated.params["type"] = json!("BackForwardCacheRestore");
+        tx.send(unrelated).unwrap();
+        let mut restored = frame_navigated(
+            json!({"id":"main","loaderId":"cached-old","url":"https://next/","urlFragment":"#part"}),
+        );
+        restored.params["type"] = json!("BackForwardCacheRestore");
+        tx.send(restored).unwrap();
+        assert_eq!(
+            lifecycle_for_commit(
+                WaitUntil::Load,
+                "page",
+                Some(CommitWatch::native("requested", "https://next/#part")),
+                &mut rx,
+                Duration::from_millis(50)
+            )
+            .await
+            .unwrap(),
+            LifecycleWait::Reached
+        );
+    }
+
+    #[test]
+    fn cached_restore_must_name_the_requested_main_frame_url() {
+        let mut watch = CommitWatch::native("requested", "https://next/#part");
+        for frame in [
+            json!({"id":"child","parentId":"main","loaderId":"cached","url":"https://next/","urlFragment":"#part"}),
+            json!({"id":"main","loaderId":"cached","url":"https://other/","urlFragment":"#part"}),
+        ] {
+            let mut event = frame_navigated(frame);
+            event.params["type"] = json!("BackForwardCacheRestore");
+            assert!(!watch.observe(&event));
+            assert!(!watch.committed());
+        }
     }
 
     #[test]

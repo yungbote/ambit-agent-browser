@@ -844,7 +844,7 @@ fn tools() -> Vec<Value> {
         tool(
             TOOL_OPEN,
             "Open page",
-            "Launch the browser and optionally navigate to a URL. On Windows, owned headless Chrome uses a private desktop and its process tree closes with the daemon, including forced termination. Headed browsers use the interactive desktop. Successful navigation responses include WebMCP availability metadata when the page exposes allowed tools.",
+            "Launch the browser and optionally navigate to a URL. In an owned window, navigation types in Chrome's address bar under existing custody and interruption rules; headless and external CDP use their existing adapter. On Windows, owned headless Chrome uses a private desktop and its process tree closes with the daemon, including forced termination. Headed browsers use the interactive desktop. Successful navigation responses include WebMCP availability metadata when the page exposes allowed tools.",
             json!({
                 "url": { "type": "string", "description": "URL to open. Omit to launch about:blank." },
                 "headed": { "type": "boolean", "description": "Show the browser window. Explicit true/false overrides AGENT_BROWSER_HEADED and config; omit to use those defaults." },
@@ -1055,9 +1055,9 @@ fn tools() -> Vec<Value> {
 
 fn parity_tools() -> Vec<Value> {
     vec![
-        tool(TOOL_BACK, "Back", "Navigate back.", json!({}), &[]),
-        tool(TOOL_FORWARD, "Forward", "Navigate forward.", json!({}), &[]),
-        tool(TOOL_RELOAD, "Reload", "Reload the page.", json!({}), &[]),
+        tool(TOOL_BACK, "Back", "Navigate back; owned windows use Chrome's native keyboard shortcut.", json!({}), &[]),
+        tool(TOOL_FORWARD, "Forward", "Navigate forward; owned windows use Chrome's native keyboard shortcut.", json!({}), &[]),
+        tool(TOOL_RELOAD, "Reload", "Reload the page; owned windows use Chrome's native keyboard shortcut.", json!({}), &[]),
         tool(
             TOOL_DBLCLICK,
             "Double-click element",

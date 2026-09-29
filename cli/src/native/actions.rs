@@ -5887,8 +5887,6 @@ async fn clear_active_page_context(state: &mut DaemonState) {
     } else {
         state.webmcp.clear_invocations();
     }
-    let _ = enable_webmcp_events(state).await;
-
     // With one tab, every tracked iframe belongs to the page being replaced.
     // With multiple tabs, retain the other tabs' sessions so switching back to
     // an already-attached OOPIF does not lose its execution context.
@@ -5910,9 +5908,55 @@ async fn navigate_active_page(
     url: &str,
     wait_until: WaitUntil,
 ) -> Result<Value, String> {
+    if state.browser_control.lock().await.has_native_display() {
+        let mut events = interaction::native_key_chord_events("l", Some(2));
+        events.extend(interaction::native_inserted_events(url));
+        // Chrome may select an inline history completion after the typed
+        // address. Delete removes that suffix; at the text's end with no
+        // completion it does nothing. Enter must submit the requested URL.
+        events.extend(interaction::native_key_chord_events("Delete", None));
+        events.extend(interaction::native_key_chord_events("Enter", None));
+        return Box::pin(navigate_native_active_page(state, url, wait_until, &events)).await;
+    }
     clear_active_page_context(state).await;
+    let result = state
+        .browser
+        .as_mut()
+        .ok_or("Browser not launched")?
+        .open(url, wait_until)
+        .await?;
+    state.refresh_active_iframe_sessions().await;
+    Ok(result)
+}
+
+/// Browser controls share one input owner and the same document bookkeeping.
+/// The caller admits the destination and prepares network controls first.
+async fn navigate_native_active_page(
+    state: &mut DaemonState,
+    url: &str,
+    wait_until: WaitUntil,
+    events: &[Value],
+) -> Result<Value, String> {
+    clear_active_page_context(state).await;
+    let control = state.browser_control.clone();
     let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-    let result = mgr.open(url, wait_until).await?;
+    let client = mgr.client.clone();
+    let session = mgr.active_session_id()?.to_string();
+    let result = mgr
+        .open_native(url, wait_until, async {
+            control
+                .lock()
+                .await
+                .agent_native_browser_keys(
+                    events,
+                    super::browser_control::motion::KEY_INTERVAL,
+                    &client,
+                    &session,
+                )
+                .await
+                .map_err(String::from)
+        })
+        .await?;
     state.refresh_active_iframe_sessions().await;
     Ok(result)
 }
@@ -7035,6 +7079,28 @@ async fn history_navigation(
         let entry_id = entry["id"]
             .as_i64()
             .ok_or("Browser history is unavailable")?;
+        if state.browser_control.lock().await.has_native_display() {
+            let destination = entry["url"]
+                .as_str()
+                .ok_or("Browser history is unavailable")?
+                .to_string();
+            let events = interaction::native_key_chord_events(
+                if delta < 0 { "ArrowLeft" } else { "ArrowRight" },
+                Some(1),
+            );
+            let result = Box::pin(navigate_native_active_page(
+                state,
+                &destination,
+                if wait {
+                    WaitUntil::Load
+                } else {
+                    WaitUntil::None
+                },
+                &events,
+            ))
+            .await?;
+            return Ok(json!({"url":result["url"]}));
+        }
         clear_active_page_context(state).await;
         client
             .send_command(
@@ -7069,6 +7135,31 @@ async fn handle_reload(state: &mut DaemonState) -> Result<Value, String> {
     }
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
+
+    if state.browser_control.lock().await.has_native_display() {
+        let client = mgr.client.clone();
+        let target = mgr.active_target_id()?.to_string();
+        let info = client
+            .send_command(
+                "Target.getTargetInfo",
+                Some(json!({"targetId":target})),
+                None,
+            )
+            .await?;
+        let url = info["targetInfo"]["url"]
+            .as_str()
+            .ok_or("Browser URL is unavailable")?
+            .to_string();
+        let events = interaction::native_key_chord_events("r", Some(2));
+        let result = Box::pin(navigate_native_active_page(
+            state,
+            &url,
+            WaitUntil::Load,
+            &events,
+        ))
+        .await?;
+        return Ok(json!({"url":result["url"]}));
+    }
 
     mgr.client
         .send_command_no_params("Page.reload", Some(&session_id))
@@ -9918,15 +10009,6 @@ async fn collect_webmcp_tools(state: &mut DaemonState) -> Result<Vec<webmcp::Too
         }
     }
     Ok(tools)
-}
-
-async fn enable_webmcp_events(state: &DaemonState) -> Result<(), String> {
-    let (client, session_id, _) = webmcp_page_context(state).await?;
-    client
-        .send_command_no_params("WebMCP.enable", Some(&session_id))
-        .await
-        .map(|_| ())
-        .map_err(|error| webmcp::unsupported_error(&error))
 }
 
 async fn handle_webmcp_list(state: &mut DaemonState) -> Result<Value, String> {

@@ -1572,6 +1572,12 @@ With a URL, launches and navigates. If no protocol is provided, https://
 is automatically prepended. When the page registers WebMCP tools, successful
 navigation output tells you to run `agent-browser webmcp list`.
 
+In an owned window (AGENT_BROWSER_WINDOW_STREAM=1), navigation types
+in Chrome's address bar. Back, forward and reload use native shortcuts.
+Custody and interruption rules still apply; a busy or password-focused
+page does not block browser controls. Ordinary page typing retains its
+secret-field checks. Headless and external CDP use their existing adapter.
+
 The `goto` and `navigate` aliases still require a URL.
 
 Global Options:

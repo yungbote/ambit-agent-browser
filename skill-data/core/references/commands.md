@@ -4,6 +4,8 @@ Complete reference for all agent-browser commands. For quick start and common pa
 
 ## Navigation
 
+In an owned window (`AGENT_BROWSER_WINDOW_STREAM=1`), open/navigate type in Chrome's address bar; back, forward and reload use native shortcuts. The existing input owner enforces custody and cancellation, and the driver observes the requested main-frame navigation before reporting its result. Browser controls remain usable on a busy or password-focused page; ordinary page typing still refuses secret fields. Headless and external CDP browsers keep their existing adapter.
+
 ```bash
 agent-browser open            # Launch browser (no navigation); stays on about:blank.
                               # Pair with `network route`, `cookies set --curl`, or

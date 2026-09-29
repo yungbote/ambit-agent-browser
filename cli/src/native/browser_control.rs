@@ -606,6 +606,33 @@ impl BrowserControl {
         client: &CdpClient,
         session: &str,
     ) -> Result<(), CommandError> {
+        self.agent_native_keys_for(events, interval, client, session, true)
+            .await
+    }
+
+    /// Reserved browser UI input has no page-field target: address-bar and
+    /// tab/history shortcuts must work even while the renderer is busy or a
+    /// password field remains the page's active element. Only native browser
+    /// operations call this; raw agent keys keep their page-field admission.
+    pub(crate) async fn agent_native_browser_keys(
+        &mut self,
+        events: &[Value],
+        interval: Duration,
+        client: &CdpClient,
+        session: &str,
+    ) -> Result<(), CommandError> {
+        self.agent_native_keys_for(events, interval, client, session, false)
+            .await
+    }
+
+    async fn agent_native_keys_for(
+        &mut self,
+        events: &[Value],
+        interval: Duration,
+        client: &CdpClient,
+        session: &str,
+        page_target: bool,
+    ) -> Result<(), CommandError> {
         if let Some(error) = self.agent_error() {
             return Err(format!("{}: {}", error.code, error.message).into());
         }
@@ -613,6 +640,11 @@ impl BrowserControl {
             .require_known()
             .map_err(|error| error.replace("mouse input", "keyboard input"))?;
         let display = self.display.clone().ok_or("No owned browser display")?;
+        // Reserved Chrome controls need their exact shortcut, rather than
+        // inheriting a prior agent keydown/gesture's held modifiers.
+        if !page_target && self.native_mouse.needs_release() {
+            self.native_mouse.release(&display).await?;
+        }
         let strokes = motion::strokes(events);
         let total = strokes.iter().map(|stroke| stroke.characters).sum();
         let mut raised = self.interrupts.subscribe();
@@ -638,16 +670,18 @@ impl BrowserControl {
             }
             // Read when the stroke is due, a whole interval after the one
             // before it went, so the page has taken what came before.
-            if let Some(refusal) = focused
-                .refuses(
-                    client,
-                    session,
-                    &events[stroke.events.start],
-                    &mut page_events,
-                )
-                .await
-            {
-                return Err(refusal.stopped(index > 0, typed, total));
+            if page_target {
+                if let Some(refusal) = focused
+                    .refuses(
+                        client,
+                        session,
+                        &events[stroke.events.start],
+                        &mut page_events,
+                    )
+                    .await
+                {
+                    return Err(refusal.stopped(index > 0, typed, total));
+                }
             }
             let typing = events[stroke.events.clone()]
                 .iter()

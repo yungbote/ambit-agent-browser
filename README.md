@@ -467,6 +467,8 @@ agent-browser state clean --older-than <days>  # Delete old states
 
 ### Navigation
 
+In an owned window (`AGENT_BROWSER_WINDOW_STREAM=1`), `open` and `navigate` use Chrome's address bar, and back, forward and reload use native keyboard shortcuts. Input follows the existing custody and interruption rules; navigation waits for the requested main-frame document, including redirects and fragment changes. A busy page or its focused password field does not block browser controls. Ordinary page typing keeps its secret-field checks. Headless and external CDP browsers keep their existing navigation adapter.
+
 ```bash
 agent-browser back                    # Go back
 agent-browser forward                 # Go forward

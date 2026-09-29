@@ -1856,6 +1856,75 @@ async fn typing_never_reaches_a_secret_field_that_has_focus() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn browser_ui_keys_do_not_read_the_renderer_and_still_respect_custody() {
+    use super::super::interaction::native_key_chord_events;
+    let (display, mut ops, _frames) = acknowledging_display();
+    // This renderer never answers a command. Chrome UI input must not ask
+    // it for the page's active field, even if that field remains secret.
+    let mut browser = Browser::new().await;
+    let mut control = BrowserControl {
+        display: Some(display),
+        ..BrowserControl::default()
+    };
+    let events = native_key_chord_events("l", Some(2));
+    tokio::time::timeout(
+        Duration::from_millis(200),
+        control.agent_native_browser_keys(&events, motion::KEY_INTERVAL, &browser.client, "page"),
+    )
+    .await
+    .expect("browser UI does not wait for a busy renderer")
+    .unwrap();
+    assert_eq!(ops.try_recv().unwrap()["op"], "input");
+    assert!(
+        browser.commands.try_recv().is_err(),
+        "no renderer command was issued"
+    );
+    let interrupts = control.interrupts();
+    let takeover = interrupts.raise(InterruptReason::HumanControl);
+    let refused = control
+        .agent_native_browser_keys(&events, motion::KEY_INTERVAL, &browser.client, "page")
+        .await
+        .unwrap_err();
+    assert!(refused.error.starts_with("browser_controlled_by_user: "));
+    assert!(
+        ops.try_recv().is_err(),
+        "nothing is typed under human custody"
+    );
+    drop(takeover);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn browser_ui_shortcuts_settle_prior_agent_modifiers_first() {
+    let (display, mut ops, _frames) = acknowledging_display();
+    let browser = Browser::new().await;
+    let mut control = BrowserControl {
+        display: Some(display),
+        ..BrowserControl::default()
+    };
+    control.native_mouse.keys_acknowledged(&[json!({"type":"input_keyboard","eventType":"keyDown","key":"Shift","code":"ShiftLeft","modifiers":8})]);
+    control
+        .agent_native_browser_keys(
+            &super::super::interaction::native_key_chord_events("l", Some(2)),
+            motion::KEY_INTERVAL,
+            &browser.client,
+            "page",
+        )
+        .await
+        .unwrap();
+    assert_eq!(ops.try_recv().unwrap()["op"], "reset");
+    let input = ops.try_recv().unwrap();
+    assert_eq!(input["op"], "input");
+    assert!(input["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|event| event["modifiers"] == 2));
+    assert!(!control.native_mouse.needs_release());
+}
+
 /// Focus that moves into a secret field while the agent types stops the
 /// typing at that field, however the command began: the report counts
 /// exactly the characters that went in.
