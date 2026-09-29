@@ -36,9 +36,8 @@ use crate::native::video::convert::Planar;
 use crate::native::video::{self as codec, EncodeRequest, VideoCodec, VideoEncoder, VideoError};
 
 /// The longest a picture request waits in the helper for damage. The helper
-/// serves one request at a time, so a wait holds back every encoding: it
-/// never runs past the moment another encoding owes a picture
-/// (`damage_wait`).
+/// serves one request at a time, so a wait holds back every encoding:
+/// `decide` ends it when another encoding will owe a picture.
 const PICTURE_WAIT_MS: u32 = 100;
 /// Encoder threads per stream, measured on the production node
 /// (encoder-decision.md): full motion is as fast at 2 as at 4, but 4 cut
@@ -626,7 +625,9 @@ enum Decision {
 /// whole one; one that has not seen the screen does not wait for more
 /// damage, since an unchanged answer means the slot already holds the
 /// screen. The helper serves one request at a time, so a wait for damage
-/// never runs past the moment another encoding owes a picture.
+/// ends when another encoding will owe a picture (`Due::owed`); one that
+/// begins to owe during the wait, such as a new codec's first viewer, waits
+/// for it to end.
 fn decide(encodings: &[Arc<Encoding>], now: Instant) -> Decision {
     let (taking, waiting): (Vec<_>, Vec<_>) = encodings
         .iter()
