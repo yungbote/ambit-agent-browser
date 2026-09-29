@@ -939,7 +939,7 @@ impl CdpClient {
         self.target_sessions.lock().unwrap().get(session).cloned()
     }
 
-    pub(super) fn session_for_target(&self, target: &str) -> Option<String> {
+    pub(crate) fn session_for_target(&self, target: &str) -> Option<String> {
         self.target_sessions
             .lock()
             .unwrap()

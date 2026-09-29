@@ -107,7 +107,7 @@ pub(crate) const FACTS: &str = r#"((el) => {
 
 /// Finds the deepest focused element, through open shadow roots and
 /// same-origin frames.
-const FOCUSED: &str = r#"(() => {
+pub(crate) const FOCUSED: &str = r#"(() => {
     let el = document.activeElement;
     for (;;) {
         if (el && el.shadowRoot && el.shadowRoot.activeElement) { el = el.shadowRoot.activeElement; continue; }
@@ -201,10 +201,27 @@ pub(crate) struct Recorders(Mutex<HashSet<String>>);
 
 impl Recorders {
     /// The execution context of the channel's world in `session`'s main
-    /// frame. The first time, the secret-field recorder is installed for
-    /// every document to come, and the landing watcher's binding for every
-    /// context of the world.
+    /// frame (`frame_world`).
     pub(crate) async fn world(&self, client: &CdpClient, session: &str) -> Result<i64, String> {
+        let tree = client
+            .send_command_no_params("Page.getFrameTree", Some(session))
+            .await?;
+        let frame = tree["frameTree"]["frame"]["id"]
+            .as_str()
+            .ok_or("The page has no main frame")?;
+        self.frame_world(client, session, frame).await
+    }
+
+    /// The execution context of the channel's world in the frame `frame` of
+    /// `session`. The first time for a session, the secret-field recorder is
+    /// installed for every document to come in each of its frames, and the
+    /// landing watcher's binding for every context of the world.
+    pub(crate) async fn frame_world(
+        &self,
+        client: &CdpClient,
+        session: &str,
+        frame: &str,
+    ) -> Result<i64, String> {
         let first = {
             let mut recorded = self.0.lock().unwrap_or_else(|error| error.into_inner());
             // Sessions end with their tabs and browsers; installing again is
@@ -233,12 +250,6 @@ impl Recorders {
                 )
                 .await?;
         }
-        let tree = client
-            .send_command_no_params("Page.getFrameTree", Some(session))
-            .await?;
-        let frame = tree["frameTree"]["frame"]["id"]
-            .as_str()
-            .ok_or("The page has no main frame")?;
         let world = client
             .send_command(
                 "Page.createIsolatedWorld",
