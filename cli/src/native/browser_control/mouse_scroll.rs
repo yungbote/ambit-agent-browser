@@ -757,7 +757,11 @@ impl NativeMouse {
         acted: Acted,
     ) -> Result<bool, CommandError> {
         let [delta_x, delta_y] = scroll.course.remaining(first);
-        if delta_x.abs() <= 1.0 && delta_y.abs() <= 1.0 {
+        // Readback tolerance can finish an already executed wheel gesture;
+        // it must not swallow a valid initial pixel/fractional request.
+        if (delta_x == 0.0 && delta_y == 0.0)
+            || (acted != Acted::Nothing && delta_x.abs() <= 1.0 && delta_y.abs() <= 1.0)
+        {
             return Ok(false);
         }
         if pacing.check(acted)? {
@@ -804,7 +808,14 @@ impl NativeMouse {
             now = read;
             let left = scroll.course.remaining(&now);
             let reached = match scroll.course.goal {
-                Goal::By(_) => left.iter().all(|value| value.abs() <= 1.0),
+                Goal::By(_) => {
+                    left.iter().all(|value| value.abs() <= 1.0)
+                        && (acted != Acted::Nothing
+                            || [delta_x, delta_y].iter().enumerate().all(|(axis, delta)| {
+                                *delta == 0.0
+                                    || delta.signum() * (now.at[axis] - first.at[axis]) > 0.0
+                            }))
+                }
                 Goal::Into(_) => !now.outside.iter().any(|value| *value),
             };
             if still >= SETTLED_FRAMES {
