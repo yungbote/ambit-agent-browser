@@ -114,6 +114,45 @@ impl Viewer {
         }
     }
 
+    /// Takes units until the painted picture shows `colour` at `row`, and
+    /// returns the unit that first showed it.
+    async fn until_shows(&mut self, row: u32, colour: [u8; 4]) -> Arc<Unit> {
+        loop {
+            let unit = self.unit().await;
+            if near(self.painted(row), colour) {
+                return unit;
+            }
+        }
+    }
+
+    /// Takes units until a refinement comes.
+    async fn refined(&mut self) -> Arc<Unit> {
+        loop {
+            let unit = self.unit().await;
+            if unit.quality == Quality::Final {
+                return unit;
+            }
+        }
+    }
+
+    /// Every unit is a newer capture than the one before, the key unit a
+    /// viewer asked for of the same capture, or the one refinement of the
+    /// capture before it: no picture is doubled and none goes back in time.
+    fn assert_ordered(&self) {
+        for pair in self.units.windows(2) {
+            let (before, after) = (&pair[0], &pair[1]);
+            let ordered = match after.quality {
+                Quality::Motion => after.ts > before.ts || (after.key && after.ts == before.ts),
+                Quality::Final => before.quality == Quality::Motion && after.ts == before.ts,
+            };
+            assert!(
+                ordered,
+                "{:?} {} after {:?} {}",
+                after.quality, after.ts, before.quality, before.ts
+            );
+        }
+    }
+
     /// The next unit of motion quality.
     async fn motion(&mut self) -> Arc<Unit> {
         loop {
@@ -157,7 +196,11 @@ fn near(actual: [u8; 3], bgrx: [u8; 4]) -> bool {
 /// A new stream's first picture is taken whole and encoded as a key unit
 /// at the window's size class; damage then travels as dependent units that
 /// carry exactly what changed, and a still picture is refined to the still
-/// target soon after the last damage.
+/// target by re-encoding its capture, with no more damage and no new
+/// capture. When the refinement is due is the policy's
+/// (`a_still_picture_is_refined_once_and_new_damage_owes_it_again`); how
+/// soon it arrives is the CPU's, measured on a real path by the real-Chrome
+/// proof.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_stream_starts_whole_follows_damage_and_refines_a_still_picture() {
     let rig = rig();
@@ -177,22 +220,16 @@ async fn a_stream_starts_whole_follows_damage_and_refines_a_still_picture() {
     assert_eq!(asked[0]["force"], true, "{asked:?}");
 
     rig.paint(100, 140, RED);
-    let damaged = std::time::Instant::now();
-    let moved = viewer.motion().await;
-    let refined = viewer.unit().await;
-    let refined_after = damaged.elapsed();
-    assert!(!moved.key && moved.codec_string.is_none());
-    assert!(moved.ts >= first.ts);
-    assert_eq!(refined.quality, Quality::Final);
+    let moved = viewer.until_shows(120, RED).await;
+    let refined = viewer.refined().await;
+    assert!(moved.quality == Quality::Motion && !moved.key && moved.codec_string.is_none());
+    assert!(moved.ts > first.ts);
     assert!(!refined.key);
     assert_eq!(
         refined.ts, moved.ts,
         "a refinement re-encodes the same capture"
     );
-    assert!(
-        refined_after < Duration::from_millis(150),
-        "refined {refined_after:?} after the damage"
-    );
+    viewer.assert_ordered();
     assert!(near(viewer.painted(120), RED));
     assert!(near(viewer.painted(200), GREY));
 }
@@ -287,36 +324,39 @@ async fn pictures_never_carry_the_pointer() {
 /// Viewers of another codec or another rate get their own encoding. The
 /// helper reports a change once, to whichever picture comes next; an
 /// encoding that picture was not for catches up from the slot when it is
-/// due, without waiting for more damage.
+/// due, by a capture of its own with no more damage. However late the
+/// threads run, the change reaches both viewers, no picture is doubled or
+/// goes back in time, and each still picture is refined. That no wait for
+/// damage holds the catch-up back is
+/// `a_wait_for_damage_ends_when_another_encoding_owes_a_picture`.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_encoding_a_picture_was_not_for_catches_up_when_due() {
     let rig = rig();
     let mut fast = Viewer::new(rig.subscribe_to(VideoCodec::Av1Full, 60));
-    let mut slow = Viewer::new(rig.subscribe_to(VideoCodec::Av1, 10));
-    // Each new encoding's first picture is whole, so the other may see an
-    // unchanged picture again: wait until both are still.
-    tokio::join!(fast.settle(), slow.settle());
-    rig.paint(100, 120, RED);
+    // A second's period: a change right after its picture reaches only the
+    // fast encoding.
+    let mut slow = Viewer::new(rig.subscribe_to(VideoCodec::Av1, 1));
     fast.motion().await;
     slow.motion().await;
-    // Right after the slow encoding's picture: only the fast one is due.
-    rig.paint(200, 220, BLUE);
-    let painted_at = std::time::Instant::now();
-    fast.motion().await;
-    let caught_up = slow.motion().await;
-    let elapsed = painted_at.elapsed();
-    assert!(!caught_up.key);
-    // Due one period after its previous picture, which preceded the change;
-    // waiting for more damage would add the helper's whole wait.
-    assert!(
-        elapsed < period(10) + Duration::from_millis(50),
-        "caught up {elapsed:?} after the change"
-    );
-    assert!(near(fast.painted(210), BLUE));
-    assert!(
-        near(slow.painted(210), BLUE),
-        "the slow stream shows the change"
-    );
+    for colour in [RED, BLUE, GREEN] {
+        rig.paint(200, 220, colour);
+        let alone = fast.until_shows(210, colour).await;
+        let caught_up = slow.until_shows(210, colour).await;
+        if caught_up.ts <= alone.ts {
+            // A thread ran a second late and the slow encoding was due when
+            // the change came, so it took the change itself: again, right
+            // after that picture.
+            continue;
+        }
+        assert!(!caught_up.key, "a catch-up is a dependent unit");
+        for viewer in [&mut fast, &mut slow] {
+            viewer.refined().await;
+            viewer.assert_ordered();
+            assert!(near(viewer.painted(210), colour));
+        }
+        return;
+    }
+    panic!("the slow encoding was due for every change");
 }
 
 /// The capture thread serves one request at a time, so a wait for damage
@@ -513,8 +553,10 @@ async fn a_broken_helper_ends_every_subscription_with_its_reason() {
     let rig = rig();
     let viewer = rig.subscribe();
     assert!(unit(&viewer).await.key);
+    // The break comes with the helper's next answer, whether the producer
+    // is waiting in it or asks next; the helper then leaves, so nothing more
+    // can be painted.
     rig.change(Change::Break);
-    rig.paint(0, 4, RED);
     loop {
         match delivery(&viewer).await {
             Delivery::Unit(_) => continue,
