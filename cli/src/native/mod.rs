@@ -65,6 +65,7 @@ pub(crate) mod video;
 pub mod webdriver;
 #[allow(dead_code)]
 pub mod webmcp;
+pub(crate) mod workspace_role;
 
 #[cfg(test)]
 mod e2e_tests;

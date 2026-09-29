@@ -2740,6 +2740,15 @@ pub(crate) async fn execute_command_received(
     state: &mut DaemonState,
     received_at: std::time::Instant,
 ) -> Value {
+    let role = match super::workspace_role::current() {
+        Ok(role) => role,
+        Err(error) => return error_response(cmd["id"].as_str().unwrap_or_default(), error),
+    };
+    if cmd["action"] == "run_playwright" {
+        if let Err(error) = role.admit_local_program() {
+            return error_response(cmd["id"].as_str().unwrap_or_default(), error);
+        }
+    }
     // The theme is session state, not agent activity: it passes no window,
     // custody, observation or action-policy gate and captures no host
     // feedback.

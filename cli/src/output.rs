@@ -2269,6 +2269,11 @@ The body runs in Node; document and window exist only inside page.evaluate().
 The default page is the native driver's current tab. Open the browser first.
 Requires Node and installed playwright-core 1.62.1 or a qualified newer version.
 
+Browser hosts reject local programs before Chrome or Node starts; run them
+in the conversation workspace. Standalone and code-workspace use are unchanged.
+AMBIT_WORKSPACE_ROLE is reserved for the platform's workspace manifest and
+is fixed at daemon startup, not selected by a launch or model argument.
+
 Options:
   --target <id>        Exact existing CDP target ID (default: current native tab)
   --timeout-ms <ms>    Program deadline, 1 through 120000 (default: 30000)
@@ -4256,6 +4261,7 @@ Configuration:
 
 Environment:
   AGENT_BROWSER_REQUIRE_SANDBOX  Require sandboxed local Chrome (1 or true)
+  AMBIT_WORKSPACE_ROLE           Reserved platform role: code or browser_host; absent is standalone
   AGENT_BROWSER_PLAYWRIGHT_MODULE Installed playwright-core/index.mjs path
   AGENT_BROWSER_PLAYWRIGHT_RUNNER Optional installed Playwright runner module
   AGENT_BROWSER_NODE_PATH        Node executable for Playwright (default: node)

@@ -333,6 +333,7 @@ async fn diagnostics(mut reader: impl AsyncRead + Unpin) -> (String, bool) {
 /// The enclosing command retains exclusive native custody until the temporary
 /// connection, every input operation and the Node group have settled.
 pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
+    super::workspace_role::current()?.admit_local_program()?;
     #[cfg(not(unix))]
     return Err(
         "browser_operation_rejected: Supervised Playwright execution requires a Unix workspace."
