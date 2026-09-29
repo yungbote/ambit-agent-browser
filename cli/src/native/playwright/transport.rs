@@ -230,8 +230,10 @@ async fn serve(
                     let carries = value["method"]
                         .as_str()
                         .is_some_and(boundary::carries_credentials);
-                    if carries { boundary::scrub(&mut value["params"]); }
-                    connection.site_context().values.scrub_protocol(&mut value["params"]);
+                    if let Some(params)=value.get_mut("params") {
+                        if carries { boundary::scrub(params); }
+                        connection.site_context().values.scrub_protocol(params);
+                    }
                     value.to_string()
                 }
                 Some(id) => {
@@ -243,13 +245,13 @@ async fn serve(
                     let Some((program, carries)) = program else { continue };
                     value["id"] = program;
                     if carries {
-                        boundary::scrub(&mut value["result"]);
+                        if let Some(result)=value.get_mut("result") { boundary::scrub(result); }
                     }
                     if let Some(targets) = value.pointer_mut("/result/targetInfos").and_then(Value::as_array_mut) {
                         targets.retain(|target| !target["targetId"].as_str().is_some_and(|target| connection.site_context().private_target(target)));
                     }
-                    connection.site_context().values.scrub_protocol(&mut value["result"]);
-                    connection.site_context().values.scrub(&mut value["error"]);
+                    if let Some(result)=value.get_mut("result") { connection.site_context().values.scrub_protocol(result); }
+                    if let Some(error)=value.get_mut("error") { connection.site_context().values.scrub(error); }
                     value.to_string()
                 }
             };
