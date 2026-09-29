@@ -319,6 +319,140 @@ async fn an_encoding_a_picture_was_not_for_catches_up_when_due() {
     );
 }
 
+/// The capture thread serves one request at a time, so a wait for damage
+/// holds back every encoding: it never runs past the moment another
+/// encoding owes a picture, to the wire's millisecond.
+#[test]
+fn a_wait_for_damage_ends_when_another_encoding_owes_a_picture() {
+    let now = Instant::now();
+    let ms = Duration::from_millis;
+    // Due now (its 16.7 ms period has passed) and has seen the screen.
+    let fast = || encoding(60, Some(ms(20)), false, false, now);
+    let wait = |encodings: &[Arc<Encoding>]| captured(decide(encodings, now)).wait_ms;
+    assert_eq!(
+        wait(&[fast()]),
+        PICTURE_WAIT_MS,
+        "nothing else: the whole wait"
+    );
+    assert_eq!(
+        wait(&[fast(), encoding(10, Some(ms(10)), false, false, now)]),
+        PICTURE_WAIT_MS,
+        "an encoding that has seen the screen owes nothing"
+    );
+    assert_eq!(
+        wait(&[fast(), encoding(10, Some(ms(10)), true, false, now)]),
+        90,
+        "one that has not is due 90 ms from now"
+    );
+    assert_eq!(
+        wait(&[fast(), encoding(2, Some(ms(10)), true, false, now)]),
+        PICTURE_WAIT_MS,
+        "one due after the whole wait"
+    );
+    assert_eq!(
+        wait(&[
+            fast(),
+            encoding(10, Some(ms(10)), true, false, now),
+            encoding(10, Some(ms(40)), true, false, now),
+        ]),
+        60,
+        "the earliest owed"
+    );
+}
+
+/// An encoding whose encoder holds both buffers takes no picture; it owes
+/// one once a buffer comes back, which the capture thread cannot hear while
+/// the helper waits: a wait for damage ends when it is due, and after that
+/// within its period.
+#[test]
+fn an_encoding_waiting_for_its_encoder_is_looked_at_within_its_period() {
+    let now = Instant::now();
+    let ms = Duration::from_millis;
+    let fast = || encoding(60, Some(ms(20)), false, false, now);
+    let wait = |encodings: &[Arc<Encoding>]| captured(decide(encodings, now)).wait_ms;
+    assert_eq!(
+        wait(&[fast(), encoding(10, Some(ms(10)), true, true, now)]),
+        90,
+        "its due time"
+    );
+    assert_eq!(
+        wait(&[fast(), encoding(60, Some(ms(20)), true, true, now)]),
+        17,
+        "a period from now, to the millisecond"
+    );
+    assert_eq!(
+        wait(&[fast(), encoding(60, Some(ms(20)), false, true, now)]),
+        PICTURE_WAIT_MS,
+        "it has seen the screen"
+    );
+    assert!(
+        matches!(
+            decide(&[encoding(60, Some(ms(20)), true, true, now)], now),
+            Decision::Wait(None)
+        ),
+        "its encoder wakes the thread"
+    );
+}
+
+/// A picture that needs no damage asks for none; a whole one waits only for
+/// a layout in progress; and with nothing due the thread sleeps until the
+/// next encoding is due.
+#[test]
+fn a_capture_asks_for_what_its_encodings_need() {
+    let now = Instant::now();
+    let ms = Duration::from_millis;
+    let request = captured(decide(&[encoding(60, Some(ms(20)), true, false, now)], now));
+    assert_eq!((request.force, request.wait_ms), (false, 0));
+    let request = captured(decide(
+        &[
+            encoding(60, None, true, false, now),
+            encoding(10, Some(ms(10)), true, false, now),
+        ],
+        now,
+    ));
+    assert_eq!((request.force, request.wait_ms), (true, PICTURE_WAIT_MS));
+    match decide(
+        &[
+            encoding(60, Some(ms(5)), false, false, now),
+            encoding(60, Some(ms(20)), true, true, now),
+        ],
+        now,
+    ) {
+        Decision::Wait(at) => assert_eq!(at, Some(now - ms(5) + period(60))),
+        Decision::Capture(_) => panic!("nothing is due"),
+    }
+    assert!(matches!(decide(&[], now), Decision::Wait(None)));
+}
+
+/// An encoding of `rate` whose last picture was `ago` before `now` (none:
+/// it has none yet), that has seen the screen or not, and whose encoder
+/// holds both buffers or not.
+fn encoding(
+    rate: u32,
+    ago: Option<Duration>,
+    behind: bool,
+    busy: bool,
+    now: Instant,
+) -> Arc<Encoding> {
+    let encoding = Arc::new(Encoding::new(VideoCodec::Av1Full));
+    lock(&encoding.subscribers).push(Arc::new(Subscriber::new(rate)));
+    let mut mailbox = lock(&encoding.mailbox);
+    mailbox.pictured = ago.map(|ago| now - ago);
+    mailbox.behind = behind;
+    if busy {
+        mailbox.free.clear();
+    }
+    drop(mailbox);
+    encoding
+}
+
+fn captured(decision: Decision) -> PictureRequest {
+    match decision {
+        Decision::Capture(plan) => plan.request,
+        Decision::Wait(at) => panic!("a capture, not a wait until {at:?}"),
+    }
+}
+
 /// A viewer whose path has no room skips captures; the damage accumulates
 /// and its next picture shows all of it. Nothing encoded is dropped.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
