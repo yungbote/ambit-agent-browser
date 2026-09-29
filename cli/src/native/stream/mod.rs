@@ -1344,6 +1344,105 @@ mod tests {
         ws
     }
 
+    /// Read until a "status" record arrives. Timed out so a broken server
+    /// fails instead of hanging.
+    async fn next_status(ws: &mut WsClient) -> Value {
+        loop {
+            let msg = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+                .await
+                .expect("timed out waiting for a status record")
+                .expect("stream ended")
+                .expect("ws error");
+            if let Message::Text(text) = msg {
+                let parsed: Value = serde_json::from_str(&text).expect("valid json");
+                if parsed["type"] == "status" {
+                    return parsed;
+                }
+            }
+        }
+    }
+
+    /// `browser` follows the view's source and the daemon's note, and
+    /// `connected` is false exactly when it says `closed`, which alone
+    /// carries why and whether the browser can be restarted.
+    #[test]
+    fn the_status_record_says_what_the_browser_does_and_why() {
+        let note = |restarting, closed, restartable| BrowserNote {
+            restarting,
+            closed,
+            restartable,
+        };
+        let record =
+            |connected, note| status_record(connected, note, false, (1280, 720), "chrome", false);
+        for restartable in [false, true] {
+            let running = record(true, note(false, ClosedReason::Exited, restartable));
+            assert_eq!(running["connected"], true);
+            assert_eq!(running["browser"], "running");
+            assert!(running.get("reason").is_none() && running.get("restartable").is_none());
+            let restarting = record(true, note(true, ClosedReason::RestartFailed, restartable));
+            assert_eq!(restarting["connected"], true);
+            assert_eq!(restarting["browser"], "restarting");
+            assert!(restarting.get("reason").is_none() && restarting.get("restartable").is_none());
+        }
+        for (reason, token) in [
+            (ClosedReason::Closed, "closed"),
+            (ClosedReason::Exited, "exited"),
+            (ClosedReason::RestartFailed, "restart_failed"),
+        ] {
+            for restarting in [false, true] {
+                for restartable in [false, true] {
+                    let closed = record(false, note(restarting, reason, restartable));
+                    assert_eq!(closed["connected"], false);
+                    assert_eq!(closed["browser"], "closed");
+                    assert_eq!(closed["reason"], token);
+                    assert_eq!(closed["restartable"], restartable);
+                }
+            }
+        }
+    }
+
+    /// A viewer's opening records and every later status broadcast carry the
+    /// daemon's note: why no browser runs, then that its successor starts
+    /// while the retired window is still the source.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn opening_records_and_broadcasts_carry_the_browser_note() {
+        let (server, _slot) = StreamServer::start_without_client(
+            0,
+            "browser-note".into(),
+            true,
+            Arc::new(IdleActivity::new()),
+        )
+        .await
+        .unwrap();
+        server.set_browser_note(BrowserNote {
+            restarting: false,
+            closed: ClosedReason::Exited,
+            restartable: true,
+        });
+        let mut viewer = connect_client(server.port()).await;
+        let opening = next_status(&mut viewer).await;
+        assert_eq!(opening["connected"], false, "{opening}");
+        assert_eq!(opening["browser"], "closed", "{opening}");
+        assert_eq!(opening["reason"], "exited", "{opening}");
+        assert_eq!(opening["restartable"], true, "{opening}");
+
+        // The note comes first, so whichever producer reports the attached
+        // source (the capture loop's attach or this broadcast) says it.
+        server.set_browser_note(BrowserNote {
+            restarting: true,
+            ..BrowserNote::default()
+        });
+        let (display, _control, _frames) = super::super::display::DisplayClient::test_channel();
+        server.set_display(Some(display)).await;
+        server.broadcast_status(false, 1280, 720, "chrome").await;
+        let attached = next_status(&mut viewer).await;
+        assert_eq!(attached["connected"], true, "{attached}");
+        assert_eq!(attached["browser"], "restarting", "{attached}");
+        assert!(attached.get("reason").is_none(), "{attached}");
+        server.shutdown().await;
+    }
+
     /// Read until a "frame" arrives, skipping status and tabs. Timed out so a
     /// broken server fails instead of hanging.
     async fn next_frame(ws: &mut WsClient) -> Value {
