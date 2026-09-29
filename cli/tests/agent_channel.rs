@@ -71,8 +71,10 @@ fn serve(mut stream: std::net::TcpStream) {
     let target = request.split_whitespace().nth(1).unwrap_or("/").to_string();
     let path = target.split('?').next().unwrap_or("/");
     let (status, page) = page(path);
-    if path == "/slow" {
-        thread::sleep(Duration::from_millis(1500));
+    match path {
+        "/slow" => thread::sleep(Duration::from_millis(1500)),
+        "/slower" => thread::sleep(Duration::from_millis(3000)),
+        _ => {}
     }
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
@@ -112,6 +114,10 @@ fn page(path: &str) -> (&'static str, String) {
         "/slow" => format!("<!doctype html><title>Slow</title>{STYLE}<main><h1>Slow</h1></main>"),
         "/slow-link" => format!(
             "<!doctype html><title>Slow link</title>{STYLE}<main style=\"padding:24px\"><a id=slow href=\"/slow\">Go slowly</a></main>"
+        ),
+        "/slower" => format!("<!doctype html><title>Slower</title>{STYLE}<main><h1>Slower</h1></main>"),
+        "/slower-link" => format!(
+            "<!doctype html><title>Slower link</title>{STYLE}<main style=\"padding:24px\"><a id=slow href=\"/slower\">Go slower</a></main>"
         ),
         "/cover" => format!(
             "<!doctype html><title>Cover</title>{STYLE}\
@@ -1058,6 +1064,94 @@ fn e2e_agent_channel_take_control_during_a_step_and_during_the_landed_wait() {
             "landingEndedAfterTakeoverUs": after_takeover.as_micros() as u64,
             "clickAnsweredAfterUs": answered.as_micros() as u64,
             "interruptedStep": interrupted["steps"][0], "pendingLanding": landed }),
+    );
+}
+
+/// A page between documents answers nothing until its navigation commits,
+/// so nothing waits on it: a click whose page takes 3 s to answer ends at
+/// its 1 s deadline with `pending`, and the frame's reads say why; a judged
+/// step sent next is refused at once, which also shows the first reply came
+/// before the commit; and the host's wait for the load then observes the
+/// page the click went to.
+#[test]
+#[ignore = "requires AMBIT_TEST_CHROME_EXECUTABLE, Xvfb and AGENT_BROWSER_DISPLAY_HELPER"]
+fn e2e_agent_channel_a_page_between_documents_is_not_waited_on() {
+    let host = Host::new();
+    let mut channel = host.channel();
+    channel.run(
+        &host,
+        json!([step(
+            "agent_browser_open",
+            json!({ "url": host.site.url("/slower-link") })
+        )]),
+    );
+    let (generation, nodes) = channel.resolve(&host, &["#slow"]);
+    let click = |timeout: u64| {
+        json!({ "op": "agent_browser_click",
+            "arguments": { "selector": "#slow", "timeoutMs": timeout },
+            "preconditions": { "pageGeneration": generation,
+                "backendNodeId": nodes[0], "effects": "read" } })
+    };
+    let pending = json!({ "status": "unavailable", "code": "browser_navigation_pending" });
+
+    let mut frame = sequence(&host, json!([click(1000)]));
+    frame["observe"] = json!(true);
+    frame["resolve"] = json!(["#slow"]);
+    let (clicked, clicked_round) = channel.call(frame);
+    assert_eq!(clicked["success"], true, "{clicked}");
+    let landed = &clicked["steps"][0]["landed"];
+    assert_eq!(landed["pending"], true, "{clicked}");
+    assert!(landed.get("navigation").is_none(), "{landed}");
+    assert_eq!(
+        landed["target"],
+        json!({ "backendNodeId": nodes[0] }),
+        "{landed}"
+    );
+    assert_eq!(clicked["observation"], pending, "{clicked}");
+    assert_eq!(clicked["resolved"], pending, "{clicked}");
+    assert_eq!(
+        clicked["browser"]["capture"]["code"], "browser_navigation_pending",
+        "{clicked}"
+    );
+
+    let (refused, refused_round) = channel.call(sequence(&host, json!([click(1000)])));
+    assert_eq!(refused["success"], false, "{refused}");
+    assert_eq!(
+        response(&refused, 0)["code"],
+        "browser_navigation_pending",
+        "{refused}"
+    );
+    assert_eq!(response(&refused, 0)["data"], json!({}), "{refused}");
+    assert!(
+        refused["steps"][0].get("landed").is_none(),
+        "a refused step has no landing: {refused}"
+    );
+
+    let mut waited = sequence(
+        &host,
+        json!([step(
+            "agent_browser_wait_for_load",
+            json!({ "state": "domcontentloaded", "timeoutMs": 10000 })
+        )]),
+    );
+    waited["observe"] = json!(true);
+    let (loaded, loaded_round) = channel.call(waited);
+    assert_eq!(loaded["success"], true, "{loaded}");
+    assert!(loaded["observation"]["candidates"].is_array(), "{loaded}");
+    assert!(
+        loaded["browser"]["page"]["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/slower")),
+        "{loaded}"
+    );
+    evidence(
+        "e2e-navigation-pending",
+        &json!({ "clickRoundTripUs": clicked_round.as_micros() as u64,
+            "clickTiming": clicked["timing"], "clickLanded": landed,
+            "refusedRoundTripUs": refused_round.as_micros() as u64,
+            "refusal": response(&refused, 0),
+            "waitRoundTripUs": loaded_round.as_micros() as u64,
+            "waitTiming": loaded["timing"] }),
     );
 }
 

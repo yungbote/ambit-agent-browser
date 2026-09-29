@@ -676,8 +676,6 @@ pub struct DaemonState {
     pub mouse_state: MouseState,
     /// Tracks the currently open JavaScript dialog (alert/confirm/prompt), if any.
     pub pending_dialog: Option<PendingDialog>,
-    /// The pages between documents, from the events the drain applies.
-    documents: super::documents::Documents,
     /// A mouse button left logically down because a dialog opened between
     /// mousePressed and mouseReleased; released when the dialog is resolved.
     pub pending_pointer_release: Option<super::interaction::PendingRelease>,
@@ -798,13 +796,7 @@ impl DaemonState {
     pub(crate) fn active_page_between_documents(&self) -> bool {
         self.browser
             .as_ref()
-            .and_then(|browser| browser.active_session_id().ok())
-            .is_some_and(|session| self.documents.between(session))
-    }
-
-    /// Whether the page of `session` is between documents (`documents`).
-    pub(crate) fn between_documents(&self, session: &str) -> bool {
-        self.documents.between(session)
+            .is_some_and(|browser| browser.active_page_between_documents())
     }
 
     /// The expiry path every command and maintenance tick runs. A sign-in
@@ -895,7 +887,6 @@ impl DaemonState {
             dialog_handler_task: None,
             mouse_state: MouseState::default(),
             pending_dialog: None,
-            documents: super::documents::Documents::default(),
             pending_pointer_release: None,
             auto_dialog: !matches!(
                 env::var("AGENT_BROWSER_NO_AUTO_DIALOG").as_deref(),
@@ -1869,7 +1860,6 @@ impl DaemonState {
                             if let Some(sid) =
                                 event.params.get("sessionId").and_then(|v| v.as_str())
                             {
-                                self.documents.forget(sid);
                                 if let Some(frame_id) =
                                     self.iframe_sessions
                                         .iter()
@@ -1892,19 +1882,9 @@ impl DaemonState {
 
                     // Every page's own document events, before the drain
                     // narrows to the active page: a page switched to is
-                    // still between documents if it was. A page's main
-                    // frame has its target's id.
-                    if let Some(session) = event.session_id.as_deref() {
-                        let frame = event.params["frameId"]
-                            .as_str()
-                            .or_else(|| event.params["frame"]["id"].as_str());
-                        if let Some(frame) = frame.filter(|frame| {
-                            self.browser.as_ref().is_some_and(|browser| {
-                                browser.session_id_for_target(frame) == Some(session)
-                            })
-                        }) {
-                            self.documents.note(session, frame, &event);
-                        }
+                    // still between documents if it was.
+                    if let Some(browser) = self.browser.as_mut() {
+                        browser.note_document(&event);
                     }
 
                     let session_matches = if let Some(ref browser) = self.browser {
@@ -2812,8 +2792,21 @@ pub(crate) trait HostFence {
     /// person used the browser: the fence refuses it if the page moved.
     fn fences_point(&self) -> bool;
 
+    /// Whether the fence reads the page before the command's first input.
+    /// Such a command is refused while the page is between documents
+    /// (`documents`): its renderer would answer nothing until the commit,
+    /// and what the command was chosen on is the document being left.
+    fn reads_page(&self) -> bool;
+
     /// Admits the command, or refuses it with a native response.
     async fn admit(&mut self, command: &Value, state: &mut DaemonState) -> Result<(), Value>;
+}
+
+/// Whether the active page is between documents, once the events that
+/// arrived so far are applied.
+async fn navigation_pending(state: &mut DaemonState) -> bool {
+    let _ = state.drain_cdp_events_background().await;
+    state.active_page_between_documents()
 }
 
 /// A host-bound command once the window admitted it, as both transports run
@@ -2839,8 +2832,9 @@ pub(crate) async fn run_host_command(
         state.browser_control.lock().await.needs_observation(),
         fence.fences_point(),
     );
-    // A person's control is reported before a stale page, and the fence is
-    // asked only once both gates admitted the command.
+    // A person's control is reported before an observation the agent owes,
+    // both before a page between documents, and the fence is asked only once
+    // every gate admitted the command.
     let refusal = if let Some(error) = controlled {
         Some(
             json!({ "id": command["id"], "success": false, "code": error.code, "error": error.message }),
@@ -2849,6 +2843,10 @@ pub(crate) async fn run_host_command(
         Some(
             json!({ "id": command["id"], "success": false, "code": "browser_observation_required", "error": window_actions::OBSERVATION_REQUIRED }),
         )
+    } else if fence.reads_page() && navigation_pending(state).await {
+        Some(json!({ "id": command["id"], "success": false,
+            "code": super::documents::NAVIGATION_PENDING,
+            "error": super::documents::NAVIGATION_PENDING_MESSAGE, "data": {} }))
     } else {
         fence.admit(&command, state).await.err()
     };
@@ -17940,11 +17938,14 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         let leaving =
             |frame: &str| json!({ "frameId": frame, "navigationType": "differentDocument" });
 
+        let background =
+            |state: &DaemonState| state.browser.as_ref().unwrap().between_documents("T2");
+
         send(Some("S2"), "Page.frameStartedNavigating", leaving("T2"));
         send(Some("S1"), "Page.frameStartedNavigating", leaving("CHILD"));
         state.drain_cdp_events_background().await.unwrap();
         assert!(!state.active_page_between_documents());
-        assert!(state.between_documents("S2"));
+        assert!(background(&state));
 
         send(Some("S1"), "Page.frameStartedNavigating", leaving("T1"));
         state.drain_cdp_events_background().await.unwrap();
@@ -17957,26 +17958,27 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         );
         state.drain_cdp_events_background().await.unwrap();
         assert!(!state.active_page_between_documents());
-        assert!(state.between_documents("S2"));
+        assert!(background(&state));
 
-        send(
-            None,
-            "Target.detachedFromTarget",
-            json!({ "sessionId": "S2" }),
-        );
+        send(None, "Target.targetDestroyed", json!({ "targetId": "T2" }));
         state.drain_cdp_events_background().await.unwrap();
-        assert!(!state.between_documents("S2"));
+        assert!(!background(&state));
     }
 
     /// A fence that refuses every command it is asked about and counts them.
     struct RefusingFence {
         points: bool,
+        reads: bool,
         asked: usize,
     }
 
     impl HostFence for RefusingFence {
         fn fences_point(&self) -> bool {
             self.points
+        }
+
+        fn reads_page(&self) -> bool {
+            self.reads
         }
 
         async fn admit(&mut self, command: &Value, _: &mut DaemonState) -> Result<(), Value> {
@@ -18012,6 +18014,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             interrupts.raise(super::super::browser_control::InterruptReason::HumanControl);
         let mut unfenced = RefusingFence {
             points: false,
+            reads: false,
             asked: 0,
         };
         let refused = run_host_command(&named, &request, &mut state, now(), &mut unfenced).await;
@@ -18036,10 +18039,83 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         assert_eq!(unfenced.asked, 1);
         let mut fenced = RefusingFence {
             points: true,
+            reads: true,
             asked: 0,
         };
         let refused = run_host_command(&point, &request, &mut state, now(), &mut fenced).await;
         assert_eq!(refused["error"], "fenced", "{refused}");
         assert_eq!(fenced.asked, 1);
+    }
+
+    /// A command whose fence reads the page before acting is refused while
+    /// the active page is between documents, before its fence is asked: not
+    /// performed. One whose fence does not read the page reaches its fence,
+    /// and so does the first once the navigation commits.
+    #[tokio::test]
+    async fn a_command_that_reads_the_page_first_is_refused_between_documents() {
+        use super::super::cdp::types::CdpEvent;
+        let mut state = DaemonState::new();
+        state.browser = Some(
+            super::super::browser::tests::test_manager(vec![super::super::browser::PageInfo {
+                tab_id: 1,
+                label: None,
+                target_id: "T1".into(),
+                session_id: "S1".into(),
+                url: "https://shop.example/".into(),
+                title: String::new(),
+                target_type: "page".into(),
+            }])
+            .await,
+        );
+        let (events, receiver) = tokio::sync::broadcast::channel(16);
+        state.event_rx = Some(receiver);
+        let send = |method: &str, params: Value| {
+            events
+                .send(CdpEvent {
+                    method: method.into(),
+                    params,
+                    session_id: Some("S1".into()),
+                })
+                .unwrap();
+        };
+        let request = super::super::feedback::FeedbackRequest {
+            namespace: String::new(),
+            session: state.session_id.clone(),
+            capture_directory: "/".into(),
+            timeout_ms: 1_000,
+            expected_observation: None,
+            launch: None,
+        };
+        let named = json!({ "id": "n", "action": "click", "selector": "#go",
+            super::super::feedback::REQUEST_FIELD: {} });
+        let now = std::time::Instant::now;
+        let fence = |reads: bool| RefusingFence {
+            points: false,
+            reads,
+            asked: 0,
+        };
+
+        send(
+            "Page.frameStartedNavigating",
+            json!({ "frameId": "T1", "navigationType": "differentDocument" }),
+        );
+        let mut reading = fence(true);
+        let refused = run_host_command(&named, &request, &mut state, now(), &mut reading).await;
+        assert_eq!(refused["code"], "browser_navigation_pending", "{refused}");
+        assert_eq!(refused["id"], "n");
+        assert_eq!(refused["data"], json!({}));
+        assert_eq!(reading.asked, 0);
+        let mut blind = fence(false);
+        let fenced = run_host_command(&named, &request, &mut state, now(), &mut blind).await;
+        assert_eq!(fenced["error"], "fenced", "{fenced}");
+        assert_eq!(blind.asked, 1);
+
+        send(
+            "Page.frameNavigated",
+            json!({ "frame": { "id": "T1", "loaderId": "L2", "url": "https://shop.example/next" } }),
+        );
+        let fenced = run_host_command(&named, &request, &mut state, now(), &mut reading).await;
+        assert_eq!(fenced["error"], "fenced", "{fenced}");
+        assert_eq!(reading.asked, 1);
     }
 }

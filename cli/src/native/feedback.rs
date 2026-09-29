@@ -213,6 +213,11 @@ impl super::actions::HostFence for ImageFence<'_> {
         self.0.expected_observation.is_some()
     }
 
+    /// The image's page is read before a point it carries is sent.
+    fn reads_page(&self) -> bool {
+        self.0.expected_observation.is_some()
+    }
+
     async fn admit(&mut self, command: &Value, state: &mut DaemonState) -> Result<(), Value> {
         if matches_expected(self.0, state).await {
             return Ok(());
