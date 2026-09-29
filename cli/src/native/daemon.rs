@@ -33,6 +33,7 @@ pub enum DaemonMode {
 }
 
 pub async fn run_daemon(session: &str, mode: DaemonMode) -> Result<(), String> {
+    super::workspace_role::current().map_err(String::from)?;
     // Claim ownership before changing metadata, sockets, or log files. The guard
     // cleans up only this daemon's files and releases its lock after shutdown.
     let _session = DaemonSession::acquire(session, mode == DaemonMode::Foreground)?;

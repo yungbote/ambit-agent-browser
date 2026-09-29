@@ -6,6 +6,8 @@ Linux private window streaming defaults to ANGLE software GLES for WebGL with so
 
 The Unix native daemon runs one supervised Node program against its existing Chromium instance. The host installs Node and a qualified `playwright-core` version (1.62.1 supports the required `noDefaults` attachment). The runner never installs packages or browsers. `AGENT_BROWSER_PLAYWRIGHT_MODULE` selects an absolute installed `playwright-core/index.mjs`; without it normal Node package resolution applies. `AGENT_BROWSER_NODE_PATH` selects Node. `AGENT_BROWSER_PLAYWRIGHT_RUNNER` optionally selects the installed runner module; otherwise the native binary uses its bundled runner.
 
+The platform reserves `AMBIT_WORKSPACE_ROLE` for the workspace manifest: `code` or `browser_host`; absence is standalone. The daemon fixes it at startup and invalid values refuse startup. A browser host rejects local `run-playwright` with `browser_operation_rejected` before program preparation or an implicit browser launch, including before its first site-state offer. Run browser programs in the conversation's code workspace. A model or launch argument cannot change the role, and the marker grants no site access. Standalone/code local execution remains compatible.
+
 ```sh
 agent-browser open https://example.test
 agent-browser run-playwright --timeout-ms 30000 --stdin <<'JS'

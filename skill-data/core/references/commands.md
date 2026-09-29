@@ -542,6 +542,8 @@ agent-browser network route '*' --resource-type image,font --body '' # Stub imag
 
 ## Environment Variables
 
+`AMBIT_WORKSPACE_ROLE` is reserved for the platform's workspace manifest (`code` or `browser_host`; absent is standalone). It is fixed at daemon startup, invalid values refuse startup, and a browser host never runs local Playwright/Node programs. It grants no site access and is not a model or launch argument.
+
 ```bash
 AGENT_BROWSER_SESSION="mysession"            # Default session name
 AGENT_BROWSER_EXECUTABLE_PATH="/path/chrome" # Custom browser path
