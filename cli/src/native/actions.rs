@@ -3495,7 +3495,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         "press" => stating(handle_press(cmd, state).await, &mut failure_data),
         "hover" => stating(handle_hover(cmd, state).await, &mut failure_data),
         "scroll" => stating(handle_scroll(cmd, state).await, &mut failure_data),
-        "select" => handle_select(cmd, state).await,
+        "select" => stating(handle_select(cmd, state).await, &mut failure_data),
         "check" => stating(handle_check(cmd, state).await, &mut failure_data),
         "uncheck" => stating(handle_uncheck(cmd, state).await, &mut failure_data),
         "wait" => handle_wait(cmd, state).await,
@@ -3549,9 +3549,9 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         "credentials_list" => handle_credentials_list().await,
         "mouse" => stating(handle_mouse(cmd, state).await, &mut failure_data),
         "keyboard" => stating(handle_keyboard(cmd, state).await, &mut failure_data),
-        "focus" => handle_focus(cmd, state).await,
-        "clear" => handle_clear(cmd, state).await,
-        "selectall" => handle_selectall(cmd, state).await,
+        "focus" => stating(handle_focus(cmd, state).await, &mut failure_data),
+        "clear" => stating(handle_clear(cmd, state).await, &mut failure_data),
+        "selectall" => stating(handle_selectall(cmd, state).await, &mut failure_data),
         "scrollintoview" => stating(handle_scrollintoview(cmd, state).await, &mut failure_data),
         "dispatch" => handle_dispatch(cmd, state).await,
         "highlight" => handle_highlight(cmd, state).await,
@@ -6807,7 +6807,7 @@ async fn handle_scroll(cmd: &Value, state: &mut DaemonState) -> Result<Value, Co
     Ok(json!({ "scrolled": true }))
 }
 
-async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
@@ -6828,6 +6828,23 @@ async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .unwrap_or_default(),
     };
 
+    if state.browser_control.lock().await.has_native_display() {
+        let selected = interaction::native_select_option(
+            &mgr.client,
+            &state.browser_control,
+            &session_id,
+            &state.ref_map,
+            selector,
+            &values,
+            &state.iframe_sessions,
+        )
+        .await?;
+        if selected.dialog_opened {
+            state.pending_pointer_release = selected.pending_release;
+            return Ok(json!({ "selected": values, "dialogOpened": true }));
+        }
+        return Ok(json!({ "selected": values }));
+    }
     interaction::select_option(
         &mgr.client,
         &session_id,
@@ -8659,7 +8676,7 @@ async fn handle_pdf(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
 // Phase 8 handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_focus(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_focus(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
@@ -8667,6 +8684,22 @@ async fn handle_focus(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
+    if state.browser_control.lock().await.has_native_display() {
+        let focused = interaction::native_focus(
+            &mgr.client,
+            &state.browser_control,
+            &session_id,
+            &state.ref_map,
+            selector,
+            &state.iframe_sessions,
+        )
+        .await?;
+        if focused.dialog_opened {
+            state.pending_pointer_release = focused.pending_release;
+            return Ok(json!({ "focused": selector, "dialogOpened": true }));
+        }
+        return Ok(json!({ "focused": selector }));
+    }
     interaction::focus(
         &mgr.client,
         &session_id,
@@ -8678,7 +8711,7 @@ async fn handle_focus(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     Ok(json!({ "focused": selector }))
 }
 
-async fn handle_clear(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_clear(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
@@ -8686,6 +8719,19 @@ async fn handle_clear(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
+    if state.browser_control.lock().await.has_native_display() {
+        let cleared = fill_field(state, selector, "").await?;
+        if cleared["dialogOpened"] == true {
+            return Ok(json!({ "cleared": selector, "dialogOpened": true }));
+        }
+        if cleared["valueMatches"] == false {
+            return Err(
+                "The field did not accept clearing. Inspect its current value before retrying."
+                    .into(),
+            );
+        }
+        return Ok(json!({ "cleared": selector }));
+    }
     interaction::clear(
         &mgr.client,
         &session_id,
@@ -8697,7 +8743,7 @@ async fn handle_clear(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     Ok(json!({ "cleared": selector }))
 }
 
-async fn handle_selectall(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_selectall(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
@@ -8705,6 +8751,22 @@ async fn handle_selectall(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
+    if state.browser_control.lock().await.has_native_display() {
+        let selected = interaction::native_select_all(
+            &mgr.client,
+            &state.browser_control,
+            &session_id,
+            &state.ref_map,
+            selector,
+            &state.iframe_sessions,
+        )
+        .await?;
+        if selected.dialog_opened {
+            state.pending_pointer_release = selected.pending_release;
+            return Ok(json!({ "selected": selector, "dialogOpened": true }));
+        }
+        return Ok(json!({ "selected": selector }));
+    }
     interaction::select_all(
         &mgr.client,
         &session_id,

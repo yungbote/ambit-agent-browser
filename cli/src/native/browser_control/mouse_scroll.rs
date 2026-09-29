@@ -10,12 +10,11 @@
 //! element) once per frame while it waits, and each round sends the notches
 //! the remaining distance needs at the distance per notch the scroller has
 //! shown. A long distance turns more notches per event rather than more
-//! events (`motion::wheel_events`), within `motion::WHEEL_BUDGET`. Script
-//! takes over, published as `scrolling` with no pointer path, for a scroller
-//! the wheel leaves unmoved for `motion::WHEEL_STALL` after a round's first
-//! notch (a canvas that takes the wheel, overflow a person cannot scroll),
-//! one no visible point turns, a distance under half a notch, and whatever
-//! the budget cannot reach. No motion is invented.
+//! events (`motion::wheel_events`), within `motion::WHEEL_BUDGET`. A residual
+//! distance uses Chrome's trusted precision wheel input at the same visible
+//! pointer, including distances smaller than an X11 notch. Actual scroller
+//! readback proves completion; blocked input fails instead of changing DOM
+//! scroll offsets. The human sign-in browser never uses this attached CDP path.
 
 use std::time::{Duration, Instant};
 
@@ -52,21 +51,59 @@ const SETTLE_RESERVE: Duration = Duration::from_millis(250);
 /// The most nested scrollers one element is brought through by the wheel.
 const MOST_SCROLLERS: usize = 3;
 
-/// A scroller's offsets and how far each can go, then, given an element (in
-/// its document or a same-origin frame inside it), how far the element's
-/// centre is from the middle of what the scroller shows and whether it lies
-/// outside it, per axis. All in CSS pixels of the scroller's document.
-pub(super) const READ: &str = r#"function(element) {
-    const offsets = [this.scrollLeft, this.scrollTop, this.scrollWidth - this.clientWidth, this.scrollHeight - this.clientHeight];
-    if (!element) return offsets;
-    const doc = this.ownerDocument, win = doc.defaultView, root = doc.scrollingElement || doc.documentElement;
+// Selection of a hiding scroller and the distance that scroller moves must
+// read the same clipped point. Compile the one projection into both read-only
+// scripts so it cannot drift and adds no per-frame script allocation.
+macro_rules! projected_target {
+    () => {
+        r#"function(element, stop) {
+    const parent = el => el.assignedSlot || el.parentElement || (el.parentNode && el.parentNode.host) || null;
+    const scrolls = el => {
+        const style = getComputedStyle(el);
+        return /^(auto|scroll|overlay)$/.test(style.overflowX) || /^(auto|scroll|overlay)$/.test(style.overflowY);
+    };
     const box = element.getBoundingClientRect();
     let x = box.left + box.width / 2, y = box.top + box.height / 2;
-    for (let w = element.ownerDocument.defaultView; w && w !== win && w.frameElement; w = w.parent) {
-        const frame = w.frameElement, rect = frame.getBoundingClientRect();
+    let hider = null, doc = element.ownerDocument, node = parent(element);
+    const projects = (el, left, top) => {
+        const outsideX = x < left || x >= left + el.clientWidth;
+        const outsideY = y < top || y >= top + el.clientHeight;
+        if (outsideX) x = left + el.clientWidth / 2;
+        if (outsideY) y = top + el.clientHeight / 2;
+        return outsideX || outsideY;
+    };
+    for (;;) {
+        const root = doc.scrollingElement || doc.documentElement;
+        for (; node && node !== root; node = parent(node)) {
+            if (node === stop) return [x, y, hider];
+            if (!scrolls(node)) continue;
+            const rect = node.getBoundingClientRect();
+            if (projects(node, rect.left + node.clientLeft, rect.top + node.clientTop)) hider = node;
+        }
+        if (root === stop) return [x, y, hider];
+        if (projects(root, 0, 0)) hider = root;
+        const frame = doc.defaultView.frameElement;
+        if (!frame) return [x, y, hider];
+        const rect = frame.getBoundingClientRect();
         x += rect.left + frame.clientLeft;
         y += rect.top + frame.clientTop;
+        doc = frame.ownerDocument;
+        node = parent(frame);
     }
+}"#
+    };
+}
+
+/// A scroller's offsets and limits, then its target's projected distance
+/// and visibility per axis, all in that scroller's document's CSS pixels.
+pub(super) const READ: &str = concat!(
+    r#"function(element) {
+    const offsets = [this.scrollLeft, this.scrollTop, this.scrollWidth - this.clientWidth, this.scrollHeight - this.clientHeight];
+    if (!element) return offsets;
+    const [x, y] = ("#,
+    projected_target!(),
+    r#")(element, this);
+    const root = this.ownerDocument.scrollingElement || this.ownerDocument.documentElement;
     let left = 0, top = 0;
     if (this !== root) {
         const rect = this.getBoundingClientRect();
@@ -76,37 +113,16 @@ pub(super) const READ: &str = r#"function(element) {
     const width = this.clientWidth, height = this.clientHeight;
     return offsets.concat([x - (left + width / 2), y - (top + height / 2),
         x < left || x >= left + width, y < top || y >= top + height]);
-}"#;
+}"#
+);
 
-/// The outermost scroller that hides this element's centre, walking up
+/// The outermost scroller hiding the target's visible projection, walking
 /// through shadow trees and same-origin frames, or null when it shows.
-pub(super) const HIDER: &str = r#"function() {
-    const parent = el => el.assignedSlot || el.parentElement || (el.parentNode && el.parentNode.host) || null;
-    const scrolls = el => {
-        const style = getComputedStyle(el);
-        return /^(auto|scroll|overlay)$/.test(style.overflowX) || /^(auto|scroll|overlay)$/.test(style.overflowY);
-    };
-    const box = this.getBoundingClientRect();
-    let x = box.left + box.width / 2, y = box.top + box.height / 2;
-    let hider = null, doc = this.ownerDocument, node = parent(this);
-    for (;;) {
-        const root = doc.scrollingElement || doc.documentElement;
-        const hides = (el, left, top) => x < left || x >= left + el.clientWidth || y < top || y >= top + el.clientHeight;
-        for (; node && node !== root; node = parent(node)) {
-            if (!scrolls(node)) continue;
-            const rect = node.getBoundingClientRect();
-            if (hides(node, rect.left + node.clientLeft, rect.top + node.clientTop)) hider = node;
-        }
-        if (hides(root, 0, 0)) hider = root;
-        const frame = doc.defaultView.frameElement;
-        if (!frame) return hider;
-        const rect = frame.getBoundingClientRect();
-        x += rect.left + frame.clientLeft;
-        y += rect.top + frame.clientTop;
-        doc = frame.ownerDocument;
-        node = parent(frame);
-    }
-}"#;
+pub(super) const HIDER: &str = concat!(
+    "function() { return (",
+    projected_target!(),
+    ")(this, null)[2]; }"
+);
 
 /// Where a wheel turned in the direction `(dx, dy)` reaches this scroller
 /// first, as near the pointer `(px, py)` (null when unknown) as a point can
@@ -407,7 +423,6 @@ impl<'a> Course<'a> {
 /// One scroll's scroller, and the course it takes.
 struct Scroll<'a> {
     client: &'a CdpClient,
-    page_session: &'a str,
     session: &'a str,
     scroller: String,
     course: Course<'a>,
@@ -423,23 +438,6 @@ impl Scroll<'_> {
                 self.course.goal,
             ))
             .await
-    }
-
-    /// The rest of the way by script, published as `scrolling`.
-    async fn by_script(&self, now: &Reading) -> Result<bool, CommandError> {
-        let [delta_x, delta_y] = self.course.remaining(now);
-        if delta_x != 0.0 || delta_y != 0.0 {
-            crate::native::interaction::scroll_by(
-                self.client,
-                self.page_session,
-                self.session,
-                &self.scroller,
-                delta_x,
-                delta_y,
-            )
-            .await?;
-        }
-        Ok(false)
     }
 }
 
@@ -479,8 +477,8 @@ impl NativeMouse {
     /// does: each scroller hiding its centre, outermost first, is turned by
     /// the wheel until the centre is in the middle of what it shows. An
     /// element of an out-of-process frame first has its frame brought into
-    /// view in the page. Nothing moves while the centre shows, and whatever
-    /// the wheel leaves hidden is revealed by script, as `scrolling`.
+    /// view in the page. Nothing moves while the centre shows. A target still
+    /// hidden after wheel input fails; it is never revealed by a DOM mutation.
     /// Returns true when a dialog opened.
     pub(in crate::native::browser_control) async fn scroll_into_view(
         &mut self,
@@ -538,7 +536,7 @@ impl NativeMouse {
                 }
             }
             if hider(client, session, element).await?.is_some() {
-                crate::native::interaction::reveal(client, page_session, session, element).await?;
+                return Err("The wheel could not reveal the target. Inspect the page and choose a visible control; do not replay the action.".into());
             }
         }
         Ok(false)
@@ -572,7 +570,6 @@ impl NativeMouse {
         };
         let scroll = Scroll {
             client,
-            page_session,
             session,
             scroller,
             course: Course::new(goal, &first),
@@ -580,10 +577,8 @@ impl NativeMouse {
         let surface = display.surface();
         let scale = mapping.scale()?;
         let mut per_notch = [NOTCH_DIP * f64::from(surface.device_scale_factor) / scale; 2];
-        if scroll.course.wanted(&first, per_notch) == [0, 0] {
-            // Nothing to scroll, or less than half a notch: no wheel turns
-            // that little.
-            return scroll.by_script(&first).await;
+        if scroll.course.remaining(&first) == [0.0, 0.0] {
+            return Ok(false);
         }
         let pointer = display
             .pointer()
@@ -602,7 +597,7 @@ impl NativeMouse {
             let to = mapping.point(x, y, &surface).ok()?;
             Some((to, (x, y), width))
         }) else {
-            return scroll.by_script(&first).await;
+            return Err("No visible point can deliver wheel input to this scroller. Choose a visible scroll target.".into());
         };
         let from = self.origin(&mapping, display, &surface)?;
         if let Some(glide) = Glide::new(from, to, width * scale, motion::REACHED_CSS_PX * scale) {
@@ -628,7 +623,9 @@ impl NativeMouse {
         for round in 0..=ROUNDS {
             let count = scroll.course.wanted(&now, per_notch);
             if count == [0, 0] {
-                return Ok(false);
+                return self
+                    .precision_scroll(&scroll, &now, (x, y), &mapping, display, &mut pacing, acted)
+                    .await;
             }
             // The frames left for notches: the whole budget until the first
             // notch starts its clock.
@@ -638,15 +635,23 @@ impl NativeMouse {
             });
             let frames = u32::try_from(frames).unwrap_or(u32::MAX);
             let events = count.map(|notches| motion::wheel_events(notches, frames));
-            if round == ROUNDS || events.iter().all(Vec::is_empty) {
-                return scroll.by_script(&now).await;
+            // A plan already known to leave a remainder must not spend the
+            // entire native budget before starting its precision input.
+            let cannot_finish = events
+                .iter()
+                .zip(count)
+                .any(|(events, wanted)| events.iter().sum::<u32>() < wanted);
+            if round == ROUNDS || cannot_finish || events.iter().all(Vec::is_empty) {
+                return self
+                    .precision_scroll(&scroll, &now, (x, y), &mapping, display, &mut pacing, acted)
+                    .await;
             }
             let from = now;
             for index in 0..events[0].len().max(events[1].len()) {
                 pacing.tick().await;
                 // The budget is time, whatever the plan counted: a wheel
                 // slower than a notch a frame stops at it, and what it has
-                // not reached is finished by script.
+                // not reached uses the same browser's precision wheel input.
                 if frames_until.is_some_and(|until| Instant::now() >= until) {
                     break;
                 }
@@ -685,7 +690,17 @@ impl NativeMouse {
                         break;
                     }
                     if turned.elapsed() >= motion::WHEEL_STALL {
-                        return scroll.by_script(&read).await;
+                        return self
+                            .precision_scroll(
+                                &scroll,
+                                &read,
+                                (x, y),
+                                &mapping,
+                                display,
+                                &mut pacing,
+                                acted,
+                            )
+                            .await;
                     }
                 }
             }
@@ -715,6 +730,82 @@ impl NativeMouse {
             });
         }
         Ok(false)
+    }
+
+    /// Chrome receives a real precision wheel event at the pointer the native
+    /// owner already positioned. Custody and the original document mapping
+    /// remain held through its acknowledgement; the existing CDP observer
+    /// publishes that acknowledgement, rather than inventing a helper receipt.
+    #[allow(clippy::too_many_arguments)]
+    async fn precision_scroll(
+        &mut self,
+        scroll: &Scroll<'_>,
+        first: &Reading,
+        (x, y): (f64, f64),
+        mapping: &Mapping,
+        display: &DisplayClient,
+        pacing: &mut Pacing<'_>,
+        acted: Acted,
+    ) -> Result<bool, CommandError> {
+        let [delta_x, delta_y] = scroll.course.remaining(first);
+        if delta_x.abs() <= 1.0 && delta_y.abs() <= 1.0 {
+            return Ok(false);
+        }
+        if pacing.check(acted)? {
+            return Ok(true);
+        }
+        let atomic = display.atomic_input().await;
+        self.current(mapping, scroll.client, display).await?;
+        if pacing.check(acted)? {
+            return Ok(true);
+        }
+        let params = json!({"type":"mouseWheel", "x":x, "y":y,
+            "deltaX":delta_x, "deltaY":delta_y, "buttons":self.buttons,
+            "modifiers":self.holding(0)});
+        self.unknown = true;
+        let mut command = scroll
+            .client
+            .enqueue_command(
+                "Input.dispatchMouseEvent",
+                Some(params),
+                Some(scroll.session),
+            )
+            .await?;
+        let response = tokio::time::timeout(Duration::from_secs(5), command.acknowledgment())
+            .await.map_err(|_| "browser_control_outcome_unknown: Precision wheel acknowledgement was lost. Inspect the page before continuing; do not replay the scroll.")??;
+        if let Some(error) = response.error {
+            return Err(format!("browser_control_outcome_unknown: Precision wheel input failed ({error}). Inspect the page before continuing.").into());
+        }
+        self.unknown = false;
+        drop(atomic);
+        pacing.sent();
+        let started = Instant::now();
+        let mut now = *first;
+        let mut still = 0;
+        while started.elapsed() < SETTLE_LIMIT {
+            pacing.tick().await;
+            if pacing.check(Acted::Turned)? {
+                return Ok(true);
+            }
+            self.current(mapping, scroll.client, display).await?;
+            let Some(read) = scroll.read(pacing).await? else {
+                return Ok(true);
+            };
+            still = if read.at == now.at { still + 1 } else { 0 };
+            now = read;
+            let left = scroll.course.remaining(&now);
+            let reached = match scroll.course.goal {
+                Goal::By(_) => left.iter().all(|value| value.abs() <= 1.0),
+                Goal::Into(_) => !now.outside.iter().any(|value| *value),
+            };
+            if still >= SETTLED_FRAMES {
+                if reached {
+                    return Ok(false);
+                }
+                break;
+            }
+        }
+        Err("The page did not reach the requested scroll position after trusted wheel input. It may block scrolling or have changed. Inspect the page before continuing; do not replay the scroll.".into())
     }
 }
 

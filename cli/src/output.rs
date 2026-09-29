@@ -1818,6 +1818,9 @@ Usage: agent-browser focus <selector>
 
 Sets keyboard focus to the specified element.
 
+In an owned window, text fields take a pointer click; other controls
+take keyboard focus without being activated.
+
 Global Options:
   --json               Output as JSON
   --session <name>     Use specific session
@@ -1834,6 +1837,9 @@ agent-browser check - Check a checkbox
 Usage: agent-browser check <selector>
 
 Checks a checkbox element. If already checked, no action is taken.
+
+In an owned window a hidden input needs a visible control or label;
+without one the command is refused before a change.
 
 Global Options:
   --json               Output as JSON
@@ -1868,6 +1874,9 @@ agent-browser select - Select a dropdown option
 Usage: agent-browser select <selector> <value...>
 
 Selects one or more options in a <select> dropdown by value.
+
+In an owned window, selection uses the native pointer and keys.
+The control keeps its single-select or multiple-select behavior.
 
 Global Options:
   --json               Output as JSON
@@ -2065,8 +2074,9 @@ Scrolls the page or a specific element in the specified direction.
 In an owned window (AGENT_BROWSER_WINDOW_STREAM=1) the pointer goes
 where the wheel reaches the scroller and the wheel turns one event per
 frame, a notch (about 120 px) each, more notches per event for a long
-way, for at most about 1.5 s; the distance is the nearest whole number
-of notches. What no wheel can move or reach in time scrolls by script.
+way, for at most about 1.5 s. A residual pixel distance uses trusted
+precision wheel input in the already attached automation browser.
+Actual displacement is checked; a page blocking the wheel fails.
 
 Arguments:
   direction            up, down, left, right (default: down)

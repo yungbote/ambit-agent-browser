@@ -229,11 +229,19 @@ async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     let mut state = DaemonState::new();
     let html = r#"<!doctype html><div id=hidden><input id=control type=checkbox style='display:none'></div><input id=labelled type=checkbox style='display:none'><label for=labelled id=label>Visible checkbox label</label><div id=semantic role=checkbox aria-checked=false tabindex=0 style=padding:20px>Custom checkbox<input type=checkbox style=display:none></div><script>window.buttons=0;window.domClicks=0;window.refuse=false;window.ask=false;addEventListener('pointerdown',()=>buttons++,true);control.addEventListener('click',e=>{domClicks++;if(refuse)e.preventDefault();if(ask){ask=false;confirm('Apply checkbox?')}});semantic.addEventListener('click',()=>{const checked=semantic.getAttribute('aria-checked')!=='true';semantic.setAttribute('aria-checked',String(checked));semantic.querySelector('input').checked=checked});</script>"#;
     assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
-    for (action, method) in [("check", "dom"), ("check", "unchanged"), ("uncheck", "dom")] {
+    for action in ["check", "uncheck"] {
         let result =
             control_test_command(&json!({"action":action,"selector":"#hidden"}), &mut state).await;
-        assert_success(&result);
-        assert_eq!(result["data"]["method"], method);
+        if action == "check" {
+            assert_eq!(result["success"], false);
+            assert!(result["error"]
+                .as_str()
+                .unwrap()
+                .contains("visible control or label"));
+        } else {
+            assert_success(&result);
+            assert_eq!(result["data"]["method"], "unchanged");
+        }
     }
     let measured = control_test_command(
         &json!({"action":"evaluate","script":"({buttons,domClicks,checked:control.checked})"}),
@@ -243,7 +251,7 @@ async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     assert_success(&measured);
     assert_eq!(
         measured["data"]["result"],
-        json!({"buttons":0,"domClicks":2,"checked":false})
+        json!({"buttons":0,"domClicks":0,"checked":false})
     );
     assert_success(
         &control_test_command(
@@ -281,7 +289,7 @@ async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     assert!(refused["error"]
         .as_str()
         .unwrap()
-        .contains("requested state"));
+        .contains("visible control or label"));
     let measured = control_test_command(
         &json!({"action":"evaluate","script":"({buttons,domClicks,checked:control.checked})"}),
         &mut state,
@@ -290,7 +298,7 @@ async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     assert_success(&measured);
     assert_eq!(
         measured["data"]["result"],
-        json!({"buttons":0,"domClicks":3,"checked":false})
+        json!({"buttons":0,"domClicks":0,"checked":false})
     );
     assert_success(
         &control_test_command(
@@ -301,12 +309,11 @@ async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     );
     let blocked =
         control_test_command(&json!({"action":"check","selector":"#hidden"}), &mut state).await;
-    assert_success(&blocked);
-    assert_eq!(blocked["data"]["method"], "dom");
-    assert_eq!(blocked["data"]["dialogOpened"], true);
-    assert_success(
-        &control_test_command(&json!({"action":"dialog","response":"accept"}), &mut state).await,
-    );
+    assert_eq!(blocked["success"], false);
+    assert!(blocked["error"]
+        .as_str()
+        .unwrap()
+        .contains("visible control or label"));
     let completed = control_test_command(
         &json!({"action":"evaluate","script":"({buttons,domClicks,checked:control.checked})"}),
         &mut state,
@@ -315,7 +322,7 @@ async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     assert_success(&completed);
     assert_eq!(
         completed["data"]["result"],
-        json!({"buttons":0,"domClicks":4,"checked":true})
+        json!({"buttons":0,"domClicks":0,"checked":false})
     );
     // An associated visible label remains a real native pointer activation,
     // even when the selector names its hidden input.
@@ -334,7 +341,7 @@ async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     assert_success(&measured);
     assert_eq!(
         measured["data"]["result"],
-        json!({"buttons":1,"domClicks":4,"checked":true})
+        json!({"buttons":1,"domClicks":0,"checked":true})
     );
     let semantic = control_test_command(
         &json!({"action":"check","selector":"#semantic"}),
@@ -347,7 +354,561 @@ async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     assert_success(&measured);
     assert_eq!(
         measured["data"]["result"],
-        json!({"buttons":2,"domClicks":4,"checked":"true"})
+        json!({"buttons":2,"domClicks":0,"checked":"true"})
+    );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_native_select_uses_real_pointer_and_keys_without_dom_selection() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<!doctype html><style>select{margin:30px;width:180px;font-size:20px}</style><form onsubmit="submits++;event.preventDefault()"><select id=single><option value=a>Alpha</option><option value=b disabled>Beta</option><option value=c>Gamma</option><option value=d>Delta</option></select><select id=multi multiple size=4><option value=a selected>Alpha</option><option value=b selected>Beta</option><option value=c>Gamma</option><option value=d>Delta</option></select><select id=disabled disabled><option value=a>Alpha</option><option value=d>Delta</option></select></form><script>window.events=[];window.submits=0;for(const type of ['pointerdown','keydown','input','change'])addEventListener(type,e=>events.push({type,trusted:e.isTrusted,target:e.target.id,key:e.key??null}),true)</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
+    let read = json!({"action":"evaluate","script":"({single:single.value,multi:[...multi.selectedOptions].map(o=>o.value),events,submits})"});
+    assert_success(
+        &control_test_command(
+            &json!({"action":"select","selector":"#single","values":["Gamma"]}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"select","selector":"#multi","values":["a","Delta"]}),
+            &mut state,
+        )
+        .await,
+    );
+    let actual = control_test_command(&read, &mut state).await;
+    assert_success(&actual);
+    let actual = &actual["data"]["result"];
+    assert_eq!(actual["single"], "c");
+    assert_eq!(actual["multi"], json!(["a", "d"]));
+    assert_eq!(actual["submits"], 0);
+    let events = actual["events"].as_array().unwrap();
+    assert!(events.iter().any(|event| event["type"] == "pointerdown"));
+    assert!(events.iter().any(|event| event["type"] == "keydown"));
+    assert!(events.iter().any(|event| event["type"] == "change"));
+    assert!(
+        events.iter().all(|event| event["trusted"] == true),
+        "Native selection emitted synthetic events: {events:?}"
+    );
+    let before = events.len();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"select","selector":"#multi","values":["a","d"]}),
+            &mut state,
+        )
+        .await,
+    );
+    for command in [
+        json!({"action":"select","selector":"#single","values":["missing"]}),
+        json!({"action":"select","selector":"#single","values":["b"]}),
+        json!({"action":"select","selector":"#disabled","values":["d"]}),
+    ] {
+        let result = control_test_command(&command, &mut state).await;
+        assert_eq!(result["success"], false);
+    }
+    let final_state = control_test_command(&read, &mut state).await;
+    assert_success(&final_state);
+    assert_eq!(
+        final_state["data"]["result"]["events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        before,
+        "A no-op or refused selection performed input"
+    );
+    assert_eq!(final_state["data"]["result"]["single"], "c");
+    assert_eq!(final_state["data"]["result"]["multi"], json!(["a", "d"]));
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_native_focus_clear_selectall_use_real_input_without_button_activation() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<!doctype html><style>input,button,textarea{margin:20px;font-size:20px}textarea{width:240px;height:80px}</style><input id=first value=one><input id=second value=two><button id=button onclick="activations++">Do action</button><textarea id=area>hello world</textarea><input id=readOnly readonly value="read only"><script>window.activations=0;window.events=[];for(const type of ['pointerdown','keydown','input','click'])addEventListener(type,e=>events.push({type,trusted:e.isTrusted,target:e.target.id,key:e.key??null}),true)</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}),&mut state).await);
+    assert_success(
+        &control_test_command(&json!({"action":"focus","selector":"#second"}), &mut state).await,
+    );
+    let focused = control_test_command(
+        &json!({"action":"evaluate","script":"({focused:document.activeElement.id,events})"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&focused);
+    assert_eq!(focused["data"]["result"]["focused"], "second");
+    assert!(focused["data"]["result"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["type"] == "pointerdown" && event["target"] == "second"));
+    assert_success(
+        &control_test_command(&json!({"action":"focus","selector":"#button"}), &mut state).await,
+    );
+    let focused=control_test_command(&json!({"action":"evaluate","script":"({focused:document.activeElement.id,activations,events})"}),&mut state).await;
+    assert_success(&focused);
+    assert_eq!(focused["data"]["result"]["focused"], "button");
+    assert_eq!(focused["data"]["result"]["activations"], 0);
+    assert!(focused["data"]["result"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|event| event["type"] == "keydown" && event["key"] == "Tab"));
+    assert_success(
+        &control_test_command(
+            &json!({"action":"selectall","selector":"#area"}),
+            &mut state,
+        )
+        .await,
+    );
+    let selected=control_test_command(&json!({"action":"evaluate","script":"({start:area.selectionStart,end:area.selectionEnd,text:area.value})"}),&mut state).await;
+    assert_success(&selected);
+    assert_eq!(
+        selected["data"]["result"],
+        json!({"start":0,"end":11,"text":"hello world"})
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"selectall","selector":"#readOnly"}),
+            &mut state,
+        )
+        .await,
+    );
+    let selected=control_test_command(&json!({"action":"evaluate","script":"({start:readOnly.selectionStart,end:readOnly.selectionEnd,text:readOnly.value})"}),&mut state).await;
+    assert_success(&selected);
+    assert_eq!(
+        selected["data"]["result"],
+        json!({"start":0,"end":9,"text":"read only"})
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"clear","selector":"#area"}), &mut state).await,
+    );
+    let cleared = control_test_command(
+        &json!({"action":"evaluate","script":"({text:area.value,events,activations})"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&cleared);
+    assert_eq!(cleared["data"]["result"]["text"], "");
+    assert_eq!(cleared["data"]["result"]["activations"], 0);
+    let events = cleared["data"]["result"]["events"].as_array().unwrap();
+    assert!(events
+        .iter()
+        .any(|event| event["type"] == "input" && event["target"] == "area"));
+    assert!(
+        events.iter().all(|event| event["trusted"] == true),
+        "Native field commands emitted synthetic events: {events:?}"
+    );
+    let bad =
+        control_test_command(&json!({"action":"clear","selector":"#button"}), &mut state).await;
+    assert_eq!(bad["success"], false);
+    let unchanged = control_test_command(
+        &json!({"action":"evaluate","script":"activations"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&unchanged);
+    assert_eq!(unchanged["data"]["result"], 0);
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_native_static_selectall_preserves_exact_scope_through_nested_scroll() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let lines = (0..60)
+        .map(|index| format!("<span>Scoped line {index}.</span><br>"))
+        .collect::<String>();
+    let html = format!(
+        r#"<!doctype html><style>body{{font:20px sans-serif;padding:20px}}#box{{height:180px;width:350px;overflow:auto;border:1px solid}}#long{{margin:0;line-height:28px}}</style><p id=before>Outside before.</p><p id=short>Only <b>this</b> text.</p><div id=box><p id=long>{lines}</p></div><p id=after>Outside after.</p><script>window.events=[];for(const type of ['pointerdown','pointermove','pointerup','wheel'])addEventListener(type,e=>events.push({{type,trusted:e.isTrusted,target:e.target.id,time:performance.timeOrigin+performance.now()}}),true)</script>"#
+    );
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(&html))}),&mut state).await);
+    for selector in ["#short", "#long"] {
+        let started = std::time::Instant::now();
+        let response = control_test_command(
+            &json!({"action":"selectall","selector":selector}),
+            &mut state,
+        )
+        .await;
+        println!(
+            "NATIVE_SELECTALL_RETURN {}",
+            json!({"selector":selector,"commandToReturnMs":started.elapsed().as_secs_f64()*1000.0,"response":response})
+        );
+        if response["success"] != true {
+            let diagnostics=control_test_command(&json!({"action":"evaluate","script":"({scroll:box.scrollTop,box:box.getBoundingClientRect().toJSON(),first:long.firstChild.getBoundingClientRect().toJSON(),last:long.lastElementChild.previousElementSibling.getBoundingClientRect().toJSON(),events:events.slice(-12)})"}),&mut state).await;
+            println!("NATIVE_SELECTALL_FAILURE {}", diagnostics["data"]["result"]);
+            if let Ok(prefix) = std::env::var("AMBIT_NATIVE_INPUT_SCREENSHOT_PREFIX") {
+                let capture=control_test_command(&json!({"action":"screenshot","path":format!("{prefix}-failure-{}.png",selector.trim_start_matches('#'))}),&mut state).await;
+                println!("NATIVE_SELECTALL_FAILURE_CAPTURE {}", capture);
+            }
+        }
+        assert_success(&response);
+        let target = if selector == "#short" {
+            "short"
+        } else {
+            "long"
+        };
+        let observation=control_test_command(&json!({"action":"evaluate","script":format!("(()=>{{const range=getSelection().getRangeAt(0);return{{text:range.toString(),expected:{target}.textContent,inside:{target}.contains(range.commonAncestorContainer),scroll:box.scrollTop,events}}}})()")}),&mut state).await;
+        assert_success(&observation);
+        let actual = &observation["data"]["result"];
+        assert_eq!(
+            actual["text"], actual["expected"],
+            "The exact requested text was not selected: {actual}"
+        );
+        assert_eq!(
+            actual["inside"], true,
+            "Selection escaped the requested element: {actual}"
+        );
+        let events = actual["events"].as_array().unwrap();
+        assert!(events.iter().all(|event| event["trusted"] == true));
+        if let Ok(prefix) = std::env::var("AMBIT_NATIVE_INPUT_SCREENSHOT_PREFIX") {
+            assert_success(&control_test_command(&json!({"action":"screenshot","path":format!("{prefix}-{}.png",selector.trim_start_matches('#'))}),&mut state).await);
+        }
+        if selector == "#long" {
+            assert!(actual["scroll"].as_f64().unwrap() > 0.0);
+            assert!(
+                events.iter().any(|event| event["type"] == "wheel"),
+                "Offscreen selection did not turn the native wheel"
+            );
+        }
+    }
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#after"}), &mut state).await,
+    );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_native_static_selection_failure_releases_held_input_without_retargeting() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<!doctype html><style>p,button{margin:40px;font:20px sans-serif}</style><p id=target>Exact text that disappears on press.</p><button id=next onclick="clicks++">Next</button><script>window.downs=0;window.clicks=0;window.moves=[];addEventListener('pointerdown',e=>{downs++;if(target?.isConnected)target.remove()},{capture:true,once:true});addEventListener('pointermove',e=>moves.push(e.buttons),true)</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}),&mut state).await);
+    let response = control_test_command(
+        &json!({"action":"selectall","selector":"#target"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(
+        response["success"], false,
+        "A detached range was reported selected: {response}"
+    );
+    assert_success(&control_test_command(&json!({"action":"snapshot"}), &mut state).await);
+    assert_success(
+        &control_test_command(&json!({"action":"mousemove","x":240,"y":180}), &mut state).await,
+    );
+    let released = control_test_command(
+        &json!({"action":"evaluate","script":"({buttons:moves.at(-1),downs,clicks})"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&released);
+    assert_eq!(
+        released["data"]["result"],
+        json!({"buttons":0,"downs":1,"clicks":0}),
+        "The failed selection retained input or replayed a press"
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#next"}), &mut state).await,
+    );
+    let clicked =
+        control_test_command(&json!({"action":"evaluate","script":"clicks"}), &mut state).await;
+    assert_success(&clicked);
+    assert_eq!(
+        clicked["data"]["result"], 1,
+        "The next click became a drag or a double action"
+    );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_native_nested_target_reveal_scrolls_outer_then_inner_with_wheel() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<!doctype html><style>body{margin:0;font:20px sans-serif}#box{margin-top:1400px;width:350px;height:180px;overflow:auto;border:1px solid}#inside{height:2000px}button{margin-top:1700px;width:200px;height:40px}#tail{height:2500px}</style><div id=box><div id=inside><button id=target onclick="clicks++">Nested target</button></div></div><div id=tail></div><script>window.clicks=0;window.innerWheels=0;window.events=[];box.addEventListener('wheel',e=>{innerWheels++;events.push({type:'innerWheel',trusted:e.isTrusted})},true);addEventListener('wheel',e=>events.push({type:'wheel',trusted:e.isTrusted}),true)</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}),&mut state).await);
+    let response =
+        control_test_command(&json!({"action":"click","selector":"#target"}), &mut state).await;
+    assert_success(&response);
+    let observed=control_test_command(&json!({"action":"evaluate","script":"({clicks,innerWheels,outerScroll:scrollY,innerScroll:box.scrollTop,events})"}),&mut state).await;
+    assert_success(&observed);
+    let result = &observed["data"]["result"];
+    assert_eq!(result["clicks"], 1);
+    assert!(result["outerScroll"].as_f64().unwrap() > 0.0);
+    assert!(result["innerScroll"].as_f64().unwrap() > 0.0);
+    assert!(
+        result["innerWheels"].as_u64().unwrap() > 0,
+        "The hidden descendant was revealed by script rather than its native wheel: {result}"
+    );
+    assert!(result["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|event| event["trusted"] == true));
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_native_static_selection_takeover_releases_before_new_input() {
+    use super::browser_control::InterruptReason;
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let lines = "Selection line.<br>".repeat(100);
+    let html = format!(
+        r#"<!doctype html><style>#box{{height:180px;width:350px;overflow:auto}}#text{{font:20px/28px sans-serif}}</style><div id=box><p id=text>{lines}</p></div><button id=next onclick="clicks++">Next</button><script>window.moves=[];window.clicks=0;addEventListener('pointermove',e=>moves.push(e.buttons),true)</script>"#
+    );
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(&html))}), &mut state).await);
+    let client = state.browser.as_ref().unwrap().client.clone();
+    let mut watch = client.subscribe();
+    let interrupts = state.browser_control.lock().await.interrupts();
+    let request = json!({"action":"selectall","selector":"#text"});
+    let command = control_test_command(&request, &mut state);
+    let takeover = async {
+        loop {
+            let event = watch.recv().await.unwrap();
+            if event.method == crate::native::activity::EVENT
+                && event.params["eventType"] == "press"
+            {
+                return interrupts.raise(InterruptReason::HumanControl);
+            }
+        }
+    };
+    let (response, guard) = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        tokio::join!(command, takeover)
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        response["success"], false,
+        "Takeover was ignored: {response}"
+    );
+    drop(guard);
+    assert_success(&control_test_command(&json!({"action":"snapshot"}), &mut state).await);
+    assert_success(
+        &control_test_command(&json!({"action":"mousemove","x":220,"y":180}), &mut state).await,
+    );
+    let read = control_test_command(
+        &json!({"action":"evaluate","script":"moves.at(-1)"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(
+        read["data"]["result"], 0,
+        "Selection retained a button after takeover"
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#next"}), &mut state).await,
+    );
+    let read =
+        control_test_command(&json!({"action":"evaluate","script":"clicks"}), &mut state).await;
+    assert_eq!(read["data"]["result"], 1);
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_native_precision_wheel_measures_small_delta_and_refuses_blocked_scroll() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<!doctype html><style>body{margin:0}#box{width:400px;height:200px;overflow:auto}#content{height:400000px}#tail{height:4000px}</style><div id=box><div id=content></div></div><div id=tail></div><script>window.block=false;window.events=[];box.addEventListener('wheel',e=>{events.push({trusted:e.isTrusted,delta:e.deltaY,buttons:e.buttons,at:performance.timeOrigin+e.timeStamp});if(block)e.preventDefault()},{passive:false});</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}),&mut state).await);
+    let mut activity = state.browser.as_ref().unwrap().client.subscribe();
+    for amount in [17, 300, -9, 300000] {
+        let before = control_test_command(
+            &json!({"action":"evaluate","script":"box.scrollTop"}),
+            &mut state,
+        )
+        .await["data"]["result"]
+            .as_f64()
+            .unwrap();
+        let started = std::time::Instant::now();
+        let response = control_test_command(&json!({"action":"scroll","selector":"#box","direction":if amount < 0 {"up"} else {"down"},"amount":i32::abs(amount)}), &mut state).await;
+        assert_success(&response);
+        let observed = control_test_command(
+            &json!({"action":"evaluate","script":"({at:box.scrollTop,page:scrollY,events})"}),
+            &mut state,
+        )
+        .await;
+        let result = &observed["data"]["result"];
+        assert!(
+            (result["at"].as_f64().unwrap() - before - f64::from(amount)).abs() <= 1.0,
+            "{result}"
+        );
+        assert_eq!(result["page"], 0);
+        assert!(result["events"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|event| event["trusted"] == true));
+        let mut observed_wheel = false;
+        while let Ok(event) = activity.try_recv() {
+            if event.method == crate::native::activity::EVENT
+                && event.params["eventType"] == "scroll"
+            {
+                assert_eq!(event.params["source"], "agent");
+                assert!(
+                    event.params["screenX"].is_number() && event.params["screenY"].is_number(),
+                    "Precision wheel has no viewer coordinate: {}",
+                    event.params
+                );
+                assert!(event.params["timestamp"].is_number() && event.params["ts"].is_number());
+                observed_wheel = true;
+            }
+        }
+        assert!(
+            observed_wheel,
+            "Trusted wheel acknowledgement was not published to the owning browser's viewers"
+        );
+        println!(
+            "PRECISION_WHEEL_PROOF {}",
+            json!({"requestedCssPx":amount,"actualCssPx":result["at"].as_f64().unwrap()-before,"commandToObservedMs":started.elapsed().as_secs_f64()*1000.0,"events":result["events"]})
+        );
+    }
+    assert_success(
+        &control_test_command(
+            &json!({"action":"evaluate","script":"block=true; events=[]; box.scrollTop"}),
+            &mut state,
+        )
+        .await,
+    );
+    let before = control_test_command(
+        &json!({"action":"evaluate","script":"box.scrollTop"}),
+        &mut state,
+    )
+    .await["data"]["result"]
+        .clone();
+    let response = control_test_command(
+        &json!({"action":"scroll","selector":"#box","direction":"down","amount":17}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(
+        response["success"], false,
+        "Blocked input was reported complete: {response}"
+    );
+    let observed = control_test_command(
+        &json!({"action":"evaluate","script":"({at:box.scrollTop,events})"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(
+        observed["data"]["result"]["at"], before,
+        "Blocked wheel was repaired by DOM mutation"
+    );
+    let events = observed["data"]["result"]["events"].as_array().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0]["trusted"], true);
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+/// Command dispatch, acknowledged native input, trusted page events and
+/// return are kept separately. Native activity is stamped at the helper's
+/// acknowledgement, so this does not pretend it measures its earlier send.
+#[tokio::test]
+#[ignore]
+async fn e2e_native_named_input_per_action_proof() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<!doctype html><style>input,select,textarea,button,p{margin:15px;font:20px sans-serif}textarea{width:250px;height:70px}</style><select id=single><option value=a>Alpha</option><option value=b>Beta</option><option value=c>Gamma</option></select><select id=multi multiple size=3><option value=a selected>Alpha</option><option value=b>Beta</option><option value=c>Gamma</option></select><input id=field value=draft><button id=button onclick="clicks++">Action</button><textarea id=area>selected text</textarea><input id=box type=checkbox><p id=text>Scoped <b>static</b> text.</p><script>window.clicks=0;window.events=[];for(const type of ['pointermove','pointerdown','pointerup','keydown','input','change','wheel'])addEventListener(type,e=>events.push({type,trusted:e.isTrusted,at:performance.timeOrigin+e.timeStamp}),true)</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}),&mut state).await);
+    let client = state.browser.as_ref().unwrap().client.clone();
+    let mut native = client.subscribe();
+    let mut proof = Vec::new();
+    let epoch_ms = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs_f64()
+            * 1000.0
+    };
+    let commands = [
+        json!({"action":"select","selector":"#single","values":["c"]}),
+        json!({"action":"select","selector":"#multi","values":["b","c"]}),
+        json!({"action":"focus","selector":"#field"}),
+        json!({"action":"focus","selector":"#button"}),
+        json!({"action":"selectall","selector":"#area"}),
+        json!({"action":"clear","selector":"#area"}),
+        json!({"action":"check","selector":"#box"}),
+        json!({"action":"uncheck","selector":"#box"}),
+        json!({"action":"selectall","selector":"#text"}),
+    ];
+    for command in commands {
+        while native.try_recv().is_ok() {}
+        let before = control_test_command(
+            &json!({"action":"evaluate","script":"events.length"}),
+            &mut state,
+        )
+        .await;
+        assert_success(&before);
+        let count = before["data"]["result"].as_u64().unwrap();
+        let started = std::time::Instant::now();
+        let dispatch = epoch_ms();
+        let response = control_test_command(&command, &mut state).await;
+        let returned = epoch_ms();
+        let command_ms = started.elapsed().as_secs_f64() * 1000.0;
+        assert_success(&response);
+        let read = control_test_command(
+            &json!({"action":"evaluate","script":format!("events.slice({count})")}),
+            &mut state,
+        )
+        .await;
+        assert_success(&read);
+        let events = read["data"]["result"].as_array().unwrap();
+        assert!(!events.is_empty(), "No trusted page input for {command}");
+        assert!(events.iter().all(|event| event["trusted"] == true));
+        let first_page = events
+            .iter()
+            .filter_map(|event| event["at"].as_f64())
+            .min_by(f64::total_cmp)
+            .unwrap();
+        let mut acknowledged = Vec::new();
+        while let Ok(event) = native.try_recv() {
+            if event.method == crate::native::activity::EVENT && event.params["source"] == "agent" {
+                if let Some(at) = event.params["timestamp"].as_f64() {
+                    acknowledged.push(at)
+                }
+            }
+        }
+        let first_ack = acknowledged.iter().copied().min_by(f64::total_cmp);
+        proof.push(json!({"action":command["action"],"selector":command["selector"],"commandToReturnMs":command_ms,"commandDispatchEpochMs":dispatch,"firstNativeAcknowledgementEpochMs":first_ack,"firstTrustedPageEventEpochMs":first_page,"commandReturnEpochMs":returned,"commandToFirstTrustedPageEventMs":first_page-dispatch,"nativeAcknowledgements":acknowledged.len(),"trustedPageEvents":events.len()}));
+    }
+    let proof = json!({"clock":"same-host UTC epoch; native acknowledgement is not dispatch","helperDispatchMeasured":false,"actions":proof});
+    println!("NATIVE_INPUT_PER_ACTION {proof}");
+    if let Ok(path) = std::env::var("AMBIT_NATIVE_INPUT_PROOF") {
+        std::fs::write(path, serde_json::to_vec_pretty(&proof).unwrap()).unwrap();
+    }
+    assert_success(
+        &control_test_command(
+            &json!({"action":"evaluate","script":"clicks===0"}),
+            &mut state,
+        )
+        .await,
     );
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }

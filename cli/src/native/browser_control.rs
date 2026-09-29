@@ -727,7 +727,14 @@ impl BrowserControl {
     /// reporting the original command's uncertain outcome.
     pub(crate) async fn cancel_native_input(&mut self) -> Result<(), String> {
         self.needs_observation = true;
-        if self.agent_error().is_none() && self.native_mouse.needs_release() {
+        // A pending takeover stops agent effects, but must still neutralize
+        // the gesture it interrupted before the human acquires the lease.
+        // Once acquired, cleanup cannot reset the human's input devices.
+        let human_owns_input = self
+            .lease
+            .as_ref()
+            .is_some_and(|lease| lease.holds_custody(Instant::now()));
+        if !human_owns_input && self.native_mouse.needs_release() {
             if let Some(display) = self.display.as_ref() {
                 self.native_mouse.release(display).await?;
             }

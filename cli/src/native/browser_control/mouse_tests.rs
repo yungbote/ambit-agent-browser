@@ -166,6 +166,50 @@ async fn an_interrupted_held_gesture_releases_and_stays_interrupted() {
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
+async fn pending_takeover_neutralizes_agent_input_before_the_human_lease_exists() {
+    let fake = Fake::new().await;
+    let mut control = fake.control();
+    fake.place_pointer(shown(210.0, 175.0)).await;
+    control
+        .agent_native_mouse(
+            json!({"type":"mousePressed","x":210.0,"y":175.0,"button":"left"}),
+            &fake.client,
+            "page",
+            &["page"],
+        )
+        .await
+        .unwrap();
+    let _guard = control.interrupts().raise(InterruptReason::HumanControl);
+    assert!(control.agent_error().is_some());
+    control.cancel_native_input().await.unwrap();
+    assert!(fake.helper_ops().contains(&"reset".to_owned()));
+    assert!(!control.native_mouse.needs_release());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cancellation_cleanup_does_not_reset_input_after_human_custody_was_acquired() {
+    let fake = Fake::new().await;
+    let mut control = fake.control();
+    control.native_mouse.buttons = 1;
+    control.lease = Some(crate::native::browser_control::Lease {
+        controller_id: "human".into(),
+        expires_at: u64::MAX,
+        deadline: Instant::now() + Duration::from_secs(10),
+        last_sequence: 0,
+        outcome_unknown: false,
+        held: Default::default(),
+        native_input_pending: false,
+        download_cursor: 0,
+        sign_in: None,
+    });
+    control.cancel_native_input().await.unwrap();
+    assert!(!fake.helper_ops().contains(&"reset".to_owned()));
+    assert!(control.native_mouse.needs_release());
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
 async fn lost_reset_receipt_retains_unknown_hold_and_fences_new_input() {
     let (display, peer, _frames) = DisplayClient::test_channel();
     let server = tokio::spawn(async move {
@@ -309,6 +353,14 @@ fn answer(page: &mut Page, command: &Value) -> Value {
         "Page.getFrameTree" => json!({"frameTree":{"frame":{"id":"frame"}}}),
         "Page.createIsolatedWorld" => json!({"executionContextId":7}),
         "DOM.getNodeForLocation" => json!({"backendNodeId":99}),
+        "Input.dispatchMouseEvent" if command["params"]["type"] == "mouseWheel" => {
+            if page.scroller.wheel {
+                page.scroller.target = (page.scroller.target
+                    + command["params"]["deltaY"].as_f64().unwrap_or(0.0))
+                .clamp(0.0, page.scroller.most);
+            }
+            json!({})
+        }
         "Runtime.evaluate" if expression == GEOMETRY => {
             json!({"result":{"value":page.geometry}})
         }
@@ -993,8 +1045,8 @@ async fn a_wheel_turns_one_notch_per_frame() {
 }
 
 /// `scroll` travels to where the wheel reaches the scroller, then turns it
-/// one notch per frame: the nearest whole number of notches, read back from
-/// the scroller, with no script scroll and nothing invented.
+/// one notch per frame, then corrects the fractional-notch remainder with
+/// trusted precision input, with no script scroll and nothing invented.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_scroll_turns_the_wheel_where_it_reaches_the_scroller_until_it_is_there() {
@@ -1031,25 +1083,25 @@ async fn a_scroll_turns_the_wheel_where_it_reaches_the_scroller_until_it_is_ther
         point
     );
     assert_one_a_frame(&wheels);
-    assert_eq!(fake.page.lock().unwrap().scroller.at, 360.0);
+    assert_eq!(fake.page.lock().unwrap().scroller.at, 300.0);
     assert_eq!(fake.page_commands("scrollBy"), 0);
+    assert_eq!(fake.page_commands("Input.dispatchMouseEvent"), 1);
     let published = agent_activity(&mut activity);
     assert_eq!(
         published
             .iter()
             .filter(|event| event["eventType"] == "scroll")
             .count(),
-        3
+        4
     );
     assert!(!published.iter().any(|event| event["kind"] == "scrolling"));
 }
 
 /// A scroller the wheel does not move (a canvas takes it, overflow a person
-/// cannot scroll) is scrolled by script once the stall passes: one notch
-/// went, then the script, published as `scrolling` with no path.
+/// cannot scroll) fails after real wheel input without a DOM repair.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_scroll_the_wheel_cannot_move_goes_by_script_after_the_stall() {
+async fn a_scroll_the_wheel_cannot_move_fails_without_dom_repair() {
     let fake = Fake::new().await;
     let mut control = fake.control();
     let mut activity = fake.client.subscribe();
@@ -1059,25 +1111,27 @@ async fn a_scroll_the_wheel_cannot_move_goes_by_script_after_the_stall() {
     control
         .agent_native_scroll(&fake.client, "page", None, (0.0, 300.0))
         .await
-        .unwrap();
+        .unwrap_err();
     let spent = started.elapsed();
     assert!(
-        spent >= motion::WHEEL_STALL && spent < motion::WHEEL_STALL + Duration::from_millis(300),
+        spent >= motion::WHEEL_STALL && spent < motion::WHEEL_STALL + Duration::from_millis(500),
         "{spent:?}"
     );
     assert_eq!(wheels(&fake.helper_inputs()).len(), 1);
-    assert_eq!(fake.page_commands("scrollBy"), 1);
-    assert_eq!(fake.page.lock().unwrap().scroller.at, 300.0);
-    assert!(agent_activity(&mut activity)
+    assert_eq!(fake.page_commands("scrollBy"), 0);
+    assert_eq!(fake.page_commands("Input.dispatchMouseEvent"), 1);
+    assert_eq!(fake.page.lock().unwrap().scroller.at, 0.0);
+    assert!(!agent_activity(&mut activity)
         .iter()
         .any(|event| event["kind"] == "scrolling"));
 }
 
 /// No wheel where no visible point reaches the scroller, and none for less
-/// than half a notch: those go by script at once.
+/// than half a notch: precision input handles the latter and the former
+/// fails before sending any wheel input.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_scroll_no_wheel_can_do_goes_by_script_at_once() {
+async fn precision_scroll_handles_sub_notch_distances_and_refuses_hidden_scrollers() {
     let fake = Fake::new().await;
     let mut control = fake.control();
     fake.place_pointer(shown(640.0, 320.0)).await;
@@ -1091,10 +1145,11 @@ async fn a_scroll_no_wheel_can_do_goes_by_script_at_once() {
     control
         .agent_native_scroll(&fake.client, "page", None, (0.0, 600.0))
         .await
-        .unwrap();
+        .unwrap_err();
     assert!(started.elapsed() < Duration::from_millis(200));
-    assert_eq!(fake.page.lock().unwrap().scroller.at, 650.0);
-    assert_eq!(fake.page_commands("scrollBy"), 2);
+    assert_eq!(fake.page.lock().unwrap().scroller.at, 50.0);
+    assert_eq!(fake.page_commands("scrollBy"), 0);
+    assert_eq!(fake.page_commands("Input.dispatchMouseEvent"), 1);
     assert!(wheels(&fake.helper_inputs()).is_empty());
 }
 
@@ -1219,10 +1274,11 @@ async fn a_long_way_down_turns_more_notches_per_event_within_the_budget() {
 }
 
 /// A distance even ten notches an event cannot carry within the budget is
-/// finished by script, as `scrolling`, after the wheel has done its part.
+/// sent as precision wheel input before an infeasible notch plan consumes
+/// the deadline. The actual displacement remains proved by readback.
 #[cfg(target_os = "linux")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn what_the_wheel_budget_cannot_reach_is_finished_by_script() {
+async fn what_the_wheel_budget_cannot_reach_is_finished_by_precision_input() {
     let fake = Fake::new().await;
     let mut control = fake.control();
     let mut activity = fake.client.subscribe();
@@ -1242,11 +1298,12 @@ async fn what_the_wheel_budget_cannot_reach_is_finished_by_script() {
         spent <= motion::WHEEL_BUDGET + Duration::from_millis(300),
         "{spent:?}"
     );
-    assert!(!wheels(&fake.helper_inputs()).is_empty());
-    assert_eq!(fake.page_commands("scrollBy"), 1);
+    assert!(wheels(&fake.helper_inputs()).is_empty());
+    assert_eq!(fake.page_commands("scrollBy"), 0);
+    assert_eq!(fake.page_commands("Input.dispatchMouseEvent"), 1);
     let at = fake.page.lock().unwrap().scroller.at;
     assert!((at - 299_680.0).abs() <= 1.0, "at {at}");
-    assert!(agent_activity(&mut activity)
+    assert!(!agent_activity(&mut activity)
         .iter()
         .any(|event| event["kind"] == "scrolling"));
 }

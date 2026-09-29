@@ -355,6 +355,8 @@ async fn field_state(
 }
 
 /// A field the pointer clicked, ready for keys.
+const TEXT_FIELD: &str = "this.isContentEditable || this.matches('textarea,input:not([type=button],[type=submit],[type=reset],[type=image],[type=checkbox],[type=radio],[type=range],[type=color],[type=file],[type=hidden])')";
+
 struct ClickedField {
     object_id: String,
     session_id: String,
@@ -377,6 +379,7 @@ async fn click_field(
     ref_map: &RefMap,
     selector_or_ref: &str,
     iframe_sessions: &HashMap<String, String>,
+    text_only: bool,
 ) -> Result<Clicked, CommandError> {
     let (object_id, effective_session_id) = resolve_element_object_id(
         client,
@@ -386,6 +389,23 @@ async fn click_field(
         iframe_sessions,
     )
     .await?;
+    if text_only {
+        let read = client
+            .send_command(
+                "Runtime.callFunctionOn",
+                Some(json!({
+                    "objectId": object_id, "returnByValue": true,
+                    "functionDeclaration": format!("function() {{ return {TEXT_FIELD}; }}"),
+                })),
+                Some(&effective_session_id),
+            )
+            .await?;
+        if read["result"]["value"] != true {
+            return Err(
+                "Choose a text field; no control was clicked and nothing was typed.".into(),
+            );
+        }
+    }
     let target = (object_id.as_str(), effective_session_id.as_str());
     let Some((x, y)) = native_point(client, control, session_id, target, selector_or_ref).await?
     else {
@@ -482,6 +502,7 @@ pub(crate) async fn native_fill(
         ref_map,
         selector_or_ref,
         iframe_sessions,
+        true,
     )
     .await?
     {
@@ -551,6 +572,7 @@ pub(crate) async fn native_type_into(
         ref_map,
         selector_or_ref,
         iframe_sessions,
+        true,
     )
     .await?
     {
@@ -619,6 +641,281 @@ pub async fn type_text(
     )
     .await?;
     type_text_into_active_context(client, session_id, text, delay_ms).await
+}
+
+/// Focus through native input without activating a button or link. Text
+/// fields use their normal pointer focus; other tab stops use Tab keys.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn native_focus(
+    client: &CdpClient,
+    control: &Mutex<BrowserControl>,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector_or_ref: &str,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<ClickResult, CommandError> {
+    use super::browser_control::motion::KEY_INTERVAL;
+    let (object_id, element_session) = resolve_element_object_id(
+        client,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        iframe_sessions,
+    )
+    .await?;
+    let read = client.send_command("Runtime.callFunctionOn", Some(json!({
+        "objectId": object_id, "returnByValue": true,
+        "functionDeclaration": format!("function() {{ return {{text:{TEXT_FIELD},tabbable:this.tabIndex>=0&&!this.matches(':disabled')&&!this.closest('[inert],[aria-disabled=\"true\"]')}}; }}"),
+    })),Some(&element_session)).await?;
+    if field_state(client, &element_session, &object_id, "", |_| true)
+        .await?
+        .focused
+    {
+        return Ok(ClickResult::default());
+    }
+    if read["result"]["value"]["text"] == true {
+        return Ok(
+            match click_field(
+                client,
+                control,
+                session_id,
+                ref_map,
+                selector_or_ref,
+                iframe_sessions,
+                true,
+            )
+            .await?
+            {
+                Clicked::Dialog(click) => click,
+                Clicked::Field(_) => ClickResult::default(),
+            },
+        );
+    }
+    if read["result"]["value"]["tabbable"] != true {
+        return Err(
+            "This control cannot take physical keyboard focus. Choose a visible, enabled control."
+                .into(),
+        );
+    }
+    // Count tab stops across the page's frame sessions; the browser owns
+    // their actual tab order, including its toolbar and shadow trees.
+    let mut sessions = vec![session_id, element_session.as_str()];
+    sessions.extend(iframe_sessions.values().map(String::as_str));
+    sessions.sort_unstable();
+    sessions.dedup();
+    let mut stops = 8;
+    for session in sessions {
+        let count = client.send_command("Runtime.evaluate",Some(json!({
+            "expression":"document.querySelectorAll('a[href],button,input,select,textarea,[tabindex],[contenteditable]').length",
+            "returnByValue":true,
+        })),Some(session)).await?;
+        stops += count["result"]["value"].as_u64().unwrap_or(0) as usize;
+    }
+    for _ in 0..stops {
+        control
+            .lock()
+            .await
+            .agent_native_keys(
+                &native_key_chord_events("Tab", None),
+                KEY_INTERVAL,
+                client,
+                session_id,
+            )
+            .await?;
+        if field_state(client, &element_session, &object_id, "", |_| true)
+            .await?
+            .focused
+        {
+            return Ok(ClickResult::default());
+        }
+    }
+    Err("The control did not take focus through the browser's keyboard order. Inspect the current page before retrying.".into())
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn native_select_all(
+    client: &CdpClient,
+    control: &Mutex<BrowserControl>,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector_or_ref: &str,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<ClickResult, CommandError> {
+    let (object_id, element_session) = resolve_element_object_id(
+        client,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        iframe_sessions,
+    )
+    .await?;
+    let text_field = client
+        .send_command(
+            "Runtime.callFunctionOn",
+            Some(json!({
+                "objectId":object_id,"returnByValue":true,
+                "functionDeclaration":format!("function() {{ return {TEXT_FIELD}; }}"),
+            })),
+            Some(&element_session),
+        )
+        .await?;
+    if text_field["result"]["value"] != true {
+        return native_select_text(client, control, session_id, &element_session, &object_id).await;
+    }
+    let field = match click_field(
+        client,
+        control,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        iframe_sessions,
+        true,
+    )
+    .await?
+    {
+        Clicked::Dialog(click) => return Ok(click),
+        Clicked::Field(field) => field,
+    };
+    type_after_click(
+        control,
+        client,
+        session_id,
+        &native_key_chord_events("a", Some(2)),
+        super::browser_control::motion::KEY_INTERVAL,
+    )
+    .await?;
+    if !field_state(client, &field.session_id, &field.object_id, "", |_| true)
+        .await?
+        .focused
+    {
+        return Err("The field lost focus while its text was selected. Inspect the current page before typing.".into());
+    }
+    Ok(ClickResult::default())
+}
+
+/// A read-only geometry projection of one visible text boundary. The wheel
+/// owner needs the boundary's box and ancestry, not a DOM mutation or a
+/// synthetic selection. Its fallback refuses instead of jumping the page.
+const TEXT_ENDPOINT: &str = r#"function(last) {
+    const walker=this.ownerDocument.createTreeWalker(this,NodeFilter.SHOW_TEXT),nodes=[];
+    while(walker.nextNode())nodes.push(walker.currentNode);
+    if(last)nodes.reverse();
+    for(const node of nodes) {
+        const parent=node.parentElement,style=parent&&getComputedStyle(parent);
+        if(!parent||style.display==='none'||style.visibility==='hidden'||style.userSelect==='none')continue;
+        for(let n=0;n<node.length;n++) {
+            const index=last?node.length-1-n:n,range=this.ownerDocument.createRange();
+            range.setStart(node,index);range.setEnd(node,index+1);
+            const rect=range.getBoundingClientRect();
+            if(!(rect.width>0&&rect.height>0))continue;
+            const offset=last?index+1:index;
+            return {ownerDocument:this.ownerDocument,parentElement:parent,node,offset,
+                getBoundingClientRect(){if(!node.isConnected)throw Error('The text is no longer on this page.');return range.getBoundingClientRect()},
+                scrollIntoView(){throw Error('The text endpoint could not be reached by the wheel; scroll the page and try again.')},
+                point(){
+                    const box=this.getBoundingClientRect(),y=(box.top+box.bottom)/2;
+                    for(const x of [box.left+.1,box.right-.1]) {
+                        let caret=null;
+                        if(typeof this.ownerDocument.caretPositionFromPoint==='function') {
+                            const root=node.getRootNode(),roots=root instanceof ShadowRoot?[root]:[];
+                            caret=this.ownerDocument.caretPositionFromPoint(x,y,{shadowRoots:roots});
+                        }
+                        const old=!caret&&this.ownerDocument.caretRangeFromPoint?.(x,y);
+                        if((caret?.offsetNode??old?.startContainer)===node&&(caret?.offset??old?.startOffset)===offset)return [x,y];
+                    }
+                    throw Error('The browser could not place the pointer at this text boundary.');
+                }};
+        }
+    }
+    return null;
+}"#;
+
+async fn text_endpoint(
+    client: &CdpClient,
+    session: &str,
+    element: &str,
+    last: bool,
+) -> Result<String, String> {
+    let read = client
+        .send_command(
+            "Runtime.callFunctionOn",
+            Some(json!({
+                "objectId":element,"functionDeclaration":TEXT_ENDPOINT,
+                "arguments":[{"value":last}],"returnByValue":false,
+            })),
+            Some(session),
+        )
+        .await?;
+    read["result"]["objectId"]
+        .as_str()
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            "The element has no visible text to select; the existing selection was not changed."
+                .into()
+        })
+}
+
+async fn text_endpoint_point(
+    client: &CdpClient,
+    session: &str,
+    endpoint: &str,
+) -> Result<(f64, f64), String> {
+    let read=client.send_command("Runtime.callFunctionOn",Some(json!({
+        "objectId":endpoint,"functionDeclaration":"function(){return this.point()}","returnByValue":true,
+    })),Some(session)).await?;
+    let point = &read["result"]["value"];
+    point[0].as_f64().zip(point[1].as_f64()).ok_or_else(||"The text boundary could not be reached. Inspect the current page before selecting again.".into())
+}
+
+async fn native_select_text(
+    client: &CdpClient,
+    control: &Mutex<BrowserControl>,
+    page_session: &str,
+    element_session: &str,
+    element: &str,
+) -> Result<ClickResult, CommandError> {
+    let first = text_endpoint(client, element_session, element, false).await?;
+    let last = text_endpoint(client, element_session, element, true).await?;
+    let selection=async {
+        if control.lock().await.agent_native_scroll_into_view(client,page_session,(&first,element_session)).await? {
+            return Ok(ClickResult{dialog_opened:true,pending_release:None});
+        }
+        let (sx,sy)=text_endpoint_point(client,element_session,&first).await?;
+        let pending=||Some(PendingRelease{session_id:element_session.into(),x:sx,y:sy,button:"left".into()});
+        if control.lock().await.agent_native_mouse(json!({"type":"mousePressed","x":sx,"y":sy,"button":"left","buttons":1,"clickCount":1}),client,element_session,&[element_session,page_session]).await? {
+            return Ok(ClickResult{dialog_opened:true,pending_release:pending()});
+        }
+        if control.lock().await.agent_native_scroll_into_view(client,page_session,(&last,element_session)).await? {
+            return Ok(ClickResult{dialog_opened:true,pending_release:pending()});
+        }
+        let (tx,ty)=text_endpoint_point(client,element_session,&last).await?;
+        for event in ["mouseMoved","mouseReleased"] {
+            if control.lock().await.agent_native_mouse(json!({"type":event,"x":tx,"y":ty,"button":"left","buttons":if event=="mouseReleased"{0}else{1},"clickCount":1}),client,element_session,&[element_session,page_session]).await? {
+                return Ok(ClickResult{dialog_opened:true,pending_release:pending()});
+            }
+        }
+        let deadline=tokio::time::Instant::now()+FIELD_SETTLE;
+        loop {
+            let read=client.send_command("Runtime.callFunctionOn",Some(json!({
+                "objectId":first,"returnByValue":true,"arguments":[{"objectId":last}],
+                "functionDeclaration":"function(end){const selection=this.ownerDocument.getSelection();if(selection.rangeCount!==1)return false;const expected=this.ownerDocument.createRange();expected.setStart(this.node,this.offset);expected.setEnd(end.node,end.offset);const actual=selection.getRangeAt(0);return actual.compareBoundaryPoints(Range.START_TO_START,expected)===0&&actual.compareBoundaryPoints(Range.END_TO_END,expected)===0}",
+            })),Some(element_session)).await?;
+            if read["result"]["value"]==true{return Ok(ClickResult::default())}
+            if tokio::time::Instant::now()>=deadline {
+                return Err("The browser did not select the exact requested text range. Inspect its current selection before retrying.".into());
+            }
+            tokio::time::sleep(FIELD_POLL).await;
+        }
+    }.await;
+    if selection.is_err() {
+        control
+            .lock()
+            .await
+            .cancel_native_input()
+            .await
+            .map_err(CommandError::from)?;
+    }
+    selection
 }
 
 /// Focus the target element (and optionally clear it) so that keystrokes,
@@ -813,8 +1110,8 @@ pub async fn press_key_with_modifiers(
 
 /// Scrolls by script, published on the tab's page as `scrolling`: the view
 /// moves with no pointer path. Headless and DevTools-only browsers scroll
-/// this way; the owned window's wheel (`BrowserControl::agent_native_scroll`)
-/// falls back to it where no wheel moves the scroller.
+/// this way. The owned window's wheel (`BrowserControl::agent_native_scroll`)
+/// uses trusted input and does not enter this programmatic path.
 pub async fn scroll(
     client: &CdpClient,
     session_id: &str,
@@ -873,7 +1170,7 @@ pub(crate) async fn reveal(
         client.page_generation(page_session),
         super::activity::InputSource::Agent,
     );
-    client
+    let response = client
         .send_command(
             "Runtime.callFunctionOn",
             Some(serde_json::json!({
@@ -883,6 +1180,9 @@ pub(crate) async fn reveal(
             Some(session_id),
         )
         .await?;
+    if response.get("exceptionDetails").is_some() {
+        return Err("The browser could not bring the requested target into view. Inspect the current page before retrying.".into());
+    }
     observation.acknowledged();
     Ok(())
 }
@@ -903,7 +1203,7 @@ pub(crate) async fn scroll_by(
         client.page_generation(page_session),
         super::activity::InputSource::Agent,
     );
-    client
+    let response = client
         .send_command_typed::<_, Value>(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
@@ -925,8 +1225,248 @@ pub(crate) async fn scroll_by(
             Some(session_id),
         )
         .await?;
+    if response.get("exceptionDetails").is_some() {
+        return Err("The browser did not accept the requested scroll. Inspect the current page before retrying.".into());
+    }
     observation.acknowledged();
     Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct NativeSelectOption {
+    value: String,
+    label: String,
+    disabled: bool,
+    selected: bool,
+}
+
+struct NativeSelectState {
+    multiple: bool,
+    popup: bool,
+    disabled: bool,
+    focused: bool,
+    options: Vec<NativeSelectOption>,
+}
+
+async fn native_select_state(
+    client: &CdpClient,
+    session_id: &str,
+    object_id: &str,
+) -> Result<NativeSelectState, String> {
+    let read = client.send_command("Runtime.callFunctionOn", Some(json!({
+        "objectId": object_id, "returnByValue": true,
+        "functionDeclaration": r#"function() {
+            if (!this.isConnected || this.tagName !== 'SELECT') return {error:'Choose a select control on the current page.'};
+            return {multiple:this.multiple,popup:this.size<=1,disabled:this.matches(':disabled')||Boolean(this.closest('[inert],[aria-disabled="true"]')),
+                focused:document.activeElement===this||this.getRootNode().activeElement===this,
+                options:Array.from(this.options,o=>({value:o.value,label:o.textContent.trim(),disabled:o.disabled||Boolean(o.closest('optgroup:disabled')),selected:o.selected}))};
+        }"#,
+    })), Some(session_id)).await?;
+    let value = &read["result"]["value"];
+    if let Some(error) = value["error"].as_str() {
+        return Err(error.into());
+    }
+    let options = value["options"]
+        .as_array()
+        .ok_or("The select control could not be read.")?
+        .iter()
+        .map(|option| NativeSelectOption {
+            value: option["value"].as_str().unwrap_or_default().into(),
+            label: option["label"].as_str().unwrap_or_default().into(),
+            disabled: option["disabled"] == true,
+            selected: option["selected"] == true,
+        })
+        .collect();
+    Ok(NativeSelectState {
+        multiple: value["multiple"] == true,
+        popup: value["popup"] == true,
+        disabled: value["disabled"] == true,
+        focused: value["focused"] == true,
+        options,
+    })
+}
+
+fn native_select_indices(
+    options: &[NativeSelectOption],
+    values: &[String],
+    multiple: bool,
+) -> Result<Vec<usize>, String> {
+    if values.is_empty() {
+        return Err("Select at least one option.".into());
+    }
+    let mut indices: Vec<_> = options
+        .iter()
+        .enumerate()
+        .filter_map(|(index, option)| {
+            values
+                .iter()
+                .any(|value| option.value == *value || option.label == *value)
+                .then_some(index)
+        })
+        .collect();
+    if indices.is_empty() {
+        return Err(format!(
+            "No option matched {}. Available options: {}",
+            serde_json::to_string(values).unwrap_or_default(),
+            options
+                .iter()
+                .map(|option| format!("{} (\"{}\")", option.value, option.label))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    // The existing DOM path visits matching options in document order. A
+    // single-select keeps its last match; preserve that browser cardinality
+    // rule for duplicate values/labels and multi-value callers too.
+    if !multiple {
+        indices = vec![*indices.last().unwrap()];
+    }
+    Ok(indices)
+}
+
+fn selected_indices(state: &NativeSelectState) -> Vec<usize> {
+    state
+        .options
+        .iter()
+        .enumerate()
+        .filter_map(|(index, option)| option.selected.then_some(index))
+        .collect()
+}
+
+fn same_select_options(left: &NativeSelectState, right: &NativeSelectState) -> bool {
+    left.multiple == right.multiple
+        && left.popup == right.popup
+        && left.options.len() == right.options.len()
+        && left
+            .options
+            .iter()
+            .zip(&right.options)
+            .all(|(left, right)| {
+                left.value == right.value
+                    && left.label == right.label
+                    && left.disabled == right.disabled
+            })
+}
+
+/// Selects through the owned window's pointer and keyboard. Reading option
+/// identities is harmless; all selection changes are Chrome's native key
+/// behavior, and a changed control is reported rather than repaired by DOM.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn native_select_option(
+    client: &CdpClient,
+    control: &Mutex<BrowserControl>,
+    session_id: &str,
+    ref_map: &RefMap,
+    selector_or_ref: &str,
+    values: &[String],
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<ClickResult, CommandError> {
+    use super::browser_control::motion::KEY_INTERVAL;
+    let (object_id, element_session) = resolve_element_object_id(
+        client,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        iframe_sessions,
+    )
+    .await?;
+    let before = native_select_state(client, &element_session, &object_id).await?;
+    let desired = native_select_indices(&before.options, values, before.multiple)?;
+    if selected_indices(&before) == desired {
+        return Ok(ClickResult::default());
+    }
+    if before.disabled || desired.iter().any(|index| before.options[*index].disabled) {
+        return Err(
+            "The requested select control or option is disabled; nothing was changed.".into(),
+        );
+    }
+    match click_field(
+        client,
+        control,
+        session_id,
+        ref_map,
+        selector_or_ref,
+        iframe_sessions,
+        false,
+    )
+    .await?
+    {
+        Clicked::Dialog(click) => return Ok(click),
+        Clicked::Field(_) => {}
+    }
+    let current = native_select_state(client, &element_session, &object_id).await?;
+    if !same_select_options(&before, &current) || !current.focused || current.disabled {
+        return Err("The select control changed after it was clicked. Inspect the current page before choosing again.".into());
+    }
+    let enabled: Vec<_> = current
+        .options
+        .iter()
+        .enumerate()
+        .filter_map(|(index, option)| (!option.disabled).then_some(index))
+        .collect();
+    if before.multiple {
+        type_after_click(
+            control,
+            client,
+            session_id,
+            &native_key_chord_events("Home", Some(2)),
+            KEY_INTERVAL,
+        )
+        .await?;
+        let current = native_select_state(client, &element_session, &object_id).await?;
+        if !same_select_options(&before, &current) || !current.focused {
+            return Err("The select control changed while it was taking keyboard focus. Inspect the current page before choosing again.".into());
+        }
+        for (position, index) in enabled.iter().enumerate() {
+            if position > 0 {
+                type_after_click(
+                    control,
+                    client,
+                    session_id,
+                    &native_key_chord_events("ArrowDown", Some(2)),
+                    KEY_INTERVAL,
+                )
+                .await?;
+            }
+            if current.options[*index].selected != desired.contains(index) {
+                type_after_click(
+                    control,
+                    client,
+                    session_id,
+                    &native_key_chord_events(" ", Some(2)),
+                    KEY_INTERVAL,
+                )
+                .await?;
+            }
+        }
+    } else {
+        let position = enabled
+            .iter()
+            .position(|index| *index == desired[0])
+            .ok_or("The requested option is no longer available.")?;
+        let mut events = native_key_chord_events("Home", None);
+        for _ in 0..position {
+            events.extend(native_key_chord_events("ArrowDown", None));
+        }
+        if before.popup {
+            events.extend(native_key_chord_events("Enter", None));
+        }
+        type_after_click(control, client, session_id, &events, KEY_INTERVAL).await?;
+    }
+    let deadline = tokio::time::Instant::now() + FIELD_SETTLE;
+    loop {
+        let final_state = native_select_state(client, &element_session, &object_id).await?;
+        if !same_select_options(&before, &final_state) {
+            return Err("The options changed during selection. Inspect the current page before choosing again.".into());
+        }
+        if selected_indices(&final_state) == desired {
+            return Ok(ClickResult::default());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("The page did not accept the requested selection. Inspect its current values before retrying; no DOM repair was attempted.".into());
+        }
+        tokio::time::sleep(FIELD_POLL).await;
+    }
 }
 
 pub async fn select_option(
@@ -996,7 +1536,7 @@ pub async fn select_option(
 
 fn checkbox_function(body: &str) -> String {
     [
-        "function(desired) { const el=this; const {input,aria,checked}=(",
+        "function(desired,allowDom) { const el=this; const {input,aria,checked}=(",
         super::element::CHECKED_TARGET_JS,
         r#")(el);
         const pointerAccessible = node => {
@@ -1078,13 +1618,14 @@ async fn set_checked(
         iframe_sessions,
     )
     .await?;
+    let native = control.lock().await.has_native_display();
     // State, disabledness and the semantic action share one renderer task.
     // A state change before this task cannot turn an idempotent check into a
     // toggle. This is the existing associated-control DOM click, selected
     // before any physical button instead of retried after a failed click.
     let preflight = client.send_command("Runtime.callFunctionOn", Some(serde_json::json!({
         "objectId":object_id, "returnByValue":true,
-        "arguments":[{"value":desired}],
+        "arguments":[{"value":desired},{"value":!native}],
         "functionDeclaration":checkbox_function(r#"
             if (!el.isConnected) return {error:'The checkbox is no longer attached.'};
             if (checked() === desired) return {method:'unchanged'};
@@ -1092,6 +1633,7 @@ async fn set_checked(
                 return {error:'The checkbox is disabled.'};
             }
             if (pointer) return {method:'pointer'};
+            if (!allowDom) return {error:'The checkbox has no visible control or label to click. Choose its visible control or label; nothing was changed.'};
             input.click();
             return {method:'dom'};
         "#),
