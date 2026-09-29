@@ -16,6 +16,9 @@ struct Host {
     /// (`AGENT_BROWSER_DISPLAY_HELPER`), as an Ambit image runs it, instead
     /// of a headless one.
     window: bool,
+    /// The temporary directory the client and its daemon use, when not the
+    /// test's own.
+    temporary: Option<std::path::PathBuf>,
 }
 
 impl Host {
@@ -23,6 +26,7 @@ impl Host {
         let host = Self {
             directory: tempfile::tempdir().unwrap(),
             window: false,
+            temporary: None,
         };
         fs::create_dir(host.path("captures")).unwrap();
         fs::create_dir(host.path("sockets")).unwrap();
@@ -80,6 +84,9 @@ impl Host {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if let Some(temporary) = &self.temporary {
+            command.env("TMPDIR", temporary);
+        }
         if self.window {
             command
                 .env("AGENT_BROWSER_WINDOW_STREAM", "1")
@@ -874,4 +881,28 @@ return {
         host.call("agent_browser_close", json!({}))["isError"],
         false
     );
+}
+
+/// The first daemon of a run removes the temporary browser profiles that a
+/// daemon of an earlier run, killed with its sandbox, left behind: each
+/// holds that browser's cookies. A directory without a run's mark stays.
+#[test]
+#[cfg(target_os = "linux")]
+fn a_new_run_removes_the_profiles_a_killed_daemon_left() {
+    let mut host = Host::new();
+    let temporary = host.path("tmp");
+    fs::create_dir(&temporary).unwrap();
+    let left = temporary.join("agent-browser-chrome-left");
+    fs::create_dir(&left).unwrap();
+    fs::write(left.join(".agent-browser-run"), "an-earlier-boot/1").unwrap();
+    fs::write(left.join("Cookies"), "sid=s3cr3t-session").unwrap();
+    let unmarked = temporary.join("agent-browser-chrome-unmarked");
+    fs::create_dir(&unmarked).unwrap();
+    host.temporary = Some(temporary);
+    let closed = host.call("agent_browser_close", json!({}));
+    assert!(
+        !left.exists(),
+        "the profile an earlier run left is removed: {closed}"
+    );
+    assert!(unmarked.exists(), "an unmarked directory is not judged");
 }

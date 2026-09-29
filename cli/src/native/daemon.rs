@@ -61,6 +61,12 @@ pub async fn run_daemon(session: &str, mode: DaemonMode) -> Result<(), String> {
         );
     }
 
+    // A daemon killed with its sandbox never removed its browser's temporary
+    // profile, which holds that browser's cookies; the next run's removes it.
+    if let Some(run) = super::cdp::profiles::machine_run() {
+        super::cdp::profiles::sweep_left(&env::temp_dir(), run);
+    }
+
     if let Ok(days_str) = env::var("AGENT_BROWSER_STATE_EXPIRE_DAYS") {
         if let Ok(days) = days_str.parse::<u64>() {
             if days > 0 {
