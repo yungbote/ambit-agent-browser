@@ -13,12 +13,18 @@ use tokio::sync::{broadcast, RwLock};
 struct Rig {
     producer: Arc<Producer>,
     screen: FakeScreen,
+    display: Arc<DisplayClient>,
+    /// The helper's side of the control socket: layouts are answered here.
+    control: tokio::io::BufReader<tokio::net::UnixStream>,
 }
 
 /// A producer of a 640x480 grey window.
 fn rig() -> Rig {
     let crate::native::display::TestPictures {
-        display, helper, ..
+        display,
+        helper,
+        control,
+        ..
     } = DisplayClient::test_pictures();
     let (frame_tx, _) = broadcast::channel(16);
     let media = Arc::new(StreamMedia::new(Default::default()));
@@ -29,7 +35,7 @@ fn rig() -> Rig {
         Arc::new(RwLock::new(None)),
     );
     let producer = Producer::start(Source {
-        display,
+        display: display.clone(),
         media,
         cursors,
         runtime: tokio::runtime::Handle::current(),
@@ -38,6 +44,8 @@ fn rig() -> Rig {
     Rig {
         producer,
         screen: FakeScreen::new(helper),
+        display,
+        control: tokio::io::BufReader::new(control),
     }
 }
 
@@ -62,6 +70,27 @@ impl Rig {
     fn requested(&self) -> Vec<Value> {
         self.screen.requested()
     }
+
+    /// The next request on the helper's control socket.
+    async fn control_request(&mut self) -> Value {
+        use tokio::io::AsyncBufReadExt;
+        let mut line = String::new();
+        tokio::time::timeout(Duration::from_secs(5), self.control.read_line(&mut line))
+            .await
+            .expect("a control request")
+            .unwrap();
+        serde_json::from_str(&line).unwrap()
+    }
+
+    async fn control_answer(&mut self, request: &Value, data: Value) {
+        use tokio::io::AsyncWriteExt;
+        let reply = serde_json::json!({"id": request["id"], "success": true, "data": data});
+        self.control
+            .get_mut()
+            .write_all(format!("{reply}\n").as_bytes())
+            .await
+            .unwrap();
+    }
 }
 
 async fn delivery(subscription: &Subscription) -> Delivery {
@@ -83,6 +112,8 @@ async fn unit(subscription: &Subscription) -> Arc<Unit> {
 struct Viewer {
     subscription: Subscription,
     units: Vec<Arc<Unit>>,
+    /// When each unit arrived.
+    arrivals: Vec<Instant>,
     decoder: Decoder,
     decoded: usize,
     shown: Option<Decoded>,
@@ -93,6 +124,7 @@ impl Viewer {
         Self {
             subscription,
             units: Vec::new(),
+            arrivals: Vec::new(),
             decoder: Decoder::new(),
             decoded: 0,
             shown: None,
@@ -102,6 +134,7 @@ impl Viewer {
     async fn unit(&mut self) -> Arc<Unit> {
         let unit = unit(&self.subscription).await;
         self.units.push(unit.clone());
+        self.arrivals.push(Instant::now());
         unit
     }
 
@@ -111,6 +144,7 @@ impl Viewer {
             tokio::time::timeout(Duration::from_millis(150), self.subscription.next()).await
         {
             self.units.push(unit);
+            self.arrivals.push(Instant::now());
         }
     }
 
@@ -232,6 +266,50 @@ async fn a_stream_starts_whole_follows_damage_and_refines_a_still_picture() {
     viewer.assert_ordered();
     assert!(near(viewer.painted(120), RED));
     assert!(near(viewer.painted(200), GREY));
+}
+
+/// A still picture is refined only once the window's geometry holds too. A
+/// drag lays the window out again within a frame or two of each picture, so
+/// none of its pictures is refined: while a layout is in flight the
+/// refinement waits, and it follows the layout's answer by the still time.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_picture_is_not_refined_while_the_window_is_laid_out() {
+    let mut rig = rig();
+    let mut viewer = Viewer::new(rig.subscribe());
+    viewer.motion().await;
+    viewer.refined().await;
+    let display = rig.display.clone();
+    let layout = tokio::spawn(async move {
+        let guard = display.layout().await;
+        display.resize(&guard, 640, 480, None, false).await.is_ok()
+    });
+    let request = rig.control_request().await;
+    assert_eq!(request["op"], "resize", "{request}");
+    rig.paint(100, 140, RED);
+    viewer.until_shows(120, RED).await;
+    let moved = viewer.units.len();
+    // Held well past the still time: a refinement due by the picture alone
+    // would come now.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let answered = Instant::now();
+    rig.control_answer(
+        &request,
+        serde_json::json!({"width": 640, "height": 480, "windows": []}),
+    )
+    .await;
+    assert!(layout.await.unwrap(), "the layout is answered");
+    viewer.refined().await;
+    let refined = viewer.units[moved..]
+        .iter()
+        .position(|unit| unit.quality == Quality::Final)
+        .map(|index| viewer.arrivals[moved + index])
+        .expect("a refinement");
+    assert!(
+        refined >= answered + super::super::policy::STILL_AFTER,
+        "refined {:?} after the layout was answered",
+        refined.saturating_duration_since(answered)
+    );
+    viewer.assert_ordered();
 }
 
 /// Key units come on a subscription, on a viewer's request and on a new

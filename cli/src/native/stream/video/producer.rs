@@ -20,7 +20,7 @@
 //! rate therefore lowers the rate: the capture waits for a buffer.
 //!
 //! Lock order: the producer's state, then an encoding's mailbox, then its
-//! subscribers; never the reverse.
+//! subscribers or the display's surface state; never the reverse.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
@@ -440,8 +440,15 @@ impl Encoding {
     }
 
     /// The encode thread's next work, waiting for it; none once stopped. A
-    /// held picture owes its refinement only while a path has room for it.
-    fn next_work(&self, holds: bool, refinement: &Refinement) -> Option<Work> {
+    /// held picture owes its refinement only while a path has room for it,
+    /// and only once the window's geometry (`geometry`: since when it has
+    /// held) is still too.
+    fn next_work(
+        &self,
+        holds: bool,
+        refinement: &Refinement,
+        geometry: &dyn Fn() -> Instant,
+    ) -> Option<Work> {
         let mut mailbox = lock(&self.mailbox);
         loop {
             if mailbox.stop {
@@ -454,7 +461,9 @@ impl Encoding {
             if holds && std::mem::take(&mut mailbox.key_requested) {
                 return Some(Work::Key);
             }
-            let due = refinement.due().filter(|_| holds && self.rate().is_some());
+            let due = refinement
+                .due(geometry())
+                .filter(|_| holds && self.rate().is_some());
             mailbox = match due {
                 Some(at) => {
                     let now = Instant::now();
@@ -684,11 +693,15 @@ fn damage_wait(now: Instant, owed: Option<Instant>) -> u32 {
 
 /// Encodes one encoding's pictures until it stops or fails.
 fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
+    let Some(display) = producer.upgrade().map(|inner| inner.source.display.clone()) else {
+        return;
+    };
+    let geometry = || display.geometry_since();
     let mut encoder: Option<Box<dyn VideoEncoder>> = None;
     let mut held: Option<(Buffer, Capture)> = None;
     let mut refinement = Refinement::default();
     loop {
-        let Some(work) = encoding.next_work(held.is_some(), &refinement) else {
+        let Some(work) = encoding.next_work(held.is_some(), &refinement, &geometry) else {
             return;
         };
         let (quality, asked) = match work {
