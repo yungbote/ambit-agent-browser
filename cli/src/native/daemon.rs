@@ -516,7 +516,7 @@ async fn handle_connection<S>(
                 let admitted_at = std::time::Instant::now();
                 let mut response = match admitted {
                     Ok(mut s) => {
-                        let response = if action == "run_playwright" {
+                        let mut response = if action == "run_playwright" {
                             let execution = execute_command_received(&cmd, &mut s, received_at);
                             tokio::pin!(execution);
                             tokio::select! {
@@ -533,6 +533,14 @@ async fn handle_connection<S>(
                         };
                         // Refresh while command custody is still held.
                         idle_activity.mark();
+                        if let Some(browser) = &s.browser {
+                            let values = browser.client.site_context().values;
+                            if matches!(action.as_str(), "evaluate" | "run_playwright") {
+                                values.scrub_response(&mut response);
+                            } else {
+                                values.scrub_browser_response(&mut response);
+                            }
+                        }
                         response
                     }
                     Err(response) => response,

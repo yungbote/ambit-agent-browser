@@ -14,6 +14,8 @@ use super::types::{CdpCommand, CdpEvent, CdpMessage};
 use crate::native::activity::{self, ActivityObservation, InputSource};
 
 struct PendingResponse {
+    attached_target: Option<String>,
+    detached_session: Option<String>,
     sender: oneshot::Sender<CdpMessage>,
     response: Option<CdpMessage>,
     activity: Option<ActivityObservation>,
@@ -242,6 +244,9 @@ pub struct RawCdpMessage {
 }
 
 pub struct CdpClient {
+    site_context: std::sync::RwLock<crate::native::site_sessions::Context>,
+    site_custody:
+        std::sync::RwLock<std::sync::Weak<crate::native::site_sessions::custody::Custody>>,
     ws_tx: Arc<
         Mutex<
             futures_util::stream::SplitSink<
@@ -518,6 +523,30 @@ impl CdpClient {
                     // Response to a command
                     let mut pending = pending_clone.lock().await;
                     if let Some(mut request) = pending.remove(&id) {
+                        if parsed.error.is_none() {
+                            if let Some(session) = request.detached_session.as_ref() {
+                                targets_clone
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .remove(session);
+                                frames_clone
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .remove(session);
+                            }
+                            if let (Some(target), Some(session)) = (
+                                request.attached_target.as_ref(),
+                                parsed
+                                    .result
+                                    .as_ref()
+                                    .and_then(|result| result["sessionId"].as_str()),
+                            ) {
+                                targets_clone
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .insert(session.into(), target.clone());
+                            }
+                        }
                         if parsed.error.is_none()
                             && request
                                 .activity
@@ -583,6 +612,28 @@ impl CdpClient {
                         {
                             targets_clone.lock().unwrap().remove(session);
                             frames_clone.lock().unwrap().remove(session);
+                        }
+                    } else if method == "Target.targetDestroyed" {
+                        if let Some(target) = parsed
+                            .params
+                            .as_ref()
+                            .and_then(|params| params["targetId"].as_str())
+                        {
+                            let mut targets = targets_clone
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner());
+                            let removed = targets
+                                .iter()
+                                .filter(|(_, held)| held.as_str() == target)
+                                .map(|(session, _)| session.clone())
+                                .collect::<std::collections::HashSet<_>>();
+                            targets.retain(|_, held| held.as_str() != target);
+                            frames_clone
+                                .lock()
+                                .unwrap_or_else(|error| error.into_inner())
+                                .retain(|session, parent| {
+                                    !removed.contains(session) && !removed.contains(parent)
+                                });
                         }
                     }
                     if method == "Runtime.bindingCalled" {
@@ -729,6 +780,8 @@ impl CdpClient {
         });
 
         Ok(Self {
+            site_context: std::sync::RwLock::default(),
+            site_custody: std::sync::RwLock::default(),
             ws_tx,
             next_id: AtomicU64::new(1),
             pending,
@@ -836,6 +889,18 @@ impl CdpClient {
         session_id: Option<&str>,
         source: InputSource,
     ) -> Result<PendingCommand, String> {
+        if matches!(method, "Page.navigate" | "Runtime.runIfWaitingForDebugger") {
+            let custody = self
+                .site_custody
+                .read()
+                .unwrap_or_else(|error| error.into_inner())
+                .upgrade();
+            if let (Some(custody), Some(session)) = (custody, session_id) {
+                Box::pin(custody.prepare_session(self, session))
+                    .await
+                    .map_err(str::to_owned)?;
+            }
+        }
         let mut observation = session_id.and_then(|session| {
             activity::from_command(method, params.as_ref()?).map(|value| {
                 self.observe_activity(value, session, self.page_generation(session), source)
@@ -891,6 +956,22 @@ impl CdpClient {
             pending.insert(
                 id,
                 PendingResponse {
+                    detached_session: (method == "Target.detachFromTarget")
+                        .then(|| {
+                            cmd.params
+                                .as_ref()
+                                .and_then(|params| params["sessionId"].as_str())
+                                .map(str::to_owned)
+                        })
+                        .flatten(),
+                    attached_target: (method == "Target.attachToTarget")
+                        .then(|| {
+                            cmd.params
+                                .as_ref()
+                                .and_then(|params| params["targetId"].as_str())
+                                .map(str::to_owned)
+                        })
+                        .flatten(),
                     sender: tx,
                     response: None,
                     activity: observation,
@@ -1175,6 +1256,10 @@ impl CdpClient {
     /// Publish this connection's acknowledged input as `owner`'s, for
     /// targets the owner is attached to. Set once, before any input.
     pub(crate) fn publish_activity_as(&self, owner: &CdpClient) {
+        *self
+            .site_context
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = owner.site_context();
         let _ = self.activity_owner.set(ActivityOwner {
             events: owner.event_tx.clone(),
             targets: owner.target_sessions.clone(),
@@ -1185,6 +1270,28 @@ impl CdpClient {
 
     pub fn subscribe(&self) -> broadcast::Receiver<CdpEvent> {
         self.event_tx.subscribe()
+    }
+
+    pub(crate) fn site_context(&self) -> crate::native::site_sessions::Context {
+        self.site_context
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn set_site_custody(
+        &self,
+        owner: std::sync::Weak<crate::native::site_sessions::custody::Custody>,
+        context: crate::native::site_sessions::Context,
+    ) {
+        *self
+            .site_custody
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = owner;
+        *self
+            .site_context
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = context;
     }
 
     /// Deliver every event carrying `session_id` to the returned receiver
@@ -1333,6 +1440,136 @@ impl InspectProxyHandle {
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn explicit_attach_replies_share_the_target_session_association_writer() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for succeeds in [true, false] {
+                let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                    panic!("a command");
+                };
+                let command: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(command["method"], "Target.attachToTarget");
+                let response = if succeeds {
+                    serde_json::json!({"id":command["id"],"result":{"sessionId":"explicit-session"}})
+                } else {
+                    serde_json::json!({"id":command["id"],"error":{"code":-32000,"message":"refused"}})
+                };
+                socket
+                    .send(Message::Text(response.to_string()))
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        client
+            .send_command(
+                "Target.attachToTarget",
+                Some(serde_json::json!({"targetId":"native-target","flatten":true})),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client.target_for_session("explicit-session").as_deref(),
+            Some("native-target")
+        );
+        assert_eq!(
+            client.session_for_target("native-target").as_deref(),
+            Some("explicit-session")
+        );
+        assert!(client
+            .send_command(
+                "Target.attachToTarget",
+                Some(serde_json::json!({"targetId":"refused-target","flatten":true})),
+                None
+            )
+            .await
+            .is_err());
+        assert!(client.session_for_target("refused-target").is_none());
+        client.disconnect();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn explicit_detach_reattach_and_target_destruction_leave_no_stale_association() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for index in 0..4 {
+                let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                    panic!("a command");
+                };
+                let command: Value = serde_json::from_str(&text).unwrap();
+                let result = match index {
+                    0 => serde_json::json!({"sessionId":"first-session"}),
+                    1 => {
+                        assert_eq!(command["method"], "Target.detachFromTarget");
+                        serde_json::json!({})
+                    }
+                    2 => serde_json::json!({"sessionId":"second-session"}),
+                    _ => {
+                        socket.send(Message::Text(serde_json::json!({"method":"Target.targetDestroyed","params":{"targetId":"native-target"}}).to_string())).await.unwrap();
+                        serde_json::json!({})
+                    }
+                };
+                socket
+                    .send(Message::Text(
+                        serde_json::json!({"id":command["id"],"result":result}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let client = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        client
+            .send_command(
+                "Target.attachToTarget",
+                Some(serde_json::json!({"targetId":"native-target","flatten":true})),
+                None,
+            )
+            .await
+            .unwrap();
+        client
+            .send_command(
+                "Target.detachFromTarget",
+                Some(serde_json::json!({"sessionId":"first-session"})),
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(client.target_for_session("first-session").is_none());
+        client
+            .send_command(
+                "Target.attachToTarget",
+                Some(serde_json::json!({"targetId":"native-target","flatten":true})),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client.session_for_target("native-target").as_deref(),
+            Some("second-session")
+        );
+        client
+            .send_command("Target.getTargets", Some(serde_json::json!({})), None)
+            .await
+            .unwrap();
+        assert!(client.session_for_target("native-target").is_none());
+        assert!(client.target_for_session("second-session").is_none());
+        client.disconnect();
+        server.await.unwrap();
+    }
 
     /// Viewers watch a page, not its out-of-process frames: a frame's
     /// activity that carries screen coordinates, or no point at all, is

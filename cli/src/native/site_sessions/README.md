@@ -1,0 +1,15 @@
+# Browser site custody
+
+Above: the backend identity service owns grants and sealed state; this driver adapts the admitted state to Chrome in a dedicated browser host.
+Inside: attach is one-use and bound to an outstanding lazy request; capture and detach operate per offered site. State never enters a model reply, retained-result file or log.
+Sideways: the agent channel transports host-only frames, the native CDP connection applies them, and model-written programs use their own scoped CDP sessions with output redaction.
+Road ahead: W6 expiry, W7 read ceilings and W8 vault use the same site custody. Their authority stays in their owners; this module does not infer grants or manufacture approval.
+Delete: one custody actor replaces per-operation state handling; a shared exact-value registry serves normal results and the program tunnel.
+
+Pre-mortem: a paused navigation deadlocks behind command custody; program CDP sees daemon Fetch pauses; stored values escape through evaluation or retained files. Tests challenge these boundaries directly.
+
+The agreed contract preserves agent protocol 1 and advertises `sessionCustody: 3` in hello. Host-only frames are bounded to 8 MiB plus 1024 bytes of enclosing JSON; normal request/reply bounds remain 2/4 MiB. State is native JSON, with no base64 or double-JSON expansion. Export captures exactly one site per request. Positive-id requests are `site_sessions.offer`, `site_session.attach`, `site_session.refuse`, `site_session.export`, and `site_session.detach`. The driver emits `site_session.need` without a numeric id. The backend/toolbox distinguish unsolicited events and correlate replies by id. An attach consumes exactly one request, matching its site, offered mode and canonical use UUID, before the two-second deadline. Offer replacement, detach and disconnect invalidate outstanding requests.
+
+State follows `ambit.browser-site-state.v1`, defined by the backend at `b580ffd7a`: cookies, origin localStorage, structured IndexedDB values and omission metadata, bounded to 8 MiB. The backend computes schemeful sites using the private public-suffix list and validates authority before release; the driver treats only the authenticated offer as the site's domain boundary. A model receives neither this protocol nor these values. The existing 26 withheld secret tools remain withheld. Therefore no CLI/MCP command or model skill documents this host-only protocol.
+
+W4 stores grant mode but does not claim W7 read-only effect enforcement. Exact-value redaction covers attached and captured scalar values and their plain, URL-encoded, base64 and hex spellings. Values shorter than eight bytes are matched as whole scalar values so a storage setting such as `a` or `true` does not erase ordinary prose. Protocol identifiers, sequencing and numeric geometry remain metadata; runtime by-value data is redacted recursively. This mechanism does not guarantee protection against arbitrary transformations or pixels in screenshots; HttpOnly cookies are additionally protected by the closed CDP boundary.

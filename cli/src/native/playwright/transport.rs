@@ -223,14 +223,16 @@ async fn serve(
                 serde_json::from_str(&message.text).map_err(|error| error.to_string())?;
             let text = match value.get("id") {
                 None => {
+                    if value.pointer("/params/targetInfo/targetId").and_then(Value::as_str)
+                        .is_some_and(|target| connection.site_context().private_target(target)) {
+                        continue;
+                    }
                     let carries = value["method"]
                         .as_str()
                         .is_some_and(boundary::carries_credentials);
-                    if carries && boundary::scrub(&mut value["params"]) {
-                        value.to_string()
-                    } else {
-                        message.text
-                    }
+                    if carries { boundary::scrub(&mut value["params"]); }
+                    connection.site_context().values.scrub_protocol(&mut value["params"]);
+                    value.to_string()
                 }
                 Some(id) => {
                     let program = id
@@ -243,6 +245,11 @@ async fn serve(
                     if carries {
                         boundary::scrub(&mut value["result"]);
                     }
+                    if let Some(targets) = value.pointer_mut("/result/targetInfos").and_then(Value::as_array_mut) {
+                        targets.retain(|target| !target["targetId"].as_str().is_some_and(|target| connection.site_context().private_target(target)));
+                    }
+                    connection.site_context().values.scrub_protocol(&mut value["result"]);
+                    connection.site_context().values.scrub(&mut value["error"]);
                     value.to_string()
                 }
             };
@@ -296,6 +303,13 @@ async fn serve(
                     Err(_) => break Err("Invalid Playwright protocol message.".into()),
                 };
                 let Some(method) = command["method"].as_str() else { break Err("Missing Playwright protocol method.".into()); };
+                if command.pointer("/params/targetId").and_then(Value::as_str)
+                    .is_some_and(|target| client.site_context().private_target(target)) {
+                    if outgoing.send(Message::Text(error_reply(&command, "Site custody targets are private to the browser host.").to_string())).is_err() {
+                        break Err("Playwright transport closed".into());
+                    }
+                    continue;
+                }
                 if let Some(refusal) = boundary::refusal(method, &command["params"]) {
                     if outgoing.send(Message::Text(error_reply(&command, &refusal).to_string())).is_err() {
                         break Err("Playwright transport closed".into());
