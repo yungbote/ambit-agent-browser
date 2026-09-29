@@ -325,9 +325,10 @@ fn opens_dialog(event: &CdpEvent, sessions: &[&str]) -> bool {
 /// The clock paced input runs on: one helper event per presenter frame.
 /// A glide samples on absolute deadlines from a clock started one frame
 /// before its first sample (`until`), so the first goes at once and a late
-/// one never delays the rest; counted events (wheel notches) go once a frame
-/// (`tick`). Between events it stops for a pending interruption and for a
-/// JavaScript dialog opening for the page.
+/// one never delays the rest; counted events (wheel notches) go a whole
+/// frame after the previous one's send returned (`tick`, `sent`). Between
+/// events it stops for a pending interruption and for a JavaScript dialog
+/// opening for the page.
 struct Pacing<'a> {
     clock: Instant,
     /// When the next counted event is due: none yet, so the first goes at
@@ -393,20 +394,30 @@ impl<'a> Pacing<'a> {
         }
     }
 
-    /// Waits for the next counted event's frame: the first at once, then one
-    /// frame after the one before. A late event goes at once and the next is
-    /// a whole frame after it, so events never bunch and never come faster
-    /// than one a frame. A raised interruption wakes it early.
+    /// Waits for the next counted event's frame: the first at once, then a
+    /// whole frame after the previous event's send returned (`sent`), or
+    /// after the previous tick when it sent nothing. Each deadline is taken
+    /// from what happened rather than from the schedule, so a late timer or
+    /// a slow send never brings the next event closer: two events are never
+    /// less than a frame apart. Only a pending interruption ends the wait
+    /// early, and then nothing is sent.
     async fn tick(&mut self) {
-        let now = Instant::now();
-        let due = self.next_tick.unwrap_or(now);
-        if due > now {
+        while let Some(due) = self.next_tick.filter(|due| *due > Instant::now()) {
+            if self.interrupts.pending().is_some() {
+                break;
+            }
             tokio::select! {
                 _ = tokio::time::sleep_until(tokio::time::Instant::from_std(due)) => {}
                 _ = self.raised.changed() => {}
             }
         }
-        self.next_tick = Some(due.max(now) + motion::FRAME);
+        self.next_tick = Some(Instant::now() + motion::FRAME);
+    }
+
+    /// The event this tick paced was sent and its send returned: the next
+    /// is due a whole frame from now.
+    fn sent(&mut self) {
+        self.next_tick = Some(Instant::now() + motion::FRAME);
     }
 
     /// A page read, unless a dialog opens for the page first (`None`): the
@@ -1002,6 +1013,7 @@ impl NativeMouse {
             }
             self.send(&notch, point, mapping, client, display, atomic)
                 .await?;
+            pacing.sent();
         }
         Ok(false)
     }

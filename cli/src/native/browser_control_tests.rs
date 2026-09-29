@@ -1744,9 +1744,13 @@ async fn key_presses_keep_their_interval() {
         .unwrap();
     let arrivals = arrivals.lock().unwrap().clone();
     assert_eq!(arrivals.len(), 20);
+    // The helper stamps a key as it reads it, before acknowledging it, and
+    // the next key goes an interval after that acknowledgement returned.
     let gaps: Vec<_> = arrivals.windows(2).map(|pair| pair[1] - pair[0]).collect();
-    let floor = motion::KEY_INTERVAL - Duration::from_millis(1);
-    assert!(gaps.iter().all(|gap| *gap >= floor), "{gaps:?}");
+    assert!(
+        gaps.iter().all(|gap| *gap >= motion::KEY_INTERVAL),
+        "{gaps:?}"
+    );
     let total = *arrivals.last().unwrap() - arrivals[0];
     assert!(
         total < motion::KEY_INTERVAL * 19 + Duration::from_millis(150),

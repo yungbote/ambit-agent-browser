@@ -137,8 +137,8 @@ impl Glide {
     }
 }
 
-/// When the next key may go: one `interval` after the previous key was
-/// sent, or now when that moment has passed. A late key never makes the
+/// When the next key may go: one `interval` after the previous key's send
+/// returned, or now when that moment has passed. A late key never makes the
 /// following ones hurry.
 pub(crate) fn key_due(previous: Option<Instant>, now: Instant, interval: Duration) -> Instant {
     previous.map_or(now, |previous| (previous + interval).max(now))

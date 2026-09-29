@@ -644,6 +644,12 @@ impl NativeMouse {
             let from = now;
             for index in 0..events[0].len().max(events[1].len()) {
                 pacing.tick().await;
+                // The budget is time, whatever the plan counted: a wheel
+                // slower than a notch a frame stops at it, and what it has
+                // not reached is finished by script.
+                if frames_until.is_some_and(|until| Instant::now() >= until) {
+                    break;
+                }
                 if pacing.check(acted)? {
                     return Ok(true);
                 }
@@ -658,6 +664,7 @@ impl NativeMouse {
                 self.turning_layout(display, acted)?;
                 self.send(&params, to, &mapping, client, display, atomic)
                     .await?;
+                pacing.sent();
                 acted = Acted::Turned;
                 if index > 0 {
                     continue;
