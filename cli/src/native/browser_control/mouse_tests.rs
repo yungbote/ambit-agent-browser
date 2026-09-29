@@ -402,6 +402,8 @@ fn answer(page: &mut Page, command: &Value) -> Value {
             if function == super::scroll::READ {
                 let with_element = command["params"]["arguments"][0]["objectId"].is_string();
                 json!({"result":{"value":scroller.read(with_element)}})
+            } else if function.contains("this === next") {
+                json!({"result":{"value":command["params"]["objectId"]==command["params"]["arguments"][0]["objectId"]}})
             } else if function == super::scroll::HIDER {
                 if scroller.hides_element() {
                     json!({"result":{"type":"object","objectId":"scroller"}})
@@ -1321,6 +1323,40 @@ async fn an_element_that_shows_is_left_where_it_is() {
         .unwrap();
     assert!(fake.helper_inputs().is_empty());
     assert_eq!(fake.page.lock().unwrap().scroller.at, 0.0);
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_unreachable_target_refuses_once_the_hiding_container_cannot_advance() {
+    let fake = Fake::new().await;
+    let mut control = fake.control();
+    fake.place_pointer(shown(640.0, 320.0)).await;
+    {
+        let mut page = fake.page.lock().unwrap();
+        page.scroller.most = 0.0;
+        page.scroller.element = 10_000.0;
+    }
+    let failure = tokio::time::timeout(
+        Duration::from_secs(1),
+        control.agent_native_scroll_into_view(&fake.client, "page", ("element", "page")),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(
+        failure.error.contains("could not reveal"),
+        "{}",
+        failure.error
+    );
+    // Proving a previously unmeasured pointer may send its one-pixel move;
+    // an unreachable target must send no wheel, press or release.
+    assert!(fake
+        .helper_inputs()
+        .iter()
+        .all(|(_, event)| event["eventType"] == "mouseMoved"));
+    assert_eq!(fake.page_commands("this === next"), 1);
+    assert_eq!(fake.page_commands("scrollBy"), 0);
+    assert_eq!(fake.page_commands("scrollIntoView"), 0);
 }
 
 #[cfg(target_os = "linux")]

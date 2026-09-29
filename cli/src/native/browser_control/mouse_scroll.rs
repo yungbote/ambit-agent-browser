@@ -48,9 +48,6 @@ const SETTLE_LIMIT: Duration = Duration::from_secs(1);
 /// sees it still for `SETTLED_FRAMES`.
 const SETTLE_RESERVE: Duration = Duration::from_millis(250);
 
-/// The most nested scrollers one element is brought through by the wheel.
-const MOST_SCROLLERS: usize = 3;
-
 // Selection of a hiding scroller and the distance that scroller moves must
 // read the same clipped point. Compile the one projection into both read-only
 // scripts so it cannot drift and adds no per-frame script allocation.
@@ -517,10 +514,8 @@ impl NativeMouse {
         }
         targets.push((session, element.to_owned()));
         for (session, element) in &targets {
-            for _ in 0..MOST_SCROLLERS {
-                let Some(scroller) = hider(client, session, element).await? else {
-                    break;
-                };
+            let mut hiding = hider(client, session, element).await?;
+            while let Some(scroller) = hiding {
                 if self
                     .scroll_with_wheel(
                         client,
@@ -534,9 +529,23 @@ impl NativeMouse {
                 {
                     return Ok(true);
                 }
-            }
-            if hider(client, session, element).await?.is_some() {
-                return Err("The wheel could not reveal the target. Inspect the page and choose a visible control; do not replay the action.".into());
+                hiding = hider(client, session, element).await?;
+                if let Some(next) = hiding.as_ref() {
+                    // Remote object ids are handles, not node identities.
+                    // Reject a non-advancing hiding container, without an
+                    // arbitrary nesting limit or another input attempt.
+                    let unchanged = call(
+                        client,
+                        session,
+                        &scroller,
+                        "function(next) { return this === next; }",
+                        json!([{"objectId":next}]),
+                    )
+                    .await?;
+                    if unchanged.as_bool().ok_or("The browser could not confirm progress through the hiding scroll container.")? {
+                        return Err("The wheel could not reveal the target. Inspect the page and choose a visible control; do not replay the action.".into());
+                    }
+                }
             }
         }
         Ok(false)

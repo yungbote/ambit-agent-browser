@@ -669,6 +669,37 @@ async fn e2e_native_nested_target_reveal_scrolls_outer_then_inner_with_wheel() {
 
 #[tokio::test]
 #[ignore]
+async fn e2e_native_reveal_traverses_all_actual_nested_scrollers() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<!doctype html><style>body{margin:0}.scroll{height:180px;overflow:auto;border:1px solid;width:400px}.space{height:2200px}#outer{margin-top:1400px}#middle,#inner{margin-top:800px}button{margin-top:1700px;width:180px;height:40px}#tail{height:2500px}</style><div id=outer class=scroll><div class=space><div id=middle class=scroll><div class=space><div id=inner class=scroll><div class=space><button id=target onclick="clicks++">Deep target</button></div></div></div></div></div></div><div id=tail></div><script>window.clicks=0;window.wheels=[];for(const node of [document,outer,middle,inner])node.addEventListener('wheel',e=>{if(e.currentTarget===node)wheels.push({target:node.id||'page',trusted:e.isTrusted})},{capture:true})</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
+    let response =
+        control_test_command(&json!({"action":"click","selector":"#target"}), &mut state).await;
+    assert_success(&response);
+    let result=control_test_command(&json!({"action":"evaluate","script":"({clicks,scrolls:[scrollY,outer.scrollTop,middle.scrollTop,inner.scrollTop],wheels})"}), &mut state).await;
+    let actual = &result["data"]["result"];
+    assert_eq!(actual["clicks"], 1);
+    assert!(
+        actual["scrolls"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|value| value.as_f64().unwrap() > 0.0),
+        "{actual}"
+    );
+    assert!(actual["wheels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|event| event["trusted"] == true));
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_native_static_selection_takeover_releases_before_new_input() {
     use super::browser_control::InterruptReason;
     let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);

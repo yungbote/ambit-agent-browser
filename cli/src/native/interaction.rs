@@ -811,7 +811,6 @@ const TEXT_ENDPOINT: &str = r#"function(last) {
             const offset=last?index+1:index;
             return {ownerDocument:this.ownerDocument,parentElement:parent,node,offset,
                 getBoundingClientRect(){if(!node.isConnected)throw Error('The text is no longer on this page.');return range.getBoundingClientRect()},
-                scrollIntoView(){throw Error('The text endpoint could not be reached by the wheel; scroll the page and try again.')},
                 point(){
                     const box=this.getBoundingClientRect(),y=(box.top+box.bottom)/2;
                     for(const x of [box.left+.1,box.right-.1]) {
@@ -1155,38 +1154,6 @@ pub async fn scroll(
     Ok(())
 }
 
-/// Brings `object_id` (an element in `session_id`) to the middle of the view
-/// by script, published on the tab's page (`page_session`) as `scrolling`:
-/// what the owned window's wheel could not reveal.
-pub(crate) async fn reveal(
-    client: &CdpClient,
-    page_session: &str,
-    session_id: &str,
-    object_id: &str,
-) -> Result<(), String> {
-    let observation = client.observe_activity(
-        serde_json::json!({ "type": "activity", "kind": "scrolling" }),
-        page_session,
-        client.page_generation(page_session),
-        super::activity::InputSource::Agent,
-    );
-    let response = client
-        .send_command(
-            "Runtime.callFunctionOn",
-            Some(serde_json::json!({
-                "objectId": object_id, "returnByValue": true,
-                "functionDeclaration": "function() { this.scrollIntoView({ block: 'center', inline: 'center' }); }",
-            })),
-            Some(session_id),
-        )
-        .await?;
-    if response.get("exceptionDetails").is_some() {
-        return Err("The browser could not bring the requested target into view. Inspect the current page before retrying.".into());
-    }
-    observation.acknowledged();
-    Ok(())
-}
-
 /// Scrolls `object_id` (a scroller in `session_id`) by script, published on
 /// the tab's page (`page_session`) as `scrolling`.
 pub(crate) async fn scroll_by(
@@ -1203,7 +1170,7 @@ pub(crate) async fn scroll_by(
         client.page_generation(page_session),
         super::activity::InputSource::Agent,
     );
-    let response = client
+    client
         .send_command_typed::<_, Value>(
             "Runtime.callFunctionOn",
             &CallFunctionOnParams {
@@ -1225,9 +1192,6 @@ pub(crate) async fn scroll_by(
             Some(session_id),
         )
         .await?;
-    if response.get("exceptionDetails").is_some() {
-        return Err("The browser did not accept the requested scroll. Inspect the current page before retrying.".into());
-    }
     observation.acknowledged();
     Ok(())
 }
