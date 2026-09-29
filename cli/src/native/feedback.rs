@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::actions::DaemonState;
+use super::documents;
 use super::screenshot::{capture_screenshot_base64, ScreenshotOptions};
 
 pub(crate) const REQUEST_FIELD: &str = "ambitFeedback";
@@ -196,6 +197,46 @@ pub(crate) async fn capture_for(request: &FeedbackRequest, state: &DaemonState) 
     browser
 }
 
+/// The capture after a command, within `CAPTURE_TIMEOUT`. A navigation the
+/// command `started` holds every read of its page until it commits
+/// (`documents`), and a capture that spanned the commit saw two pages: it is
+/// taken again of the page the navigation committed, the image in which the
+/// model sees where the command went. A page still between documents when the
+/// bound passes, or already when the command came, is named as such.
+async fn after_command(request: &FeedbackRequest, state: &mut DaemonState, started: bool) -> Value {
+    let deadline = tokio::time::Instant::now() + CAPTURE_TIMEOUT;
+    let _ = state.drain_cdp_events_background().await;
+    if !started && state.active_page_between_documents() {
+        return request.unavailable(documents::NAVIGATION_PENDING);
+    }
+    loop {
+        let document = generation(state);
+        match tokio::time::timeout_at(deadline, capture(request, state)).await {
+            Ok(Ok(browser)) => return browser,
+            Ok(Err("capture_page_changed")) if generation(state) != document => {}
+            Ok(Err(code)) => return request.unavailable(code),
+            Err(_) => {
+                let _ = state.drain_cdp_events_background().await;
+                return request.unavailable(if state.active_page_between_documents() {
+                    documents::NAVIGATION_PENDING
+                } else {
+                    "capture_timeout"
+                });
+            }
+        }
+    }
+}
+
+/// The active page's generation, which a committed document moves.
+fn generation(state: &DaemonState) -> Option<String> {
+    let browser = state.browser.as_ref()?;
+    Some(
+        browser
+            .client
+            .page_generation(browser.active_session_id().ok()?),
+    )
+}
+
 pub(crate) async fn matches_expected(request: &FeedbackRequest, state: &DaemonState) -> bool {
     let Some(expected) = request.expected_observation.as_ref() else {
         return true;
@@ -319,16 +360,21 @@ async fn capture(request: &FeedbackRequest, state: &DaemonState) -> Result<Value
     )
 }
 
-pub(crate) async fn attach(request: &FeedbackRequest, response: &mut Value, state: &DaemonState) {
+/// The capture a host-bound command answers with, unless a person holds the
+/// browser. `started` says whether a navigation pending now may be the
+/// command's own: one the page was already making when the command came, or
+/// any after a refusal, is not the command's to wait for.
+pub(crate) async fn attach(
+    request: &FeedbackRequest,
+    response: &mut Value,
+    state: &mut DaemonState,
+    started: bool,
+) {
     let controlled = state.browser_control.lock().await.agent_error();
     response["browser"] = if let Some(error) = controlled {
         request.unavailable(error.code)
     } else {
-        match tokio::time::timeout(CAPTURE_TIMEOUT, capture(request, state)).await {
-            Ok(Ok(browser)) => browser,
-            Ok(Err(code)) => request.unavailable(code),
-            Err(_) => request.unavailable("capture_timeout"),
-        }
+        after_command(request, state, started).await
     };
     let capture = &response["browser"]["capture"];
     if capture.get("path").is_some() || capture["code"] == "no_active_page" {

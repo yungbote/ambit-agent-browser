@@ -2750,7 +2750,7 @@ pub(crate) async fn execute_command_received(
         let mut response = state.window_refusal(&cmd["id"], code, message);
         if let Some(value) = cmd.get(super::feedback::REQUEST_FIELD) {
             if let Ok(request) = super::feedback::FeedbackRequest::parse(value, state) {
-                super::feedback::attach(&request, &mut response, state).await;
+                super::feedback::attach(&request, &mut response, state, false).await;
             }
         }
         return response;
@@ -2770,6 +2770,10 @@ pub(crate) async fn execute_command_received(
             return json!({ "id": cmd["id"], "success": false, "code": "browser_feedback_invalid", "error": error })
         }
     };
+    // A page already between documents is not making the command's
+    // navigation: its capture does not wait for that one.
+    let _ = state.drain_cdp_events_background().await;
+    let started = !state.active_page_between_documents();
     let mut response = run_host_command(
         cmd,
         &request,
@@ -2778,7 +2782,7 @@ pub(crate) async fn execute_command_received(
         &mut super::feedback::ImageFence(&request),
     )
     .await;
-    super::feedback::attach(&request, &mut response, state).await;
+    super::feedback::attach(&request, &mut response, state, started).await;
     response
 }
 
