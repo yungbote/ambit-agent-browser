@@ -1088,7 +1088,7 @@ async fn reader_loop(
                     }
                     continue;
                 }
-                if msg_type == "video" {
+                if msg_type == "video" || msg_type == "rate" {
                     // Output only, like audio: it never touches input.
                     if let Some(video) = &video {
                         let demand = config.borrow().video_demand;

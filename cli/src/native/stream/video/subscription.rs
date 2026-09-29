@@ -8,11 +8,11 @@
 //! backlog is dropped here, at the producer, never skipped on the wire.
 
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use super::policy::Quality;
+use super::policy::{LinkRate, Quality};
 use crate::native::display::{Rect, Surface};
 
 /// One encoded picture, shared by every subscriber of its encoding.
@@ -63,6 +63,7 @@ pub(crate) struct Subscriber {
     ready: AtomicBool,
     /// Pictures per second this viewer is served at most.
     rate: AtomicU32,
+    link_rate: AtomicU64,
 }
 
 impl Subscriber {
@@ -75,6 +76,7 @@ impl Subscriber {
             notify: tokio::sync::Notify::new(),
             ready: AtomicBool::new(true),
             rate: AtomicU32::new(rate),
+            link_rate: AtomicU64::new(0),
         }
     }
 
@@ -84,6 +86,21 @@ impl Subscriber {
 
     pub(super) fn set_rate(&self, rate: u32) {
         self.rate.store(rate, Ordering::Release);
+    }
+
+    pub(super) fn set_link_rate(&self, rate: LinkRate) {
+        self.link_rate.store(
+            (u64::from(rate.bits_per_second) << 32) | u64::from(rate.burst_bytes),
+            Ordering::Release,
+        );
+    }
+
+    pub(super) fn link_rate(&self) -> Option<LinkRate> {
+        let rate = self.link_rate.load(Ordering::Acquire);
+        (rate != 0).then_some(LinkRate {
+            bits_per_second: (rate >> 32) as u32,
+            burst_bytes: rate as u32,
+        })
     }
 
     fn queue(&self) -> std::sync::MutexGuard<'_, Queue> {
@@ -190,9 +207,13 @@ pub(crate) struct Flow {
     last_unit: usize,
     rates: VecDeque<(Instant, f64)>,
     round_trips: VecDeque<(Instant, Duration)>,
+    burst: Option<usize>,
 }
 
 impl Flow {
+    pub(crate) fn set_link_rate(&mut self, rate: Option<LinkRate>) {
+        self.burst = rate.map(|rate| rate.burst_bytes as usize);
+    }
     pub(crate) fn sent(&mut self, seq: u64, bytes: usize, at: Instant) {
         self.sent.push_back(Sent {
             seq,
@@ -234,6 +255,9 @@ impl Flow {
     /// What may be in flight: the best recent rate over the shortest recent
     /// round trip, and never less than one picture of the last size.
     pub(crate) fn budget(&self) -> usize {
+        if let Some(burst) = self.burst {
+            return burst;
+        }
         let rate = self.rates.iter().map(|(_, rate)| *rate).reduce(f64::max);
         let round_trip = self.round_trips.iter().map(|(_, rtt)| *rtt).min();
         match (rate, round_trip) {
@@ -394,5 +418,22 @@ mod tests {
         flow.sent(4, 10, later);
         flow.reset();
         assert_eq!((flow.bytes, flow.last_sent()), (0, None));
+    }
+
+    #[test]
+    fn an_explicit_path_burst_is_not_inflated_by_the_last_unit_or_an_epoch_reset() {
+        let mut flow = Flow::default();
+        let rate = LinkRate {
+            bits_per_second: 5_000_000,
+            burst_bytes: 125_000,
+        };
+        flow.set_link_rate(Some(rate));
+        flow.sent(1, 250_000, Instant::now());
+        assert_eq!(flow.budget(), 125_000);
+        assert!(!flow.has_room(0));
+        flow.reset();
+        assert_eq!(flow.budget(), 125_000);
+        flow.set_link_rate(None);
+        assert_eq!(flow.budget(), INITIAL_BUDGET);
     }
 }

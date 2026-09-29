@@ -15,7 +15,9 @@ use std::sync::OnceLock;
 
 use super::convert::COLOUR;
 use super::library::Library;
-use super::{Chroma, EncodeRequest, EncodedUnit, Picture, VideoCodec, VideoEncoder, VideoError};
+use super::{
+    Chroma, EncodeRequest, EncodedUnit, EncoderRate, Picture, VideoCodec, VideoEncoder, VideoError,
+};
 
 const SONAME: &CStr = c"libaom.so.3";
 /// `AOM_ENCODER_ABI_VERSION` of the headers the layouts below come from.
@@ -30,6 +32,7 @@ const FRAME_IS_KEY: u32 = 1;
 const EFLAG_FORCE_KF: c_long = 1;
 const RC_ONE_PASS: c_uint = 0;
 const Q: c_uint = 3;
+const CBR: c_uint = 1;
 const KF_DISABLED: c_uint = 0;
 const BITS_8: c_uint = 8;
 
@@ -52,6 +55,8 @@ mod control {
     use std::ffi::c_int;
     pub(super) const CPU_USED: c_int = 13;
     pub(super) const ROW_MT: c_int = 32;
+    pub(super) const MAX_INTRA_BITRATE_PCT: c_int = 26;
+    pub(super) const MAX_INTER_BITRATE_PCT: c_int = 28;
     pub(super) const TILE_COLUMNS: c_int = 33;
     pub(super) const TILE_ROWS: c_int = 34;
     pub(super) const ENABLE_TPL_MODEL: c_int = 35;
@@ -217,7 +222,6 @@ type Destroy = unsafe extern "C" fn(*mut Context) -> c_int;
 type Describe = unsafe extern "C" fn(*const Context) -> *const c_char;
 type ImageWrap =
     unsafe extern "C" fn(*mut Image, c_uint, c_uint, c_uint, c_uint, *mut u8) -> *mut Image;
-#[cfg(test)]
 type ConfigSet = unsafe extern "C" fn(*mut Context, *const EncoderConfig) -> c_int;
 
 /// The functions this encoder calls, resolved once per process.
@@ -233,7 +237,6 @@ struct Api {
     error: Describe,
     error_detail: Describe,
     image_wrap: ImageWrap,
-    #[cfg(test)]
     config_set: ConfigSet,
 }
 
@@ -253,7 +256,6 @@ impl Api {
                 error: library.function(c"aom_codec_error")?,
                 error_detail: library.function(c"aom_codec_error_detail")?,
                 image_wrap: library.function(c"aom_img_wrap")?,
-                #[cfg(test)]
                 config_set: library.function(c"aom_codec_enc_config_set")?,
                 _library: library,
             })
@@ -382,6 +384,8 @@ pub(crate) struct AomEncoder {
     width: u32,
     height: u32,
     level: u8,
+    config: Box<EncoderConfig>,
+    rate: Option<EncoderRate>,
     /// The quantizer and speed the encoder holds; set only when a request
     /// differs.
     quantizer: Option<u8>,
@@ -445,6 +449,8 @@ impl AomEncoder {
             width,
             height,
             level: level(width, height),
+            config,
+            rate: None,
             quantizer: None,
             speed: MOTION_SPEED,
             pictures: 0,
@@ -508,7 +514,35 @@ impl AomEncoder {
             return Err(self.api.describe(&self.context));
         }
         self.quantizer = None;
+        self.config = config;
         self.control(control::TILE_COLUMNS, tile_columns)
+    }
+
+    fn rate_configuration(&mut self, refine: bool) -> Result<(), VideoError> {
+        let end_usage = if self.rate.is_some() && !refine {
+            CBR
+        } else {
+            Q
+        };
+        let bitrate = self.rate.map_or(self.config.target_bitrate, |rate| {
+            rate.bits_per_second.div_ceil(1000)
+        });
+        if self.config.end_usage == end_usage && self.config.target_bitrate == bitrate {
+            return Ok(());
+        }
+        self.config.end_usage = end_usage;
+        self.config.target_bitrate = bitrate;
+        self.config.min_quantizer = if end_usage == CBR { 20 } else { 0 };
+        self.config.max_quantizer = if end_usage == CBR { 48 } else { 63 };
+        self.config.buffer_size = 300;
+        self.config.buffer_initial_size = 150;
+        self.config.buffer_optimal_size = 150;
+        // SAFETY: initialized context and the same owned configuration used at open.
+        if unsafe { (self.api.config_set)(&mut *self.context, &*self.config) } != CODEC_OK {
+            return Err(VideoError::Failed(self.api.describe(&self.context)));
+        }
+        self.quantizer = None;
+        Ok(())
     }
 
     fn control(&mut self, id: c_int, value: c_int) -> Result<(), String> {
@@ -542,6 +576,34 @@ impl VideoEncoder for AomEncoder {
         format!("av01.{profile}.{:02}M.08", self.level)
     }
 
+    fn set_rate(&mut self, rate: Option<EncoderRate>) -> Result<(), VideoError> {
+        if rate.is_some_and(|rate| {
+            rate.bits_per_second < 1000
+                || rate.pictures_per_second == 0
+                || rate.pictures_per_second > 60
+                || rate.key_bytes == 0
+        }) {
+            return Err(VideoError::Failed("invalid video rate budget".into()));
+        }
+        if self.rate == rate {
+            return Ok(());
+        }
+        self.rate = rate;
+        self.rate_configuration(false)?;
+        let key_percent = rate.map_or(0, |rate| {
+            ((u64::from(rate.key_bytes) * 800 * u64::from(rate.pictures_per_second))
+                / u64::from(rate.bits_per_second))
+            .clamp(1, c_int::MAX as u64) as u32
+        });
+        self.control(control::MAX_INTRA_BITRATE_PCT, key_percent as c_int)
+            .map_err(VideoError::Failed)?;
+        self.control(
+            control::MAX_INTER_BITRATE_PCT,
+            if rate.is_some() { 115 } else { 0 },
+        )
+        .map_err(VideoError::Failed)
+    }
+
     fn encode(
         &mut self,
         picture: &Picture<'_>,
@@ -570,7 +632,8 @@ impl VideoEncoder for AomEncoder {
                 request.quantizer
             )));
         }
-        if self.quantizer != Some(request.quantizer) {
+        self.rate_configuration(request.refine)?;
+        if (self.rate.is_none() || request.refine) && self.quantizer != Some(request.quantizer) {
             self.control(control::QUANTIZER_ONE_PASS, c_int::from(request.quantizer))
                 .map_err(VideoError::Failed)?;
             self.quantizer = Some(request.quantizer);
@@ -614,10 +677,22 @@ impl VideoEncoder for AomEncoder {
         self.image.range = c_uint::from(COLOUR.full_range);
         let flags = if request.key { EFLAG_FORCE_KF } else { 0 };
         let pts = self.pictures;
-        self.pictures += 1;
+        // CBR budgets bits over the actual picture period, not the legacy fixed-Q path's one microsecond.
+        let duration = self
+            .rate
+            .map_or(1, |rate| 1_000_000 / u64::from(rate.pictures_per_second));
+        self.pictures += duration as i64;
         // SAFETY: an initialized context and an image whose planes borrow
         // `picture` for this call; libaom copies the source before returning.
-        let status = unsafe { (self.api.encode)(&mut *self.context, &*self.image, pts, 1, flags) };
+        let status = unsafe {
+            (self.api.encode)(
+                &mut *self.context,
+                &*self.image,
+                pts,
+                duration as c_ulong,
+                flags,
+            )
+        };
         if status != CODEC_OK {
             return Err(VideoError::Failed(self.api.describe(&self.context)));
         }

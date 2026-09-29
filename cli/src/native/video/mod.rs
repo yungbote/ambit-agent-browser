@@ -182,13 +182,22 @@ impl std::fmt::Display for VideoError {
     }
 }
 
-/// One stream's encoder: one picture in, exactly one temporal unit out, in
-/// the same call. No lookahead, no reordering, no frame delay.
+/// The path's bitrate, actual picture period and payload target for keys.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EncoderRate {
+    pub bits_per_second: u32,
+    pub pictures_per_second: u32,
+    pub key_bytes: u32,
+}
+
+/// One picture in, one temporal unit out, without lookahead or reordering.
 pub(crate) trait VideoEncoder: Send {
     /// The encoded picture size.
     fn coded(&self) -> (u32, u32);
     /// The WebCodecs codec string of this stream.
     fn codec_string(&self) -> String;
+    /// A path's explicit rate budget; absence preserves fixed-quality encoding.
+    fn set_rate(&mut self, rate: Option<EncoderRate>) -> Result<(), VideoError>;
     fn encode(
         &mut self,
         picture: &Picture<'_>,

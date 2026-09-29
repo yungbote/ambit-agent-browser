@@ -3,7 +3,48 @@
 //! viewer is served. Each is a small state machine the producer drives with
 //! its own clock.
 
+use serde_json::Value;
 use std::time::{Duration, Instant};
+
+/// The edge's current path budget. It changes encoding, never input custody.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LinkRate {
+    pub bits_per_second: u32,
+    pub burst_bytes: u32,
+}
+
+impl LinkRate {
+    pub(super) fn read(message: &Value, generation: u64, enabled: bool) -> Option<Self> {
+        let fields = message.as_object()?;
+        if !enabled
+            || generation == 0
+            || fields.len() != 4
+            || message["type"] != "rate"
+            || message["generation"].as_u64()? != generation
+        {
+            return None;
+        }
+        let bits_per_second = u32::try_from(message["bitsPerSecond"].as_u64()?).ok()?;
+        let burst_bytes = u32::try_from(message["burstBytes"].as_u64()?).ok()?;
+        (bits_per_second >= 1000 && (1..=12 * 1024 * 1024).contains(&burst_bytes)).then_some(Self {
+            bits_per_second,
+            burst_bytes,
+        })
+    }
+
+    pub(super) fn capture_rate(self, requested: u32, picture_bytes: u32) -> u32 {
+        let affordable = (self.bits_per_second / 8 / picture_bytes.max(1)).clamp(10, MAX_RATE);
+        affordable.min(requested)
+    }
+
+    /// Payload target of a key: a quarter second of the path, within its burst after the bounded header.
+    pub(super) fn key_bytes(self) -> u32 {
+        (self.bits_per_second / 32)
+            .min(self.burst_bytes.saturating_sub(4096 + 4))
+            .min(4 * 1024 * 1024)
+            .max(1)
+    }
+}
 
 /// The coded size moves in steps of this many device pixels.
 const CLASS_STEP: u32 = 256;
@@ -173,6 +214,45 @@ pub(super) fn period(rate: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_path_rate_is_integral_bounded_and_belongs_to_the_enabled_generation() {
+        let valid =
+            json!({"type":"rate","generation":3,"bitsPerSecond":5_000_000,"burstBytes":200_000});
+        assert_eq!(
+            LinkRate::read(&valid, 3, true),
+            Some(LinkRate {
+                bits_per_second: 5_000_000,
+                burst_bytes: 200_000
+            })
+        );
+        assert_eq!(LinkRate::read(&valid, 2, true), None);
+        assert_eq!(LinkRate::read(&valid, 3, false), None);
+        for (field, value) in [
+            ("bitsPerSecond", json!(999)),
+            ("bitsPerSecond", json!(-1)),
+            ("bitsPerSecond", json!(u64::from(u32::MAX) + 1)),
+            ("bitsPerSecond", json!(5_000_000.5)),
+            ("burstBytes", json!(0)),
+            ("burstBytes", json!(12 * 1024 * 1024 + 1)),
+            ("generation", json!(3.5)),
+        ] {
+            let mut message = valid.clone();
+            message[field] = value;
+            assert_eq!(LinkRate::read(&message, 3, true), None, "{message}");
+        }
+        let mut extra = valid.clone();
+        extra["enabled"] = json!(true);
+        assert_eq!(LinkRate::read(&extra, 3, true), None);
+        let rate = LinkRate {
+            bits_per_second: 5_000_000,
+            burst_bytes: 200_000,
+        };
+        assert_eq!(rate.capture_rate(60, 25_000), 25);
+        assert_eq!(rate.capture_rate(15, 25_000), 15);
+        assert_eq!(rate.key_bytes(), 156_250);
+    }
 
     #[test]
     fn a_class_is_a_step_up_with_one_step_of_headroom_inside_the_probed_size() {
