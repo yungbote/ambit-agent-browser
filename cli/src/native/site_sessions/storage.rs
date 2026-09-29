@@ -75,11 +75,7 @@ pub(crate) async fn import(client: &CdpClient, state: &SiteState) -> Result<(), 
     applying
 }
 
-pub(crate) async fn capture(
-    client: &CdpClient,
-    site: &str,
-    origins: &[String],
-) -> Result<SiteState, &'static str> {
+async fn cookies(client: &CdpClient, site: &str) -> Result<Vec<Value>, &'static str> {
     let boundary = state::site_url(site)?;
     let raw = command(client, "Storage.getCookies", json!({}), None).await?;
     let mut cookies = Vec::new();
@@ -102,6 +98,16 @@ pub(crate) async fn capture(
             "sourceScheme":match cookie["sourceScheme"].as_str() { Some("Secure") => "secure", Some("NonSecure") => "non_secure", _ => "unset" },
             "partitionKey":partition_site.map(|site| json!({"topLevelSite":site,"hasCrossSiteAncestor":partition.and_then(|key| key["hasCrossSiteAncestor"].as_bool()).unwrap_or(false)})) }));
     }
+    Ok(cookies)
+}
+
+pub(crate) async fn capture(
+    client: &CdpClient,
+    site: &str,
+    origins: &[String],
+) -> Result<SiteState, &'static str> {
+    let boundary = state::site_url(site)?;
+    let cookies = cookies(client, site).await?;
     let mut stored = Vec::new();
     let mut omitted = Vec::new();
     for origin in origins {
@@ -162,6 +168,34 @@ fn bound_storage(value: &mut Value) -> Result<(), &'static str> {
 }
 
 pub(crate) async fn clear(client: &CdpClient, state: &SiteState) -> Result<(), &'static str> {
+    clear_site(
+        client,
+        &state.site,
+        &state
+            .origins
+            .iter()
+            .map(|origin| origin.origin.clone())
+            .collect::<Vec<_>>(),
+    )
+    .await
+}
+
+/// Deletion needs current cookie keys and origin names, not a copy of every
+/// IndexedDB record. It remains bounded even when the site's cache is huge.
+pub(crate) async fn clear_site(
+    client: &CdpClient,
+    site: &str,
+    origins: &[String],
+) -> Result<(), &'static str> {
+    let boundary = state::site_url(site)?;
+    if origins
+        .iter()
+        .any(|origin| !state::origin_in_site(origin, &boundary))
+    {
+        return Err(state::INVALID);
+    }
+    let current: Vec<Cookie> =
+        serde_json::from_value(Value::Array(cookies(client, site).await?)).map_err(|_| FAILED)?;
     let targets = command(client, "Target.getTargets", json!({}), None).await?;
     // As BrowserManager's download context adapter already establishes,
     // TargetInfo carries a synthetic default-context id. Only contexts in
@@ -184,7 +218,7 @@ pub(crate) async fn clear(client: &CdpClient, state: &SiteState) -> Result<(), &
                 .and_then(|target| client.session_for_target(target))
         })
         .ok_or("The browser has no native default-context page session for site clearing.")?;
-    for cookie in &state.cookies {
+    for cookie in &current {
         let mut deletion = json!({"name":cookie.name,"domain":cookie.domain,"path":cookie.path});
         if let Some(partition) = &cookie.partition_key {
             deletion["partitionKey"] = json!({
@@ -194,11 +228,11 @@ pub(crate) async fn clear(client: &CdpClient, state: &SiteState) -> Result<(), &
             .await
             .map_err(|_| "The browser could not clear the site's cookies.")?;
     }
-    for origin in &state.origins {
+    for origin in origins {
         command(
             client,
             "Storage.clearDataForOrigin",
-            json!({"origin":origin.origin,"storageTypes":"all"}),
+            json!({"origin":origin,"storageTypes":"all"}),
             Some(&session),
         )
         .await

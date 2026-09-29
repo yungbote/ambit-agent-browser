@@ -134,6 +134,7 @@ async fn e2e_site_state_roundtrips_native_cookie_storage_and_revocation() {
         .await,
         true
     );
+    second.client.send_command("Network.setCookie",Some(json!({"name":"rotated-fixture","value":"nosecret-rotated-cookie","domain":"127.0.0.1","path":"/","httpOnly":true})),Some(second.active_session_id().unwrap())).await.unwrap();
     storage::clear(&second.client, &captured).await.unwrap();
     let revoked = storage::capture(&second.client, "http://127.0.0.1", &[origin.clone()])
         .await
@@ -387,6 +388,7 @@ async fn e2e_lazy_site_attach_applies_before_the_first_real_document_request() {
         snapshot["states"][0]["cookies"].as_array().unwrap().len(),
         1
     );
+    assert_eq!(evaluate(&browser,r#"new Promise((resolve,reject)=>{const opening=indexedDB.open('large-cache',1);opening.onupgradeneeded=()=>opening.result.createObjectStore('cache');opening.onsuccess=()=>{const database=opening.result;const writing=database.transaction('cache','readwrite');writing.objectStore('cache').put(new Blob([new Uint8Array(16*1024*1024)]),'large');writing.oncomplete=()=>{database.close();resolve(true)};writing.onerror=()=>reject(writing.error)};opening.onerror=()=>reject(opening.error)})"#).await,true);
     let deadline = chrono::Utc::now() + chrono::Duration::milliseconds(200);
     let expires_at = deadline.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     custody.request(foreign,Request::read("site_sessions.offer",json!({"sites":[{"site":"http://127.0.0.1","mode":"act","useId":"22222222-2222-4222-8222-222222222222","expiresAt":expires_at}]})).unwrap()).await.unwrap();

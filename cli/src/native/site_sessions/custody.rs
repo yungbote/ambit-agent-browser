@@ -11,8 +11,7 @@ use url::Url;
 
 use super::{
     protocol::{self, Mode, Offer, Request},
-    state::{self, SiteState},
-    storage, Context,
+    state, storage, Context,
 };
 use crate::native::agent_channel::frame::ChannelId;
 use crate::native::cdp::client::CdpClient;
@@ -35,7 +34,6 @@ struct Pending {
 struct Held {
     use_id: String,
     mode: Mode,
-    state: SiteState,
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 #[derive(Default)]
@@ -255,20 +253,27 @@ impl Custody {
     }
 
     async fn release(&self, request_id: &str) {
-        let (pending, client, held) = {
+        let (pending, client, had_state, origins) = {
             let mut state = self.state.lock().await;
             let Some(pending) = state.pending.remove(request_id) else {
                 return;
             };
             state.resolved.insert(pending.site.clone());
-            let held = state.held.remove(&pending.site);
-            (pending, state.client.clone(), held)
+            let had_state = state.held.remove(&pending.site).is_some();
+            let boundary = state::site_url(&pending.site).expect("an admitted pending site");
+            let origins = state
+                .origins
+                .iter()
+                .filter(|origin| state::origin_in_site(origin, &boundary))
+                .cloned()
+                .collect::<Vec<_>>();
+            (pending, state.client.clone(), had_state, origins)
         };
         if let Some(client) = client {
-            if let Some(held) = held {
+            if had_state {
                 // A refused revalidation must really continue signed out,
                 // including cookies retained across a native relaunch.
-                let _ = storage::clear(&client, &held.state).await;
+                let _ = storage::clear_site(&client, &pending.site, &origins).await;
             }
             for pause in pending.pauses {
                 let _ = continue_request(&client, pause).await;
@@ -430,7 +435,6 @@ impl Custody {
                             Held {
                                 use_id: use_id.clone(),
                                 mode,
-                                state: attached,
                                 expires_at: protocol::expiry(expires_at.as_deref())?,
                             },
                         );
@@ -483,7 +487,7 @@ impl Custody {
     }
 
     async fn detach(&self, site: &str) -> Result<(), &'static str> {
-        let (requests, held, client, origins) = {
+        let (requests, client, origins) = {
             let mut state = self.state.lock().await;
             state.offers.remove(site);
             state.resolved.insert(site.into());
@@ -493,7 +497,7 @@ impl Custody {
                 .filter(|(_, pending)| pending.site == site)
                 .map(|(id, _)| id.clone())
                 .collect::<Vec<_>>();
-            let held = state.held.remove(site);
+            state.held.remove(site);
             let boundary = state::site_url(site)?;
             let origins = state
                 .origins
@@ -501,25 +505,13 @@ impl Custody {
                 .filter(|origin| state::origin_in_site(origin, &boundary))
                 .cloned()
                 .collect::<Vec<_>>();
-            (requests, held, state.client.clone(), origins)
+            (requests, state.client.clone(), origins)
         };
         for request in requests {
             self.release(&request).await;
         }
         if let Some(client) = client {
-            // Clear rotated cookies and newly written storage, not only the
-            // originally attached snapshot. Keep an original fallback.
-            let current = storage::capture(&client, site, &origins).await;
-            match current {
-                Ok(state) => storage::clear(&client, &state).await?,
-                Err(_) => {
-                    if let Some(held) = held {
-                        storage::clear(&client, &held.state).await?;
-                    } else {
-                        return Err(REFUSED);
-                    }
-                }
-            }
+            storage::clear_site(&client, site, &origins).await?;
             let targets = client
                 .send_command("Target.getTargets", Some(json!({})), None)
                 .await
