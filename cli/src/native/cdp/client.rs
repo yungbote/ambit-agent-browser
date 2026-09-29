@@ -1279,6 +1279,17 @@ impl CdpClient {
             .clone()
     }
 
+    pub(crate) async fn site_request_ready(self: &Arc<Self>, session: String, params: Value) {
+        let custody = self
+            .site_custody
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .upgrade();
+        if let Some(custody) = custody {
+            Box::pin(custody.paused(self, session, params)).await;
+        }
+    }
+
     pub(crate) fn set_site_custody(
         &self,
         owner: std::sync::Weak<crate::native::site_sessions::custody::Custody>,

@@ -20,8 +20,7 @@ const REFUSED: &str = "The browser site custody request is no longer authorized 
 const DEADLINE: Duration = Duration::from_secs(2);
 
 struct Pause {
-    session: String,
-    request: String,
+    ready: tokio::sync::oneshot::Sender<()>,
 }
 struct Pending {
     channel: ChannelId,
@@ -120,11 +119,7 @@ impl Custody {
                         let Some(owner) = owner.upgrade() else {
                             break;
                         };
-                        if event.method == "Fetch.requestPaused" {
-                            if let Some(session) = event.session_id {
-                                owner.paused(&connection, session, event.params).await;
-                            }
-                        } else if event.method == "Page.frameNavigated" {
+                        if event.method == "Page.frameNavigated" {
                             if let Some(url) =
                                 event.params.pointer("/frame/url").and_then(Value::as_str)
                             {
@@ -175,8 +170,15 @@ impl Custody {
         Ok(())
     }
 
-    async fn paused(self: &Arc<Self>, client: &Arc<CdpClient>, session: String, params: Value) {
-        let Some(request) = params["requestId"].as_str().map(str::to_owned) else {
+    /// The canonical Fetch resolver waits here before applying its existing
+    /// routes, domain and header policy. Custody never answers Fetch itself.
+    pub(crate) async fn paused(
+        self: &Arc<Self>,
+        client: &Arc<CdpClient>,
+        session: String,
+        params: Value,
+    ) {
+        let Some(_) = params["requestId"].as_str() else {
             return;
         };
         let url = params
@@ -199,8 +201,6 @@ impl Custody {
                 .cloned()
         });
         let Some(site) = site.filter(|site| !state.resolved.contains(site)) else {
-            drop(state);
-            let _ = continue_request(client, Pause { session, request }).await;
             return;
         };
         if protocol::expiry(state.offers[&site].expires_at.as_deref())
@@ -210,15 +210,17 @@ impl Custody {
         {
             drop(state);
             let _ = self.detach(&site).await;
-            let _ = continue_request(client, Pause { session, request }).await;
             return;
         }
+        let (ready, waiting) = tokio::sync::oneshot::channel();
         if let Some((_, pending)) = state
             .pending
             .iter_mut()
             .find(|(_, pending)| pending.site == site)
         {
-            pending.pauses.push(Pause { session, request });
+            pending.pauses.push(Pause { ready });
+            drop(state);
+            let _ = waiting.await;
             return;
         }
         let Some(channel) = state.channel else {
@@ -235,10 +237,7 @@ impl Custody {
                 mode,
                 expires: Instant::now() + DEADLINE,
                 offer_generation,
-                pauses: vec![Pause {
-                    session: session.clone(),
-                    request,
-                }],
+                pauses: vec![Pause { ready }],
             },
         );
         drop(state);
@@ -250,6 +249,7 @@ impl Custody {
                 owner.release(&request_id).await;
             }
         });
+        let _ = waiting.await;
     }
 
     async fn release(&self, request_id: &str) {
@@ -276,7 +276,7 @@ impl Custody {
                 let _ = storage::clear_site(&client, &pending.site, &origins).await;
             }
             for pause in pending.pauses {
-                let _ = continue_request(&client, pause).await;
+                let _ = pause.ready.send(());
             }
         }
     }
@@ -421,7 +421,7 @@ impl Custody {
                         drop(state);
                         let _ = storage::clear(&client, &attached).await;
                         for pause in pending.pauses {
-                            let _ = continue_request(&client, pause).await;
+                            let _ = pause.ready.send(());
                         }
                         return Err(REFUSED);
                     }
@@ -441,7 +441,7 @@ impl Custody {
                     }
                 }
                 for pause in pending.pauses {
-                    let _ = continue_request(&client, pause).await;
+                    let _ = pause.ready.send(());
                 }
                 imported?;
                 if let Some(deadline) = protocol::expiry(expires_at.as_deref())? {
@@ -614,18 +614,6 @@ impl Custody {
             }
         });
     }
-}
-
-async fn continue_request(client: &CdpClient, pause: Pause) -> Result<(), &'static str> {
-    client
-        .send_command(
-            "Fetch.continueRequest",
-            Some(json!({"requestId":pause.request})),
-            Some(&pause.session),
-        )
-        .await
-        .map(|_| ())
-        .map_err(|_| REFUSED)
 }
 
 impl Drop for Custody {

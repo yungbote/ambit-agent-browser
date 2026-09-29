@@ -1015,8 +1015,17 @@ impl DaemonState {
         let include_browser_ui = browser.display_client().is_some();
 
         self.fetch_handler_task = Some(tokio::spawn(async move {
+            // A document awaiting host custody cannot hold up target attach,
+            // authentication or another request. This remains the sole
+            // responder after custody admits each paused request.
+            let mut requests = tokio::task::JoinSet::new();
             loop {
-                match rx.recv().await {
+                let event = tokio::select! {
+                    _=client.closed()=>break,
+                    completed=requests.join_next(),if !requests.is_empty()=>{ let _=completed;continue; },
+                    event=rx.recv()=>event,
+                };
+                match event {
                     Ok(event) if event.method == "Fetch.authRequired" => {
                         let request_id = event
                             .params
@@ -1134,6 +1143,7 @@ impl DaemonState {
                         }
                     }
                     Ok(event) if event.method == "Fetch.requestPaused" => {
+                        let params = event.params.clone();
                         let request_id = event
                             .params
                             .get("requestId")
@@ -1169,11 +1179,21 @@ impl DaemonState {
                             request_headers,
                         };
 
-                        let df = domain_filter.read().await;
-                        let rt = routes.read().await;
-                        let oh = origin_headers.read().await;
-
-                        resolve_fetch_paused(&client, df.as_ref(), &rt, &oh, &paused).await;
+                        let (client, domain_filter, routes, origin_headers) = (
+                            client.clone(),
+                            domain_filter.clone(),
+                            routes.clone(),
+                            origin_headers.clone(),
+                        );
+                        requests.spawn(async move {
+                            client
+                                .site_request_ready(paused.session_id.clone(), params)
+                                .await;
+                            let df = domain_filter.read().await;
+                            let rt = routes.read().await;
+                            let oh = origin_headers.read().await;
+                            resolve_fetch_paused(&client, df.as_ref(), &rt, &oh, &paused).await;
+                        });
                     }
                     Ok(_) => continue,
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,

@@ -264,7 +264,16 @@ async fn e2e_lazy_site_attach_applies_before_the_first_real_document_request() {
             });
         }
     });
-    let mut browser = browser().await;
+    // Exercise the real daemon's generic Fetch resolver as well as custody.
+    // A BrowserManager alone cannot reveal competing paused-request owners.
+    let mut daemon_state = crate::native::actions::DaemonState::new();
+    let launched = Box::pin(crate::native::actions::execute_command(
+        &json!({"action":"launch","headless":true}),
+        &mut daemon_state,
+    ))
+    .await;
+    assert_eq!(launched["success"], true, "{launched}");
+    let browser = daemon_state.browser.as_mut().unwrap();
     let client = browser.client.clone();
     let session = browser.active_session_id().unwrap().to_owned();
     let channel = ChannelId::parse("11111111-1111-4111-8111-111111111111").unwrap();
@@ -436,7 +445,12 @@ async fn e2e_lazy_site_attach_applies_before_the_first_real_document_request() {
         .await
         .unwrap();
     custody.end(foreign).await;
-    browser.close().await.unwrap();
+    let closed = Box::pin(crate::native::actions::execute_command(
+        &json!({"action":"close"}),
+        &mut daemon_state,
+    ))
+    .await;
+    assert_eq!(closed["success"], true, "{closed}");
     server.abort();
     let _ = server.await;
 }
