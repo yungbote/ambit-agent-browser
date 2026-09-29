@@ -10,6 +10,10 @@
 //! A person taking control never waits behind the channel: the landing's
 //! wait holds no custody, and the landing's final read and the frame's
 //! observation, resolutions and capture stop the moment a takeover is raised.
+//! Nor does the channel wait on a page between documents (`documents`),
+//! which answers nothing until its navigation commits: a step that reads the
+//! page first is refused (`run_host_command`), and the landing and the
+//! frame read nothing from it.
 
 use std::sync::{Arc, Mutex as StdMutex, PoisonError};
 use std::time::{Duration, Instant};
@@ -27,6 +31,7 @@ use crate::connection::Response;
 use crate::mcp::host_bound::{step_result, Dispatch};
 use crate::native::actions::{execute_command_received, run_host_command, DaemonState, HostFence};
 use crate::native::browser_control::paced;
+use crate::native::documents;
 use crate::native::feedback::{self, FeedbackRequest, REQUEST_FIELD};
 
 const DIALOG_OPEN: &str = "browser_dialog_open";
@@ -126,7 +131,7 @@ impl DaemonBrowser {
         let read = tokio::select! {
             biased;
             _ = person.taken() => None,
-            read = landing.read(&mut state, pending) => Some(read),
+            read = landing.read(&mut state, pending, deadline) => Some(read),
         };
         drop(state);
         (read.unwrap_or_else(|| landing.without_read()), queued)
@@ -142,20 +147,19 @@ struct StepFence<'a> {
     landing: Option<Landing>,
 }
 
-impl StepFence<'_> {
-    /// Whether the step reads the page before its operation does.
+impl HostFence for StepFence<'_> {
+    fn fences_point(&self) -> bool {
+        let preconditions = &self.step.preconditions;
+        preconditions.page_generation.is_some() && preconditions.geometry_sha256.is_some()
+    }
+
+    /// A judged step, and one carrying page identity, reads the page before
+    /// its operation does.
     fn reads_page(&self) -> bool {
         let preconditions = &self.step.preconditions;
         self.step.judged.is_some()
             || preconditions.page_generation.is_some()
             || preconditions.geometry_sha256.is_some()
-    }
-}
-
-impl HostFence for StepFence<'_> {
-    fn fences_point(&self) -> bool {
-        let preconditions = &self.step.preconditions;
-        preconditions.page_generation.is_some() && preconditions.geometry_sha256.is_some()
     }
 
     async fn admit(&mut self, command: &Value, state: &mut DaemonState) -> Result<(), Value> {
@@ -257,6 +261,8 @@ impl Browser for DaemonBrowser {
             unavailable(&request, asks, error.code)
         } else if state.dialog_blocks_active_page() {
             unavailable(&request, asks, DIALOG_OPEN)
+        } else if state.active_page_between_documents() {
+            unavailable(&request, asks, documents::NAVIGATION_PENDING)
         } else {
             let mut person = PersonWatch::of(&state).await;
             let read = async {

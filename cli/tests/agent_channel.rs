@@ -71,8 +71,10 @@ fn serve(mut stream: std::net::TcpStream) {
     let target = request.split_whitespace().nth(1).unwrap_or("/").to_string();
     let path = target.split('?').next().unwrap_or("/");
     let (status, page) = page(path);
-    if path == "/slow" {
-        thread::sleep(Duration::from_millis(1500));
+    match path {
+        "/slow" => thread::sleep(Duration::from_millis(1500)),
+        "/slower" => thread::sleep(Duration::from_millis(3000)),
+        _ => {}
     }
     let response = format!(
         "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{page}",
@@ -112,6 +114,10 @@ fn page(path: &str) -> (&'static str, String) {
         "/slow" => format!("<!doctype html><title>Slow</title>{STYLE}<main><h1>Slow</h1></main>"),
         "/slow-link" => format!(
             "<!doctype html><title>Slow link</title>{STYLE}<main style=\"padding:24px\"><a id=slow href=\"/slow\">Go slowly</a></main>"
+        ),
+        "/slower" => format!("<!doctype html><title>Slower</title>{STYLE}<main><h1>Slower</h1></main>"),
+        "/slower-link" => format!(
+            "<!doctype html><title>Slower link</title>{STYLE}<main style=\"padding:24px\"><a id=slow href=\"/slower\">Go slower</a></main>"
         ),
         "/cover" => format!(
             "<!doctype html><title>Cover</title>{STYLE}\
@@ -175,9 +181,9 @@ impl Host {
         self.path("actions/one")
     }
 
-    /// A host-bound MCP call over the file protocol: a fresh client per
-    /// call, which starts the daemon when none runs.
-    fn mcp(&self, name: &str, arguments: Value) -> Value {
+    /// The host-bound MCP client as the host spawns it: the binding's
+    /// environment and none of the test's own.
+    fn client(&self) -> Command {
         let mut command = Command::new(BIN);
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("AGENT_BROWSER_") {
@@ -202,12 +208,17 @@ impl Host {
         if let Ok(helper) = std::env::var("AGENT_BROWSER_DISPLAY_HELPER") {
             command.env("AGENT_BROWSER_DISPLAY_HELPER", helper);
         }
-        let mut child = command.spawn().unwrap();
+        command
+    }
+
+    /// A host-bound MCP call over the file protocol: a fresh client per
+    /// call, which starts the daemon when none runs.
+    fn mcp(&self, name: &str, arguments: Value) -> Value {
+        let mut child = self.client().spawn().unwrap();
         writeln!(
             child.stdin.take().unwrap(),
             "{}",
-            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": { "name": name, "arguments": arguments } })
+            tool_call(name, arguments)
         )
         .unwrap();
         let output = child.wait_with_output().unwrap();
@@ -266,16 +277,23 @@ impl Host {
 }
 
 impl Drop for Host {
+    /// The host ends its session through its binding, as it began it: the
+    /// daemon closes its browser and exits. A CLI with other launch settings
+    /// would restart that daemon instead of closing it.
     fn drop(&mut self) {
-        let _ = Command::new(BIN)
-            .args(["--session", "browser", "close"])
-            .env("AGENT_BROWSER_SOCKET_DIR", self.path("sockets"))
-            .env("AGENT_BROWSER_NAMESPACE", NAMESPACE)
-            .env("AGENT_BROWSER_REQUIRE_DAEMON", "1")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let Ok(mut child) = self.client().spawn() else {
+            return;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = writeln!(stdin, "{}", tool_call("agent_browser_close", json!({})));
+        }
+        let _ = child.wait_with_output();
     }
+}
+
+fn tool_call(name: &str, arguments: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": name, "arguments": arguments } })
 }
 
 /// One agent channel on its own daemon connection.
@@ -1047,6 +1065,148 @@ fn e2e_agent_channel_take_control_during_a_step_and_during_the_landed_wait() {
             "clickAnsweredAfterUs": answered.as_micros() as u64,
             "interruptedStep": interrupted["steps"][0], "pendingLanding": landed }),
     );
+}
+
+/// A page between documents answers nothing until its navigation commits,
+/// so nothing waits on it: a click whose page takes 3 s to answer ends at
+/// its 1 s deadline with `pending`, and the frame's reads say why; a judged
+/// step sent next is refused at once, which also shows the first reply came
+/// before the commit; and the host's wait for the load then observes the
+/// page the click went to.
+#[test]
+#[ignore = "requires AMBIT_TEST_CHROME_EXECUTABLE, Xvfb and AGENT_BROWSER_DISPLAY_HELPER"]
+fn e2e_agent_channel_a_page_between_documents_is_not_waited_on() {
+    let host = Host::new();
+    let mut channel = host.channel();
+    channel.run(
+        &host,
+        json!([step(
+            "agent_browser_open",
+            json!({ "url": host.site.url("/slower-link") })
+        )]),
+    );
+    let (generation, nodes) = channel.resolve(&host, &["#slow"]);
+    let click = |timeout: u64| {
+        json!({ "op": "agent_browser_click",
+            "arguments": { "selector": "#slow", "timeoutMs": timeout },
+            "preconditions": { "pageGeneration": generation,
+                "backendNodeId": nodes[0], "effects": "read" } })
+    };
+    let pending = json!({ "status": "unavailable", "code": "browser_navigation_pending" });
+
+    let mut frame = sequence(&host, json!([click(1000)]));
+    frame["observe"] = json!(true);
+    frame["resolve"] = json!(["#slow"]);
+    let (clicked, clicked_round) = channel.call(frame);
+    assert_eq!(clicked["success"], true, "{clicked}");
+    let landed = &clicked["steps"][0]["landed"];
+    assert_eq!(landed["pending"], true, "{clicked}");
+    assert!(landed.get("navigation").is_none(), "{landed}");
+    assert_eq!(
+        landed["target"],
+        json!({ "backendNodeId": nodes[0] }),
+        "{landed}"
+    );
+    assert_eq!(clicked["observation"], pending, "{clicked}");
+    assert_eq!(clicked["resolved"], pending, "{clicked}");
+    assert_eq!(
+        clicked["browser"]["capture"]["code"], "browser_navigation_pending",
+        "{clicked}"
+    );
+
+    let (refused, refused_round) = channel.call(sequence(&host, json!([click(1000)])));
+    assert_eq!(refused["success"], false, "{refused}");
+    assert_eq!(
+        response(&refused, 0)["code"],
+        "browser_navigation_pending",
+        "{refused}"
+    );
+    assert_eq!(response(&refused, 0)["data"], json!({}), "{refused}");
+    assert!(
+        refused["steps"][0].get("landed").is_none(),
+        "a refused step has no landing: {refused}"
+    );
+
+    let mut waited = sequence(
+        &host,
+        json!([step(
+            "agent_browser_wait_for_load",
+            json!({ "state": "domcontentloaded", "timeoutMs": 10000 })
+        )]),
+    );
+    waited["observe"] = json!(true);
+    let (loaded, loaded_round) = channel.call(waited);
+    assert_eq!(loaded["success"], true, "{loaded}");
+    assert!(loaded["observation"]["candidates"].is_array(), "{loaded}");
+    assert!(
+        loaded["browser"]["page"]["url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/slower")),
+        "{loaded}"
+    );
+    evidence(
+        "e2e-navigation-pending",
+        &json!({ "clickRoundTripUs": clicked_round.as_micros() as u64,
+            "clickTiming": clicked["timing"], "clickLanded": landed,
+            "refusedRoundTripUs": refused_round.as_micros() as u64,
+            "refusal": response(&refused, 0),
+            "waitRoundTripUs": loaded_round.as_micros() as u64,
+            "waitTiming": loaded["timing"] }),
+    );
+}
+
+/// With no person holding the browser, a file chooser a step's click opens
+/// shows no dialog and holds nothing: the landing names it, and an upload
+/// step fills the input.
+#[test]
+#[ignore = "requires AMBIT_TEST_CHROME_EXECUTABLE, Xvfb and AGENT_BROWSER_DISPLAY_HELPER"]
+fn e2e_agent_channel_a_chooser_a_step_opens_is_named_and_uploaded_into() {
+    let host = Host::new();
+    let mut channel = host.channel();
+    channel.run(
+        &host,
+        json!([step(
+            "agent_browser_open",
+            json!({ "url": host.site.url("/form") })
+        )]),
+    );
+    let (generation, nodes) = channel.resolve(&host, &["#upload"]);
+    let (clicked, _) = channel.call(sequence(
+        &host,
+        json!([judged(
+            "agent_browser_click",
+            json!({ "selector": "#upload" }),
+            &generation,
+            &nodes[0],
+            "commit"
+        )]),
+    ));
+    assert_eq!(clicked["success"], true, "{clicked}");
+    let chooser = &clicked["steps"][0]["landed"]["fileChooser"];
+    assert_eq!(chooser["mode"], "selectSingle", "{clicked}");
+    assert_eq!(chooser["backendNodeId"], nodes[0], "{clicked}");
+
+    let file = host.path("upload.bin");
+    fs::write(&file, [5, 6]).unwrap();
+    let (uploaded, _) = channel.call(sequence(
+        &host,
+        json!([judged(
+            "agent_browser_upload",
+            json!({ "selector": "#upload", "files": [file] }),
+            &generation,
+            &nodes[0],
+            "commit"
+        )]),
+    ));
+    assert_eq!(uploaded["success"], true, "{uploaded}");
+    let (read, _) = channel.call(sequence(
+        &host,
+        json!([step(
+            "agent_browser_eval",
+            json!({ "script": "document.getElementById('upload').files[0].size" })
+        )]),
+    ));
+    assert_eq!(response(&read, 0)["data"]["result"], 2, "{read}");
 }
 
 #[test]

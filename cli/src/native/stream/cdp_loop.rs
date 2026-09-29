@@ -1425,15 +1425,9 @@ mod tests {
     async fn test_file_pickers_and_settled_downloads_ring_the_files_doorbell() {
         let (client, events, methods) = mock_cdp("F-MAIN").await;
         client.files.begin("aabbccdd-1111-4222-8333-123456789abc");
-        client.files.intercepted("S-ACTIVE");
         let mut harness =
             start_loop_with_client(Some("S-ACTIVE"), client.clone(), events, methods).await;
         let send = |event: Value| harness.events.send(event).unwrap();
-        // A picker in a page without interception is not a destination.
-        send(
-            json!({"method":"Page.fileChooserOpened","sessionId":"S-OTHER",
-            "params":{"frameId":"F-MAIN","mode":"selectSingle","backendNodeId":7}}),
-        );
         send(
             json!({"method":"Page.fileChooserOpened","sessionId":"S-ACTIVE",
             "params":{"frameId":"F-MAIN","mode":"selectSingle","backendNodeId":7}}),

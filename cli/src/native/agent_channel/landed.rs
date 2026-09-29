@@ -19,6 +19,11 @@
 //! for the final read of the addressed element and of the tabs the step
 //! opened (`Landing::read`), which also leaves the active page painted, as
 //! the file protocol's capture does, so the next step's input reaches it.
+//! The final read reads nothing from a page between documents
+//! (`documents`), which answers nothing until its navigation commits, and
+//! nothing after the step's deadline; the block then says `pending` too. A
+//! file chooser the step's input opened is reported as cancelled
+//! (`browser_files`).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -31,8 +36,10 @@ use tokio::sync::{broadcast, watch};
 use super::target::{self, Node, Recorders, FACTS};
 use crate::native::actions::DaemonState;
 use crate::native::browser_control::Interrupts;
+use crate::native::browser_files::FileDestinations;
 use crate::native::cdp::client::CdpClient;
 use crate::native::cdp::types::CdpEvent;
+use crate::native::documents;
 
 /// The page is quiet once this long has passed without a mutation or a
 /// scroll.
@@ -154,7 +161,8 @@ struct Page {
     session: String,
     /// Its main frame.
     frame: String,
-    /// The document's loader when the input began.
+    /// The document's loader when the input began; empty when the page was
+    /// between documents then.
     loader: String,
     /// The channel's world, when the watcher runs there.
     watched: Option<i64>,
@@ -167,8 +175,8 @@ struct Recorded {
     committed: Option<String>,
     /// The main frame's URL after its last navigation of either kind.
     url: Option<String>,
-    /// A main-frame document navigation began and has neither committed nor
-    /// stopped.
+    /// The page is between documents (`documents`), from what this step
+    /// saw.
     navigating: bool,
     /// HTTP status of each main-frame document response, by loader.
     statuses: HashMap<String, i64>,
@@ -196,12 +204,11 @@ impl Recorded {
             self.closed |= params["sessionId"] == session;
             return;
         }
-        if event.method == "Browser.downloadWillBegin" && params["frameId"] == frame {
-            self.navigating = false;
-            return;
-        }
         if event.session_id.as_deref() != Some(session) {
             return;
+        }
+        if let Some(change) = documents::change(event, frame) {
+            self.navigating = change == documents::Change::Leaving;
         }
         let main = params["frameId"] == frame;
         match event.method.as_str() {
@@ -215,24 +222,9 @@ impl Recorded {
                     self.activity = Some(now);
                 }
             }
-            "Page.frameStartedNavigating" if main => {
-                let within = matches!(
-                    params["navigationType"].as_str(),
-                    Some("sameDocument" | "historySameDocument")
-                );
-                self.navigating |= !within;
-            }
-            "Page.frameStartedLoading" if main => self.navigating = true,
-            "Page.frameStoppedLoading" | "Page.downloadWillBegin" if main => {
-                self.navigating = false
-            }
-            "Page.frameNavigated" => {
-                let committed = &params["frame"];
-                if committed["id"] == frame && committed.get("parentId").is_none() {
-                    self.committed = committed["loaderId"].as_str().map(String::from);
-                    self.url = committed["url"].as_str().map(String::from);
-                    self.navigating = false;
-                }
+            "Page.frameNavigated" if params["frame"]["id"] == frame => {
+                self.committed = params["frame"]["loaderId"].as_str().map(String::from);
+                self.url = params["frame"]["url"].as_str().map(String::from);
             }
             "Page.navigatedWithinDocument" if main => {
                 self.url = params["url"].as_str().map(String::from);
@@ -279,7 +271,8 @@ impl Recorded {
     }
 
     /// The navigation the page made during the step: a new document if it
-    /// committed one, else a change of its URL within the document.
+    /// committed one, else a change of its URL within the document, when
+    /// that document's `loader` is known.
     fn navigation(&self, loader: &str) -> Option<Value> {
         if let Some(committed) = &self.committed {
             return Some(
@@ -287,7 +280,7 @@ impl Recorded {
                 "httpStatus": self.statuses.get(committed) }),
             );
         }
-        let url = self.url.as_ref()?;
+        let url = self.url.as_ref().filter(|_| !loader.is_empty())?;
         Some(
             json!({ "kind": "same_document", "url": url, "loaderId": loader,
             "httpStatus": null }),
@@ -306,6 +299,8 @@ fn media_instant(ts_us: u64) -> Instant {
 pub(crate) struct Landing {
     token: String,
     armed: Instant,
+    /// The browser's file choosers (`browser_files`).
+    choosers: Option<Arc<FileDestinations>>,
     page: Option<Page>,
     events: Option<broadcast::Receiver<CdpEvent>>,
     /// The tab roster when the input began.
@@ -328,6 +323,7 @@ impl Landing {
         let mut landing = Self {
             token,
             armed: Instant::now(),
+            choosers: None,
             page: None,
             events: None,
             tabs: Vec::new(),
@@ -337,30 +333,44 @@ impl Landing {
         let Some(browser) = state.browser.as_ref() else {
             return landing;
         };
+        landing.choosers = Some(browser.client.files.clone());
         landing.tabs = tab_ids(&browser.tab_list());
         let Ok(session) = browser.active_session_id() else {
             return landing;
         };
         let client = browser.client.clone();
         landing.events = Some(client.subscribe());
-        let Ok(tree) = client
-            .send_command_no_params("Page.getFrameTree", Some(session))
-            .await
-        else {
-            return landing;
-        };
-        let main = &tree["frameTree"]["frame"];
-        let (Some(frame), Some(loader)) = (main["id"].as_str(), main["loaderId"].as_str()) else {
-            return landing;
+        // A page between documents answers nothing until its navigation
+        // commits, and the document a watcher would watch is going: only its
+        // events are recorded. Its main frame has its target's id.
+        let leaving = browser.active_page_between_documents();
+        let (frame, loader) = if leaving {
+            let Ok(target) = browser.active_target_id() else {
+                return landing;
+            };
+            (target.to_string(), String::new())
+        } else {
+            let Ok(tree) = client
+                .send_command_no_params("Page.getFrameTree", Some(session))
+                .await
+            else {
+                return landing;
+            };
+            let main = &tree["frameTree"]["frame"];
+            let (Some(frame), Some(loader)) = (main["id"].as_str(), main["loaderId"].as_str())
+            else {
+                return landing;
+            };
+            (frame.to_string(), loader.to_string())
         };
         let mut page = Page {
             client,
             session: session.to_string(),
-            frame: frame.to_string(),
-            loader: loader.to_string(),
+            frame,
+            loader,
             watched: None,
         };
-        if watch {
+        if watch && !leaving {
             if let Ok(context) = recorders.world(&page.client, &page.session).await {
                 let started = page
                     .client
@@ -485,22 +495,44 @@ impl Landing {
 
     /// The final read, under command custody: the addressed element's state
     /// and the tabs the step opened. `pending` says a navigation was still
-    /// uncommitted when the wait ended.
-    pub(crate) async fn read(&mut self, state: &mut DaemonState, pending: bool) -> Value {
+    /// uncommitted when the wait ended. Nothing is read from a page between
+    /// documents, and the page is read only until the step's `deadline`:
+    /// either way the block says `pending`, with the element unread.
+    pub(crate) async fn read(
+        &mut self,
+        state: &mut DaemonState,
+        pending: bool,
+        deadline: Instant,
+    ) -> Value {
         self.note_available();
         let _ = state.drain_cdp_events_background().await;
         let blocked = self.recorded.dialog.is_some() || state.dialog_blocks_active_page();
-        if let (Some(browser), false) = (state.browser.as_ref(), blocked) {
-            if let Ok(session) = browser.active_session_id() {
-                painted(&browser.client, session).await;
+        let leaving = state.active_page_between_documents();
+        let read = async {
+            if let Some(browser) = state.browser.as_ref() {
+                if let Ok(session) = browser.active_session_id() {
+                    painted(&browser.client, session).await;
+                }
             }
-        }
-        let client = self.page.as_ref().map(|page| page.client.clone());
-        let target = match (&self.target, client, blocked) {
-            (Some(node), Some(client), false) => Some(element_state(&client, node).await),
-            (Some(node), ..) => Some(json!({ "backendNodeId": node.backend_node_id })),
-            (None, ..) => None,
+            match (&self.target, self.page.as_ref()) {
+                (Some(node), Some(page)) => Some(element_state(&page.client, node).await),
+                _ => None,
+            }
         };
+        let (read, cut) = if blocked || leaving {
+            (None, leaving)
+        } else {
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)) => (None, true),
+                read = read => (read, false),
+            }
+        };
+        let target = read.or_else(|| {
+            self.target
+                .as_ref()
+                .map(|node| json!({ "backendNodeId": node.backend_node_id }))
+        });
         let opened = state
             .browser
             .as_ref()
@@ -517,7 +549,7 @@ impl Landing {
                     .collect()
             })
             .unwrap_or_default();
-        self.block(target, opened, pending)
+        self.block(target, opened, pending || cut)
     }
 
     fn block(&self, target: Option<Value>, opened: Vec<Value>, pending: bool) -> Value {
@@ -532,6 +564,11 @@ impl Landing {
         }
         if let Some(dialog) = &recorded.dialog {
             landed["dialog"] = dialog.clone();
+        }
+        // A chooser the step's input opened was cancelled: nothing was shown
+        // and nothing waits; its input takes files through an upload.
+        if let Some(chooser) = self.choosers.as_ref().and_then(|c| c.take_cancelled()) {
+            landed["fileChooser"] = chooser;
         }
         if !opened.is_empty() {
             landed["openedTabs"] = json!(opened);
@@ -704,6 +741,9 @@ mod tests {
             )
         );
         assert_eq!(noted(&[]).navigation("L1"), None);
+        // Within a document whose loader is not known, as when the step
+        // began between documents, nothing is reported.
+        assert_eq!(within.navigation(""), None);
     }
 
     #[test]
@@ -725,21 +765,17 @@ mod tests {
             let recorded = noted(&[event("Page.frameStartedNavigating", start.clone())]);
             assert_eq!(recorded.navigating, navigating, "{start}");
         }
+        // A 204, a download and a stop all end the main frame's loading
+        // without a commit.
         let stopped = noted(&[
-            event("Page.frameStartedLoading", json!({ "frameId": FRAME })),
+            event(
+                "Page.frameStartedNavigating",
+                json!({ "frameId": FRAME, "navigationType": "differentDocument" }),
+            ),
             event("Page.frameStoppedLoading", json!({ "frameId": FRAME })),
         ]);
         assert!(!stopped.navigating);
         assert_eq!(stopped.navigation("L1"), None);
-        let downloaded = noted(&[
-            event("Page.frameStartedLoading", json!({ "frameId": FRAME })),
-            CdpEvent {
-                method: "Browser.downloadWillBegin".into(),
-                params: json!({ "frameId": FRAME, "url": "https://shop.example/file.pdf" }),
-                session_id: None,
-            },
-        ]);
-        assert!(!downloaded.navigating);
     }
 
     #[test]
