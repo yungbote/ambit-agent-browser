@@ -94,12 +94,15 @@ async fn observe(state: &DaemonState) -> Result<Observation, &'static str> {
     let browser = state.browser.as_ref().ok_or("no_active_page")?;
     let session_id = browser.active_session_id().map_err(|_| "no_active_page")?;
     let target_id = browser.active_target_id().map_err(|_| "no_active_page")?;
-    let page_generation = browser.client.page_generation(session_id);
     let tree = browser
         .client
         .send_command_no_params("Page.getFrameTree", Some(session_id))
         .await
         .map_err(|_| "capture_page_unavailable")?;
+    // The generation of the document the frame tree describes: Chrome holds
+    // the frame tree of a page between documents until the commit, whose
+    // event moves the generation before the tree arrives.
+    let page_generation = browser.client.page_generation(session_id);
     let frame = &tree["frameTree"]["frame"];
     let frame_id = frame["id"].as_str().ok_or("capture_page_unavailable")?;
     let loader_id = frame["loaderId"]
