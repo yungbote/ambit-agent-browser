@@ -175,9 +175,9 @@ impl Host {
         self.path("actions/one")
     }
 
-    /// A host-bound MCP call over the file protocol: a fresh client per
-    /// call, which starts the daemon when none runs.
-    fn mcp(&self, name: &str, arguments: Value) -> Value {
+    /// The host-bound MCP client as the host spawns it: the binding's
+    /// environment and none of the test's own.
+    fn client(&self) -> Command {
         let mut command = Command::new(BIN);
         for (key, _) in std::env::vars_os() {
             if key.to_string_lossy().starts_with("AGENT_BROWSER_") {
@@ -202,12 +202,17 @@ impl Host {
         if let Ok(helper) = std::env::var("AGENT_BROWSER_DISPLAY_HELPER") {
             command.env("AGENT_BROWSER_DISPLAY_HELPER", helper);
         }
-        let mut child = command.spawn().unwrap();
+        command
+    }
+
+    /// A host-bound MCP call over the file protocol: a fresh client per
+    /// call, which starts the daemon when none runs.
+    fn mcp(&self, name: &str, arguments: Value) -> Value {
+        let mut child = self.client().spawn().unwrap();
         writeln!(
             child.stdin.take().unwrap(),
             "{}",
-            json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                "params": { "name": name, "arguments": arguments } })
+            tool_call(name, arguments)
         )
         .unwrap();
         let output = child.wait_with_output().unwrap();
@@ -266,16 +271,23 @@ impl Host {
 }
 
 impl Drop for Host {
+    /// The host ends its session through its binding, as it began it: the
+    /// daemon closes its browser and exits. A CLI with other launch settings
+    /// would restart that daemon instead of closing it.
     fn drop(&mut self) {
-        let _ = Command::new(BIN)
-            .args(["--session", "browser", "close"])
-            .env("AGENT_BROWSER_SOCKET_DIR", self.path("sockets"))
-            .env("AGENT_BROWSER_NAMESPACE", NAMESPACE)
-            .env("AGENT_BROWSER_REQUIRE_DAEMON", "1")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        let Ok(mut child) = self.client().spawn() else {
+            return;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = writeln!(stdin, "{}", tool_call("agent_browser_close", json!({})));
+        }
+        let _ = child.wait_with_output();
     }
+}
+
+fn tool_call(name: &str, arguments: Value) -> Value {
+    json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+        "params": { "name": name, "arguments": arguments } })
 }
 
 /// One agent channel on its own daemon connection.
