@@ -676,6 +676,8 @@ pub struct DaemonState {
     pub mouse_state: MouseState,
     /// Tracks the currently open JavaScript dialog (alert/confirm/prompt), if any.
     pub pending_dialog: Option<PendingDialog>,
+    /// The pages between documents, from the events the drain applies.
+    documents: super::documents::Documents,
     /// A mouse button left logically down because a dialog opened between
     /// mousePressed and mouseReleased; released when the dialog is resolved.
     pub pending_pointer_release: Option<super::interaction::PendingRelease>,
@@ -790,6 +792,21 @@ impl DaemonState {
         }
     }
 
+    /// Whether the active page is between documents (`documents`): until
+    /// its navigation commits or stops, its renderer answers nothing. As
+    /// current as the events the last drain applied.
+    pub(crate) fn active_page_between_documents(&self) -> bool {
+        self.browser
+            .as_ref()
+            .and_then(|browser| browser.active_session_id().ok())
+            .is_some_and(|session| self.documents.between(session))
+    }
+
+    /// Whether the page of `session` is between documents (`documents`).
+    pub(crate) fn between_documents(&self, session: &str) -> bool {
+        self.documents.between(session)
+    }
+
     /// The expiry path every command and maintenance tick runs. A sign-in
     /// ends here too, so no agent command can reach a browser a person holds.
     pub(crate) async fn expire_browser_control(
@@ -878,6 +895,7 @@ impl DaemonState {
             dialog_handler_task: None,
             mouse_state: MouseState::default(),
             pending_dialog: None,
+            documents: super::documents::Documents::default(),
             pending_pointer_release: None,
             auto_dialog: !matches!(
                 env::var("AGENT_BROWSER_NO_AUTO_DIALOG").as_deref(),
@@ -1851,6 +1869,7 @@ impl DaemonState {
                             if let Some(sid) =
                                 event.params.get("sessionId").and_then(|v| v.as_str())
                             {
+                                self.documents.forget(sid);
                                 if let Some(frame_id) =
                                     self.iframe_sessions
                                         .iter()
@@ -1869,6 +1888,23 @@ impl DaemonState {
                             continue;
                         }
                         _ => {}
+                    }
+
+                    // Every page's own document events, before the drain
+                    // narrows to the active page: a page switched to is
+                    // still between documents if it was. A page's main
+                    // frame has its target's id.
+                    if let Some(session) = event.session_id.as_deref() {
+                        let frame = event.params["frameId"]
+                            .as_str()
+                            .or_else(|| event.params["frame"]["id"].as_str());
+                        if let Some(frame) = frame.filter(|frame| {
+                            self.browser.as_ref().is_some_and(|browser| {
+                                browser.session_id_for_target(frame) == Some(session)
+                            })
+                        }) {
+                            self.documents.note(session, frame, &event);
+                        }
                     }
 
                     let session_matches = if let Some(ref browser) = self.browser {
@@ -17868,6 +17904,68 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             let auto_handled = auto_dialog && matches!(*dialog_type, "beforeunload" | "alert");
             assert!(!auto_handled, "{dialog_type} should NOT be auto-handled");
         }
+    }
+
+    /// The daemon reads whether a page is between documents from each page's
+    /// own events, whichever page is active: a page switched to is still
+    /// between documents if it was, a child frame's navigation is not its
+    /// page's, the commit settles it, and a page that went away is forgotten.
+    #[tokio::test]
+    async fn every_pages_own_events_say_whether_it_is_between_documents() {
+        use super::super::cdp::types::CdpEvent;
+        let page = |tab_id: u32, target: &str| super::super::browser::PageInfo {
+            tab_id,
+            label: None,
+            target_id: target.into(),
+            session_id: format!("S{tab_id}"),
+            url: "https://shop.example/".into(),
+            title: String::new(),
+            target_type: "page".into(),
+        };
+        let mut state = DaemonState::new();
+        state.browser = Some(
+            super::super::browser::tests::test_manager(vec![page(1, "T1"), page(2, "T2")]).await,
+        );
+        let (events, receiver) = tokio::sync::broadcast::channel(16);
+        state.event_rx = Some(receiver);
+        let send = |session: Option<&str>, method: &str, params: Value| {
+            events
+                .send(CdpEvent {
+                    method: method.into(),
+                    params,
+                    session_id: session.map(String::from),
+                })
+                .unwrap();
+        };
+        let leaving =
+            |frame: &str| json!({ "frameId": frame, "navigationType": "differentDocument" });
+
+        send(Some("S2"), "Page.frameStartedNavigating", leaving("T2"));
+        send(Some("S1"), "Page.frameStartedNavigating", leaving("CHILD"));
+        state.drain_cdp_events_background().await.unwrap();
+        assert!(!state.active_page_between_documents());
+        assert!(state.between_documents("S2"));
+
+        send(Some("S1"), "Page.frameStartedNavigating", leaving("T1"));
+        state.drain_cdp_events_background().await.unwrap();
+        assert!(state.active_page_between_documents());
+
+        send(
+            Some("S1"),
+            "Page.frameNavigated",
+            json!({ "frame": { "id": "T1", "loaderId": "L2", "url": "https://shop.example/next" } }),
+        );
+        state.drain_cdp_events_background().await.unwrap();
+        assert!(!state.active_page_between_documents());
+        assert!(state.between_documents("S2"));
+
+        send(
+            None,
+            "Target.detachedFromTarget",
+            json!({ "sessionId": "S2" }),
+        );
+        state.drain_cdp_events_background().await.unwrap();
+        assert!(!state.between_documents("S2"));
     }
 
     /// A fence that refuses every command it is asked about and counts them.

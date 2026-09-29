@@ -33,6 +33,7 @@ use crate::native::actions::DaemonState;
 use crate::native::browser_control::Interrupts;
 use crate::native::cdp::client::CdpClient;
 use crate::native::cdp::types::CdpEvent;
+use crate::native::documents;
 
 /// The page is quiet once this long has passed without a mutation or a
 /// scroll.
@@ -167,8 +168,8 @@ struct Recorded {
     committed: Option<String>,
     /// The main frame's URL after its last navigation of either kind.
     url: Option<String>,
-    /// A main-frame document navigation began and has neither committed nor
-    /// stopped.
+    /// The page is between documents (`documents`), from what this step
+    /// saw.
     navigating: bool,
     /// HTTP status of each main-frame document response, by loader.
     statuses: HashMap<String, i64>,
@@ -196,12 +197,11 @@ impl Recorded {
             self.closed |= params["sessionId"] == session;
             return;
         }
-        if event.method == "Browser.downloadWillBegin" && params["frameId"] == frame {
-            self.navigating = false;
-            return;
-        }
         if event.session_id.as_deref() != Some(session) {
             return;
+        }
+        if let Some(change) = documents::change(event, frame) {
+            self.navigating = change == documents::Change::Leaving;
         }
         let main = params["frameId"] == frame;
         match event.method.as_str() {
@@ -215,24 +215,9 @@ impl Recorded {
                     self.activity = Some(now);
                 }
             }
-            "Page.frameStartedNavigating" if main => {
-                let within = matches!(
-                    params["navigationType"].as_str(),
-                    Some("sameDocument" | "historySameDocument")
-                );
-                self.navigating |= !within;
-            }
-            "Page.frameStartedLoading" if main => self.navigating = true,
-            "Page.frameStoppedLoading" | "Page.downloadWillBegin" if main => {
-                self.navigating = false
-            }
-            "Page.frameNavigated" => {
-                let committed = &params["frame"];
-                if committed["id"] == frame && committed.get("parentId").is_none() {
-                    self.committed = committed["loaderId"].as_str().map(String::from);
-                    self.url = committed["url"].as_str().map(String::from);
-                    self.navigating = false;
-                }
+            "Page.frameNavigated" if params["frame"]["id"] == frame => {
+                self.committed = params["frame"]["loaderId"].as_str().map(String::from);
+                self.url = params["frame"]["url"].as_str().map(String::from);
             }
             "Page.navigatedWithinDocument" if main => {
                 self.url = params["url"].as_str().map(String::from);
@@ -725,21 +710,17 @@ mod tests {
             let recorded = noted(&[event("Page.frameStartedNavigating", start.clone())]);
             assert_eq!(recorded.navigating, navigating, "{start}");
         }
+        // A 204, a download and a stop all end the main frame's loading
+        // without a commit.
         let stopped = noted(&[
-            event("Page.frameStartedLoading", json!({ "frameId": FRAME })),
+            event(
+                "Page.frameStartedNavigating",
+                json!({ "frameId": FRAME, "navigationType": "differentDocument" }),
+            ),
             event("Page.frameStoppedLoading", json!({ "frameId": FRAME })),
         ]);
         assert!(!stopped.navigating);
         assert_eq!(stopped.navigation("L1"), None);
-        let downloaded = noted(&[
-            event("Page.frameStartedLoading", json!({ "frameId": FRAME })),
-            CdpEvent {
-                method: "Browser.downloadWillBegin".into(),
-                params: json!({ "frameId": FRAME, "url": "https://shop.example/file.pdf" }),
-                session_id: None,
-            },
-        ]);
-        assert!(!downloaded.navigating);
     }
 
     #[test]
