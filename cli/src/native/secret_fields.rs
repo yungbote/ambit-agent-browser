@@ -29,6 +29,7 @@ use super::agent_channel::ceiling::{self, Interaction, TargetFacts};
 use super::agent_channel::target::{self, Recorders, FACTS, FOCUSED, WORLD};
 use super::cdp::client::CdpClient;
 use super::cdp::types::CdpEvent;
+use super::documents::{self, NAVIGATION_PENDING, NAVIGATION_PENDING_MESSAGE};
 
 /// The refusal of an effect no ceiling admits, as the channel answers it.
 const REFUSED: &str = "browser_effect_refused";
@@ -39,19 +40,48 @@ const UNREAD: &str = "browser_observation_stale";
 /// Frames within frames followed to the element that has focus.
 const MOST_FRAMES: usize = 8;
 
+/// What a host-bound command does with a field before it acts.
+enum FieldUse<'a> {
+    /// Enters a value into the field its selector names: `fill`, `type` and
+    /// `select`, which the channel judges as typing into that element.
+    Enters(&'a str),
+    /// Reads what the field its selector names holds: `get value`.
+    Reads(&'a str),
+    /// Types into whatever has focus, with a key that may type.
+    Types,
+}
+
+fn field_use(command: &Value) -> Option<FieldUse<'_>> {
+    match command["action"].as_str()? {
+        "fill" | "type" | "select" => Some(FieldUse::Enters(command["selector"].as_str()?)),
+        "inputvalue" => Some(FieldUse::Reads(command["selector"].as_str()?)),
+        "press" | "keydown" => {
+            may_type(ceiling::key_interaction(command["key"].as_str()?)).then_some(FieldUse::Types)
+        }
+        "keyboard" => Some(FieldUse::Types),
+        _ => None,
+    }
+}
+
+/// Whether the host path reads the page for `command` before it acts: the
+/// field the command names, or the field that has focus before a key that
+/// may type. Such a command is refused while the page is between documents
+/// (`documents`), which answers nothing until it commits.
+pub(crate) fn reads_page(command: &Value) -> bool {
+    field_use(command).is_some()
+}
+
 /// The refusal of a host-bound call that enters a value into a secret field
-/// it names (`fill`, `type` and `select`, which the channel judges as typing
-/// into that element) or reads the value one holds (`get value`), before the
-/// call does anything; `None` admits it. A name that matches nothing is
-/// admitted, and the call reports its own miss. A page a dialog blocks is not
-/// read: the call meets that dialog's refusal instead.
+/// it names or reads the value one holds, before the call does anything;
+/// `None` admits it. A name that matches nothing is admitted, and the call
+/// reports its own miss. A page a dialog blocks is not read: the call meets
+/// that dialog's refusal instead.
 pub(crate) async fn named_field_refusal(command: &Value, state: &DaemonState) -> Option<Value> {
-    let reads = match command["action"].as_str()? {
-        "fill" | "type" | "select" => false,
-        "inputvalue" => true,
-        _ => return None,
+    let (selector, reads) = match field_use(command)? {
+        FieldUse::Enters(selector) => (selector, false),
+        FieldUse::Reads(selector) => (selector, true),
+        FieldUse::Types => return None,
     };
-    let selector = command["selector"].as_str()?;
     let browser = state.browser.as_ref()?;
     if state.dialog_blocks_active_page() {
         return None;
@@ -118,6 +148,9 @@ pub(crate) enum KeyRefusal {
     /// A JavaScript dialog opened for the page: nothing in it answers, and
     /// keys would go to the dialog, until someone answers it.
     Dialog,
+    /// The page began loading another document: it answers nothing until
+    /// that commits, and its keys would reach whichever document then shows.
+    Leaving,
     /// The field that has focus could not be read.
     Unread(String),
 }
@@ -136,8 +169,12 @@ impl KeyRefusal {
             (Self::Unread(error), false) => {
                 return format!("{UNREAD}: The field that has focus could not be read ({error}), so nothing was typed. Observe the page again.").into()
             }
+            (Self::Leaving, false) => {
+                return format!("{NAVIGATION_PENDING}: {NAVIGATION_PENDING_MESSAGE}").into()
+            }
             (Self::Secret, true) => format!("focus moved into {SECRET}"),
             (Self::Unread(error), true) => format!("the field that has focus could not be read ({error})"),
+            (Self::Leaving, true) => "the page began loading another document".to_string(),
             (Self::Dialog, _) => "a JavaScript dialog opened for the page; answer it first".to_string(),
         };
         CommandError::with_data(
@@ -212,20 +249,21 @@ impl FocusedField {
     /// Why `event`, a keyboard event in the display helper's shape, must not
     /// reach the field that has focus in `session`'s page; `None` when it
     /// may. An event that cannot type is admitted without a reading. A
-    /// JavaScript dialog opening for the page ends the reading: the page
-    /// answers nothing until someone answers the dialog.
+    /// JavaScript dialog opening for the page, or the page beginning to load
+    /// another document, ends the reading: the page answers nothing until
+    /// the dialog is answered or the document commits.
     pub(crate) async fn refuses(
         &mut self,
         client: &CdpClient,
         session: &str,
         event: &Value,
-        dialogs: &mut broadcast::Receiver<CdpEvent>,
+        events: &mut broadcast::Receiver<CdpEvent>,
     ) -> Option<KeyRefusal> {
         let interaction = key_interaction(event).filter(|interaction| may_type(*interaction))?;
         let page = client.page_of(session);
         let facts = tokio::select! {
             biased;
-            () = dialog_opens(client, &page, dialogs) => return Some(KeyRefusal::Dialog),
+            blocked = page_blocks(client, &page, events) => return Some(blocked),
             facts = self.facts(client, &page) => facts,
         };
         match facts {
@@ -315,9 +353,15 @@ impl FocusedField {
     }
 }
 
-/// Completes when a JavaScript dialog opens for `page` or one of its frames;
+/// Completes when a JavaScript dialog opens for `page` or one of its
+/// frames, or when the page's main frame begins loading another document;
 /// never when the events end.
-async fn dialog_opens(client: &CdpClient, page: &str, events: &mut broadcast::Receiver<CdpEvent>) {
+async fn page_blocks(
+    client: &CdpClient,
+    page: &str,
+    events: &mut broadcast::Receiver<CdpEvent>,
+) -> KeyRefusal {
+    let main_frame = client.target_for_session(page);
     loop {
         match events.recv().await {
             Ok(event)
@@ -327,7 +371,15 @@ async fn dialog_opens(client: &CdpClient, page: &str, events: &mut broadcast::Re
                         .as_deref()
                         .is_none_or(|session| client.page_of(session) == page) =>
             {
-                return
+                return KeyRefusal::Dialog
+            }
+            Ok(event)
+                if event.session_id.as_deref() == Some(page)
+                    && main_frame.as_deref().is_some_and(|frame| {
+                        documents::change(&event, frame) == Some(documents::Change::Leaving)
+                    }) =>
+            {
+                return KeyRefusal::Leaving
             }
             Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => {}
             Err(broadcast::error::RecvError::Closed) => std::future::pending().await,
@@ -410,6 +462,43 @@ mod tests {
         }
     }
 
+    /// The host path reads the page for a command that names a field it
+    /// enters or reads, and for keys that may type into the focused field;
+    /// never for a key that cannot type or a command about no field.
+    #[test]
+    fn the_host_path_reads_the_page_for_a_named_field_and_keys_that_may_type() {
+        for (command, reads) in [
+            (
+                json!({ "action": "fill", "selector": "#pw", "value": "x" }),
+                true,
+            ),
+            (
+                json!({ "action": "type", "selector": "#pw", "text": "x" }),
+                true,
+            ),
+            (
+                json!({ "action": "select", "selector": "#month", "values": ["02"] }),
+                true,
+            ),
+            (json!({ "action": "inputvalue", "selector": "#pw" }), true),
+            (json!({ "action": "press", "key": "a" }), true),
+            (json!({ "action": "press", "key": "Control+v" }), true),
+            (json!({ "action": "press", "key": "Enter" }), true),
+            (json!({ "action": "keydown", "key": " " }), true),
+            (
+                json!({ "action": "keyboard", "subaction": "type", "text": "x" }),
+                true,
+            ),
+            (json!({ "action": "press", "key": "Tab" }), false),
+            (json!({ "action": "keydown", "key": "Shift" }), false),
+            (json!({ "action": "keyup", "key": "a" }), false),
+            (json!({ "action": "click", "selector": "#pw" }), false),
+            (json!({ "action": "fill" }), false),
+        ] {
+            assert_eq!(reads_page(&command), reads, "{command}");
+        }
+    }
+
     /// Reading the focused field only for the keys `may_type` names loses
     /// nothing: every other interaction is admitted on every secret target
     /// under some ceiling, and each named one is refused on some.
@@ -476,6 +565,16 @@ mod tests {
                 json!({ "executionStopped": true, "effectsMayHaveOccurred": true, "charactersTyped": 4 })
             )
         );
+        let leaving = KeyRefusal::Leaving.stopped(false, 0, 3);
+        assert!(
+            leaving.error.starts_with("browser_navigation_pending: "),
+            "{}",
+            leaving.error
+        );
+        assert!(KeyRefusal::Leaving
+            .stopped(true, 2, 3)
+            .error
+            .contains("after 2 of 3 characters: the page began loading another document"));
         let dialog = KeyRefusal::Dialog.stopped(false, 0, 3);
         assert!(dialog.error.starts_with("browser_operation_interrupted: Typing stopped after 0 of 3 characters: a JavaScript dialog"), "{}", dialog.error);
         assert_eq!(

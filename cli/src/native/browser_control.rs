@@ -550,9 +550,9 @@ impl BrowserControl {
         client: &CdpClient,
         session: &str,
     ) -> Result<(), CommandError> {
-        let mut dialogs = client.subscribe();
+        let mut page_events = client.subscribe();
         let refusal = FocusedField::new(self.recorders.clone())
-            .refuses(client, session, event, &mut dialogs)
+            .refuses(client, session, event, &mut page_events)
             .await;
         match refusal {
             None => Ok(()),
@@ -595,9 +595,10 @@ impl BrowserControl {
     /// typing before the next press, and the report says exactly how many
     /// characters went in. A stroke that would type into a secret field
     /// that has focus when it is due is never sent (`secret_fields`), however
-    /// focus got there: a stroke of this command, a click or the page. A
-    /// stroke that may have started leaves an uncertain outcome and releases
-    /// whatever the helper holds.
+    /// focus got there: a stroke of this command, a click or the page; and
+    /// typing stops when a dialog opens or the page begins loading another
+    /// document before such a stroke. A stroke that may have started leaves
+    /// an uncertain outcome and releases whatever the helper holds.
     pub(crate) async fn agent_native_keys(
         &mut self,
         events: &[Value],
@@ -616,7 +617,7 @@ impl BrowserControl {
         let total = strokes.iter().map(|stroke| stroke.characters).sum();
         let mut raised = self.interrupts.subscribe();
         let mut focused = FocusedField::new(self.recorders.clone());
-        let mut dialogs = client.subscribe();
+        let mut page_events = client.subscribe();
         let _paced = paced::Span::begin();
         let mut typed = 0;
         for (index, stroke) in strokes.iter().enumerate() {
@@ -638,7 +639,12 @@ impl BrowserControl {
             // Read when the stroke is due, a whole interval after the one
             // before it went, so the page has taken what came before.
             if let Some(refusal) = focused
-                .refuses(client, session, &events[stroke.events.start], &mut dialogs)
+                .refuses(
+                    client,
+                    session,
+                    &events[stroke.events.start],
+                    &mut page_events,
+                )
                 .await
             {
                 return Err(refusal.stopped(index > 0, typed, total));

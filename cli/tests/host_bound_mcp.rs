@@ -36,10 +36,9 @@ impl Host {
 
     /// A host whose browser is an owned window, as in an Ambit image.
     fn owned_window() -> Self {
-        Self {
-            window: true,
-            ..Self::new()
-        }
+        let mut host = Self::new();
+        host.window = true;
+        host
     }
 
     fn path(&self, name: &str) -> std::path::PathBuf {
@@ -164,7 +163,8 @@ impl Host {
         assert_eq!(browser["session"], "browser");
         let capture = &browser["capture"];
         let path = Path::new(capture["path"].as_str().unwrap());
-        assert!(path.starts_with(self.path("captures")));
+        // The binding canonicalizes its capture directory.
+        assert!(path.starts_with(self.path("captures").canonicalize().unwrap()));
         let bytes = fs::read(path).unwrap();
         assert_eq!(capture["sizeBytes"], bytes.len());
         assert_eq!(
@@ -176,6 +176,32 @@ impl Host {
         assert_eq!(capture["height"], image.height());
         assert_eq!(capture["coordinateSpace"]["name"], "viewport-css");
         browser.clone()
+    }
+}
+
+impl Drop for Host {
+    /// A test ends the session its calls started through the binding, as
+    /// the host does: the daemon closes its browser and exits, a failed
+    /// test's included. An owned window's daemon never idles out.
+    fn drop(&mut self) {
+        if !self
+            .path("sockets/namespaces/host-mcp-test/run/browser.sock")
+            .exists()
+        {
+            return;
+        }
+        let Ok(mut child) = self.command().spawn() else {
+            return;
+        };
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = writeln!(
+                stdin,
+                "{}",
+                json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                    "params": { "name": "agent_browser_close", "arguments": {} } })
+            );
+        }
+        let _ = child.wait_with_output();
     }
 }
 

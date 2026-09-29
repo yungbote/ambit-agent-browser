@@ -1939,6 +1939,56 @@ async fn a_dialog_that_opens_while_typing_stops_it() {
     assert!(ops.try_recv().is_err());
 }
 
+/// A page that begins loading another document while the agent types stops
+/// the typing: it answers nothing until the document commits, and later keys
+/// would reach whichever document then shows.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_navigation_that_begins_while_typing_stops_it() {
+    let (display, mut ops, _frames) = acknowledging_display();
+    // The reading before 'b' is never answered: the page is between documents.
+    let browser = Browser::typing_into(vec![Some(text_field()), None]).await;
+    // The page's session belongs to its target, whose id is its main frame's.
+    browser
+        .responses
+        .send(json!({ "method": "Target.attachedToTarget", "params": { "sessionId": "page",
+            "targetInfo": { "targetId": "T", "type": "page", "title": "", "url": "https://shop.test/",
+                "attached": true, "canAccessOpener": false }, "waitingForDebugger": false } }))
+        .await
+        .unwrap();
+    while browser.client.target_for_session("page").is_none() {
+        tokio::task::yield_now().await;
+    }
+    let mut control = BrowserControl {
+        display: Some(display),
+        ..BrowserControl::default()
+    };
+    let events = super::super::interaction::native_text_events("abc");
+    let typing = control.agent_native_keys(&events, motion::KEY_INTERVAL, &browser.client, "page");
+    let navigation = async {
+        assert_eq!(ops.recv().await.unwrap()["events"][0]["key"], "a");
+        browser
+            .responses
+            .send(
+                json!({ "method": "Page.frameStartedNavigating", "sessionId": "page",
+                "params": { "frameId": "T", "url": "https://shop.test/next", "loaderId": "L2",
+                    "navigationType": "differentDocument" } }),
+            )
+            .await
+            .unwrap();
+    };
+    let (stopped, ()) = tokio::join!(typing, navigation);
+    let stopped = stopped.unwrap_err();
+    assert!(
+        stopped.error.starts_with(
+            "browser_operation_interrupted: Typing stopped after 1 of 3 characters: the page began loading another document"
+        ),
+        "{}",
+        stopped.error
+    );
+    assert!(ops.try_recv().is_err());
+}
+
 /// A takeover stops typing after the key in flight: nothing is held
 /// between keys, and the report counts exactly the characters the helper
 /// received.
