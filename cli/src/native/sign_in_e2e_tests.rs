@@ -177,7 +177,7 @@ const FORM: &str = r#"<!doctype html><title>Sign-in fixture</title>
 const report=(kind,extra)=>fetch('/report?'+new URLSearchParams({kind,webdriver:String(navigator.webdriver),...extra}));
 report('load',{cookie:document.cookie});
 for(const type of ['pointermove','pointerdown','keydown','paste'])document.addEventListener(type,e=>report('event',{type}),true);
-form.addEventListener('submit',event=>{event.preventDefault();report('submit',{value:email.value})});
+form.addEventListener('submit',event=>{event.preventDefault();report('submit',{value:email.value}).then(()=>report('signed_in',{}))});
 </script>"#;
 
 impl Site {
@@ -229,12 +229,22 @@ impl Site {
                             ("200 OK", "Content-Type: text/plain\r\n", "released")
                         }
                         "/report" => {
-                            recorded.lock().unwrap().push(
+                            let mut report: HashMap<String, String> =
                                 url::form_urlencoded::parse(query.as_bytes())
                                     .into_owned()
-                                    .collect(),
-                            );
-                            ("204 No Content", "", "")
+                                    .collect();
+                            let submitted = report.get("kind").is_some_and(|kind| kind == "submit");
+                            // Deliberate nosecret fixture cookie; only its presence is
+                            // reported, never a credential or cookie value.
+                            let signed_in = request.lines().any(|line| {
+                                line.to_ascii_lowercase().starts_with("cookie:")
+                                    && line.contains("ambit_recent_sign_in=1")
+                            });
+                            report.insert("recentSignIn".into(), signed_in.to_string());
+                            recorded.lock().unwrap().push(report);
+                            ("204 No Content", if submitted {
+                                "Set-Cookie: ambit_recent_sign_in=1; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax\r\n"
+                            } else { "" }, "")
                         }
                         "/" => ("200 OK", "Content-Type: text/html\r\n", FORM),
                         _ => ("404 Not Found", "", ""),
@@ -617,6 +627,10 @@ async fn e2e_sign_in_relaunches_without_automation_and_hands_back() {
     };
     assert_eq!(submitted["value"], TYPED);
     assert_eq!(submitted["webdriver"], "false");
+    assert_eq!(
+        site.wait_for_report("signed_in", 0).await["recentSignIn"],
+        "true"
+    );
     viewer.never_failed_since(before);
 
     // Hand back: automation again, on the same profile, tabs and cookies.
@@ -666,6 +680,21 @@ async fn e2e_sign_in_relaunches_without_automation_and_hands_back() {
         .as_str()
         .unwrap()
         .contains("ambit_sign_in=1"));
+    // The restored DOM can show the signed-in page even when SIGTERM lost
+    // its recent cookie. A real navigation must still send the new HttpOnly
+    // cookie to the fixture, which a cached page cannot prove.
+    let loads = site.reports("load").len();
+    assert_success(
+        &command(
+            &json!({ "action": "navigate", "url": site.page("/") }),
+            &mut state,
+        )
+        .await,
+    );
+    assert_eq!(
+        site.wait_for_report("load", loads).await["recentSignIn"],
+        "true"
+    );
     let tabs = command(&json!({ "action": "tab_list" }), &mut state).await;
     let urls: Vec<String> = assert_success(&tabs)["tabs"]
         .as_array()

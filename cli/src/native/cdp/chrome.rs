@@ -248,9 +248,10 @@ impl ChromeProcess {
         }
     }
 
-    /// Close Chrome without DevTools, as a person closing it would: SIGTERM
-    /// lets the browser save its session and profile, and whatever remains
-    /// after `timeout` is killed with its process group. Blocking.
+    /// Bounded signal-close fallback when native window closure is unavailable.
+    /// SIGTERM gives the process a chance to exit; it does not guarantee that
+    /// Chrome flushes a recent sign-in. Whatever remains after `timeout` is
+    /// killed with its process group. Blocking.
     pub(crate) fn terminate(&mut self, timeout: Duration) {
         #[cfg(target_os = "linux")]
         if let Some(display) = self.display_client() {

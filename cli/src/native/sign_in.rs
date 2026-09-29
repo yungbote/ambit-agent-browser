@@ -62,12 +62,46 @@ impl SignInBrowser {
         self.chrome.has_exited()
     }
 
-    /// Close it as a person would; its profile and display stay retained by
-    /// whoever relaunches into them.
+    /// Ask its owned windows to close so Chrome flushes recent sign-ins;
+    /// its profile and display stay retained by whoever relaunches into them.
+    /// Older helpers retain the bounded signal-close path.
     pub(crate) async fn stop(self) {
         let mut chrome = self.chrome;
-        let _ = tokio::task::spawn_blocking(move || chrome.terminate(STOP)).await;
+        let deadline = std::time::Instant::now() + STOP;
+        #[cfg(target_os = "linux")]
+        let window_close = if let Some(display) = chrome.display_client() {
+            close_owned_windows(&display, deadline).await
+        } else {
+            false
+        };
+        #[cfg(not(target_os = "linux"))]
+        let window_close = false;
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        let _ = tokio::task::spawn_blocking(move || {
+            if window_close {
+                chrome.wait_or_kill(remaining);
+            } else {
+                chrome.terminate(remaining);
+            }
+        })
+        .await;
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn close_owned_windows(display: &DisplayClient, deadline: std::time::Instant) -> bool {
+    if !display.has("closeWindows") {
+        return false;
+    }
+    display.retire();
+    matches!(
+        tokio::time::timeout_at(
+            Instant::from_std(deadline),
+            display.request(serde_json::json!({ "op": "close_windows" }))
+        )
+        .await,
+        Ok(Ok(_))
+    )
 }
 
 impl DaemonState {
@@ -309,6 +343,86 @@ mod tests {
     use crate::native::stream::layout;
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+
+    #[tokio::test]
+    async fn native_window_close_is_sent_once_only_when_advertised() {
+        let (legacy, peer, _frames) = DisplayClient::test_channel();
+        assert!(!close_owned_windows(&legacy, std::time::Instant::now() + STOP).await);
+        let mut unread = [0_u8; 64];
+        assert_eq!(
+            peer.try_read(&mut unread).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        assert!(legacy.available());
+
+        let (display, peer, _frames) = DisplayClient::test_channel();
+        display.advertise(&["closeWindows"]);
+        let mut peer = BufReader::new(peer);
+        let closing = tokio::spawn({
+            let display = display.clone();
+            async move { close_owned_windows(&display, std::time::Instant::now() + STOP).await }
+        });
+        let mut line = String::new();
+        peer.read_line(&mut line).await.unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(request["op"], "close_windows");
+        peer.get_mut()
+            .write_all(
+                format!(
+                    "{}\n",
+                    json!({ "id": request["id"], "success": true, "data": {} })
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        assert!(closing.await.unwrap());
+        assert!(display.available());
+    }
+
+    #[tokio::test]
+    async fn a_refused_native_close_keeps_the_signal_fallback() {
+        let (display, peer, _frames) = DisplayClient::test_channel();
+        display.advertise(&["closeWindows"]);
+        let mut peer = BufReader::new(peer);
+        let closing = tokio::spawn({
+            let display = display.clone();
+            async move { close_owned_windows(&display, std::time::Instant::now() + STOP).await }
+        });
+        let mut line = String::new();
+        peer.read_line(&mut line).await.unwrap();
+        let request: Value = serde_json::from_str(&line).unwrap();
+        peer.get_mut().write_all(format!("{}\n", json!({ "id": request["id"], "success": false, "error": {"code":"display_unavailable", "message":"fixture", "operationPerformed":false} })).as_bytes()).await.unwrap();
+        assert!(!closing.await.unwrap());
+        assert!(
+            display.available(),
+            "a refused operation did not break the transport"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unacknowledged_native_close_ends_at_the_existing_shutdown_deadline() {
+        let (display, peer, _frames) = DisplayClient::test_channel();
+        display.advertise(&["closeWindows"]);
+        let mut peer = BufReader::new(peer);
+        let closing = tokio::spawn({
+            let display = display.clone();
+            async move {
+                close_owned_windows(
+                    &display,
+                    std::time::Instant::now() + Duration::from_millis(50),
+                )
+                .await
+            }
+        });
+        let mut line = String::new();
+        peer.read_line(&mut line).await.unwrap();
+        assert!(!closing.await.unwrap());
+        assert!(
+            !display.available(),
+            "an uncertain reply cannot be read as another command's response"
+        );
+    }
 
     /// A cropping presenter's size-class layout leaves the framebuffer (the
     /// surface) larger than the window: both relaunches keep the window's
