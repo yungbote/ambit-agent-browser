@@ -43,6 +43,7 @@ pub mod react;
 pub mod recording;
 #[allow(dead_code)]
 pub mod screenshot;
+pub(crate) mod secret_fields;
 pub(crate) mod selection;
 #[allow(dead_code)]
 pub mod snapshot;

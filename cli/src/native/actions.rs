@@ -2781,9 +2781,10 @@ pub(crate) trait HostFence {
 }
 
 /// A host-bound command once the window admitted it, as both transports run
-/// it: the custody gate, the observation gate and the caller's fence, then
-/// the operation, after the launch the request carries, under the host
-/// deadline. `cmd` still carries the host's request.
+/// it: the custody gate, the observation gate, the caller's fence and the
+/// secret field the command may name (`secret_fields`), then the operation,
+/// after the launch the request carries, under the host deadline. `cmd`
+/// still carries the host's request.
 pub(crate) async fn run_host_command(
     cmd: &Value,
     request: &super::feedback::FeedbackRequest,
@@ -2804,7 +2805,8 @@ pub(crate) async fn run_host_command(
         fence.fences_point(),
     );
     // A person's control is reported before a stale page, and the fence is
-    // asked only once both gates admitted the command.
+    // asked only once both gates admitted the command; a field it names is
+    // read on the page the fence admitted.
     let refusal = if let Some(error) = controlled {
         Some(
             json!({ "id": command["id"], "success": false, "code": error.code, "error": error.message }),
@@ -2813,8 +2815,10 @@ pub(crate) async fn run_host_command(
         Some(
             json!({ "id": command["id"], "success": false, "code": "browser_observation_required", "error": window_actions::OBSERVATION_REQUIRED }),
         )
+    } else if let Err(refusal) = fence.admit(&command, state).await {
+        Some(refusal)
     } else {
-        fence.admit(&command, state).await.err()
+        super::secret_fields::named_field_refusal(&command, state).await
     };
     let response = if let Some(refusal) = refusal {
         refusal

@@ -215,6 +215,7 @@ pub(crate) fn error_code(error: &str) -> Option<&str> {
             | super::playwright::PROGRAM_ERROR
             | "browser_control_outcome_unknown"
             | "browser_controlled_by_user"
+            | "browser_effect_refused"
             | "browser_observation_stale"
     ) || code.starts_with("webmcp_")
         || code.starts_with("browser_operation_");

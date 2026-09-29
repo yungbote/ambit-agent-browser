@@ -12,17 +12,30 @@ const BIN: &str = env!("CARGO_BIN_EXE_agent-browser");
 
 struct Host {
     directory: TempDir,
+    /// The browser is an owned window driven through the display helper
+    /// (`AGENT_BROWSER_DISPLAY_HELPER`), as an Ambit image runs it, instead
+    /// of a headless one.
+    window: bool,
 }
 
 impl Host {
     fn new() -> Self {
         let host = Self {
             directory: tempfile::tempdir().unwrap(),
+            window: false,
         };
         fs::create_dir(host.path("captures")).unwrap();
         fs::create_dir(host.path("sockets")).unwrap();
         host.configure(None);
         host
+    }
+
+    /// A host whose browser is an owned window, as in an Ambit image.
+    fn owned_window() -> Self {
+        Self {
+            window: true,
+            ..Self::new()
+        }
     }
 
     fn path(&self, name: &str) -> std::path::PathBuf {
@@ -62,12 +75,21 @@ impl Host {
             .arg(self.path("config.json"))
             .env("AGENT_BROWSER_SOCKET_DIR", self.path("sockets"))
             .env("AGENT_BROWSER_NO_WEBMCP", "1")
-            .env("AGENT_BROWSER_HEADED", "false")
             .env("AGENT_BROWSER_IDLE_TIMEOUT", "20s")
             .env("NO_COLOR", "1")
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
+        if self.window {
+            command
+                .env("AGENT_BROWSER_WINDOW_STREAM", "1")
+                .env("DISPLAY", "");
+            if let Ok(helper) = std::env::var("AGENT_BROWSER_DISPLAY_HELPER") {
+                command.env("AGENT_BROWSER_DISPLAY_HELPER", helper);
+            }
+        } else {
+            command.env("AGENT_BROWSER_HEADED", "false");
+        }
         if let Ok(chrome) = std::env::var("AMBIT_TEST_CHROME_EXECUTABLE") {
             command.env("AGENT_BROWSER_EXECUTABLE_PATH", chrome);
         }
@@ -613,4 +635,132 @@ fn host_playwright_program_that_fails_before_any_call_is_a_program_error() {
         host.call("agent_browser_close", json!({}))["isError"],
         false
     );
+}
+
+/// A form with the person's secret fields beside a plain one: a password
+/// the person already typed, a one-time code and a card expiry month.
+const SIGN_IN_FORM: &str = "data:text/html,<title>Sign in</title><style>input,select{display:block;height:40px;width:240px}</style><form method=post action=/session><input id=name autocomplete=username><input id=password type=password autocomplete=current-password value=person-typed><input id=code autocomplete=one-time-code><select id=month autocomplete=cc-exp-month><option>01</option><option>02</option></select></form>";
+
+/// What the form's fields hold, in order: name, password, code, month.
+fn form_values(host: &Host) -> Value {
+    let read = host.call(
+        "agent_browser_eval",
+        json!({ "script": "[...document.querySelectorAll('input, select')].map((field) => field.value)" }),
+    );
+    read["structuredContent"]["response"]["data"]["result"].clone()
+}
+
+/// The person's secret fields on the file protocol: a call that names a
+/// password, one-time-code or payment field is refused before it does
+/// anything, whether it would type into it, select a value in it or read
+/// what it holds; the same calls on a plain field go through.
+#[test]
+#[ignore = "requires AMBIT_TEST_CHROME_EXECUTABLE with working Chrome sandbox"]
+fn host_secret_fields_are_never_entered_or_read() {
+    let host = Host::new();
+    let opened = host.call("agent_browser_open", json!({ "url": SIGN_IN_FORM }));
+    assert_eq!(opened["isError"], false, "{opened}");
+    for (name, arguments) in [
+        (
+            "agent_browser_fill",
+            json!({ "selector": "#password", "text": "hunter2" }),
+        ),
+        (
+            "agent_browser_type",
+            json!({ "selector": "#code", "text": "123456" }),
+        ),
+        (
+            "agent_browser_select",
+            json!({ "selector": "#month", "values": ["02"] }),
+        ),
+        ("agent_browser_get_value", json!({ "selector": "#password" })),
+    ] {
+        let refused = host.call(name, arguments);
+        let response = &refused["structuredContent"]["response"];
+        assert_eq!(response["code"], "browser_effect_refused", "{name} {refused}");
+        // The answer never carries what the field holds (the page's own
+        // address, which the fixture writes it into, is feedback).
+        assert!(!response.to_string().contains("person-typed"), "{refused}");
+        assert!(!refused["content"].to_string().contains("person-typed"), "{refused}");
+    }
+    assert_eq!(form_values(&host), json!(["", "person-typed", "", "01"]));
+    let filled = host.call(
+        "agent_browser_fill",
+        json!({ "selector": "#name", "text": "someone" }),
+    );
+    assert_eq!(filled["isError"], false, "{filled}");
+    let read = host.call("agent_browser_get_value", json!({ "selector": "#name" }));
+    assert_eq!(read["structuredContent"]["response"]["data"]["value"], "someone");
+    assert_eq!(host.call("agent_browser_close", json!({}))["isError"], false);
+}
+
+/// In the owned window every key the agent sends is checked against the
+/// field that has focus when it is due: typing that tabs from the name
+/// into the password stops at the password, a key that would type into a
+/// focused secret field is refused, and keys that only move focus go.
+/// `AMBIT_SECRET_FIELDS_TRIALS` repeats the tab into the password (default
+/// 20); a single character reaching the password fails the test.
+#[test]
+#[cfg(target_os = "linux")]
+#[ignore = "requires AMBIT_TEST_CHROME_EXECUTABLE, Xvfb and AGENT_BROWSER_DISPLAY_HELPER"]
+fn host_owned_window_typing_never_reaches_a_secret_field() {
+    let host = Host::owned_window();
+    let trials: usize = std::env::var("AMBIT_SECRET_FIELDS_TRIALS")
+        .ok()
+        .and_then(|trials| trials.parse().ok())
+        .unwrap_or(20);
+    for trial in 0..trials {
+        let opened = host.call("agent_browser_open", json!({ "url": SIGN_IN_FORM }));
+        assert_eq!(opened["isError"], false, "{opened}");
+        let clicked = host.call("agent_browser_click", json!({ "selector": "#name" }));
+        assert_eq!(clicked["isError"], false, "{clicked}");
+        let typed = host.call(
+            "agent_browser_keyboard_type",
+            json!({ "text": "someone\thunter2" }),
+        );
+        let response = &typed["structuredContent"]["response"];
+        assert_eq!(response["code"], "browser_operation_interrupted", "trial {trial}: {typed}");
+        assert_eq!(response["data"]["charactersTyped"], 7, "trial {trial}: {typed}");
+        assert!(
+            response["error"].as_str().unwrap().contains(
+                "Typing stopped after 7 of 14 characters: focus moved into a password"
+            ),
+            "trial {trial}: {typed}"
+        );
+        assert_eq!(
+            form_values(&host),
+            json!(["someone", "person-typed", "", "01"]),
+            "trial {trial}"
+        );
+    }
+    // Focus is in the password: a character is refused, Tab moves on, and
+    // the one-time code refuses its digits too.
+    let pressed = host.call("agent_browser_press", json!({ "key": "a" }));
+    assert_eq!(
+        pressed["structuredContent"]["response"]["code"],
+        "browser_effect_refused",
+        "{pressed}"
+    );
+    let tabbed = host.call("agent_browser_press", json!({ "key": "Tab" }));
+    assert_eq!(tabbed["isError"], false, "{tabbed}");
+    let code = host.call(
+        "agent_browser_keyboard_type",
+        json!({ "text": "123456" }),
+    );
+    assert_eq!(
+        code["structuredContent"]["response"]["code"],
+        "browser_effect_refused",
+        "{code}"
+    );
+    assert_eq!(form_values(&host), json!(["someone", "person-typed", "", "01"]));
+    let filled = host.call(
+        "agent_browser_fill",
+        json!({ "selector": "#name", "text": "someone else" }),
+    );
+    assert_eq!(filled["isError"], false, "{filled}");
+    assert_eq!(
+        form_values(&host),
+        json!(["someone else", "person-typed", "", "01"])
+    );
+    assert_eq!(host.call("agent_browser_close", json!({}))["isError"], false);
 }

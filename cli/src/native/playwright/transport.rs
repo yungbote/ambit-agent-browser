@@ -100,9 +100,22 @@ fn is_input(method: &str) -> bool {
         "Input.dispatchMouseEvent"
             | "Input.dispatchKeyEvent"
             | "Input.insertText"
+            | "Input.imeSetComposition"
             | "Input.dispatchTouchEvent"
             | "DOM.scrollIntoViewIfNeeded"
     )
+}
+
+/// What a keyboard command types into the field that has focus, as a
+/// keyboard event in the display helper's shape; `None` for other input.
+fn keyboard_event(method: &str, params: &Value) -> Option<Value> {
+    match method {
+        "Input.dispatchKeyEvent" => Some(native_keyboard_event(params)),
+        "Input.insertText" | "Input.imeSetComposition" => Some(
+            json!({ "type": "input_keyboard", "eventType": "insertText", "text": params["text"] }),
+        ),
+        _ => None,
+    }
 }
 
 struct InputWorker(JoinHandle<()>);
@@ -378,31 +391,44 @@ async fn native_input(
                 )
                 .await?;
         }
-        match method {
-            "Input.dispatchMouseEvent" => {
-                control.agent_native_mouse(native_mouse_params(&params), client, session, &[session]).await?;
+        match (method, keyboard_event(method, &params)) {
+            ("Input.dispatchMouseEvent", _) => {
+                control
+                    .agent_native_mouse(native_mouse_params(&params), client, session, &[session])
+                    .await?;
             }
-            "DOM.scrollIntoViewIfNeeded" => {
+            ("DOM.scrollIntoViewIfNeeded", _) => {
                 let element = node_object(client, session, &params).await?;
                 let page = client.page_of(session);
                 control
                     .agent_native_scroll_into_view(client, &page, (&element, session))
                     .await?;
             }
-            "Input.insertText" => control.agent_native_keys(&[json!({ "type": "input_keyboard", "eventType": "insertText", "text": params["text"] })], KEY_INTERVAL, client, session).await?,
-            "Input.dispatchKeyEvent" => {
-                let event = native_keyboard_event(&params);
-                // CDP commands are browser editing commands, not key names.
-                // Keep composition/IME traffic on its original protocol path.
-                if params.get("commands").is_some_and(|commands| commands.as_array().is_some_and(|values| !values.is_empty())) {
-                    client.send_command(method, Some(params), Some(session)).await?;
-                } else {
-                    control.agent_native_keys(&[event], KEY_INTERVAL, client, session).await?;
-                }
+            // CDP editing commands and IME composition are browser editing,
+            // not key names: they keep their protocol path, behind the check
+            // every native stroke passes.
+            (_, Some(event))
+                if method == "Input.imeSetComposition"
+                    || params.get("commands").is_some_and(|commands| {
+                        commands.as_array().is_some_and(|values| !values.is_empty())
+                    }) =>
+            {
+                control.admit_agent_key(&event, client, session).await?;
+                client
+                    .send_command(method, Some(params), Some(session))
+                    .await?;
+            }
+            (_, Some(event)) => {
+                control
+                    .agent_native_keys(&[event], KEY_INTERVAL, client, session)
+                    .await?;
             }
             _ => unreachable!(),
         }
     } else {
+        if let Some(event) = keyboard_event(method, &params) {
+            control.admit_agent_key(&event, client, session).await?;
+        }
         let kind = match method {
             "Input.dispatchMouseEvent" => "input_mouse",
             "Input.dispatchKeyEvent" => "input_keyboard",
@@ -481,7 +507,7 @@ mod tests {
         assert!(is_input("DOM.scrollIntoViewIfNeeded"));
         assert!(!is_input("Runtime.evaluate"));
         assert!(!is_input("Runtime.callFunctionOn"));
-        assert!(!is_input("Input.imeSetComposition"));
+        assert!(is_input("Input.imeSetComposition"));
     }
 
     #[test]
@@ -709,6 +735,108 @@ mod tests {
             reached.push(method);
         }
         assert_eq!(reached, ["Page.getFrameTree", "Runtime.evaluate"]);
+        server.abort();
+    }
+
+    /// A page whose field that has focus is a password field: it answers
+    /// the readings of that field and the tab activation native input
+    /// begins with, and reports every other command that reaches it.
+    async fn secret_page() -> (
+        std::net::SocketAddr,
+        mpsc::UnboundedReceiver<String>,
+        JoinHandle<()>,
+    ) {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let (reached, page) = mpsc::unbounded_channel::<String>();
+        let server = tokio::spawn(async move {
+            let (socket, _) = upstream.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let command: Value = serde_json::from_str(&text).unwrap();
+                let method = command["method"].as_str().unwrap().to_owned();
+                let expression = command["params"]["expression"].as_str().unwrap_or_default();
+                let result = match method.as_str() {
+                    "Page.getFrameTree" => json!({ "frameTree": { "frame": { "id": "F" } } }),
+                    "Accessibility.enable" | "Runtime.addBinding" | "Target.activateTarget" => {
+                        json!({})
+                    }
+                    "Page.addScriptToEvaluateOnNewDocument" => json!({ "identifier": "1" }),
+                    "Page.createIsolatedWorld" => json!({ "executionContextId": 7 }),
+                    "Runtime.evaluate" if expression.contains("facts.frame") => {
+                        json!({ "result": { "type": "object", "value": { "kind": "field",
+                            "inputType": "password", "multiline": false, "secret": true,
+                            "frame": false } } })
+                    }
+                    "Runtime.evaluate" if expression.contains("__ambitSecrets") => {
+                        json!({ "result": { "type": "boolean", "value": true } })
+                    }
+                    "Target.getTargetInfo" => {
+                        json!({ "targetInfo": { "type": "page", "targetId": "T" } })
+                    }
+                    _ => {
+                        let _ = reached.send(method);
+                        json!({})
+                    }
+                };
+                let reply = json!({ "id": command["id"], "result": result });
+                socket.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+        });
+        (address, page, server)
+    }
+
+    /// A program's keys pass the check every native stroke passes, on every
+    /// path a keyboard command takes: typing into a secret field that has
+    /// focus is refused before anything reaches the page, with the owned
+    /// window (editing commands and IME composition keep their protocol
+    /// path) or without it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_programs_keys_never_reach_a_secret_field_that_has_focus() {
+        use crate::native::display::DisplayClient;
+        let (address, mut page, server) = secret_page().await;
+        let client = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let control = Mutex::new(BrowserControl::default());
+        let keys = [
+            json!({ "method": "Input.dispatchKeyEvent",
+                "params": { "type": "keyDown", "key": "a", "text": "a" } }),
+            json!({ "method": "Input.insertText", "params": { "text": "hunter2" } }),
+            json!({ "method": "Input.imeSetComposition",
+                "params": { "text": "hunter2", "selectionStart": 7, "selectionEnd": 7 } }),
+        ];
+        let refused = |key: &Value, error: String| {
+            assert!(
+                error.starts_with("browser_effect_refused: "),
+                "{key}: {error}"
+            );
+        };
+        for mut key in keys.clone() {
+            key["id"] = json!(1);
+            key["sessionId"] = json!("S");
+            refused(
+                &key,
+                native_input(&key, &client, &control).await.unwrap_err(),
+            );
+        }
+        let (display, _helper, _frames) = DisplayClient::test_channel();
+        control.lock().await.set_display(Some(display));
+        let paste = json!({ "method": "Input.dispatchKeyEvent", "params": { "type": "keyDown",
+            "key": "v", "modifiers": 2, "commands": ["paste"] } });
+        for mut key in [paste, keys[2].clone()] {
+            key["id"] = json!(2);
+            key["sessionId"] = json!("S");
+            refused(
+                &key,
+                native_input(&key, &client, &control).await.unwrap_err(),
+            );
+        }
+        assert!(page.try_recv().is_err(), "no input reached the page");
         server.abort();
     }
 
