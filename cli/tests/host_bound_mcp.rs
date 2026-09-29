@@ -673,15 +673,24 @@ fn host_secret_fields_are_never_entered_or_read() {
             "agent_browser_select",
             json!({ "selector": "#month", "values": ["02"] }),
         ),
-        ("agent_browser_get_value", json!({ "selector": "#password" })),
+        (
+            "agent_browser_get_value",
+            json!({ "selector": "#password" }),
+        ),
     ] {
         let refused = host.call(name, arguments);
         let response = &refused["structuredContent"]["response"];
-        assert_eq!(response["code"], "browser_effect_refused", "{name} {refused}");
+        assert_eq!(
+            response["code"], "browser_effect_refused",
+            "{name} {refused}"
+        );
         // The answer never carries what the field holds (the page's own
         // address, which the fixture writes it into, is feedback).
         assert!(!response.to_string().contains("person-typed"), "{refused}");
-        assert!(!refused["content"].to_string().contains("person-typed"), "{refused}");
+        assert!(
+            !refused["content"].to_string().contains("person-typed"),
+            "{refused}"
+        );
     }
     assert_eq!(form_values(&host), json!(["", "person-typed", "", "01"]));
     let filled = host.call(
@@ -690,8 +699,14 @@ fn host_secret_fields_are_never_entered_or_read() {
     );
     assert_eq!(filled["isError"], false, "{filled}");
     let read = host.call("agent_browser_get_value", json!({ "selector": "#name" }));
-    assert_eq!(read["structuredContent"]["response"]["data"]["value"], "someone");
-    assert_eq!(host.call("agent_browser_close", json!({}))["isError"], false);
+    assert_eq!(
+        read["structuredContent"]["response"]["data"]["value"],
+        "someone"
+    );
+    assert_eq!(
+        host.call("agent_browser_close", json!({}))["isError"],
+        false
+    );
 }
 
 /// In the owned window every key the agent sends is checked against the
@@ -719,12 +734,19 @@ fn host_owned_window_typing_never_reaches_a_secret_field() {
             json!({ "text": "someone\thunter2" }),
         );
         let response = &typed["structuredContent"]["response"];
-        assert_eq!(response["code"], "browser_operation_interrupted", "trial {trial}: {typed}");
-        assert_eq!(response["data"]["charactersTyped"], 7, "trial {trial}: {typed}");
+        assert_eq!(
+            response["code"], "browser_operation_interrupted",
+            "trial {trial}: {typed}"
+        );
+        assert_eq!(
+            response["data"]["charactersTyped"], 7,
+            "trial {trial}: {typed}"
+        );
         assert!(
-            response["error"].as_str().unwrap().contains(
-                "Typing stopped after 7 of 14 characters: focus moved into a password"
-            ),
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("Typing stopped after 7 of 14 characters: focus moved into a password"),
             "trial {trial}: {typed}"
         );
         assert_eq!(
@@ -737,22 +759,20 @@ fn host_owned_window_typing_never_reaches_a_secret_field() {
     // the one-time code refuses its digits too.
     let pressed = host.call("agent_browser_press", json!({ "key": "a" }));
     assert_eq!(
-        pressed["structuredContent"]["response"]["code"],
-        "browser_effect_refused",
+        pressed["structuredContent"]["response"]["code"], "browser_effect_refused",
         "{pressed}"
     );
     let tabbed = host.call("agent_browser_press", json!({ "key": "Tab" }));
     assert_eq!(tabbed["isError"], false, "{tabbed}");
-    let code = host.call(
-        "agent_browser_keyboard_type",
-        json!({ "text": "123456" }),
-    );
+    let code = host.call("agent_browser_keyboard_type", json!({ "text": "123456" }));
     assert_eq!(
-        code["structuredContent"]["response"]["code"],
-        "browser_effect_refused",
+        code["structuredContent"]["response"]["code"], "browser_effect_refused",
         "{code}"
     );
-    assert_eq!(form_values(&host), json!(["someone", "person-typed", "", "01"]));
+    assert_eq!(
+        form_values(&host),
+        json!(["someone", "person-typed", "", "01"])
+    );
     let filled = host.call(
         "agent_browser_fill",
         json!({ "selector": "#name", "text": "someone else" }),
@@ -762,5 +782,8 @@ fn host_owned_window_typing_never_reaches_a_secret_field() {
         form_values(&host),
         json!(["someone else", "person-typed", "", "01"])
     );
-    assert_eq!(host.call("agent_browser_close", json!({}))["isError"], false);
+    assert_eq!(
+        host.call("agent_browser_close", json!({}))["isError"],
+        false
+    );
 }
