@@ -1,5 +1,6 @@
-//! Operation-local CDP transport. Playwright keeps its complete protocol and
-//! session identities. Actual input alone joins the existing native owner;
+//! Operation-local CDP transport. Playwright keeps its protocol and session
+//! identities, behind the boundary that keeps the person's sign-ins from a
+//! program (`boundary`). Actual input alone joins the existing native owner;
 //! DOM evaluation never manufactures pointer movement or user-input events.
 
 use std::collections::HashMap;
@@ -13,6 +14,7 @@ use tokio::sync::{mpsc, watch, Mutex};
 use tokio::task::{JoinHandle, JoinSet};
 use tokio_tungstenite::tungstenite::Message;
 
+use super::boundary;
 use crate::native::browser_control::motion::KEY_INTERVAL;
 use crate::native::browser_control::BrowserControl;
 use crate::native::cdp::client::CdpClient;
@@ -118,6 +120,16 @@ fn keyboard_event(method: &str, params: &Value) -> Option<Value> {
     }
 }
 
+/// A protocol error answering a program's `command`, as the browser answers
+/// one: under the command's id and session.
+fn error_reply(command: &Value, message: &str) -> Value {
+    let mut reply = json!({ "id": command["id"], "error": { "code": -32000, "message": message } });
+    if let Some(session) = command.get("sessionId") {
+        reply["sessionId"] = session.clone();
+    }
+    reply
+}
+
 struct InputWorker(JoinHandle<()>);
 
 impl Drop for InputWorker {
@@ -184,12 +196,15 @@ async fn serve(
         }
         Ok::<_, String>(())
     });
-    // Program command ids, by the reserved browser command id carrying each.
-    let forwarded = Arc::new(std::sync::Mutex::new(HashMap::<u64, Value>::new()));
+    // Program command ids, by the reserved browser command id carrying each,
+    // with whether the reply may carry credentials (`boundary`).
+    let forwarded = Arc::new(std::sync::Mutex::new(HashMap::<u64, (Value, bool)>::new()));
     // One reader forwards the browser's replies and events in the order the
     // browser sent them. Playwright registers listeners while handling some
     // replies, so a reply that overtakes or trails its surrounding events
-    // loses them (for example, the main execution context).
+    // loses them (for example, the main execution context). Replies and
+    // events that may carry cookies or credential headers pass the
+    // boundary's scrub on the way.
     let mut browser = client.subscribe_raw();
     let replies = forwarded.clone();
     let browser_output = outgoing.clone();
@@ -207,15 +222,27 @@ async fn serve(
             let mut value: Value =
                 serde_json::from_str(&message.text).map_err(|error| error.to_string())?;
             let text = match value.get("id") {
-                None => message.text,
+                None => {
+                    let carries = value["method"]
+                        .as_str()
+                        .is_some_and(boundary::carries_credentials);
+                    if carries && boundary::scrub(&mut value["params"]) {
+                        value.to_string()
+                    } else {
+                        message.text
+                    }
+                }
                 Some(id) => {
                     let program = id
                         .as_u64()
                         .and_then(|id| replies.lock().unwrap().remove(&id));
                     // Replies to the operation's own measurement commands
                     // are not the program's.
-                    let Some(program) = program else { continue };
+                    let Some((program, carries)) = program else { continue };
                     value["id"] = program;
+                    if carries {
+                        boundary::scrub(&mut value["result"]);
+                    }
                     value.to_string()
                 }
             };
@@ -269,6 +296,12 @@ async fn serve(
                     Err(_) => break Err("Invalid Playwright protocol message.".into()),
                 };
                 let Some(method) = command["method"].as_str() else { break Err("Missing Playwright protocol method.".into()); };
+                if let Some(refusal) = boundary::refusal(method, &command["params"]) {
+                    if outgoing.send(Message::Text(error_reply(&command, &refusal).to_string())).is_err() {
+                        break Err("Playwright transport closed".into());
+                    }
+                    continue;
+                }
                 if is_input(method) {
                     let queued = tokio::select! {
                         biased;
@@ -279,7 +312,10 @@ async fn serve(
                 } else {
                     let Some(program) = command.get("id").cloned() else { break Err("Missing Playwright protocol id.".into()); };
                     let id = client.reserve_command_id();
-                    forwarded.lock().unwrap().insert(id, program.clone());
+                    forwarded
+                        .lock()
+                        .unwrap()
+                        .insert(id, (program.clone(), boundary::carries_credentials(method)));
                     // Written here, one at a time, in the program's order.
                     // Chrome runs a session's commands in arrival order and
                     // Playwright pipelines on that (Runtime.enable before
@@ -311,11 +347,7 @@ async fn serve(
                             if forwarded.lock().unwrap().remove(&id).is_none() {
                                 continue;
                             }
-                            let mut reply = json!({ "id": program, "error": { "code": -32000, "message": error } });
-                            if let Some(session) = command.get("sessionId") {
-                                reply["sessionId"] = session.clone();
-                            }
-                            if outgoing.send(Message::Text(reply.to_string())).is_err() {
+                            if outgoing.send(Message::Text(error_reply(&command, &error).to_string())).is_err() {
                                 break Err("Playwright transport closed".into());
                             }
                         }
@@ -357,9 +389,7 @@ async fn input_response(
     let result = native_input(command, client, control).await;
     match result {
         Ok(()) => response["result"] = json!({}),
-        Err(error) => {
-            response["error"] = json!({ "code": -32000, "message": error });
-        }
+        Err(error) => return error_reply(command, &error),
     }
     response
 }
@@ -561,9 +591,9 @@ mod tests {
                 for command in unanswered.drain(..) {
                     let n = &command["params"]["n"];
                     for message in [
-                        json!({"method":"Test.before","params":{"n":n},"sessionId":"S"}),
+                        json!({"method":"Runtime.consoleAPICalled","params":{"n":n},"sessionId":"S"}),
                         json!({"id":command["id"],"result":{"n":n},"sessionId":"S"}),
-                        json!({"method":"Test.after","params":{"n":n},"sessionId":"S"}),
+                        json!({"method":"Log.entryAdded","params":{"n":n},"sessionId":"S"}),
                     ] {
                         socket
                             .send(Message::Text(message.to_string()))
@@ -593,8 +623,7 @@ mod tests {
         let (mut program_tx, mut program_rx) = program.split();
         let sender = tokio::spawn(async move {
             for n in 0..COMMANDS {
-                let command =
-                    json!({"id":1000 + n,"method":"Test.command","params":{"n":n},"sessionId":"S"});
+                let command = json!({"id":1000 + n,"method":"Runtime.evaluate","params":{"n":n},"sessionId":"S"});
                 program_tx
                     .send(Message::Text(command.to_string()))
                     .await
@@ -616,9 +645,9 @@ mod tests {
         let expected: Vec<Value> = (0..COMMANDS)
             .flat_map(|n| {
                 [
-                    json!({"method":"Test.before","params":{"n":n},"sessionId":"S"}),
+                    json!({"method":"Runtime.consoleAPICalled","params":{"n":n},"sessionId":"S"}),
                     json!({"id":1000 + n,"result":{"n":n},"sessionId":"S"}),
-                    json!({"method":"Test.after","params":{"n":n},"sessionId":"S"}),
+                    json!({"method":"Log.entryAdded","params":{"n":n},"sessionId":"S"}),
                 ]
             })
             .collect();
@@ -735,6 +764,109 @@ mod tests {
             reached.push(method);
         }
         assert_eq!(reached, ["Page.getFrameTree", "Runtime.evaluate"]);
+        server.abort();
+    }
+
+    /// The boundary between a program and the person's browser: a command
+    /// that would set the person's cookies never reaches the browser and is
+    /// answered as refused; a reply or an event carrying cookies or
+    /// credential headers reaches the program blanked; every other message
+    /// reaches it as the browser sent it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_boundary_refuses_and_blanks_before_the_program_reads() {
+        let upstream = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = upstream.local_addr().unwrap();
+        let lifecycle = json!({ "method": "Page.lifecycleEvent", "sessionId": "S",
+            "params": { "frameId": "F", "loaderId": "L", "name": "load", "timestamp": 1.5 } })
+        .to_string();
+        let sent_lifecycle = lifecycle.clone();
+        let (reached, mut browser) = mpsc::unbounded_channel::<String>();
+        let server = tokio::spawn(async move {
+            let (socket, _) = upstream.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(socket).await.unwrap();
+            while let Some(Ok(message)) = socket.next().await {
+                let Message::Text(text) = message else {
+                    continue;
+                };
+                let command: Value = serde_json::from_str(&text).unwrap();
+                let _ = reached.send(command["method"].as_str().unwrap().to_owned());
+                let cookie = json!({ "name": "sid", "value": "s3cr3t", "domain": "shop.test",
+                    "path": "/", "httpOnly": true });
+                for message in [
+                    json!({ "method": "Network.requestWillBeSentExtraInfo", "sessionId": "S",
+                        "params": { "requestId": "R", "headers": { "Cookie": "sid=s3cr3t" },
+                            "associatedCookies": [{ "blockedReasons": [], "cookie": cookie }] } })
+                    .to_string(),
+                    sent_lifecycle.clone(),
+                    json!({ "id": command["id"], "sessionId": "S", "result": { "cookies": [cookie] } })
+                        .to_string(),
+                ] {
+                    socket.send(Message::Text(message)).await.unwrap();
+                }
+            }
+        });
+        let client = Arc::new(
+            CdpClient::connect(&format!("ws://{address}"))
+                .await
+                .unwrap(),
+        );
+        let mut tunnel = Tunnel::start(client, Arc::new(Mutex::new(BrowserControl::default())))
+            .await
+            .unwrap();
+        let (mut program, _) = tokio_tungstenite::connect_async(tunnel.endpoint())
+            .await
+            .unwrap();
+        for command in [
+            json!({ "id": 1, "sessionId": "S", "method": "Storage.setCookies",
+                "params": { "cookies": [{ "name": "planted", "value": "x", "domain": "shop.test" }] } }),
+            json!({ "id": 2, "sessionId": "S", "method": "Storage.getCookies", "params": {} }),
+        ] {
+            program
+                .send(Message::Text(command.to_string()))
+                .await
+                .unwrap();
+        }
+        let mut received = Vec::new();
+        while received.len() < 4 {
+            let message = tokio::time::timeout(Duration::from_secs(10), program.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            if let Message::Text(text) = message {
+                received.push(text);
+            }
+        }
+        let parsed: Vec<Value> = received
+            .iter()
+            .map(|text| serde_json::from_str(text).unwrap())
+            .collect();
+        let find = |test: &dyn Fn(&Value) -> bool| parsed.iter().find(|value| test(value)).unwrap();
+        assert_eq!(
+            find(&|value| value["id"] == 1),
+            &json!({ "id": 1, "sessionId": "S", "error": { "code": -32000,
+                "message": format!("Storage.setCookies is refused: {}.", "this browser keeps the person's sign-ins and site data, so a program never sets or clears cookies or reads or changes site storage (it lists cookies without their values)") } })
+        );
+        assert_eq!(
+            find(&|value| value["id"] == 2)["result"]["cookies"][0]["value"],
+            boundary::REDACTED
+        );
+        let extra = find(&|value| value["method"] == "Network.requestWillBeSentExtraInfo");
+        assert_eq!(extra["params"]["headers"]["Cookie"], boundary::REDACTED);
+        assert_eq!(
+            extra["params"]["associatedCookies"][0]["cookie"]["value"],
+            boundary::REDACTED
+        );
+        assert!(received.contains(&lifecycle), "{received:?}");
+        assert!(!received.iter().any(|text| text.contains("s3cr3t")));
+        assert_eq!(browser.recv().await.unwrap(), "Storage.getCookies");
+        assert!(
+            browser.try_recv().is_err(),
+            "the refused command never reached the browser"
+        );
+        program.close(None).await.unwrap();
+        tunnel.finish().await.unwrap();
+        drop(tunnel);
         server.abort();
     }
 

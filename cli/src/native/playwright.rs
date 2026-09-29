@@ -2,6 +2,7 @@
 //! The operation slot is cancellation, not a second control lease. Command
 //! custody remains with the daemon and human input remains with BrowserControl.
 
+mod boundary;
 mod transport;
 #[cfg(test)]
 mod tunnel_e2e;
@@ -1516,6 +1517,7 @@ const server = createServer((request, response) => {
     response.end('native download owner'); return;
   }
   response.setHeader('Content-Type','text/html');
+  if (request.url === '/') response.setHeader('Set-Cookie','retained=yes; HttpOnly');
   if (request.url === '/frame') response.end('<input aria-label="Frame field"><button onclick="document.title=\'Frame clicked\'">Frame action</button>');
   else if (request.url === '/popup') response.end('<title>Popup</title><button onclick="document.title=\'Popup clicked\'">Popup action</button>');
   else response.end(`<title>Playwright qualification</title><style>body{font:18px system-ui;padding:24px;height:2500px}button,input,a{margin:8px}iframe{display:block;width:600px;height:160px}</style><h1>Shared browser</h1><input aria-label="Name"><input type=file aria-label="Upload"><button id=dom onclick="window.domClicked=true">DOM action</button><a target=_blank href=/popup>Open popup</a><a href=/file>Download</a><iframe src="http://localhost:${server.address().port}/frame"></iframe><script>window.pointers=[];addEventListener('pointermove',e=>pointers.push({x:e.clientX,y:e.clientY,screenX:e.screenX,screenY:e.screenY,trusted:e.isTrusted}),true)</script>`);
@@ -1523,7 +1525,7 @@ const server = createServer((request, response) => {
 await new Promise(resolve => server.listen(0, '0.0.0.0', resolve));
 try {
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
-  await context.addCookies([{name:'retained',value:'yes',url:page.url()}]);
+  const planted = await context.addCookies([{name:'planted',value:'yes',url:page.url()}]).then(() => null, (error) => error.message);
   await page.getByRole('textbox', {name:'Name', exact:true}).fill('Ada');
   await page.getByRole('textbox', {name:'Name', exact:true}).press('End');
   await page.keyboard.type(' Lovelace');
@@ -1547,7 +1549,7 @@ try {
   await page.mouse.wheel(0, 180);
   await page.waitForFunction(() => scrollY > 0);
   await page.screenshot({path:OUTPUT + '/page.png'});
-  return {name:await page.getByRole('textbox', {name:'Name',exact:true}).inputValue(), frame:await page.frameLocator('iframe').getByRole('textbox').inputValue(), popupTitle, text, pointer, beforeDomClick, afterDomClick, uploaded:await page.getByLabel('Upload').evaluate(el=>el.files[0].name), cookies:await context.cookies(), scroll:await page.evaluate(()=>scrollY)};
+  return {name:await page.getByRole('textbox', {name:'Name',exact:true}).inputValue(), frame:await page.frameLocator('iframe').getByRole('textbox').inputValue(), popupTitle, text, pointer, beforeDomClick, afterDomClick, uploaded:await page.getByLabel('Upload').evaluate(el=>el.files[0].name), cookies:await context.cookies(), planted, scroll:await page.evaluate(()=>scrollY)};
 } finally { await new Promise(resolve => server.close(resolve)); }
 "#.replace("OUTPUT", &output);
         let result = Box::pin(execute_command(
@@ -1567,11 +1569,17 @@ try {
         assert_eq!(values["pointer"]["y"], 110);
         assert_eq!(values["beforeDomClick"], values["afterDomClick"]);
         assert!(values["scroll"].as_f64().unwrap() > 0.0);
-        assert!(values["cookies"]
-            .as_array()
-            .unwrap()
+        // The page's own cookie is shared, without its value; a program
+        // never sets one.
+        let cookies = values["cookies"].as_array().unwrap();
+        assert!(cookies
             .iter()
-            .any(|cookie| cookie["name"] == "retained" && cookie["value"] == "yes"));
+            .any(|cookie| cookie["name"] == "retained" && cookie["value"] == boundary::REDACTED));
+        assert!(!cookies.iter().any(|cookie| cookie["name"] == "planted"));
+        assert!(values["planted"]
+            .as_str()
+            .unwrap()
+            .contains("Storage.setCookies is refused"));
         assert!(std::fs::metadata(artifacts.join("page.png")).unwrap().len() > 100);
         assert_eq!(
             state.browser.as_ref().unwrap().active_target_id().unwrap(),
@@ -1657,7 +1665,7 @@ try {
         // Both native tabs are pages of one shared context. Chrome may keep
         // internal pages of its own in that context, so membership is exact
         // and the count is not.
-        let read = Box::pin(execute_command(&json!({"action":"run_playwright","code":"const targets = []; for (const page of context.pages()) { const session = await context.newCDPSession(page); targets.push((await session.send('Target.getTargetInfo')).targetInfo.targetId); await session.detach(); } return { cookies: (await context.cookies()).map(cookie => cookie.name + '=' + cookie.value), targets };","timeoutMs":15000}), &mut state)).await;
+        let read = Box::pin(execute_command(&json!({"action":"run_playwright","code":"const targets = []; for (const page of context.pages()) { const session = await context.newCDPSession(page); targets.push((await session.send('Target.getTargetInfo')).targetInfo.targetId); await session.detach(); } return { cookies: (await context.cookies()).map(cookie => cookie.name), targets };","timeoutMs":15000}), &mut state)).await;
         assert_eq!(read["success"], true, "{read}");
         let targets = read["data"]["result"]["targets"].as_array().unwrap();
         assert!(targets.contains(&json!(first_target)), "{read}");
@@ -1665,7 +1673,7 @@ try {
         assert!(read["data"]["result"]["cookies"]
             .as_array()
             .unwrap()
-            .contains(&json!("account=persistent")));
+            .contains(&json!("account")));
         // The default window has its own context, without the profile's cookies.
         let isolated = Box::pin(execute_command(&json!({"action":"window_new"}), &mut state)).await;
         assert_eq!(isolated["success"], true, "{isolated}");
@@ -1699,16 +1707,16 @@ try {
         // With an isolated window open, the installed client either represents
         // each tab's real context (adoption build) or refuses before starting
         // (stock client). A merged, misreported context is never an outcome.
-        let cookie_values = "return (await context.cookies()).map(cookie => cookie.value);";
+        let cookie_names = "return (await context.cookies()).map(cookie => cookie.name);";
         let mut adopted = None;
         for (selected, expects_persistent) in [(&isolated_target, false), (&target, true)] {
-            let read = Box::pin(execute_command(&json!({"action":"run_playwright","targetId":selected,"code":cookie_values,"timeoutMs":15000}), &mut state)).await;
+            let read = Box::pin(execute_command(&json!({"action":"run_playwright","targetId":selected,"code":cookie_names,"timeoutMs":15000}), &mut state)).await;
             let outcome = read["success"] == true;
             assert_eq!(*adopted.get_or_insert(outcome), outcome, "{read}");
             if outcome {
                 let values = read["data"]["result"].as_array().unwrap();
                 assert_eq!(
-                    values.contains(&json!("persistent")),
+                    values.contains(&json!("account")),
                     expects_persistent,
                     "{read}"
                 );
@@ -1756,16 +1764,16 @@ try {
         let observed = Box::pin(execute_command(&json!({"action":"snapshot"}), &mut state)).await;
         assert_eq!(observed["success"], true, "{observed}");
         // Without isolated contexts every client attaches and sees the profile.
-        let read = Box::pin(execute_command(&json!({"action":"run_playwright","targetId":target,"code":cookie_values,"timeoutMs":15000}), &mut state)).await;
+        let read = Box::pin(execute_command(&json!({"action":"run_playwright","targetId":target,"code":cookie_names,"timeoutMs":15000}), &mut state)).await;
         assert_eq!(read["success"], true, "{read}");
         assert!(read["data"]["result"]
             .as_array()
             .unwrap()
-            .contains(&json!("persistent")));
+            .contains(&json!("account")));
         if let Ok(stock) = std::env::var("AGENT_BROWSER_TEST_STOCK_PLAYWRIGHT_MODULE") {
             let env = crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_PLAYWRIGHT_MODULE"]);
             env.set("AGENT_BROWSER_PLAYWRIGHT_MODULE", &stock);
-            let read = Box::pin(execute_command(&json!({"action":"run_playwright","targetId":target,"code":cookie_values,"timeoutMs":15000}), &mut state)).await;
+            let read = Box::pin(execute_command(&json!({"action":"run_playwright","targetId":target,"code":cookie_names,"timeoutMs":15000}), &mut state)).await;
             assert_eq!(read["success"], true, "{read}");
         }
         Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
@@ -2173,7 +2181,7 @@ return {clicked: await page.evaluate(() => window.clicked ?? null), width: await
         assert_eq!(filled["data"]["result"]["title"], "Journey");
         assert_eq!(
             filled["data"]["result"]["cookies"],
-            json!(["journey=shared"])
+            json!([format!("journey={}", boundary::REDACTED)])
         );
         assert_eq!(filled["data"]["targetId"], target);
 
@@ -2254,11 +2262,11 @@ return {clicked: await page.evaluate(() => window.clicked ?? null), width: await
             .unwrap()
             .to_owned();
         assert_ne!(second, target);
-        let read = Box::pin(execute_command(&json!({"action":"run_playwright","targetId":second,"timeoutMs":15000,"code":"await page.goto('data:text/html,<title>Second</title>'); const extra = await context.newPage(); await extra.goto('data:text/html,<title>Third</title>'); const third = await extra.title(); await extra.close(); return {title: await page.title(), third, cookies: (await context.cookies('https://journey.example/')).map(cookie => cookie.value)};"}), &mut state)).await;
+        let read = Box::pin(execute_command(&json!({"action":"run_playwright","targetId":second,"timeoutMs":15000,"code":"await page.goto('data:text/html,<title>Second</title>'); const extra = await context.newPage(); await extra.goto('data:text/html,<title>Third</title>'); const third = await extra.title(); await extra.close(); return {title: await page.title(), third, cookies: (await context.cookies('https://journey.example/')).map(cookie => cookie.name)};"}), &mut state)).await;
         assert_eq!(read["success"], true, "{read}");
         assert_eq!(read["data"]["result"]["title"], "Second");
         assert_eq!(read["data"]["result"]["third"], "Third");
-        assert_eq!(read["data"]["result"]["cookies"], json!(["shared"]));
+        assert_eq!(read["data"]["result"]["cookies"], json!(["journey"]));
         let switched = Box::pin(execute_command(
             &json!({"action":"tab_switch","tabId":target}),
             &mut state,

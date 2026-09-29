@@ -787,3 +787,91 @@ fn host_owned_window_typing_never_reaches_a_secret_field() {
         false
     );
 }
+
+/// A page that signs the browser in: it sets an HttpOnly session cookie
+/// and a script-readable one, and serves until the test ends.
+fn signed_in_site() -> String {
+    use std::io::{BufRead, BufReader};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|read| read > 2) {
+                line.clear();
+            }
+            let body = "<title>Signed in</title><p>Account</p>";
+            let _ = write!(
+                &stream,
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nSet-Cookie: sid=s3cr3t-session; HttpOnly; Path=/\r\nSet-Cookie: theme=dark; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+        }
+    });
+    origin
+}
+
+/// A program reaches the person's browser only through the boundary: it
+/// lists the cookies there are without their values, the credential
+/// headers of the requests it watches arrive blanked, and setting or
+/// clearing cookies is refused. Page script still reads what the page's own
+/// script can: the script-readable cookie, never the HttpOnly session.
+#[test]
+#[cfg(unix)]
+#[ignore = "requires AMBIT_TEST_CHROME_EXECUTABLE, AMBIT_TEST_NODE and AMBIT_TEST_PLAYWRIGHT_MODULE"]
+fn host_playwright_program_reads_no_cookie_value() {
+    let host = Host::new();
+    let site = signed_in_site();
+    let opened = host.call("agent_browser_open", json!({ "url": format!("{site}/") }));
+    assert_eq!(opened["isError"], false, "{opened}");
+    let program = r#"const refused = (write) => write.then(() => null, (error) => error.message);
+const request = page.waitForRequest((request) => request.url().endsWith('/again'));
+await page.evaluate(() => fetch('/again'));
+const headers = await (await request).allHeaders();
+return {
+  cookies: (await context.cookies()).map((cookie) => [cookie.name, cookie.value, cookie.httpOnly]),
+  requestCookie: headers.cookie,
+  planted: await refused(context.addCookies([{ name: 'planted', value: 'x', url: page.url() }])),
+  cleared: await refused(context.clearCookies()),
+  script: await page.evaluate(() => document.cookie),
+};"#;
+    let read = host.call("agent_browser_run_playwright", json!({ "code": program }));
+    assert_eq!(read["isError"], false, "{read}");
+    assert!(!read.to_string().contains("s3cr3t-session"), "{read}");
+    let result = &read["structuredContent"]["response"]["data"]["result"];
+    let mut cookies = result["cookies"].as_array().unwrap().clone();
+    cookies.sort_by_key(|cookie| cookie[0].as_str().unwrap().to_owned());
+    assert_eq!(
+        cookies,
+        [
+            json!(["sid", "[redacted credential]", true]),
+            json!(["theme", "[redacted credential]", false]),
+        ]
+    );
+    assert_eq!(result["requestCookie"], "[redacted credential]");
+    for write in ["planted", "cleared"] {
+        assert!(
+            result[write]
+                .as_str()
+                .unwrap()
+                .contains("is refused: this browser keeps the person's sign-ins"),
+            "{write}: {result}"
+        );
+    }
+    assert_eq!(result["script"], "theme=dark");
+    // The refused writes changed nothing: the session is still there.
+    let names = host.call(
+        "agent_browser_run_playwright",
+        json!({ "code": "return (await context.cookies()).map((cookie) => cookie.name).sort();" }),
+    );
+    assert_eq!(
+        names["structuredContent"]["response"]["data"]["result"],
+        json!(["sid", "theme"]),
+        "{names}"
+    );
+    assert_eq!(
+        host.call("agent_browser_close", json!({}))["isError"],
+        false
+    );
+}
