@@ -1,6 +1,13 @@
 //! Product-only human file destinations. Bytes stay in staged files; a short
 //! lived opaque destination retains the actual renderer node and document.
 //! CDP events invalidate custody before their ordinary broadcast can lag.
+//!
+//! Every page and frame intercepts its file choosers from its attach
+//! (`intercept`), so no chooser ever opens a dialog in the owned window.
+//! While a person holds the browser, a chooser that opens is theirs, a
+//! destination; otherwise it is cancelled, and kept for the next step or
+//! call to report, once (`take_cancelled`): nothing was shown and nothing
+//! waits, and the input takes files through an upload instead.
 
 use std::collections::HashSet;
 use std::path::Path;
@@ -59,8 +66,11 @@ impl Destination {
 #[derive(Default)]
 struct State {
     controller: Option<String>,
-    sessions: HashSet<String>,
     destination: Option<Destination>,
+    /// The last chooser that opened while no person held the browser, until
+    /// a step or call reports it: its mode and, when Chrome names it, its
+    /// input.
+    cancelled: Option<Value>,
 }
 
 /// Human file destinations, and a revision that moves whenever a picker
@@ -83,14 +93,6 @@ impl FileDestinations {
         self.1.send_modify(|revision| *revision += 1);
     }
 
-    pub(crate) fn active(&self) -> bool {
-        self.0
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .controller
-            .is_some()
-    }
-
     pub(crate) fn begin(&self, controller: &str) {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if state.controller.as_deref() != Some(controller) {
@@ -101,21 +103,36 @@ impl FileDestinations {
         }
     }
 
-    pub(crate) fn end(&self) -> Vec<String> {
+    /// Whether a person's controller is named.
+    #[cfg(test)]
+    pub(crate) fn active(&self) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .controller
+            .is_some()
+    }
+
+    /// The person's hold ended: a chooser that opens from now on is
+    /// cancelled.
+    pub(crate) fn end(&self) {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         state.controller = None;
         if state.destination.take().is_some() {
             self.changed();
         }
-        state.sessions.drain().collect()
     }
 
-    pub(crate) fn intercepted(&self, session: &str) {
+    /// The chooser cancelled since the last report, `{mode, backendNodeId?}`,
+    /// for the step or call reporting it now. Chrome may tell of a chooser
+    /// just after the input that opened it is acknowledged; the report then
+    /// comes with the next step or call.
+    pub(crate) fn take_cancelled(&self) -> Option<Value> {
         self.0
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .sessions
-            .insert(session.into());
+            .cancelled
+            .take()
     }
 
     /// Invalidate the selected document and its renderer, without making an
@@ -125,7 +142,6 @@ impl FileDestinations {
         let mut state = self.0.lock().unwrap_or_else(|e| e.into_inner());
         if method == "Target.detachedFromTarget" {
             if let Some(detached) = params["sessionId"].as_str() {
-                state.sessions.remove(detached);
                 if state.destination.as_ref().is_some_and(|destination| {
                     destination.session == detached
                         || destination
@@ -165,10 +181,15 @@ impl FileDestinations {
             state.destination = None;
             self.changed();
         }
-        if method != "Page.fileChooserOpened" || !state.sessions.contains(session) {
+        if method != "Page.fileChooserOpened" {
             return;
         }
         let Some(controller) = state.controller.clone() else {
+            let mut chooser = json!({ "mode": params["mode"] });
+            if let Some(node) = params["backendNodeId"].as_i64() {
+                chooser["backendNodeId"] = json!(node);
+            }
+            state.cancelled = Some(chooser);
             return;
         };
         let Some(frame) = params["frameId"].as_str().filter(|value| !value.is_empty()) else {
@@ -238,38 +259,19 @@ impl FileDestinations {
     }
 }
 
-pub(crate) async fn intercept(
-    client: &CdpClient,
-    session: &str,
-    enabled: bool,
-) -> Result<(), String> {
-    client
-        .send_command(
+/// Intercepts the file choosers of a page or frame session, as it is
+/// prepared. Sent without waiting for its answer: the preparation's next
+/// commands on the same session answer only after it, and a new page runs
+/// only once they have. An engine without file choosers has nothing to
+/// intercept.
+pub(crate) async fn intercept(client: &CdpClient, session: &str) {
+    let _ = client
+        .enqueue_command(
             "Page.setInterceptFileChooserDialog",
-            Some(json!({"enabled":enabled})),
+            Some(json!({"enabled":true})),
             Some(session),
         )
-        .await?;
-    if enabled {
-        client.files.intercepted(session);
-    }
-    Ok(())
-}
-
-pub(crate) async fn stop(client: &CdpClient) {
-    for session in client.files.end() {
-        let _ = tokio::time::timeout(std::time::Duration::from_millis(200), async {
-            let _ = intercept(client, &session, false).await;
-            let _ = client
-                .send_command(
-                    "Runtime.releaseObjectGroup",
-                    Some(json!({"objectGroup":GROUP})),
-                    Some(&session),
-                )
-                .await;
-        })
         .await;
-    }
 }
 
 pub(crate) fn validate_paths(files: &[String]) -> Result<(), ControlError> {

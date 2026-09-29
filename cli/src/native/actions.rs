@@ -2756,12 +2756,13 @@ pub(crate) async fn execute_command_received(
         return response;
     }
     let Some(value) = cmd.get(super::feedback::REQUEST_FIELD) else {
-        let response = Box::pin(execute_command_inner(cmd, state)).await;
+        let mut response = Box::pin(execute_command_inner(cmd, state)).await;
         if response["success"] == true
             && matches!(cmd["action"].as_str(), Some("snapshot" | "screenshot"))
         {
             state.browser_control.lock().await.observed();
         }
+        name_cancelled_chooser(&mut response, state);
         return response;
     };
     let request = match super::feedback::FeedbackRequest::parse(value, state) {
@@ -2783,7 +2784,25 @@ pub(crate) async fn execute_command_received(
     )
     .await;
     super::feedback::attach(&request, &mut response, state, started).await;
+    name_cancelled_chooser(&mut response, state);
     response
+}
+
+/// Names in a command's data the file chooser cancelled since the last
+/// report (`browser_files`): nothing was shown and nothing waits, and the
+/// input takes files through an upload. A command without data leaves it
+/// for the next.
+fn name_cancelled_chooser(response: &mut Value, state: &DaemonState) {
+    if !response["data"].is_object() {
+        return;
+    }
+    if let Some(chooser) = state
+        .browser
+        .as_ref()
+        .and_then(|browser| browser.client.files.take_cancelled())
+    {
+        response["data"]["fileChooser"] = chooser;
+    }
 }
 
 /// What a host-bound command must still find once the custody and
@@ -7982,7 +8001,9 @@ impl ControlPage<'_> {
                 .is_some_and(|browser| browser.active_session_id().is_ok())
     }
 
-    pub(crate) async fn prepare_files(
+    /// Names `controller` as the one a file chooser opens for: every page
+    /// already intercepts its choosers (`browser_files`).
+    pub(crate) fn begin_files(
         &mut self,
         controller: &str,
     ) -> Result<(), browser_control::ControlError> {
@@ -7993,24 +8014,6 @@ impl ControlPage<'_> {
             )
         })?;
         browser.client.files.begin(controller);
-        let sessions: std::collections::HashSet<_> = browser
-            .pages_list()
-            .into_iter()
-            .map(|page| page.session_id)
-            .chain(self.0.iframe_sessions.values().cloned())
-            .collect();
-        for session in sessions {
-            if super::browser_files::intercept(&browser.client, &session, true)
-                .await
-                .is_err()
-            {
-                super::browser_files::stop(&browser.client).await;
-                return Err(browser_control::ControlError::new(
-                    "browser_control_files_unavailable",
-                    "The browser could not prepare file pickers.",
-                ));
-            }
-        }
         Ok(())
     }
 

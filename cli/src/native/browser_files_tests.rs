@@ -5,7 +5,6 @@ const OTHER: &str = "aabbccdd-1111-4222-8333-123456789abd";
 
 fn pending(files: &FileDestinations) -> String {
     files.begin(OWNER);
-    files.intercepted("page");
     files.observe(
         "Page.fileChooserOpened",
         &json!({"frameId":"main","backendNodeId":7}),
@@ -58,6 +57,32 @@ fn file_destinations_follow_controller_and_renderer_lifecycle() {
         Some("page"),
     );
     assert!(files.pending(OTHER).is_none());
+}
+
+/// With no person holding the browser a chooser is cancelled: nothing waits
+/// for it, and the next step or call reports it, once. A chooser that opens
+/// while a person holds the browser is theirs.
+#[test]
+fn a_chooser_with_no_controller_is_cancelled_and_reported_once() {
+    let files = FileDestinations::default();
+    let opened = |files: &FileDestinations| {
+        files.observe(
+            "Page.fileChooserOpened",
+            &json!({"frameId":"main","mode":"selectMultiple","backendNodeId":7}),
+            Some("page"),
+        )
+    };
+    assert_eq!(files.take_cancelled(), None);
+    opened(&files);
+    assert_eq!(
+        files.take_cancelled(),
+        Some(json!({"mode":"selectMultiple","backendNodeId":7}))
+    );
+    assert_eq!(files.take_cancelled(), None);
+    files.begin(OWNER);
+    opened(&files);
+    assert!(files.pending(OWNER).is_some());
+    assert_eq!(files.take_cancelled(), None);
 }
 
 #[test]

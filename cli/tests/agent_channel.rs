@@ -1155,6 +1155,60 @@ fn e2e_agent_channel_a_page_between_documents_is_not_waited_on() {
     );
 }
 
+/// With no person holding the browser, a file chooser a step's click opens
+/// shows no dialog and holds nothing: the landing names it, and an upload
+/// step fills the input.
+#[test]
+#[ignore = "requires AMBIT_TEST_CHROME_EXECUTABLE, Xvfb and AGENT_BROWSER_DISPLAY_HELPER"]
+fn e2e_agent_channel_a_chooser_a_step_opens_is_named_and_uploaded_into() {
+    let host = Host::new();
+    let mut channel = host.channel();
+    channel.run(
+        &host,
+        json!([step(
+            "agent_browser_open",
+            json!({ "url": host.site.url("/form") })
+        )]),
+    );
+    let (generation, nodes) = channel.resolve(&host, &["#upload"]);
+    let (clicked, _) = channel.call(sequence(
+        &host,
+        json!([judged(
+            "agent_browser_click",
+            json!({ "selector": "#upload" }),
+            &generation,
+            &nodes[0],
+            "commit"
+        )]),
+    ));
+    assert_eq!(clicked["success"], true, "{clicked}");
+    let chooser = &clicked["steps"][0]["landed"]["fileChooser"];
+    assert_eq!(chooser["mode"], "selectSingle", "{clicked}");
+    assert_eq!(chooser["backendNodeId"], nodes[0], "{clicked}");
+
+    let file = host.path("upload.bin");
+    fs::write(&file, [5, 6]).unwrap();
+    let (uploaded, _) = channel.call(sequence(
+        &host,
+        json!([judged(
+            "agent_browser_upload",
+            json!({ "selector": "#upload", "files": [file] }),
+            &generation,
+            &nodes[0],
+            "commit"
+        )]),
+    ));
+    assert_eq!(uploaded["success"], true, "{uploaded}");
+    let (read, _) = channel.call(sequence(
+        &host,
+        json!([step(
+            "agent_browser_eval",
+            json!({ "script": "document.getElementById('upload').files[0].size" })
+        )]),
+    ));
+    assert_eq!(response(&read, 0)["data"]["result"], 2, "{read}");
+}
+
 #[test]
 #[ignore = "requires AMBIT_TEST_CHROME_EXECUTABLE, Xvfb and AGENT_BROWSER_DISPLAY_HELPER"]
 fn e2e_agent_channel_end_releases_the_keys_its_steps_held() {

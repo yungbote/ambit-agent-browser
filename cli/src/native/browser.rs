@@ -1084,9 +1084,7 @@ impl BrowserManager {
     }
 
     async fn prepare_domains(&self, session_id: &str) -> Result<(), String> {
-        if self.client.files.active() {
-            super::browser_files::intercept(&self.client, session_id, true).await?;
-        }
+        super::browser_files::intercept(&self.client, session_id).await;
         self.client
             .send_command_no_params("Page.enable", Some(session_id))
             .await?;

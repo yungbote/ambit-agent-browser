@@ -21,7 +21,9 @@
 //! the file protocol's capture does, so the next step's input reaches it.
 //! The final read reads nothing from a page between documents
 //! (`documents`), which answers nothing until its navigation commits, and
-//! nothing after the step's deadline; the block then says `pending` too.
+//! nothing after the step's deadline; the block then says `pending` too. A
+//! file chooser the step's input opened is reported as cancelled
+//! (`browser_files`).
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -34,6 +36,7 @@ use tokio::sync::{broadcast, watch};
 use super::target::{self, Node, Recorders, FACTS};
 use crate::native::actions::DaemonState;
 use crate::native::browser_control::Interrupts;
+use crate::native::browser_files::FileDestinations;
 use crate::native::cdp::client::CdpClient;
 use crate::native::cdp::types::CdpEvent;
 use crate::native::documents;
@@ -296,6 +299,8 @@ fn media_instant(ts_us: u64) -> Instant {
 pub(crate) struct Landing {
     token: String,
     armed: Instant,
+    /// The browser's file choosers (`browser_files`).
+    choosers: Option<Arc<FileDestinations>>,
     page: Option<Page>,
     events: Option<broadcast::Receiver<CdpEvent>>,
     /// The tab roster when the input began.
@@ -318,6 +323,7 @@ impl Landing {
         let mut landing = Self {
             token,
             armed: Instant::now(),
+            choosers: None,
             page: None,
             events: None,
             tabs: Vec::new(),
@@ -327,6 +333,7 @@ impl Landing {
         let Some(browser) = state.browser.as_ref() else {
             return landing;
         };
+        landing.choosers = Some(browser.client.files.clone());
         landing.tabs = tab_ids(&browser.tab_list());
         let Ok(session) = browser.active_session_id() else {
             return landing;
@@ -557,6 +564,11 @@ impl Landing {
         }
         if let Some(dialog) = &recorded.dialog {
             landed["dialog"] = dialog.clone();
+        }
+        // A chooser the step's input opened was cancelled: nothing was shown
+        // and nothing waits; its input takes files through an upload.
+        if let Some(chooser) = self.choosers.as_ref().and_then(|c| c.take_cancelled()) {
+            landed["fileChooser"] = chooser;
         }
         if !opened.is_empty() {
             landed["openedTabs"] = json!(opened);

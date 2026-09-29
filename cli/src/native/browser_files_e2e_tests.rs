@@ -439,6 +439,14 @@ async fn browser_files_e2e_unsupported_file_engine_keeps_ordinary_control() {
 async fn browser_files_e2e_local_iframe_chooser_drop_and_detachment() {
     let (mut state, dir) = launch().await;
     evaluate(&state,&format!("{{const iframe=document.createElement('iframe');iframe.id='child';iframe.style='position:absolute;left:0;top:300px;width:600px;height:260px;border:0';iframe.srcdoc={};document.body.append(iframe)}}",serde_json::to_string(PAGE).unwrap())).await;
+    // The frame loads on its own; nothing before the click waits for it.
+    let loaded = "new Promise(done => requestAnimationFrame(() => done(!!child.contentWindow?.document?.getElementById('one'))))";
+    for _ in 0..300 {
+        if evaluate(&state, loaded).await == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
     let file = dir.path().join("frame.bin");
     std::fs::write(&file, [17, 0, 255]).unwrap();
     acquire(&mut state).await;
@@ -574,4 +582,207 @@ async fn browser_files_e2e_expiry_during_staging_never_delivers_files() {
     assert_eq!(refused["code"], "browser_control_expired", "{refused}");
     assert_eq!(evaluate(&state, "one.files.length").await, 0);
     close(&mut state).await;
+}
+
+/// A person takes control 300 ms into a navigation to a page that answers
+/// after 2 s, clicks the file input of the document being left, then that of
+/// the next document as soon as it has painted. Answers how long the acquire
+/// took, whether the page was still between documents when it returned,
+/// whether the old document's chooser was the person's, and the chooser the
+/// next document's click opened.
+async fn acquire_during_a_navigation(cross_site: bool) -> Value {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let files = if cross_site {
+        format!("{}/files", origin.replace("127.0.0.1", "localhost"))
+    } else {
+        format!("{origin}/files")
+    };
+    let start = format!(
+        "<!doctype html><title>Start</title><body style='margin:0'>\
+         <input id=old type=file style='position:absolute;left:20px;top:20px;width:250px;height:40px'>\
+         <a id=go href={} style='position:absolute;left:20px;top:120px'>Files</a>",
+        serde_json::to_string(&files).unwrap()
+    );
+    tokio::spawn(async move {
+        while let Ok((mut connection, _)) = listener.accept().await {
+            let start = start.clone();
+            tokio::spawn(async move {
+                let mut request = [0; 4096];
+                let read = connection.read(&mut request).await.unwrap_or(0);
+                let body = if String::from_utf8_lossy(&request[..read]).starts_with("GET /files") {
+                    tokio::time::sleep(Duration::from_millis(2000)).await;
+                    PAGE.to_string()
+                } else {
+                    start
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = connection.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    let (mut state, _dir) = launch().await;
+    success(
+        &command(
+            &mut state,
+            json!({"action":"navigate","url":format!("{origin}/")}),
+        )
+        .await,
+    );
+    evaluate(
+        &state,
+        "setTimeout(() => document.getElementById('go').click(), 0), true",
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let asked = std::time::Instant::now();
+    acquire(&mut state).await;
+    let took = asked.elapsed();
+    state.drain_cdp_events_background().await.unwrap();
+    let between = state.active_page_between_documents();
+    // The document being left still takes input: its chooser is the person's.
+    let files = state.browser.as_ref().unwrap().client.files.clone();
+    let mut revision = files.subscribe();
+    click(&mut state, 1, 35.0, 35.0).await;
+    let old_intercepted = tokio::time::timeout(Duration::from_secs(1), revision.changed())
+        .await
+        .is_ok_and(|changed| changed.is_ok())
+        && files.take_cancelled().is_none();
+    // The next document, once it has painted: input before its first paint
+    // would be dropped, whoever sends it.
+    let ready =
+        "!!document.getElementById('one') && performance.getEntriesByType('paint').length > 0";
+    for _ in 0..500 {
+        if evaluate(&state, ready).await == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let committed = asked.elapsed();
+    click(&mut state, 2, 35.0, 35.0).await;
+    let chooser = chooser(&mut state).await;
+    close(&mut state).await;
+    json!({ "crossSite": cross_site, "acquireUs": took.as_micros() as u64,
+        "betweenDocumentsWhenAcquireReturned": between,
+        "oldDocumentChooserWasThePersons": old_intercepted,
+        "nextDocumentPaintedAfterAcquireAskedUs": committed.as_micros() as u64,
+        "chooser": chooser })
+}
+
+/// Taking control during a navigation returns at once: every page
+/// intercepts its choosers from its attach, so the acquire only names the
+/// person. The document being left, which still takes input, opens the
+/// person's chooser, and so does the next one, same-site and cross-site (a
+/// new renderer).
+#[tokio::test]
+#[ignore = "requires installed Chromium"]
+async fn browser_files_e2e_acquire_during_a_navigation_returns_at_once() {
+    let mut measured = Vec::new();
+    for cross_site in [false, true] {
+        let one = acquire_during_a_navigation(cross_site).await;
+        println!("acquire-during-navigation {one}");
+        measured.push(one);
+    }
+    for one in measured {
+        assert_eq!(
+            one["betweenDocumentsWhenAcquireReturned"], true,
+            "the acquire returned only after the commit: {one}"
+        );
+        assert_eq!(one["oldDocumentChooserWasThePersons"], true, "{one}");
+        assert_eq!(one["chooser"]["accept"], ".bin", "{one}");
+    }
+}
+
+/// With no person holding the browser, the agent's click on a file input
+/// opens no dialog and waits for nothing: the call names the cancelled
+/// chooser, and the agent's upload fills the input, on the page the daemon
+/// launched with and on one a page opened, which the daemon adopted.
+#[tokio::test]
+#[ignore = "requires installed Chromium"]
+async fn browser_files_e2e_the_agent_learns_of_a_cancelled_chooser_and_uploads() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut connection, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0; 4096];
+                let _ = connection.read(&mut request).await;
+                let body = PAGE.replace(
+                    "</body>",
+                    "<a id=popup href=/popup target=_blank style='position:absolute;left:20px;top:260px'>Popup</a></body>",
+                );
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = connection.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    let (mut state, dir) = launch().await;
+    let file = dir.path().join("agent.bin");
+    std::fs::write(&file, [3, 1, 4]).unwrap();
+    success(
+        &command(
+            &mut state,
+            json!({"action":"navigate","url":format!("{origin}/")}),
+        )
+        .await,
+    );
+    for adopted in [false, true] {
+        if adopted {
+            let listed = command(&mut state, json!({"action":"tab_list"})).await;
+            let count = success(&listed)["tabs"].as_array().unwrap().len();
+            success(&command(&mut state, json!({"action":"click","selector":"#popup"})).await);
+            let mut opened = None;
+            for _ in 0..300 {
+                let listed = command(&mut state, json!({"action":"tab_list"})).await;
+                let tabs = success(&listed)["tabs"].as_array().unwrap().clone();
+                if tabs.len() > count {
+                    opened = tabs.last().map(|tab| tab["tabId"].clone());
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let tab = opened.expect("the page's popup was adopted");
+            success(&command(&mut state, json!({"action":"tab_switch","tabId":tab})).await);
+            for _ in 0..300 {
+                if evaluate(&state, "!!document.getElementById('one')").await == true {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+        // The click names the chooser it opened, or, when Chrome told of it
+        // just after the click was acknowledged, the next call does; once.
+        let clicked = command(&mut state, json!({"action":"click","selector":"#one"})).await;
+        let read = command(&mut state, json!({"action":"title"})).await;
+        let named: Vec<&Value> = [&clicked, &read]
+            .into_iter()
+            .map(|response| &success(response)["fileChooser"])
+            .filter(|chooser| !chooser.is_null())
+            .collect();
+        assert_eq!(named.len(), 1, "adopted {adopted}: {clicked} {read}");
+        assert_eq!(named[0]["mode"], "selectSingle", "{clicked} {read}");
+        assert!(named[0]["backendNodeId"].is_number(), "{clicked} {read}");
+        success(
+            &command(
+                &mut state,
+                json!({"action":"upload","selector":"#one","files":[file]}),
+            )
+            .await,
+        );
+        let received = receipt(&state, 0).await;
+        assert_eq!(
+            received["files"][0]["bytes"],
+            json!([3, 1, 4]),
+            "adopted {adopted}"
+        );
+    }
+    success(&command(&mut state, json!({"action":"close"})).await);
 }
