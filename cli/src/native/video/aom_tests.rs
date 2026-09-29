@@ -2,6 +2,139 @@ use super::*;
 use crate::native::video::convert::{to_rgb, Colour, Planar};
 use std::mem::{offset_of, size_of};
 
+#[test]
+fn rate_control_uses_real_picture_periods_and_preserves_the_reference_chain() {
+    let source = text_fixture(LIGHT);
+    let mut planar = Planar::new(Chroma::Full, FIXTURE.0 as u32, FIXTURE.1 as u32);
+    assert!(planar.convert(&source, FIXTURE.0 * 4, FIXTURE, (0, FIXTURE.1)));
+    let mut encoder =
+        AomEncoder::new(VideoCodec::Av1Full, FIXTURE.0 as u32, FIXTURE.1 as u32, 2).unwrap();
+    let mut decoder = Decoder::new();
+    let rate = EncoderRate {
+        bits_per_second: 500_000,
+        pictures_per_second: 60,
+        key_bytes: 15_625,
+    };
+    encoder.set_rate(Some(rate)).unwrap();
+    assert_eq!(
+        (
+            encoder.config.end_usage,
+            encoder.config.min_quantizer,
+            encoder.config.max_quantizer
+        ),
+        (CBR, 20, 48)
+    );
+    let mut bytes = Vec::new();
+    for frame in 0..60 {
+        let unit = encoder
+            .encode(
+                &planar.picture(),
+                EncodeRequest {
+                    key: frame == 0,
+                    quantizer: 32,
+                    refine: false,
+                },
+            )
+            .unwrap();
+        assert_eq!(unit.key, frame == 0);
+        let decoded = decoder.decode(&unit.data);
+        assert_eq!(
+            (decoded.width, decoded.height),
+            (FIXTURE.0 as u32, FIXTURE.1 as u32)
+        );
+        bytes.push(unit.data.len());
+    }
+    assert_eq!(
+        encoder.pictures,
+        60 * 16_666,
+        "CBR receives one actual frame period per picture"
+    );
+    assert!(
+        bytes[0] <= rate.key_bytes as usize,
+        "key unit {} bytes, budget {}",
+        bytes[0],
+        rate.key_bytes
+    );
+    assert!(bytes[1..]
+        .iter()
+        .all(|bytes| *bytes <= (rate.bits_per_second as usize / 8 / 60) * 115 / 100));
+    println!(
+        "RATE_FIXTURE {}",
+        serde_json::json!({"codec":"av1-444","width":FIXTURE.0,"height":FIXTURE.1,"bitsPerSecond":rate.bits_per_second,"picturesPerSecond":rate.pictures_per_second,"keyBudgetBytes":rate.key_bytes,"unitBytes":bytes})
+    );
+    // A refinement is fixed-quality against the same references; motion returns to CBR without a key unit.
+    let refined = encoder
+        .encode(
+            &planar.picture(),
+            EncodeRequest {
+                key: false,
+                quantizer: 8,
+                refine: true,
+            },
+        )
+        .unwrap();
+    assert!(!refined.key);
+    decoder.decode(&refined.data);
+    let motion = encoder
+        .encode(
+            &planar.picture(),
+            EncodeRequest {
+                key: false,
+                quantizer: 32,
+                refine: false,
+            },
+        )
+        .unwrap();
+    assert!(!motion.key);
+    decoder.decode(&motion.data);
+    assert_eq!(encoder.config.end_usage, CBR);
+    encoder.set_rate(None).unwrap();
+    let fixed = encoder
+        .encode(
+            &planar.picture(),
+            EncodeRequest {
+                key: false,
+                quantizer: 8,
+                refine: false,
+            },
+        )
+        .unwrap();
+    assert!(!fixed.key);
+    decoder.decode(&fixed.data);
+    assert_eq!((encoder.config.end_usage, encoder.quantizer), (Q, Some(8)));
+}
+
+#[test]
+fn malformed_rate_budgets_do_not_mutate_the_encoder() {
+    let mut encoder = AomEncoder::new(VideoCodec::Av1Full, 64, 64, 1).unwrap();
+    for rate in [
+        EncoderRate {
+            bits_per_second: 999,
+            pictures_per_second: 60,
+            key_bytes: 20_000,
+        },
+        EncoderRate {
+            bits_per_second: 1_000_000,
+            pictures_per_second: 0,
+            key_bytes: 20_000,
+        },
+        EncoderRate {
+            bits_per_second: 1_000_000,
+            pictures_per_second: 61,
+            key_bytes: 20_000,
+        },
+        EncoderRate {
+            bits_per_second: 1_000_000,
+            pictures_per_second: 60,
+            key_bytes: 0,
+        },
+    ] {
+        assert!(encoder.set_rate(Some(rate)).is_err());
+        assert_eq!(encoder.rate, None);
+        assert_eq!(encoder.config.end_usage, Q);
+    }
+}
+
 /// The layout this FFI relies on, against the values `offsetof` measured
 /// from the libaom 3.12.1 headers (the image's libaom3 3.12.1-1+deb13u1).
 /// A field declared at a wrong place fails here, not in memory.
