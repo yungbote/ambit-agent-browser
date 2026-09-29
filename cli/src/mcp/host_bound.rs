@@ -49,12 +49,41 @@ const HOST_CALLED: &[&str] = &[TOOL_SET_THEME, TOOL_OPEN_MANY];
 const SESSION_OPERATIONS: &[&str] = &[TOOL_SET_THEME];
 
 /// Process discovery, supervisor configuration, dependency installation and
-/// cross-session commands belong to the host. Browser auth and state stay in
-/// the normal admitted filesystem and retain the canonical tool semantics.
+/// cross-session commands belong to the host. So do the person's sign-ins:
+/// no host-bound call reads or sets cookies or site storage, saves or loads
+/// browser state, keeps or types a password, or records a capture that
+/// holds request headers and cookies (a HAR, a trace, a profile). The host
+/// keeps sign-ins for the person, who signs in themselves.
 pub(super) fn allows(name: &str) -> bool {
     !matches!(
         name,
-        TOOL_TOOLS_PROFILES
+        TOOL_COOKIES_GET
+            | TOOL_COOKIES_SET
+            | TOOL_COOKIES_SET_CURL
+            | TOOL_COOKIES_CLEAR
+            | TOOL_STORAGE_GET
+            | TOOL_STORAGE_SET
+            | TOOL_STORAGE_CLEAR
+            | TOOL_STATE_SAVE
+            | TOOL_STATE_LOAD
+            | TOOL_STATE_SHOW
+            | TOOL_STATE_LIST
+            | TOOL_STATE_CLEAN
+            | TOOL_STATE_CLEAR
+            | TOOL_STATE_RENAME
+            | TOOL_AUTH_SAVE
+            | TOOL_AUTH_LOGIN
+            | TOOL_AUTH_SHOW
+            | TOOL_AUTH_LIST
+            | TOOL_AUTH_DELETE
+            | TOOL_SET_CREDENTIALS
+            | TOOL_NETWORK_HAR_START
+            | TOOL_NETWORK_HAR_STOP
+            | TOOL_TRACE_START
+            | TOOL_TRACE_STOP
+            | TOOL_PROFILER_START
+            | TOOL_PROFILER_STOP
+            | TOOL_TOOLS_PROFILES
             | TOOL_SESSION
             | TOOL_SESSION_LIST
             | TOOL_SESSION_ID
@@ -415,16 +444,7 @@ mod tests {
             }
             assert_eq!(tool["inputSchema"]["additionalProperties"], false);
         }
-        for name in [
-            TOOL_OPEN,
-            TOOL_EVAL,
-            TOOL_CLICK,
-            TOOL_AUTH_SAVE,
-            TOOL_AUTH_LOGIN,
-            TOOL_STATE_SAVE,
-            TOOL_STATE_LOAD,
-            TOOL_SET_VIEWPORT,
-        ] {
+        for name in [TOOL_OPEN, TOOL_EVAL, TOOL_CLICK, TOOL_SET_VIEWPORT] {
             assert!(tools.iter().any(|tool| tool["name"] == name));
         }
         for name in [
@@ -448,9 +468,57 @@ mod tests {
         );
     }
 
+    /// The person's sign-ins stay with the host. No host-bound tool reads or
+    /// sets cookies or site storage, saves or loads browser state, keeps or
+    /// types a password, or records a capture that holds request headers and
+    /// cookies, though the canonical catalog keeps them all, and neither
+    /// transport prepares a call to one.
+    #[test]
+    fn sign_ins_stay_with_the_host() {
+        let withheld = [
+            TOOL_COOKIES_GET,
+            TOOL_COOKIES_SET,
+            TOOL_COOKIES_SET_CURL,
+            TOOL_COOKIES_CLEAR,
+            TOOL_STORAGE_GET,
+            TOOL_STORAGE_SET,
+            TOOL_STORAGE_CLEAR,
+            TOOL_STATE_SAVE,
+            TOOL_STATE_LOAD,
+            TOOL_STATE_SHOW,
+            TOOL_STATE_LIST,
+            TOOL_STATE_CLEAN,
+            TOOL_STATE_CLEAR,
+            TOOL_STATE_RENAME,
+            TOOL_AUTH_SAVE,
+            TOOL_AUTH_LOGIN,
+            TOOL_AUTH_SHOW,
+            TOOL_AUTH_LIST,
+            TOOL_AUTH_DELETE,
+            TOOL_SET_CREDENTIALS,
+            TOOL_NETWORK_HAR_START,
+            TOOL_NETWORK_HAR_STOP,
+            TOOL_TRACE_START,
+            TOOL_TRACE_STOP,
+            TOOL_PROFILER_START,
+            TOOL_PROFILER_STOP,
+        ];
+        let canonical = super::super::tools();
+        let flags = HostFlags::new("host", "browser", None).unwrap();
+        for name in withheld {
+            assert!(canonical.iter().any(|tool| tool["name"] == name), "{name}");
+            assert!(tool(name).is_none(), "{name}");
+            assert_eq!(
+                flags.prepare(name, &json!({})).unwrap_err(),
+                "Tool is not in the host-bound browser profile.",
+                "{name}"
+            );
+        }
+    }
+
     /// Arguments that satisfy a tool's schema: each required property with a
     /// value of its type (the first of an enumeration).
-    fn schema_arguments(schema: &Value, file: &str) -> Value {
+    fn schema_arguments(schema: &Value) -> Value {
         let mut arguments = serde_json::Map::new();
         for name in schema["required"].as_array().into_iter().flatten() {
             let name = name.as_str().unwrap();
@@ -467,7 +535,6 @@ mod tests {
                         "url" | "url1" | "url2" => "https://example.test/",
                         "selector" | "source" | "target" | "frame" => "#element",
                         "path" => "/workspace/file",
-                        "file" => file,
                         "key" => "Enter",
                         "tab" => "t1",
                         _ => "value",
@@ -505,17 +572,13 @@ mod tests {
             TOOL_DIALOG_DISMISS,
             TOOL_RUN_PLAYWRIGHT,
         ];
-        // `cookies set --curl` reads its file while parsing.
-        let curl = tempfile::NamedTempFile::new().unwrap();
-        fs::write(curl.path(), "curl 'https://example.test/' -H 'Cookie: a=b'").unwrap();
         let tools = tools();
         for name in implicit {
             assert!(tools.iter().any(|tool| tool["name"] == name), "{name}");
         }
         for tool in &tools {
             let name = tool["name"].as_str().unwrap();
-            let mut arguments =
-                schema_arguments(&tool["inputSchema"], curl.path().to_str().unwrap());
+            let mut arguments = schema_arguments(&tool["inputSchema"]);
             // The parser needs more than these schemas require.
             match name {
                 TOOL_DIFF_SCREENSHOT => arguments["baseline"] = json!("/workspace/base.png"),
@@ -553,7 +616,7 @@ mod tests {
     #[test]
     fn theme_is_a_host_operation_and_host_configuration() {
         let tools = tools();
-        assert_eq!(tools.len(), 132);
+        assert_eq!(tools.len(), 106);
         let set_theme = tools
             .iter()
             .find(|tool| tool["name"] == TOOL_SET_THEME)
