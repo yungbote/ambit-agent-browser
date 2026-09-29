@@ -2884,6 +2884,13 @@ pub(crate) trait HostFence {
 
     /// Admits the command, or refuses it with a native response.
     async fn admit(&mut self, command: &Value, state: &mut DaemonState) -> Result<(), Value>;
+
+    /// A command passed admission and its canonical launch succeeded. A
+    /// host-owned connection may prepare the current browser here before
+    /// the first operation uses it. Legacy fences keep their behavior.
+    async fn browser_ready(&mut self, _state: &mut DaemonState) -> Result<(), Value> {
+        Ok(())
+    }
 }
 
 /// Whether the active page is between documents, once the events that
@@ -2968,6 +2975,9 @@ pub(crate) async fn run_host_command(
                         return state.window_refusal(&command["id"], code, message);
                     }
                 }
+            }
+            if let Err(refusal) = fence.browser_ready(state).await {
+                return refusal;
             }
             Box::pin(execute_command_inner(&command, state)).await
         };
@@ -18159,6 +18169,119 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             Err(json!({ "id": command["id"], "success": false,
                 "code": "browser_observation_stale", "error": "fenced" }))
         }
+    }
+
+    struct ReadyFence {
+        admitted: bool,
+        ready: usize,
+        wait: bool,
+    }
+
+    impl HostFence for ReadyFence {
+        fn fences_point(&self) -> bool {
+            false
+        }
+        fn reads_page(&self) -> bool {
+            false
+        }
+
+        async fn admit(&mut self, _: &Value, _: &mut DaemonState) -> Result<(), Value> {
+            if self.admitted {
+                Ok(())
+            } else {
+                Err(json!({"success":false,"code":"test_admission"}))
+            }
+        }
+
+        async fn browser_ready(&mut self, _: &mut DaemonState) -> Result<(), Value> {
+            self.ready += 1;
+            if self.wait {
+                std::future::pending::<()>().await;
+            }
+            Err(json!({"success":false,"code":"test_browser_ready"}))
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_ready_runs_after_admission_and_launch_before_the_operation() {
+        let mut state = DaemonState::new();
+        let mut request = super::super::feedback::FeedbackRequest {
+            namespace: String::new(),
+            session: state.session_id.clone(),
+            capture_directory: "/".into(),
+            timeout_ms: 1000,
+            expected_observation: None,
+            launch: None,
+        };
+        let command = json!({"id":"ready","action":"test_operation_must_not_execute"});
+        let mut fence = ReadyFence {
+            admitted: false,
+            ready: 0,
+            wait: false,
+        };
+        let refused = run_host_command(
+            &command,
+            &request,
+            &mut state,
+            std::time::Instant::now(),
+            &mut fence,
+        )
+        .await;
+        assert_eq!(refused["code"], "test_admission");
+        assert_eq!(fence.ready, 0);
+        fence.admitted = true;
+        request.launch = Some(
+            json!({"action":"launch","executablePath":"/nonexistent/ambit-browser-ready-fixture"}),
+        );
+        let refused = run_host_command(
+            &command,
+            &request,
+            &mut state,
+            std::time::Instant::now(),
+            &mut fence,
+        )
+        .await;
+        assert_eq!(refused["success"], false);
+        assert_eq!(fence.ready, 0);
+        request.launch = None;
+        let refused = run_host_command(
+            &command,
+            &request,
+            &mut state,
+            std::time::Instant::now(),
+            &mut fence,
+        )
+        .await;
+        assert_eq!(refused["code"], "test_browser_ready");
+        assert_eq!(fence.ready, 1);
+    }
+
+    #[tokio::test]
+    async fn browser_ready_obeys_the_existing_command_deadline() {
+        let mut state = DaemonState::new();
+        let request = super::super::feedback::FeedbackRequest {
+            namespace: String::new(),
+            session: state.session_id.clone(),
+            capture_directory: "/".into(),
+            timeout_ms: 1,
+            expected_observation: None,
+            launch: None,
+        };
+        let mut fence = ReadyFence {
+            admitted: true,
+            ready: 0,
+            wait: true,
+        };
+        let refused = run_host_command(
+            &json!({"id":"ready","action":"test_operation_must_not_execute"}),
+            &request,
+            &mut state,
+            std::time::Instant::now(),
+            &mut fence,
+        )
+        .await;
+        assert_eq!(refused["code"], "command_outcome_unknown");
+        assert_eq!(fence.ready, 1);
     }
 
     /// Both transports' host path asks its fence only after the custody and
