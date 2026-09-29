@@ -10,7 +10,7 @@ use tokio::sync::{broadcast, Mutex};
 use url::Url;
 
 use super::{
-    protocol::{Mode, Request},
+    protocol::{self, Mode, Offer, Request},
     state::{self, SiteState},
     storage, Context,
 };
@@ -36,11 +36,12 @@ struct Held {
     use_id: String,
     mode: Mode,
     state: SiteState,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 #[derive(Default)]
 struct State {
     channel: Option<ChannelId>,
-    offers: HashMap<String, Mode>,
+    offers: HashMap<String, Offer>,
     pending: HashMap<String, Pending>,
     resolved: HashSet<String>,
     held: HashMap<String, Held>,
@@ -148,6 +149,7 @@ impl Custody {
         for session in sessions {
             self.prepare_session(&client, &session).await?;
         }
+        self.expire_due().await?;
         Ok(())
     }
 
@@ -203,6 +205,16 @@ impl Custody {
             let _ = continue_request(client, Pause { session, request }).await;
             return;
         };
+        if protocol::expiry(state.offers[&site].expires_at.as_deref())
+            .ok()
+            .flatten()
+            .is_some_and(|at| at <= chrono::Utc::now())
+        {
+            drop(state);
+            let _ = self.detach(&site).await;
+            let _ = continue_request(client, Pause { session, request }).await;
+            return;
+        }
         if let Some((_, pending)) = state
             .pending
             .iter_mut()
@@ -215,7 +227,7 @@ impl Custody {
             return;
         };
         let request_id = uuid::Uuid::new_v4().to_string();
-        let mode = state.offers[&site];
+        let mode = state.offers[&site].mode;
         let offer_generation = state.offer_generation;
         state.pending.insert(
             request_id.clone(),
@@ -243,15 +255,21 @@ impl Custody {
     }
 
     async fn release(&self, request_id: &str) {
-        let (pending, client) = {
+        let (pending, client, held) = {
             let mut state = self.state.lock().await;
             let Some(pending) = state.pending.remove(request_id) else {
                 return;
             };
             state.resolved.insert(pending.site.clone());
-            (pending, state.client.clone())
+            let held = state.held.remove(&pending.site);
+            (pending, state.client.clone(), held)
         };
         if let Some(client) = client {
+            if let Some(held) = held {
+                // A refused revalidation must really continue signed out,
+                // including cookies retained across a native relaunch.
+                let _ = storage::clear(&client, &held.state).await;
+            }
             for pause in pending.pauses {
                 let _ = continue_request(&client, pause).await;
             }
@@ -285,6 +303,10 @@ impl Custody {
                             &offer.site == *site
                                 && offer.use_id.as_ref() == Some(&held.use_id)
                                 && offer.mode == held.mode
+                                && protocol::expiry(offer.expires_at.as_deref())
+                                    .ok()
+                                    .flatten()
+                                    .is_none_or(|at| at > chrono::Utc::now())
                         })
                     })
                     .map(|(site, _)| site.clone())
@@ -298,12 +320,42 @@ impl Custody {
             state.activated = true;
             state.offers = offers
                 .into_iter()
-                .map(|offer| (offer.site, offer.mode))
+                .filter(|offer| {
+                    protocol::expiry(offer.expires_at.as_deref())
+                        .ok()
+                        .flatten()
+                        .is_none_or(|at| at > chrono::Utc::now())
+                })
+                .map(|offer| (offer.site.clone(), offer))
                 .collect();
             state.resolved.clear();
             let held = state.held.keys().cloned().collect::<Vec<_>>();
             state.resolved.extend(held);
-            return Ok(json!({"offered":state.offers.len()}));
+            let updates = state
+                .offers
+                .iter()
+                .map(|(site, offer)| {
+                    (
+                        site.clone(),
+                        protocol::expiry(offer.expires_at.as_deref()).ok().flatten(),
+                    )
+                })
+                .collect::<Vec<_>>();
+            let mut timers = Vec::new();
+            for (site, expiry) in updates {
+                if let Some(held) = state.held.get_mut(&site) {
+                    held.expires_at = expiry;
+                    if let Some(expiry) = expiry {
+                        timers.push((site, held.use_id.clone(), expiry));
+                    }
+                }
+            }
+            let offered = state.offers.len();
+            drop(state);
+            for (site, use_id, expiry) in timers {
+                self.schedule_expiry(site, use_id, expiry);
+            }
+            return Ok(json!({"offered":offered}));
         }
         if !matches!(request, Request::Export(_) | Request::Detach { .. })
             && self.state.lock().await.channel != Some(channel)
@@ -316,6 +368,7 @@ impl Custody {
                 use_id,
                 site,
                 mode,
+                expires_at,
                 state: attached,
             } => {
                 let (pending, client) = {
@@ -325,6 +378,20 @@ impl Custody {
                         || pending.site != site
                         || pending.mode != mode
                         || pending.expires <= Instant::now()
+                    {
+                        return Err(REFUSED);
+                    }
+                    let deadline = protocol::expiry(expires_at.as_deref())?;
+                    let offered = protocol::expiry(
+                        state
+                            .offers
+                            .get(&site)
+                            .ok_or(REFUSED)?
+                            .expires_at
+                            .as_deref(),
+                    )?;
+                    if deadline.is_some_and(|at| at <= chrono::Utc::now())
+                        || offered.is_some_and(|limit| deadline.is_none_or(|at| at > limit))
                     {
                         return Err(REFUSED);
                     }
@@ -343,7 +410,7 @@ impl Custody {
                     let mut state = self.state.lock().await;
                     // Offer replacement or channel close wins over late import.
                     if state.channel != Some(channel)
-                        || state.offers.get(&site) != Some(&mode)
+                        || state.offers.get(&site).map(|offer| offer.mode) != Some(mode)
                         || state.offer_generation != pending.offer_generation
                     {
                         drop(state);
@@ -361,9 +428,10 @@ impl Custody {
                         state.held.insert(
                             site.clone(),
                             Held {
-                                use_id,
+                                use_id: use_id.clone(),
                                 mode,
                                 state: attached,
+                                expires_at: protocol::expiry(expires_at.as_deref())?,
                             },
                         );
                     }
@@ -372,6 +440,9 @@ impl Custody {
                     let _ = continue_request(&client, pause).await;
                 }
                 imported?;
+                if let Some(deadline) = protocol::expiry(expires_at.as_deref())? {
+                    self.schedule_expiry(site.clone(), use_id, deadline);
+                }
                 Ok(json!({"site":site,"attached":true}))
             }
             Request::Refuse { request_id, site } => {
@@ -505,6 +576,51 @@ impl Custody {
     pub(crate) async fn admits_channel(&self, channel: ChannelId) -> bool {
         let state = self.state.lock().await;
         !state.activated || state.channel == Some(channel)
+    }
+
+    async fn expire_due(&self) -> Result<(), &'static str> {
+        let due = {
+            let state = self.state.lock().await;
+            state
+                .held
+                .iter()
+                .filter(|(_, held)| held.expires_at.is_some_and(|at| at <= chrono::Utc::now()))
+                .map(|(site, _)| site.clone())
+                .collect::<Vec<_>>()
+        };
+        for site in due {
+            self.detach(&site).await?;
+        }
+        Ok(())
+    }
+
+    fn schedule_expiry(
+        self: &Arc<Self>,
+        site: String,
+        use_id: String,
+        deadline: chrono::DateTime<chrono::Utc>,
+    ) {
+        let owner = Arc::downgrade(self);
+        let delay = (deadline - chrono::Utc::now())
+            .to_std()
+            .unwrap_or(Duration::ZERO);
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            let Some(owner) = owner.upgrade() else {
+                return;
+            };
+            let due = {
+                let state = owner.state.lock().await;
+                state.held.get(&site).is_some_and(|held| {
+                    held.use_id == use_id
+                        && held.expires_at == Some(deadline)
+                        && deadline <= chrono::Utc::now()
+                })
+            };
+            if due {
+                let _ = owner.detach(&site).await;
+            }
+        });
     }
 }
 

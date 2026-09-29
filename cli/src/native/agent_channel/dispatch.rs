@@ -39,6 +39,7 @@ const CONTROLLED: &str = "browser_controlled_by_user";
 
 /// The daemon's browser, reached under its command custody.
 pub(crate) struct DaemonBrowser {
+    custody: Arc<crate::native::site_sessions::custody::Custody>,
     state: Arc<Mutex<DaemonState>>,
     recorders: Recorders,
     /// The channel whose step acted last: the input its steps left held is
@@ -49,6 +50,7 @@ pub(crate) struct DaemonBrowser {
 impl DaemonBrowser {
     pub(crate) fn new(state: Arc<Mutex<DaemonState>>) -> Self {
         Self {
+            custody: crate::native::site_sessions::custody::Custody::new(),
             state,
             recorders: Recorders::default(),
             actor: StdMutex::new(None),
@@ -142,12 +144,34 @@ impl DaemonBrowser {
 /// protocol checks the image a point came from. Once they admit a step that
 /// is not read-only, its landing starts recording.
 struct StepFence<'a> {
+    channel: ChannelId,
+    custody: &'a Arc<crate::native::site_sessions::custody::Custody>,
     step: &'a PreparedStep,
     recorders: &'a Recorders,
     landing: Option<Landing>,
 }
 
 impl HostFence for StepFence<'_> {
+    async fn browser_ready(&mut self, state: &mut DaemonState) -> Result<(), Value> {
+        if !self.custody.admits_channel(self.channel).await {
+            return Err(
+                json!({"success":false,"code":"browser_site_custody_refused","error":"This channel needs its host's site custody offer before using the browser."}),
+            );
+        }
+        if let Some(browser) = &state.browser {
+            let sessions = browser
+                .tab_list()
+                .iter()
+                .filter_map(|tab| {
+                    tab["targetId"]
+                        .as_str()
+                        .and_then(|target| browser.client.session_for_target(target))
+                })
+                .collect();
+            self.custody.browser_ready(browser.client.clone(),sessions).await.map_err(|error|json!({"success":false,"code":"browser_site_custody_refused","error":error}))?;
+        }
+        Ok(())
+    }
     fn fences_point(&self) -> bool {
         let preconditions = &self.step.preconditions;
         preconditions.page_generation.is_some() && preconditions.geometry_sha256.is_some()
@@ -211,12 +235,74 @@ fn unavailable(
 }
 
 impl Browser for DaemonBrowser {
+    async fn site_request(
+        &self,
+        channel: ChannelId,
+        request: crate::native::site_sessions::protocol::Request,
+    ) -> Result<Value, &'static str> {
+        // Attach must never wait behind the navigation it is releasing.
+        // Other requests can refresh a new native connection without taking
+        // command custody away from an operation already using it.
+        if !matches!(
+            request,
+            crate::native::site_sessions::protocol::Request::Attach { .. }
+                | crate::native::site_sessions::protocol::Request::Refuse { .. }
+        ) {
+            if let Ok(state) = self.state.try_lock() {
+                if let Some(browser) = &state.browser {
+                    let sessions = browser
+                        .tab_list()
+                        .iter()
+                        .filter_map(|tab| {
+                            tab["targetId"]
+                                .as_str()
+                                .and_then(|target| browser.client.session_for_target(target))
+                        })
+                        .collect();
+                    self.custody
+                        .browser_ready(browser.client.clone(), sessions)
+                        .await?;
+                }
+            }
+        }
+        let response = self.custody.request(channel, request).await?;
+        // The first offer may arrive before the browser was launched.
+        if let Ok(state) = self.state.try_lock() {
+            if let Some(browser) = &state.browser {
+                let sessions = browser
+                    .tab_list()
+                    .iter()
+                    .filter_map(|tab| {
+                        tab["targetId"]
+                            .as_str()
+                            .and_then(|target| browser.client.session_for_target(target))
+                    })
+                    .collect();
+                self.custody
+                    .browser_ready(browser.client.clone(), sessions)
+                    .await?;
+            }
+        }
+        Ok(response)
+    }
+
+    fn custody_events(&self) -> Option<tokio::sync::broadcast::Receiver<(ChannelId, Value)>> {
+        Some(self.custody.subscribe())
+    }
+    fn redact(&self, value: &mut Value) {
+        self.custody.scrub(value);
+    }
+    fn redact_step(&self, op: &str, value: &mut Value) {
+        self.custody.scrub_tool(op, value);
+    }
     async fn step(&self, frame: &FrameContext<'_>, step: &PreparedStep) -> StepRecord {
         let asked = Instant::now();
         let mut state = self.state.lock().await;
         let held = Instant::now();
         *self.actor() = Some(frame.channel);
         let mut fence = StepFence {
+            channel: frame.channel,
+            custody: &self.custody,
             step,
             recorders: &self.recorders,
             landing: None,
@@ -308,6 +394,7 @@ impl Browser for DaemonBrowser {
     }
 
     async fn end(&self, channel: ChannelId) {
+        self.custody.end(channel).await;
         // Custody is held throughout: no step starts while the input its
         // channel left held is settled.
         let state = self.state.lock().await;

@@ -71,6 +71,7 @@ pub(crate) enum Frame {
     Hello(Hello),
     Sequence(Sequence),
     OpStatus(OpStatus),
+    Site(crate::native::site_sessions::protocol::Request),
 }
 
 /// The channel-scoped host configuration a `hello` carries: the members of
@@ -205,6 +206,10 @@ impl Frame {
                     .map_err(|error| invalid(format!("The op_status is not valid: {error}.")))?
                     .check()
                     .map_err(invalid)?,
+            ),
+            kind if crate::native::site_sessions::protocol::is_kind(kind) => Frame::Site(
+                crate::native::site_sessions::protocol::Request::read(kind, members)
+                    .map_err(|message| invalid(message.into()))?,
             ),
             other => {
                 return Err(invalid(format!(

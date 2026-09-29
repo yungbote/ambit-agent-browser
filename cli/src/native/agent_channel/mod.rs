@@ -42,6 +42,7 @@ use reply::{Retained, Slot, MAX_REPLY_BYTES, MAX_REQUEST_BYTES, RETAINED_ABOVE};
 use step::{PreparedStep, EXCLUDED_OPS};
 
 use crate::mcp::host_bound::{catalog_identity, HostFlags};
+use crate::native::site_sessions::protocol::{self as site_protocol, Request as SiteRequest};
 use crate::native::stream::IdleActivity;
 
 /// The daemon action the toolbox's agent route names on every line.
@@ -147,6 +148,21 @@ pub(crate) struct Finish {
 
 /// Where a channel's steps run.
 pub(crate) trait Browser: Sync {
+    fn site_request(
+        &self,
+        _channel: ChannelId,
+        _request: SiteRequest,
+    ) -> impl Future<Output = Result<Value, &'static str>> + Send {
+        async { Err("This browser does not serve site custody.") }
+    }
+
+    fn custody_events(&self) -> Option<tokio::sync::broadcast::Receiver<(ChannelId, Value)>> {
+        None
+    }
+    fn redact(&self, _value: &mut Value) {}
+    fn redact_step(&self, _op: &str, value: &mut Value) {
+        self.redact(value);
+    }
     /// Runs one prepared step under command custody taken for it alone.
     fn step(
         &self,
@@ -311,15 +327,54 @@ impl Endpoint {
             inbox.receive(line, &self.ledger);
         }
         let mut session: Option<Session> = None;
-        while let Some(received) = inbox.next(&self.ledger).await {
+        let mut events = browser.custody_events();
+        loop {
+            let received = loop {
+                tokio::select! {
+                    received=inbox.next(&self.ledger)=>break received,
+                    event=async { events.as_mut().unwrap().recv().await }, if events.is_some()=>{
+                        if let Ok((channel,event))=event {
+                            if session.as_ref().is_some_and(|session|session.channel==channel) {
+                                if write_line(writer,&event).await.is_err() { inbox.close(&self.ledger); }
+                            }
+                        }
+                    }
+                }
+            };
+            let Some(received) = received else {
+                break;
+            };
             idle.mark();
             let sequence = received.sequence;
-            let outcome = with_read_ahead(
-                self.process(browser, session.as_ref(), received),
-                &mut inbox,
-                &self.ledger,
-            )
-            .await;
+            let outcome = {
+                let work = self.process(browser, session.as_ref(), received);
+                tokio::pin!(work);
+                loop {
+                    tokio::select! {
+                        biased;
+                        output=&mut work=>break output,
+                        event=async { events.as_mut().unwrap().recv().await }, if events.is_some()=>{
+                            if let Ok((channel,event))=event {
+                                if session.as_ref().is_some_and(|session|session.channel==channel) {
+                                    if write_line(writer,&event).await.is_err() { inbox.close(&self.ledger); }
+                                }
+                            }
+                        }
+                        line=inbox.read_line(), if !inbox.closed=>{
+                            if let Some(line)=line {
+                                inbox.receive(line,&self.ledger);
+                                if inbox.frames.back().is_some_and(|received| matches!(received.frame,Ok((_,Frame::Site(_))))) {
+                                    let received=inbox.frames.pop_back().unwrap();
+                                    inbox.queued_bytes=inbox.queued_bytes.saturating_sub(received.bytes);
+                                    if let Some((reply,_))=self.process(browser,session.as_ref(),received).await {
+                                        if write_line(writer,&reply).await.is_err() { inbox.close(&self.ledger); }
+                                    }
+                                }
+                            } else { inbox.close(&self.ledger); }
+                        }
+                    }
+                }
+            };
             // A line without a usable id cannot be answered in step.
             let Some((reply, established)) = outcome else {
                 break;
@@ -394,7 +449,15 @@ impl Endpoint {
             (Frame::OpStatus(query), Some(session)) => {
                 (self.op_status(session, id, query).await, None)
             }
-            (Frame::Sequence(_), None) | (Frame::OpStatus(_), None) => (
+            (Frame::Site(request), Some(session)) => {
+                let result = browser.site_request(session.channel, request).await;
+                let reply = match result {
+                    Ok(data) => json!({"id":id,"success":true,"data":data}),
+                    Err(error) => refusal(id, "browser_site_custody_refused", error, false),
+                };
+                (reply, None)
+            }
+            (Frame::Sequence(_), None) | (Frame::OpStatus(_), None) | (Frame::Site(_), None) => (
                 refusal(
                     id,
                     PROTOCOL_REFUSED,
@@ -466,10 +529,12 @@ impl Endpoint {
             "catalog": catalog_identity(),
             "driverArtifactDigest": digest,
             "features": FEATURES,
+            "sessionCustody": site_protocol::VERSION,
             "excludedOps": EXCLUDED_OPS,
             "limits": {
                 "maxInFlight": MAX_IN_FLIGHT, "maxRequestBytes": MAX_REQUEST_BYTES,
                 "maxReplyBytes": MAX_REPLY_BYTES, "ledgerEntries": ledger::ENTRIES,
+                "maxCustodyBytes":site_protocol::MAX_FRAME_BYTES,
                 "ledgerBytes": ledger::BYTES, "candidates": CANDIDATES,
                 "resolve": frame::MAX_RESOLVE,
             },
@@ -540,7 +605,12 @@ impl Endpoint {
             if !self.ledger.may_continue(channel) {
                 break;
             }
-            let record = browser.step(&context, step).await;
+            let mut record = browser.step(&context, step).await;
+            // Redact before either the ledger or a retained result can keep it.
+            browser.redact_step(&record.op, &mut record.result);
+            if let Some(landed) = &mut record.landed {
+                browser.redact(landed);
+            }
             let succeeded = record.succeeded;
             records.push(record);
             if !succeeded {
@@ -550,7 +620,7 @@ impl Endpoint {
         // A channel that stopped asks for nothing more than the page it
         // left: nobody will act on an observation.
         let live = self.ledger.may_continue(channel);
-        let finish = browser
+        let mut finish = browser
             .finish(
                 &context,
                 &Asks {
@@ -560,6 +630,13 @@ impl Endpoint {
                 },
             )
             .await;
+        browser.redact(&mut finish.browser);
+        if let Some(observation) = &mut finish.observation {
+            browser.redact(observation);
+        }
+        if let Some(resolved) = &mut finish.resolved {
+            browser.redact(resolved);
+        }
         let success = records.iter().all(|record| record.succeeded);
         let retained = |step: usize| Retained {
             directory: frame.directory.clone(),
@@ -768,7 +845,32 @@ impl<R: AsyncRead + Unpin> Inbox<'_, R> {
             Ok(value) => {
                 let sequence = value["type"] == "sequence";
                 let owner = frame::lenient_owner(&value);
-                let frame = if value["action"] != ACTION {
+                let kind = value["type"].as_str().unwrap_or_default();
+                if !site_protocol::is_kind(kind)
+                    && (line.len() > MAX_REQUEST_BYTES + 1
+                        || self
+                            .frames
+                            .iter()
+                            .filter(|received| !matches!(received.frame, Ok((_, Frame::Site(_)))))
+                            .map(|received| received.bytes)
+                            .sum::<usize>()
+                            + line.len()
+                            > MAX_REQUEST_BYTES + 1)
+                {
+                    self.close(ledger);
+                    return;
+                }
+                let limit = if site_protocol::is_kind(kind) {
+                    site_protocol::MAX_FRAME_BYTES
+                } else {
+                    MAX_REQUEST_BYTES
+                };
+                let frame = if line.len() > limit + 1 {
+                    Err(Invalid {
+                        id: frame::id_of(&value),
+                        message: "The agent frame exceeds its byte limit.".into(),
+                    })
+                } else if value["action"] != ACTION {
                     Err(Invalid {
                         id: frame::id_of(&value),
                         message: "An agent channel carries agent frames only.".into(),
@@ -821,17 +923,6 @@ impl<R: AsyncRead + Unpin> Inbox<'_, R> {
         Some(received)
     }
 
-    /// Reads frames while one runs, until the connection ends. Safe to
-    /// cancel between reads: a partial line is kept.
-    async fn read_ahead(&mut self, ledger: &Ledger) {
-        while !self.closed {
-            match self.read_line().await {
-                Some(line) => self.receive(line, ledger),
-                None => self.close(ledger),
-            }
-        }
-    }
-
     fn close(&mut self, ledger: &Ledger) {
         self.closed = true;
         if let Some(channel) = self.channel {
@@ -851,7 +942,9 @@ impl<R: AsyncRead + Unpin> Inbox<'_, R> {
                 .iter()
                 .position(|byte| *byte == b'\n')
                 .map_or(available.len(), |index| index + 1);
-            if self.queued_bytes + self.partial.len() + count > MAX_REQUEST_BYTES + 1 {
+            if self.queued_bytes + self.partial.len() + count
+                > MAX_REQUEST_BYTES + site_protocol::MAX_FRAME_BYTES + 1
+            {
                 return None;
             }
             self.partial.extend_from_slice(&available[..count]);
@@ -863,20 +956,11 @@ impl<R: AsyncRead + Unpin> Inbox<'_, R> {
     }
 }
 
-/// Runs `work` while the connection keeps being read.
-async fn with_read_ahead<T, R: AsyncRead + Unpin>(
-    work: impl Future<Output = T>,
-    inbox: &mut Inbox<'_, R>,
-    ledger: &Ledger,
-) -> T {
-    tokio::pin!(work);
-    loop {
-        tokio::select! {
-            biased;
-            output = &mut work => return output,
-            _ = inbox.read_ahead(ledger), if !inbox.closed => {}
-        }
-    }
+async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, value: &Value) -> std::io::Result<()> {
+    let mut line = value.to_string();
+    line.push('\n');
+    writer.write_all(line.as_bytes()).await?;
+    writer.flush().await
 }
 
 /// A frame refused before any step ran. A refused `sequence` answers with

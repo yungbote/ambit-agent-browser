@@ -25,6 +25,8 @@ pub(crate) struct Offer {
     pub(crate) mode: Mode,
     #[serde(default, rename = "useId")]
     pub(crate) use_id: Option<String>,
+    #[serde(default, rename = "expiresAt")]
+    pub(crate) expires_at: Option<String>,
 }
 
 pub(crate) enum Request {
@@ -34,6 +36,7 @@ pub(crate) enum Request {
         use_id: String,
         site: String,
         mode: Mode,
+        expires_at: Option<String>,
         state: SiteState,
     },
     Refuse {
@@ -61,6 +64,21 @@ pub(crate) fn is_kind(kind: &str) -> bool {
             | "site_session.export"
             | "site_session.detach"
     )
+}
+
+pub(crate) fn expiry(
+    value: Option<&str>,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, &'static str> {
+    value
+        .map(|value| {
+            if value.len() > 35 {
+                return Err(REFUSED);
+            }
+            chrono::DateTime::parse_from_rfc3339(value)
+                .map(|value| value.with_timezone(&chrono::Utc))
+                .map_err(|_| REFUSED)
+        })
+        .transpose()
 }
 
 impl Request {
@@ -105,13 +123,17 @@ impl Request {
                     if offer.use_id.as_ref().is_some_and(|value| !uuid(value)) {
                         return Err(REFUSED);
                     }
+                    expiry(offer.expires_at.as_deref())?;
                     if !unique.insert(&offer.site) {
                         return Err(REFUSED);
                     }
                 }
                 Ok(Self::Offer(offers))
             }
-            "site_session.attach" if exact(&["requestId", "useId", "site", "mode", "state"]) => {
+            "site_session.attach"
+                if exact(&["requestId", "useId", "site", "mode", "state"])
+                    || exact(&["requestId", "useId", "site", "mode", "state", "expiresAt"]) =>
+            {
                 let request_id = text("requestId")?;
                 let use_id = text("useId")?;
                 let site = text("site")?;
@@ -119,12 +141,19 @@ impl Request {
                     return Err(REFUSED);
                 }
                 let mode = serde_json::from_value(fields["mode"].clone()).map_err(|_| REFUSED)?;
+                let expires_at = match fields.get("expiresAt") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(value)) => Some(value.clone()),
+                    _ => return Err(REFUSED),
+                };
+                expiry(expires_at.as_deref())?;
                 let state = SiteState::read(fields["state"].clone(), &site)?;
                 Ok(Self::Attach {
                     request_id,
                     use_id,
                     site,
                     mode,
+                    expires_at,
                     state,
                 })
             }
@@ -195,10 +224,33 @@ mod tests {
         let envelope = json!({"action":"ambit_browser_agent","type":"site_session.attach","id":9007199254740991u64,
             "requestId":"ffffffff-ffff-ffff-ffff-ffffffffffff","useId":"ffffffff-ffff-ffff-ffff-ffffffffffff",
             "site":format!("https://{}.{}.{}.{}","x".repeat(63),"x".repeat(63),"x".repeat(63),"x".repeat(61)),
-            "mode":"read","state":null});
+            "mode":"read","state":null,"expiresAt":"2026-09-29T00:00:00.123456789+00:00"});
         assert!(serde_json::to_vec(&envelope).unwrap().len() - 4 < 1024);
         let reply = json!({"id":9007199254740991u64,"success":true,"data":{"states":[null]}});
         assert!(serde_json::to_vec(&reply).unwrap().len() - 4 < 1024);
         assert_eq!(MAX_FRAME_BYTES, 8389632);
+    }
+
+    #[test]
+    fn custody_offer_adoption_and_expiry_metadata_are_closed_and_bounded() {
+        assert!(Request::read("site_sessions.offer",json!({"sites":[{"site":"https://example.com","mode":"act",
+            "useId":"11111111-1111-4111-8111-111111111111","expiresAt":"2026-09-29T00:00:00.000Z"}]})).is_ok());
+        for fields in [
+            json!({"useId":"11111111-1111-4111-8111-111111111111"}),
+            json!({"useId":"not-a-uuid"}),
+            json!({"expiresAt":123}),
+            json!({"expiresAt":"invalid"}),
+        ] {
+            let mut offer = json!({"site":"https://example.com","mode":"act"});
+            offer
+                .as_object_mut()
+                .unwrap()
+                .extend(fields.as_object().unwrap().clone());
+            let admitted = Request::read("site_sessions.offer", json!({"sites":[offer]})).is_ok();
+            assert_eq!(
+                admitted,
+                fields["useId"] == "11111111-1111-4111-8111-111111111111"
+            );
+        }
     }
 }

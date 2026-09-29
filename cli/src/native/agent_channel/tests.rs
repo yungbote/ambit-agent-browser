@@ -23,6 +23,7 @@ const ACTION: &str = "8c1f0e2a-3b4c-4d5e-8f60-718293a4b5c6";
 /// `agent_browser_get_html` answers with as many bytes as its selector says.
 #[derive(Default)]
 struct Scripted {
+    custody: Option<tokio::sync::broadcast::Sender<(ChannelId, Value)>>,
     ran: StdMutex<Vec<String>>,
     started: Notify,
     go: Notify,
@@ -41,8 +42,33 @@ impl Scripted {
 }
 
 impl Browser for Scripted {
-    async fn step(&self, _: &FrameContext<'_>, step: &PreparedStep) -> StepRecord {
+    fn custody_events(&self) -> Option<tokio::sync::broadcast::Receiver<(ChannelId, Value)>> {
+        self.custody.as_ref().map(|events| events.subscribe())
+    }
+
+    async fn site_request(
+        &self,
+        _: ChannelId,
+        request: SiteRequest,
+    ) -> Result<Value, &'static str> {
+        match request {
+            SiteRequest::Refuse { site, .. } => {
+                self.go.notify_one();
+                Ok(json!({"site":site,"attached":false}))
+            }
+            SiteRequest::Attach { site, .. } => Ok(json!({"site":site,"attached":true})),
+            _ => Err("The scripted browser serves only the tested custody request."),
+        }
+    }
+
+    async fn step(&self, frame: &FrameContext<'_>, step: &PreparedStep) -> StepRecord {
         self.ran.lock().unwrap().push(step.op.clone());
+        if step.op == "agent_browser_wait_ms" {
+            if let Some(events) = &self.custody {
+                let _=events.send((frame.channel,json!({"type":"site_session.need",
+                    "requestId":"11111111-1111-4111-8111-111111111111","site":"https://example.com","pageGeneration":"g"})));
+            }
+        }
         let text = match step.op.as_str() {
             "agent_browser_wait_ms" => {
                 self.started.notify_one();
@@ -253,6 +279,7 @@ async fn a_hello_answers_the_catalog_the_driver_digest_and_the_channels_bounds()
     assert_eq!(reply["success"], true, "{reply}");
     let data = &reply["data"];
     assert_eq!(data["protocol"], 1);
+    assert_eq!(data["sessionCustody"], 3);
     assert_eq!(data["catalog"], crate::mcp::host_bound::catalog_identity());
     assert!(data["catalog"].get("tools").is_none());
     assert_eq!(data["driverArtifactDigest"], DIGEST);
@@ -260,7 +287,7 @@ async fn a_hello_answers_the_catalog_the_driver_digest_and_the_channels_bounds()
     assert_eq!(data["excludedOps"], json!(["agent_browser_run_playwright"]));
     assert_eq!(
         data["limits"],
-        json!({ "maxInFlight": 4, "maxRequestBytes": 2097152, "maxReplyBytes": 4194304,
+        json!({ "maxInFlight": 4, "maxRequestBytes": 2097152, "maxReplyBytes": 4194304,"maxCustodyBytes":8389632,
             "ledgerEntries": 256, "ledgerBytes": 16777216, "candidates": 60, "resolve": 30 })
     );
 }
@@ -692,6 +719,55 @@ async fn frames_past_the_read_ahead_bound_close_the_connection() {
     // The running frame still answers; then the connection ends.
     assert_eq!(host.reply().await["success"], true);
     assert!(host.closed().await);
+}
+
+#[tokio::test]
+async fn a_paused_sequence_emits_need_and_accepts_the_reply_without_command_deadlock() {
+    let (events, _) = tokio::sync::broadcast::channel(16);
+    let browser = Arc::new(Scripted {
+        custody: Some(events),
+        ..Scripted::default()
+    });
+    let endpoint = endpoint();
+    let (_directory, path) = directory();
+    let (mut host, hello) = Host::hello(&endpoint, &browser, json!({})).await;
+    assert_eq!(hello["data"]["sessionCustody"], 3);
+    assert_eq!(hello["data"]["limits"]["maxRequestBytes"], 2 << 20);
+    host.send(sequence(2, "41", json!([wait()]), &path)).await;
+    let need = host.reply().await;
+    assert_eq!(need["type"], "site_session.need");
+    assert!(need.get("id").is_none());
+    host.send(
+        json!({"type":"site_session.refuse","id":3,"requestId":need["requestId"],
+        "site":need["site"],"reason":"denied"}),
+    )
+    .await;
+    let attached = host.reply().await;
+    assert_eq!(attached["id"], 3);
+    assert_eq!(attached["success"], true);
+    let sequence = host.reply().await;
+    assert_eq!(sequence["id"], 2);
+    assert_eq!(sequence["success"], true);
+}
+
+#[tokio::test]
+async fn a_need_while_the_channel_is_idle_is_delivered_only_to_its_owner() {
+    let (events, _) = tokio::sync::broadcast::channel(16);
+    let browser = Arc::new(Scripted {
+        custody: Some(events.clone()),
+        ..Scripted::default()
+    });
+    let endpoint = endpoint();
+    let (mut host, _) = Host::hello(&endpoint, &browser, json!({})).await;
+    let _ = events.send((
+        ChannelId::parse(CHANNEL_B).unwrap(),
+        json!({"type":"site_session.need","site":"https://other.com"}),
+    ));
+    let _ = events.send((
+        ChannelId::parse(CHANNEL_A).unwrap(),
+        json!({"type":"site_session.need","site":"https://example.com"}),
+    ));
+    assert_eq!(host.reply().await["site"], "https://example.com");
 }
 
 #[tokio::test]

@@ -240,3 +240,201 @@ async fn generator_proof(browser: &BrowserManager, origin: &str) {
         .unwrap();
     }
 }
+
+#[tokio::test]
+#[ignore]
+async fn e2e_lazy_site_attach_applies_before_the_first_real_document_request() {
+    use super::{custody::Custody, protocol::Request};
+    use crate::native::agent_channel::frame::ChannelId;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                let mut bytes = vec![0; 8192];
+                let count = socket.read(&mut bytes).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&bytes[..count]).to_string();
+                let _ = requests.send(request);
+                let body = "<!doctype html><title>Lazy identity</title><p>Ready</p>";
+                let response=format!("HTTP/1.1 200 OK\r\nContent-Type:text/html\r\nContent-Length:{}\r\nConnection:close\r\n\r\n{body}",body.len());
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    let mut browser = browser().await;
+    let client = browser.client.clone();
+    let session = browser.active_session_id().unwrap().to_owned();
+    let channel = ChannelId::parse("11111111-1111-4111-8111-111111111111").unwrap();
+    let custody = Custody::new();
+    let mut events = custody.subscribe();
+    custody
+        .request(
+            channel,
+            Request::read(
+                "site_sessions.offer",
+                json!({"sites":[{"site":"http://127.0.0.1","mode":"act"}]}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    custody
+        .browser_ready(client.clone(), vec![session.clone()])
+        .await
+        .unwrap();
+    let navigation = tokio::spawn({
+        let client = client.clone();
+        let session = session.clone();
+        let origin = origin.clone();
+        async move {
+            client
+                .send_command("Page.navigate", Some(json!({"url":origin})), Some(&session))
+                .await
+        }
+    });
+    let (owner, need) = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(owner, channel);
+    assert_eq!(need["type"], "site_session.need");
+    assert!(need.get("id").is_none());
+    assert!(
+        received.try_recv().is_err(),
+        "the document remains paused before host release"
+    );
+    let state = json!({"format":"ambit.browser-site-state.v1","site":"http://127.0.0.1","capturedAt":"2026-09-29T00:00:00.000Z","chromeMajor":154,
+        "cookies":[{"name":"lazy_fixture","value":"nosecret-lazy-cookie","domain":"127.0.0.1","path":"/","expires":1900000000,"httpOnly":true,"secure":false,"sameSite":"lax","priority":"medium","sourceScheme":"non_secure","partitionKey":null}],
+        "origins":[{"origin":origin,"localStorage":[["lazy","nosecret-lazy-storage"]],"indexedDB":[]}],"omitted":[]});
+    let attach = json!({"requestId":need["requestId"],"useId":"22222222-2222-4222-8222-222222222222","site":need["site"],"mode":"act","state":state});
+    let foreign = ChannelId::parse("33333333-3333-4333-8333-333333333333").unwrap();
+    assert!(custody
+        .request(
+            foreign,
+            Request::read("site_session.attach", attach.clone()).unwrap()
+        )
+        .await
+        .is_err());
+    let mut wrong_mode = attach.clone();
+    wrong_mode["mode"] = json!("read");
+    assert!(custody
+        .request(
+            channel,
+            Request::read("site_session.attach", wrong_mode).unwrap()
+        )
+        .await
+        .is_err());
+    let mut wrong_request = attach.clone();
+    wrong_request["requestId"] = json!("44444444-4444-4444-8444-444444444444");
+    assert!(custody
+        .request(
+            channel,
+            Request::read("site_session.attach", wrong_request).unwrap()
+        )
+        .await
+        .is_err());
+    assert!(
+        received.try_recv().is_err(),
+        "refused grants never release the paused request"
+    );
+    assert_eq!(
+        custody
+            .request(
+                channel,
+                Request::read("site_session.attach", attach.clone()).unwrap()
+            )
+            .await
+            .unwrap()["attached"],
+        true
+    );
+    assert!(
+        custody
+            .request(
+                channel,
+                Request::read("site_session.attach", attach).unwrap()
+            )
+            .await
+            .is_err(),
+        "the consumed need cannot replay"
+    );
+    navigation.await.unwrap().unwrap();
+    let request = tokio::time::timeout(std::time::Duration::from_secs(2), received.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        request.contains("lazy_fixture=nosecret-lazy-cookie"),
+        "the first real document request must carry the admitted cookie"
+    );
+    let value=client.send_command("Runtime.evaluate",Some(json!({"expression":"localStorage.getItem('lazy')==='nosecret-lazy-storage'","returnByValue":true})),Some(&session)).await.unwrap();
+    assert_eq!(value["result"]["value"], true);
+    // Socket/execution ends do not erase a site's accepted state. Exact
+    // revalidated use adoption is required before a new model channel acts.
+    custody.end(channel).await;
+    assert!(!custody.admits_channel(foreign).await);
+    custody.request(foreign,Request::read("site_sessions.offer",json!({"sites":[{"site":"http://127.0.0.1","mode":"act","useId":"22222222-2222-4222-8222-222222222222"}]})).unwrap()).await.unwrap();
+    assert!(custody.admits_channel(foreign).await);
+    let snapshot = custody
+        .request(
+            foreign,
+            Request::read("site_session.export", json!({"sites":["http://127.0.0.1"]})).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        snapshot["states"][0]["cookies"].as_array().unwrap().len(),
+        1
+    );
+    let deadline = chrono::Utc::now() + chrono::Duration::milliseconds(200);
+    let expires_at = deadline.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
+    custody.request(foreign,Request::read("site_sessions.offer",json!({"sites":[{"site":"http://127.0.0.1","mode":"act","useId":"22222222-2222-4222-8222-222222222222","expiresAt":expires_at}]})).unwrap()).await.unwrap();
+    let mut changed = client.subscribe();
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let event = changed.recv().await.unwrap();
+            if event.method == "Page.frameNavigated"
+                && event
+                    .params
+                    .pointer("/frame/url")
+                    .and_then(Value::as_str)
+                    .is_some_and(|url| url.starts_with(&origin))
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("expiry clears the site and reloads its real page");
+    let expired = custody
+        .request(
+            foreign,
+            Request::read("site_session.export", json!({"sites":["http://127.0.0.1"]})).unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(expired["states"][0]["cookies"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!(expired["states"][0]["origins"][0]["localStorage"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    custody
+        .request(
+            foreign,
+            Request::read(
+                "site_session.detach",
+                json!({"sites":["http://127.0.0.1"],"reason":"revoked"}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    custody.end(foreign).await;
+    browser.close().await.unwrap();
+    server.abort();
+    let _ = server.await;
+}
