@@ -370,11 +370,11 @@ fn configuration(
 /// Tile columns (log2) for `threads`: one tile per thread, at most four.
 /// Measured on the production node: eight threads over eight tiles cut a
 /// full-motion frame's latency by 7% at twice the CPU of four.
-fn tile_columns_log2(threads: u32) -> c_int {
+pub(crate) fn tile_columns_log2(threads: u32) -> c_int {
     threads.clamp(1, 4).next_power_of_two().trailing_zeros() as c_int
 }
 
-pub(super) struct AomEncoder {
+pub(crate) struct AomEncoder {
     api: &'static Api,
     context: Box<Context>,
     image: Box<Image>,
@@ -394,7 +394,7 @@ pub(super) struct AomEncoder {
 unsafe impl Send for AomEncoder {}
 
 impl AomEncoder {
-    pub(super) fn new(
+    pub(crate) fn new(
         codec: VideoCodec,
         width: u32,
         height: u32,
@@ -495,12 +495,12 @@ impl AomEncoder {
     }
 
     /// Threads and tile columns (log2) for the pictures that follow, for the
-    /// measurement harness only. libaom sizes its workers per picture and
-    /// grows its pool when a picture needs more; a whole configuration goes
-    /// back, which also resets the quantizer's range, so the next picture
-    /// sets its quantizer again.
+    /// measurement harnesses only. libaom sizes its workers per picture and
+    /// grows its pool when a picture needs more; it takes a whole
+    /// configuration back, which also resets the quantizer's range, so the
+    /// next picture sets its quantizer again.
     #[cfg(test)]
-    pub(super) fn set_threads(&mut self, threads: u32, tile_columns: c_int) -> Result<(), String> {
+    pub(crate) fn set_threads(&mut self, threads: u32, tile_columns: c_int) -> Result<(), String> {
         let config = configuration(self.api, self.codec, self.width, self.height, threads)
             .map_err(|error| error.to_string())?;
         // SAFETY: an initialized context; libaom copies the configuration.

@@ -43,7 +43,7 @@ const PICTURE_WAIT_MS: u32 = 100;
 /// (encoder-decision.md): full motion is as fast at 2 as at 4, but 4 cut
 /// interactive pictures from 11.8 to 9.2 ms and a page change from 298 to
 /// 221 ms; 8 doubled the CPU for 7%.
-const ENCODER_THREADS: u32 = 4;
+pub(super) const ENCODER_THREADS: u32 = 4;
 
 /// What the producer needs from its stream.
 pub(crate) struct Source {

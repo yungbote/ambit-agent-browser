@@ -20,6 +20,10 @@ mod webcodecs_e2e;
 /// libaom's own decoder, for proofs that decode what the producer sent.
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use aom::tests::{Decoded, Decoder};
+/// The AV1 encoder itself, for the measurement harnesses: it takes the
+/// thread and tile changes the producer does not make.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use aom::{tile_columns_log2, AomEncoder};
 
 /// The closed vocabulary a viewer declares (`video=<token>,...`), in the
 /// producer's own order of preference: full chroma first, since text in

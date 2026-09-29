@@ -8,14 +8,22 @@
 //! `VIDEO_BENCH_PAGE=<a PNG at least 1840 px wide and 5,000 tall>`
 //! `VIDEO_BENCH_OUT=<file.json>`, run alone:
 //! `cargo test --profile ci producer_cpu_at_the_dock_sizes -- --ignored --test-threads=1`
+//!
+//! `key_units_by_encoder_threads` measures what a key unit costs when the
+//! encoder spends more threads and tile columns on it than on the motion
+//! around it.
 
+use std::ffi::c_int;
 use std::time::Instant;
 
 use serde_json::{json, Value};
 
 use super::policy::{CodedSize, Quality};
+use super::producer::ENCODER_THREADS;
 use crate::native::video::convert::Planar;
-use crate::native::video::{open, EncodeRequest, VideoCodec};
+use crate::native::video::{
+    open, tile_columns_log2, AomEncoder, EncodeRequest, VideoCodec, VideoEncoder,
+};
 
 const PICTURES: usize = 240;
 /// The default dock and the wide dock, in device pixels (DPR 2).
@@ -60,6 +68,24 @@ impl Page {
             bgrx,
         }
     }
+
+    /// `width` x `height` BGRX rows from `top`; past the page's width it
+    /// continues with the page 2,000 rows further down, as dense.
+    fn window(&self, top: usize, width: usize, height: usize) -> Vec<u8> {
+        const SIDEWAYS: usize = 2000;
+        let mut rows = Vec::with_capacity(width * height * 4);
+        for row in top..top + height {
+            let mut x = 0;
+            while x < width {
+                let band = x / self.width;
+                let at = ((row + band * SIDEWAYS) % self.height) * self.width * 4;
+                let run = (width - x).min(self.width);
+                rows.extend_from_slice(&self.bgrx[at..at + run * 4]);
+                x += run;
+            }
+        }
+        rows
+    }
 }
 
 /// One sequence's pictures through the conversion and the encoder: the
@@ -103,7 +129,7 @@ fn producer_cpu_at_the_dock_sizes() {
         let stride = page.width * 4;
         let window = |top: usize| &page.bgrx[top * stride..(top + height) * stride];
         let run = |pictures: &mut dyn FnMut(usize) -> Vec<u8>| {
-            let mut encoder = open(codec, coded.0, coded.1, 4).unwrap();
+            let mut encoder = open(codec, coded.0, coded.1, ENCODER_THREADS).unwrap();
             let mut planar = Planar::new(codec.chroma(), coded.0, coded.1);
             let mut run = Run {
                 convert_ms: Vec::new(),
@@ -170,8 +196,151 @@ fn producer_cpu_at_the_dock_sizes() {
         );
     }
     let threads = std::thread::available_parallelism().map_or(0, |n| n.get());
-    let report = json!({"codec": codec.token(), "encoderThreads": 4, "availableCpus": threads, "docks": docks});
+    let report = json!({"codec": codec.token(), "encoderThreads": ENCODER_THREADS, "availableCpus": threads, "docks": docks});
     println!("CPU {report}");
+    if let Some(out) = std::env::var_os("VIDEO_BENCH_OUT") {
+        std::fs::write(out, serde_json::to_string_pretty(&report).unwrap()).unwrap();
+    }
+}
+
+/// The docks `key_units_by_encoder_threads` encodes key units for: the
+/// default and wide docks, and the widest the resize measurement drags to
+/// (1220 CSS px), in device pixels.
+const KEY_DOCKS: [(&str, (usize, usize)); 3] = [
+    ("default", (988, 1888)),
+    ("wide", (1840, 1888)),
+    ("widest", (2440, 1888)),
+];
+
+/// A comma-separated list of numbers from the environment, or `default`.
+fn numbers(name: &str, default: &str) -> Vec<u32> {
+    std::env::var(name)
+        .unwrap_or_else(|_| default.into())
+        .split(',')
+        .map(|value| value.trim().parse().unwrap())
+        .collect()
+}
+
+/// What a key unit costs when the encoder spends more threads and tile
+/// columns on it than on the motion around it, at the coded sizes the
+/// producer gives the docks, on a page of dense text:
+///
+/// - `fresh`: a new stream's first unit (a new viewer, a new size class),
+///   from an encoder opened at those threads and tiles;
+/// - `inStream`: a key unit inside a stream of motion at the producer's
+///   threads and tiles, switched to the key unit's and back, with the time
+///   of both switches and the encode time of the motion pictures before and
+///   after them (a switch must leave motion as it was).
+///
+/// Latency is wall time around the encode call; CPU is the process's,
+/// every thread, across it. `VIDEO_BENCH_PAGE=<a PNG at least 1840 px
+/// wide>` (continued sideways past its width), `VIDEO_BENCH_KEY_THREADS`
+/// (default 4,6,8,12,16), `VIDEO_BENCH_KEY_TILES` (tile columns, default
+/// 4,8), `VIDEO_BENCH_KEY_REPEATS` (key units per case, default 5),
+/// `VIDEO_BENCH_OUT=<file.json>`; run alone:
+/// `<unit-test binary> --ignored --exact native::stream::video::cpu_bench::key_units_by_encoder_threads --nocapture --test-threads=1`
+#[test]
+#[ignore = "measurement harness: needs a page render (VIDEO_BENCH_PAGE)"]
+fn key_units_by_encoder_threads() {
+    let page = Page::load(std::path::Path::new(
+        &std::env::var_os("VIDEO_BENCH_PAGE").unwrap(),
+    ));
+    let threads = numbers("VIDEO_BENCH_KEY_THREADS", "4,6,8,12,16");
+    let tiles = numbers("VIDEO_BENCH_KEY_TILES", "4,8");
+    let repeats = numbers("VIDEO_BENCH_KEY_REPEATS", "5")[0] as usize;
+    let codec = VideoCodec::Av1Full;
+    let motion_tiles = tile_columns_log2(ENCODER_THREADS);
+    let motion = EncodeRequest {
+        key: false,
+        quantizer: Quality::Motion.quantizer(),
+        refine: false,
+    };
+    let key = EncodeRequest {
+        key: true,
+        ..motion
+    };
+    let ms = |started: Instant| started.elapsed().as_secs_f64() * 1000.0;
+    let mut cases = Vec::new();
+    for (name, (width, height)) in KEY_DOCKS {
+        let coded = CodedSize::new().fit((width as u32, height as u32), Instant::now());
+        let converted = |top: usize| {
+            let mut picture = Planar::new(codec.chroma(), coded.0, coded.1);
+            let source = page.window(top, width, height);
+            assert!(picture.convert(&source, width * 4, (width, height), (0, height)));
+            picture
+        };
+        // A scroll of 40 px a picture, and the screen a key unit shows.
+        let scroll: Vec<Planar> = (0..30).map(|index| converted(index * 40)).collect();
+        let screen = converted(0);
+        for &count in &threads {
+            for &columns in &tiles {
+                assert!(columns.is_power_of_two(), "tile columns {columns}");
+                let layout = columns.trailing_zeros() as c_int;
+                let (mut fresh_ms, mut fresh_cpu, mut fresh_bytes) = (Vec::new(), Vec::new(), 0);
+                for _ in 0..repeats {
+                    let mut encoder = AomEncoder::new(codec, coded.0, coded.1, count).unwrap();
+                    encoder.set_threads(count, layout).unwrap();
+                    let (cpu, started) = (cpu_ms(), Instant::now());
+                    let unit = encoder.encode(&screen.picture(), key).unwrap();
+                    fresh_ms.push(ms(started));
+                    fresh_cpu.push(cpu_ms() - cpu);
+                    fresh_bytes = unit.data.len();
+                }
+                let mut encoder =
+                    AomEncoder::new(codec, coded.0, coded.1, ENCODER_THREADS).unwrap();
+                encoder.encode(&scroll[0].picture(), key).unwrap();
+                let mut before = Vec::new();
+                for picture in &scroll[1..] {
+                    let started = Instant::now();
+                    encoder.encode(&picture.picture(), motion).unwrap();
+                    before.push(ms(started));
+                }
+                let (mut key_ms, mut key_cpu, mut up, mut down, mut after) =
+                    (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+                let mut key_bytes = 0;
+                for repeat in 0..repeats {
+                    let started = Instant::now();
+                    encoder.set_threads(count, layout).unwrap();
+                    up.push(ms(started));
+                    let (cpu, started) = (cpu_ms(), Instant::now());
+                    let unit = encoder.encode(&screen.picture(), key).unwrap();
+                    key_ms.push(ms(started));
+                    key_cpu.push(cpu_ms() - cpu);
+                    key_bytes = unit.data.len();
+                    let started = Instant::now();
+                    encoder.set_threads(ENCODER_THREADS, motion_tiles).unwrap();
+                    down.push(ms(started));
+                    for step in 0..5 {
+                        let picture = &scroll[1 + (repeat * 5 + step) % (scroll.len() - 1)];
+                        let started = Instant::now();
+                        encoder.encode(&picture.picture(), motion).unwrap();
+                        after.push(ms(started));
+                    }
+                }
+                let kib = |bytes: usize| (bytes as f64 / 102.4).round() / 10.0;
+                let case = json!({"dock": name, "window": [width, height], "coded": [coded.0, coded.1],
+                    "keyThreads": count, "keyTileColumns": columns,
+                    "fresh": {"keyMs": stats(&fresh_ms), "keyCpuMs": stats(&fresh_cpu), "kib": kib(fresh_bytes)},
+                    "inStream": {"keyMs": stats(&key_ms), "keyCpuMs": stats(&key_cpu), "kib": kib(key_bytes),
+                        "switchToKeyMs": stats(&up), "switchBackMs": stats(&down),
+                        "motionMsBefore": stats(&before), "motionMsAfter": stats(&after)}});
+                println!("KEY {case}");
+                cases.push(case);
+            }
+        }
+    }
+    let cpu_model = std::fs::read_to_string("/proc/cpuinfo")
+        .ok()
+        .and_then(|info| {
+            info.lines().find_map(|line| {
+                line.strip_prefix("model name")
+                    .map(|rest| rest.trim_start_matches([' ', '\t', ':']).to_string())
+            })
+        })
+        .unwrap_or_default();
+    let available = std::thread::available_parallelism().map_or(0, |n| n.get());
+    let report = json!({"codec": codec.token(), "motionThreads": ENCODER_THREADS,
+        "motionTileColumns": 1 << motion_tiles, "availableCpus": available, "cpuModel": cpu_model, "cases": cases});
     if let Some(out) = std::env::var_os("VIDEO_BENCH_OUT") {
         std::fs::write(out, serde_json::to_string_pretty(&report).unwrap()).unwrap();
     }
