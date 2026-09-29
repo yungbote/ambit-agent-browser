@@ -616,6 +616,8 @@ pub struct BrowserManager {
     /// long as its window's pages, as a private window's session does: the
     /// destruction of its last page disposes it.
     window_contexts: HashSet<String>,
+    /// The pages between documents (`documents`), from their own events.
+    documents: super::documents::Documents,
 }
 
 #[path = "browser_tabs.rs"]
@@ -809,6 +811,7 @@ impl BrowserManager {
                 bound_target_gone: None,
                 headless,
                 window_contexts: HashSet::new(),
+                documents: Default::default(),
             };
             manager.discover_and_attach_targets().await?;
             manager
@@ -896,6 +899,7 @@ impl BrowserManager {
             bound_target_gone: None,
             headless: true,
             window_contexts: HashSet::new(),
+            documents: Default::default(),
         };
 
         if direct_page {
@@ -1081,9 +1085,7 @@ impl BrowserManager {
     }
 
     async fn prepare_domains(&self, session_id: &str) -> Result<(), String> {
-        if self.client.files.active() {
-            super::browser_files::intercept(&self.client, session_id, true).await?;
-        }
+        super::browser_files::intercept(&self.client, session_id).await;
         self.client
             .send_command_no_params("Page.enable", Some(session_id))
             .await?;
@@ -1759,6 +1761,30 @@ impl BrowserManager {
         self.pages.iter().any(|page| page.session_id == session_id)
     }
 
+    /// Notes one of a page's own events (`documents`).
+    pub(crate) fn note_document(&mut self, event: &CdpEvent) {
+        let Some(session) = event.session_id.as_deref() else {
+            return;
+        };
+        if let Some(page) = self.pages.iter().find(|page| page.session_id == session) {
+            self.documents.note(&page.target_id, event);
+        }
+    }
+
+    /// Whether the active page is between documents (`documents`): until its
+    /// navigation commits or stops, its renderer answers nothing. As current
+    /// as the events the daemon last drained.
+    pub(crate) fn active_page_between_documents(&self) -> bool {
+        self.pages
+            .get(self.active_page_index)
+            .is_some_and(|page| self.documents.between(&page.target_id))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn between_documents(&self, target: &str) -> bool {
+        self.documents.between(target)
+    }
+
     pub fn session_id_for_target(&self, target_id: &str) -> Option<&str> {
         self.pages
             .iter()
@@ -2103,6 +2129,7 @@ impl BrowserManager {
         }
 
         let page = self.pages.remove(target_index);
+        self.documents.forget(&page.target_id);
         self.update_active_page_after_removal(target_index);
         let closed_tab_id = page.tab_id;
         let closed_label = page.label.clone();
@@ -2509,6 +2536,7 @@ impl BrowserManager {
     pub fn remove_page_by_target_id(&mut self, target_id: &str) {
         if let Some(pos) = self.pages.iter().position(|p| p.target_id == target_id) {
             let page = self.pages.remove(pos);
+            self.documents.forget(&page.target_id);
             self.update_active_page_after_removal(pos);
             // If the destroyed target was the bound tab (closed externally,
             // e.g. by another session sharing this browser), fail loudly
@@ -2998,6 +3026,7 @@ async fn initialize_lightpanda_manager(
             bound_target_gone: None,
             headless: true,
             window_contexts: HashSet::new(),
+            documents: Default::default(),
         };
 
         match discover_and_attach_lightpanda_targets(&mut manager, deadline).await {
@@ -3750,6 +3779,7 @@ pub(crate) mod tests {
             bound_target_gone: None,
             headless: true,
             window_contexts: HashSet::new(),
+            documents: Default::default(),
         }
     }
 

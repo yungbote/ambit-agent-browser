@@ -11,10 +11,19 @@ use std::time::Duration;
 
 pub(crate) const ACTIVE_PAGE_AMBIGUOUS: &str = "browser_active_page_ambiguous";
 
-fn visible_page(observations: &[(usize, Result<Value, String>)], total: usize) -> Option<usize> {
+/// The page the window shows, from the pages' own observations. `leaving`
+/// is the active page when it is between documents (`documents`): it was not
+/// asked, since it answers nothing until its navigation commits.
+fn visible_page(
+    observations: &[(usize, Result<Value, String>)],
+    total: usize,
+    leaving: Option<usize>,
+) -> Option<usize> {
     let mut visible = Vec::new();
     let mut focused = Vec::new();
-    let complete = observations.len() == total && observations.iter().all(|(_, page)| page.is_ok());
+    let answered = observations.iter().all(|(_, page)| page.is_ok());
+    let complete = answered && observations.len() == total;
+    let complete_but_leaving = answered && leaving.is_some() && observations.len() + 1 == total;
     for (index, page) in observations {
         if let Ok(page) = page {
             if page["visible"] == true {
@@ -30,6 +39,9 @@ fn visible_page(observations: &[(usize, Result<Value, String>)], total: usize) -
     match focused.as_slice() {
         [one] => Some(*one),
         [] if complete && visible.len() == 1 => Some(visible[0]),
+        // A navigation keeps its tab where it was: the active page between
+        // documents stays while every other page answered that it is hidden.
+        [] if complete_but_leaving && visible.is_empty() => leaving,
         _ => None,
     }
 }
@@ -113,8 +125,11 @@ impl BrowserManager {
         // The observation reads each page's title too, so the roster of an
         // ambiguous-page refusal lists the current ones.
         self.record_titles(&observations);
+        let leaving = self
+            .active_page_between_documents()
+            .then_some(self.active_page_index);
         let selected =
-            visible_page(&observations, self.pages.len()).ok_or(ACTIVE_PAGE_AMBIGUOUS)?;
+            visible_page(&observations, self.pages.len(), leaving).ok_or(ACTIVE_PAGE_AMBIGUOUS)?;
         if self.pin_tab && self.bound_target_id.as_deref() != Some(&self.pages[selected].target_id)
         {
             return Err(ACTIVE_PAGE_AMBIGUOUS);
@@ -320,23 +335,46 @@ mod tests {
     #[test]
     fn active_page_requires_observed_visibility_or_native_focus() {
         assert_eq!(
-            visible_page(&[(0, page(false, false)), (1, page(true, false))], 2),
+            visible_page(&[(0, page(false, false)), (1, page(true, false))], 2, None),
             Some(1)
         );
         assert_eq!(
-            visible_page(&[(0, Err("suspended".into())), (1, page(true, true))], 2),
+            visible_page(
+                &[(0, Err("suspended".into())), (1, page(true, true))],
+                2,
+                None
+            ),
             Some(1)
         );
-        assert_eq!(visible_page(&[(1, page(true, true))], 2), Some(1));
-        assert_eq!(visible_page(&[(1, page(true, false))], 2), None);
+        assert_eq!(visible_page(&[(1, page(true, true))], 2, None), Some(1));
+        assert_eq!(visible_page(&[(1, page(true, false))], 2, None), None);
         assert_eq!(
-            visible_page(&[(0, page(true, true)), (1, page(true, true))], 2),
+            visible_page(&[(0, page(true, true)), (1, page(true, true))], 2, None),
             None
         );
         assert_eq!(
-            visible_page(&[(0, page(true, false)), (1, page(true, false))], 2),
+            visible_page(&[(0, page(true, false)), (1, page(true, false))], 2, None),
             None
         );
-        assert_eq!(visible_page(&[], 0), None);
+        assert_eq!(visible_page(&[], 0, None), None);
+    }
+
+    /// The active page between documents is not asked. It stays active while
+    /// every other page answered that it is hidden; a page with native focus
+    /// is still the person's choice; anything less is ambiguous.
+    #[test]
+    fn an_active_page_between_documents_keeps_its_tab() {
+        assert_eq!(visible_page(&[], 1, Some(0)), Some(0));
+        assert_eq!(
+            visible_page(&[(1, page(false, false))], 2, Some(0)),
+            Some(0)
+        );
+        assert_eq!(visible_page(&[(1, page(true, true))], 2, Some(0)), Some(1));
+        assert_eq!(visible_page(&[(1, page(true, false))], 2, Some(0)), None);
+        assert_eq!(
+            visible_page(&[(1, Err("suspended".into()))], 2, Some(0)),
+            None
+        );
+        assert_eq!(visible_page(&[], 2, Some(0)), None);
     }
 }

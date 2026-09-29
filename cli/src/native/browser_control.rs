@@ -951,7 +951,7 @@ impl BrowserControl {
             .is_some_and(|lease| lease.deadline <= Instant::now())
         {
             if let Some((client, _)) = browser {
-                super::browser_files::stop(client).await;
+                client.files.end();
             }
             self.release_held(browser).await?;
         }
@@ -1362,7 +1362,7 @@ impl BrowserControl {
                     sign_in: None,
                 });
                 if let Some(page) = page.as_mut().filter(|page| page.files_supported()) {
-                    if let Err(error) = page.prepare_files(&request.controller_id).await {
+                    if let Err(error) = page.begin_files(&request.controller_id) {
                         self.lease = None;
                         return Err(error);
                     }
@@ -1375,7 +1375,7 @@ impl BrowserControl {
                     }
                     Err(error) => {
                         if let Some((client, _)) = browser {
-                            super::browser_files::stop(client).await;
+                            client.files.end();
                         }
                         self.lease = None;
                         return Err(error);
@@ -1404,7 +1404,7 @@ impl BrowserControl {
                     .is_some_and(|lease| lease.controller_id == request.controller_id)
                 {
                     if let Some((client, _)) = browser {
-                        super::browser_files::stop(client).await;
+                        client.files.end();
                     }
                     self.release_held(browser).await?;
                     let lease = self.lease.take().unwrap();

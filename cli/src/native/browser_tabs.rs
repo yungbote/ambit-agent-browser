@@ -127,7 +127,9 @@ pub(super) async fn observe_page(
 impl BrowserManager {
     /// Evaluates `expression` in the observation realm of every open page but
     /// the one a JavaScript dialog pauses (`dialog_session`), whose renderer
-    /// answers nothing until the dialog is resolved. Pages are observed
+    /// answers nothing until the dialog is resolved, and those between
+    /// documents (`documents`), which answer nothing until their navigation
+    /// commits. Pages are observed
     /// `OBSERVED_AT_ONCE` at a time within `OBSERVATION_BOUND`; the result
     /// holds the pages that answered, by index.
     pub(super) async fn observe_pages(
@@ -141,7 +143,10 @@ impl BrowserManager {
             .pages
             .iter()
             .enumerate()
-            .filter(|(_, page)| Some(page.session_id.as_str()) != dialog_session)
+            .filter(|(_, page)| {
+                Some(page.session_id.as_str()) != dialog_session
+                    && !self.documents.between(&page.target_id)
+            })
             .map(|(index, page)| (index, page.session_id.clone()))
             .collect();
         let client = &self.client;

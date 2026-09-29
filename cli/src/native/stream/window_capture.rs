@@ -18,7 +18,7 @@ use serde_json::json;
 use tokio::sync::{broadcast, watch, Notify};
 
 use super::cursor_identity::CursorIdentities;
-use super::presentation::Presentation;
+use super::presentation::{FramePacing, Presentation};
 use super::{StreamFrame, StreamMedia};
 use crate::native::browser_control::custody_active;
 use crate::native::display::{CaptureRequest, DisplayClient, Rect, Surface};
@@ -143,9 +143,6 @@ async fn run(
         }
         let controlled = custody_active(*custody.borrow_and_update());
         let pacing = sinks.presentation.capture_pacing(controlled);
-        let shown = input_shown
-            .borrow_and_update()
-            .is_some_and(|until| until > Instant::now());
         // Patches amend a whole frame every viewer of frames holds; one that
         // does not composite them makes the next frame whole for everyone.
         let patches = sinks.media.roster().patches();
@@ -190,10 +187,11 @@ async fn run(
                     Some((capture, surface)) => {
                         let patch = capture.data.is_none();
                         publish(&sinks, &mut published, capture, surface, ts);
-                        started + Duration::from_micros(waited) + pacing.after(patch, shown)
+                        started
+                            + Duration::from_micros(waited)
+                            + spacing(Some(patch), waits, pacing, &mut input_shown)
                     }
-                    None if waits => started + IDLE_SPACING,
-                    None => started + pacing.after(true, shown),
+                    None => started + spacing(None, waits, pacing, &mut input_shown),
                 };
             }
             Err(error) if error.is_transient() => {
@@ -210,6 +208,34 @@ async fn run(
                 return;
             }
         }
+    }
+}
+
+/// How long after a capture's answer the next capture is asked. A frame
+/// (`Some(patch)`) is followed at its tier's pacing, at the interactive rate
+/// after patches while native input is on screen (`FramePacing::after`); an
+/// unchanged answer (`None`) from a helper that waits for damage is asked
+/// again almost at once, and an older helper is polled at the pacing.
+///
+/// Input on screen is read here, as the next capture is scheduled, rather
+/// than when the last one was asked: that capture may have waited for
+/// damage while input began or ended. Reading it marks it seen, so input
+/// the schedule already follows does not wake the loop again.
+fn spacing(
+    frame: Option<bool>,
+    waits: bool,
+    pacing: FramePacing,
+    input_shown: &mut watch::Receiver<Option<Instant>>,
+) -> Duration {
+    let mut shown = || {
+        input_shown
+            .borrow_and_update()
+            .is_some_and(|until| until > Instant::now())
+    };
+    match frame {
+        Some(patch) => pacing.after(patch, shown()),
+        None if waits => IDLE_SPACING,
+        None => pacing.after(true, shown()),
     }
 }
 
@@ -405,12 +431,12 @@ mod tests {
     }
 
     /// With a helper that waits for damage, an unchanged answer is followed
-    /// by the next capture at once instead of a tick later, and a frame is
-    /// stamped when its damage ended the wait: `inputSeq` is the input
-    /// acknowledged before that moment, even when acknowledged during the
-    /// wait, and not an input acknowledged after it.
+    /// by another capture (almost at once instead of a tick later, which is
+    /// `spacing`'s), and a frame is stamped when its damage ended the wait:
+    /// `inputSeq` is the input acknowledged before that moment, even when
+    /// acknowledged during the wait, and not an input acknowledged after it.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn a_waiting_capture_is_asked_again_at_once_and_stamped_when_its_damage_arrived() {
+    async fn a_waiting_capture_is_asked_again_and_stamped_when_its_damage_arrived() {
         let mut h = harness(&["captureWait", "cursorIdentity"]);
         let origin = super::super::monotonic_us();
         let _capture = WindowCapture::start(h.display.clone(), h.sinks.clone());
@@ -419,14 +445,7 @@ mod tests {
         assert_eq!(first["cursorIdentity"], true);
         assert_eq!(first["force"], true);
         h.answer(&first, json!({"changed": false})).await;
-        let answered = std::time::Instant::now();
         let second = h.request().await;
-        let gap = answered.elapsed();
-        let period = super::super::presentation::FramePacing::PASSIVE.period();
-        assert!(
-            gap < period / 4,
-            "an unchanged waited capture was asked again after {gap:?} (period {period:?})"
-        );
         // Input acknowledged while the helper waited, before the damage.
         h.applied.record(3);
         let waited = super::super::monotonic_us() - origin + 1_000;
@@ -443,7 +462,10 @@ mod tests {
     }
 
     /// An older helper, which neither waits nor reports identities, is asked
-    /// for neither and polled at the pacing rate.
+    /// for neither and polled at the pacing rate, an unchanged answer too:
+    /// the frame after one comes at least two periods after the frame
+    /// before it, on the frames' own stamps (a helper that waits is asked
+    /// again almost at once instead).
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_older_helper_is_polled_at_the_pacing_rate_without_new_fields() {
         let mut h = harness(&[]);
@@ -451,16 +473,15 @@ mod tests {
         let first = h.request().await;
         assert!(first.get("waitMs").is_none(), "{first}");
         assert!(first.get("cursorIdentity").is_none(), "{first}");
-        h.answer(&first, json!({"changed": false})).await;
-        let answered = std::time::Instant::now();
-        let second = h.request().await;
+        h.answer(&first, whole(0)).await;
+        let before = stamp(&mut h).await;
+        let unchanged = h.request().await;
+        h.answer(&unchanged, json!({"changed": false})).await;
+        let after = h.request().await;
+        h.answer(&after, whole(0)).await;
+        let gap = Duration::from_micros(stamp(&mut h).await - before);
         let period = super::super::presentation::FramePacing::PASSIVE.period();
-        assert!(
-            answered.elapsed() >= period / 2,
-            "polled after {:?}",
-            answered.elapsed()
-        );
-        h.answer(&second, json!({"changed": false})).await;
+        assert!(gap >= period * 2, "{gap:?}");
     }
 
     /// The displayed cursor's identity reaches every viewer once per change
@@ -549,32 +570,19 @@ mod tests {
             "quality":75,"patches":[{"x":16,"y":32,"width":160,"height":48,"data":"AA=="}]})
     }
 
-    /// Request-to-request gaps of four patch frames in a row, after one that
-    /// answers whatever capture was already waiting in the helper.
-    async fn patch_gaps(h: &mut Harness) -> Vec<Duration> {
-        let waiting = h.request().await;
-        h.answer(&waiting, patch()).await;
-        h.frame().await;
-        let mut asked = h.request().await;
-        let mut gaps = Vec::new();
-        for _ in 0..4 {
-            let at = std::time::Instant::now();
-            h.answer(&asked, patch()).await;
-            h.frame().await;
-            asked = h.request().await;
-            gaps.push(at.elapsed());
-        }
-        h.answer(&asked, json!({"changed": false})).await;
-        gaps
+    /// A patch whose damage ended the helper's wait after `waited`.
+    fn patch_after(waited: Duration) -> Value {
+        let mut patch = patch();
+        patch["timings"] = json!({"waitUs": waited.as_micros()});
+        patch
     }
 
-    /// While native input is on screen (an agent's travel, its keys), a
-    /// presented view's patches follow at the interactive rate; once it has
-    /// stopped showing, they keep the presented rate again.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn patches_follow_native_input_at_the_interactive_rate() {
-        use super::super::presentation::{FramePacing, PresentationConfig};
-        let mut h = patching_harness(&["captureWait"]);
+    /// A presented view (a presenter watching the agent work) whose one
+    /// viewer composites patches, captured by a helper that waits for
+    /// damage.
+    fn presented_harness() -> Harness {
+        use super::super::presentation::PresentationConfig;
+        let h = patching_harness(&["captureWait"]);
         h.sinks.presentation.configure(
             uuid::Uuid::new_v4(),
             PresentationConfig {
@@ -584,43 +592,184 @@ mod tests {
                 crops: false,
             },
         );
+        h
+    }
+
+    async fn show_input(h: &Harness) {
+        h.display
+            .input(&[json!({"type":"input_mouse","eventType":"mouseMoved","x":5,"y":5})])
+            .await
+            .unwrap();
+    }
+
+    /// When a published frame's capture read the screen, in microseconds.
+    async fn stamp(h: &mut Harness) -> u64 {
+        h.frame().await["ts"].as_u64().unwrap()
+    }
+
+    /// The gaps between five patch frames' own stamps, the first answering
+    /// whatever capture was already waiting in the helper. These answers do
+    /// not wait, so a frame is stamped when its capture was asked; the loop
+    /// asks for the next one no sooner than the spacing it chose after that,
+    /// however late its thread runs, so each gap is at least that spacing.
+    async fn patch_gaps(h: &mut Harness) -> Vec<Duration> {
+        let mut stamps = Vec::new();
+        for _ in 0..5 {
+            let asked = h.request().await;
+            h.answer(&asked, patch()).await;
+            stamps.push(stamp(h).await);
+        }
+        let asked = h.request().await;
+        h.answer(&asked, json!({"changed": false})).await;
+        stamps
+            .windows(2)
+            .map(|pair| Duration::from_micros(pair[1] - pair[0]))
+            .collect()
+    }
+
+    /// A presented view's patches are never asked for sooner than its
+    /// pacing allows, before native input, while it shows and after: the
+    /// interactive rate while it shows, the presented rate otherwise. Which
+    /// rate the loop chooses is `the_spacing_follows_input_on_screen_when_it_is_scheduled`;
+    /// how punctually a loaded machine keeps it is not measured here.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn patches_are_never_asked_for_sooner_than_their_pacing() {
+        use super::super::presentation::FramePacing;
+        let mut h = presented_harness();
         let _capture = WindowCapture::start(h.display.clone(), h.sinks.clone());
         let first = h.request().await;
         h.answer(&first, whole(0)).await;
         h.frame().await;
         let presented = FramePacing::PRESENTED.period();
         let idle = patch_gaps(&mut h).await;
-        assert!(idle.iter().all(|gap| *gap >= presented * 4 / 5), "{idle:?}");
-        h.display
-            .input(&[json!({"type":"input_mouse","eventType":"mouseMoved","x":5,"y":5})])
-            .await
-            .unwrap();
+        assert!(idle.iter().all(|gap| *gap >= presented), "{idle:?}");
+        show_input(&h).await;
         let moving = patch_gaps(&mut h).await;
-        assert!(
-            moving.iter().all(|gap| *gap < presented * 3 / 4),
-            "{moving:?}"
-        );
+        let controlled = FramePacing::CONTROLLED.period();
+        assert!(moving.iter().all(|gap| *gap >= controlled), "{moving:?}");
+        // Input shows for 250 ms after its last batch.
         tokio::time::sleep(Duration::from_millis(300)).await;
         let settled = patch_gaps(&mut h).await;
+        assert!(settled.iter().all(|gap| *gap >= presented), "{settled:?}");
+    }
+
+    /// Input that begins while a capture waits for damage is followed by
+    /// that capture's frame; the next capture keeps the interactive spacing
+    /// after it instead of being asked at once as well.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn input_that_began_during_a_wait_is_followed_at_the_interactive_rate() {
+        use super::super::presentation::FramePacing;
+        let mut h = presented_harness();
+        let _capture = WindowCapture::start(h.display.clone(), h.sinks.clone());
+        let first = h.request().await;
+        h.answer(&first, whole(0)).await;
+        h.frame().await;
+        let waiting = h.request().await;
+        let received = std::time::Instant::now();
+        show_input(&h).await;
+        h.answer(&waiting, patch_after(received.elapsed())).await;
+        let followed = stamp(&mut h).await;
+        let next = h.request().await;
+        h.answer(&next, patch()).await;
+        let gap = Duration::from_micros(stamp(&mut h).await - followed);
+        assert!(gap >= FramePacing::CONTROLLED.period(), "{gap:?}");
+    }
+
+    /// Input that stops showing while a capture waits for damage leaves the
+    /// next capture at the presented spacing: the pacing reads input on
+    /// screen when it schedules, not when the capture was asked.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn input_that_ended_during_a_wait_leaves_the_presented_rate() {
+        use super::super::presentation::FramePacing;
+        let mut h = presented_harness();
+        let _capture = WindowCapture::start(h.display.clone(), h.sinks.clone());
+        let first = h.request().await;
+        h.answer(&first, whole(0)).await;
+        h.frame().await;
+        // The loop sleeps the presented spacing; input wakes it at once.
+        show_input(&h).await;
+        let waiting = h.request().await;
+        let received = std::time::Instant::now();
+        // Input shows for 250 ms after its last batch.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        h.answer(&waiting, patch_after(received.elapsed())).await;
+        let followed = stamp(&mut h).await;
+        let next = h.request().await;
+        h.answer(&next, patch()).await;
+        let gap = Duration::from_micros(stamp(&mut h).await - followed);
+        assert!(gap >= FramePacing::PRESENTED.period(), "{gap:?}");
+    }
+
+    /// The next capture's spacing follows input on screen as it is when the
+    /// capture is scheduled: a presented view's patches at the interactive
+    /// rate while input shows, its whole frames and the other tiers at their
+    /// own; an unchanged answer from a waiting helper is asked again almost
+    /// at once, and an older helper is polled at the pacing.
+    #[test]
+    fn the_spacing_follows_input_on_screen_when_it_is_scheduled() {
+        use super::super::presentation::FramePacing;
+        let (input, mut shown) = watch::channel(None);
+        let presented = FramePacing::PRESENTED;
+        let controlled = FramePacing::CONTROLLED.period();
+        assert_eq!(
+            spacing(Some(true), true, presented, &mut shown),
+            presented.period()
+        );
+        input.send_replace(Some(Instant::now() + Duration::from_secs(60)));
+        assert_eq!(spacing(Some(true), true, presented, &mut shown), controlled);
         assert!(
-            settled.iter().all(|gap| *gap >= presented * 4 / 5),
-            "{settled:?}"
+            !shown.has_changed().unwrap(),
+            "input the schedule follows wakes nothing"
+        );
+        assert_eq!(
+            spacing(Some(false), true, presented, &mut shown),
+            presented.period(),
+            "a whole frame keeps its tier"
+        );
+        let passive = FramePacing::PASSIVE;
+        assert_eq!(
+            spacing(Some(true), true, passive, &mut shown),
+            passive.period()
+        );
+        assert_eq!(spacing(None, true, presented, &mut shown), IDLE_SPACING);
+        assert_eq!(spacing(None, false, presented, &mut shown), controlled);
+        input.send_replace(Some(Instant::now()));
+        assert_eq!(
+            spacing(Some(true), true, presented, &mut shown),
+            presented.period(),
+            "input no longer on screen"
+        );
+        assert_eq!(
+            spacing(None, false, passive, &mut shown),
+            passive.period(),
+            "an older helper is polled at the pacing"
         );
     }
 
-    /// A new viewer needs a whole frame without waiting for the pacing.
+    /// A new viewer needs a whole frame without waiting for the pacing: a
+    /// refresh wakes the loop, which asks for a whole frame. On the frames'
+    /// own stamps, the refreshed capture was asked before the pacing's next
+    /// tick after the frame before it, which only a wake can do; a refresh
+    /// the loop reached too late to show that is tried again.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_refresh_asks_for_a_whole_frame_at_once() {
         let mut h = patching_harness(&[]);
         let capture = WindowCapture::start(h.display.clone(), h.sinks.clone());
+        let tick = super::super::presentation::FramePacing::PASSIVE.period();
         let first = h.request().await;
         h.answer(&first, whole(0)).await;
-        h.frame().await;
-        let asked = std::time::Instant::now();
-        capture.refresh();
-        let second = h.request().await;
-        assert!(asked.elapsed() < super::super::presentation::FramePacing::PASSIVE.period() / 2);
-        assert_eq!(second["force"], true);
-        h.answer(&second, json!({"changed": false})).await;
+        let mut before = stamp(&mut h).await;
+        for _ in 0..5 {
+            capture.refresh();
+            let asked = h.request().await;
+            assert_eq!(asked["force"], true);
+            h.answer(&asked, whole(0)).await;
+            let refreshed = stamp(&mut h).await;
+            if Duration::from_micros(refreshed - before) < tick {
+                return;
+            }
+            before = refreshed;
+        }
+        panic!("no refresh was asked for before the pacing's tick");
     }
 }

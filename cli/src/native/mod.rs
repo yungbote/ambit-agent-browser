@@ -20,6 +20,7 @@ pub mod daemon;
 #[allow(dead_code)]
 pub mod diff;
 pub(crate) mod display;
+pub(crate) mod documents;
 pub(crate) mod downloads;
 #[allow(dead_code)]
 pub mod element;

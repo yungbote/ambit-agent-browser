@@ -24,7 +24,7 @@
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::policy::{period, rate, CodedSize, Quality, Refinement};
 use super::subscription::{Delivery, Subscriber, Unit};
@@ -35,7 +35,9 @@ use crate::native::stream::StreamMedia;
 use crate::native::video::convert::Planar;
 use crate::native::video::{self as codec, EncodeRequest, VideoCodec, VideoEncoder, VideoError};
 
-/// How long a picture request waits in the helper for damage.
+/// The longest a picture request waits in the helper for damage. The helper
+/// serves one request at a time, so a wait holds back every encoding:
+/// `decide` ends it when another encoding will owe a picture.
 const PICTURE_WAIT_MS: u32 = 100;
 /// Encoder threads per stream, measured on the production node
 /// (encoder-decision.md): full motion is as fast at 2 as at 4, but 4 cut
@@ -135,10 +137,37 @@ struct Plan {
 /// When an encoding may take its next picture, and what it needs of it.
 struct Due {
     at: Instant,
+    /// Its fastest ready viewer's period.
+    period: Duration,
     /// It holds no picture yet: the helper writes every row.
     whole: bool,
     /// It has not seen the screen: the helper need not wait for damage.
     behind: bool,
+    /// Its encoder holds both buffers: it takes a picture once one comes
+    /// back, which wakes the capture thread.
+    busy: bool,
+}
+
+impl Due {
+    /// Whether the encoding takes a picture at `now`.
+    fn takes(&self, now: Instant) -> bool {
+        !self.busy && self.at <= now
+    }
+
+    /// The latest a wait for damage may end without holding back a picture
+    /// this encoding owes; none once it has seen the screen. A busy encoding
+    /// owes one once a buffer comes back, which the capture thread cannot
+    /// hear while the helper waits, so after its due time it is looked at
+    /// again every period.
+    fn owed(&self, now: Instant) -> Option<Instant> {
+        self.behind.then(|| {
+            if self.busy && self.at <= now {
+                now + self.period
+            } else {
+                self.at
+            }
+        })
+    }
 }
 
 /// What the encode thread does next.
@@ -331,18 +360,20 @@ impl Encoding {
             .max()
     }
 
-    /// When this encoding may take its next picture, if a buffer is free
-    /// and a path has room.
+    /// When this encoding may take its next picture; none once it stops or
+    /// while no path has room.
     fn due(&self, now: Instant) -> Option<Due> {
         let mailbox = lock(&self.mailbox);
-        if mailbox.stop || mailbox.free.is_empty() {
+        if mailbox.stop {
             return None;
         }
-        let rate = self.rate()?;
+        let period = period(self.rate()?);
         Some(Due {
-            at: mailbox.pictured.map_or(now, |last| last + period(rate)),
+            at: mailbox.pictured.map_or(now, |last| last + period),
+            period,
             whole: mailbox.pictured.is_none(),
             behind: mailbox.behind,
+            busy: mailbox.free.is_empty(),
         })
     }
 
@@ -557,9 +588,7 @@ fn capture_loop(inner: Weak<Inner>) {
 }
 
 /// Waits until some encoding is due for a picture and says how to take it;
-/// none when stopping. An encoding without a picture yet gets a whole one;
-/// one that has not seen the screen does not wait for more damage: an
-/// unchanged answer means the slot already holds the screen.
+/// none when stopping.
 fn plan(inner: &Inner) -> Option<Plan> {
     let mut state = lock(&inner.state);
     loop {
@@ -567,47 +596,90 @@ fn plan(inner: &Inner) -> Option<Plan> {
             return None;
         }
         let now = Instant::now();
-        let mut encodings = Vec::new();
-        let (mut whole, mut behind) = (false, false);
-        let mut next: Option<Instant> = None;
-        for encoding in &state.encodings {
-            match encoding.due(now) {
-                Some(due) if due.at <= now => {
-                    whole |= due.whole;
-                    behind |= due.behind;
-                    encodings.push(encoding.clone());
-                }
-                Some(due) => next = Some(next.map_or(due.at, |next| next.min(due.at))),
-                None => {}
-            }
-        }
-        if !encodings.is_empty() {
-            return Some(Plan {
-                request: PictureRequest {
-                    cursor: false,
-                    force: whole,
-                    // A whole picture waits only for a layout in progress;
-                    // the helper answers it at once otherwise.
-                    wait_ms: if behind && !whole { 0 } else { PICTURE_WAIT_MS },
-                    cursor_identity: true,
-                },
-                encodings,
-            });
-        }
-        state = match next {
-            Some(at) => {
+        state = match decide(&state.encodings, now) {
+            Decision::Capture(plan) => return Some(plan),
+            Decision::Wait(Some(at)) => {
                 inner
                     .wake
                     .wait_timeout(state, at.saturating_duration_since(now))
                     .unwrap_or_else(|error| error.into_inner())
                     .0
             }
-            None => inner
+            Decision::Wait(None) => inner
                 .wake
                 .wait(state)
                 .unwrap_or_else(|error| error.into_inner()),
         };
     }
+}
+
+/// What the capture thread does at a moment.
+enum Decision {
+    /// Takes a picture for the encodings that are due.
+    Capture(Plan),
+    /// Waits until the next encoding is due, if one will be.
+    Wait(Option<Instant>),
+}
+
+/// The capture decision at `now`. An encoding without a picture yet gets a
+/// whole one; one that has not seen the screen does not wait for more
+/// damage, since an unchanged answer means the slot already holds the
+/// screen. The helper serves one request at a time, so a wait for damage
+/// ends when another encoding will owe a picture (`Due::owed`); one that
+/// begins to owe during the wait, such as a new codec's first viewer, waits
+/// for it to end.
+fn decide(encodings: &[Arc<Encoding>], now: Instant) -> Decision {
+    let (taking, waiting): (Vec<_>, Vec<_>) = encodings
+        .iter()
+        .filter_map(|encoding| Some((encoding, encoding.due(now)?)))
+        .partition(|(_, due)| due.takes(now));
+    if taking.is_empty() {
+        // A busy encoding's encoder wakes the thread when a buffer comes back.
+        return Decision::Wait(
+            waiting
+                .iter()
+                .filter(|(_, due)| !due.busy)
+                .map(|(_, due)| due.at)
+                .min(),
+        );
+    }
+    let whole = taking.iter().any(|(_, due)| due.whole);
+    let wait_ms = if whole {
+        // A whole picture waits only for a layout in progress; the helper
+        // answers it at once otherwise.
+        PICTURE_WAIT_MS
+    } else if taking.iter().any(|(_, due)| due.behind) {
+        0
+    } else {
+        damage_wait(
+            now,
+            waiting.iter().filter_map(|(_, due)| due.owed(now)).min(),
+        )
+    };
+    Decision::Capture(Plan {
+        request: PictureRequest {
+            cursor: false,
+            force: whole,
+            wait_ms,
+            cursor_identity: true,
+        },
+        encodings: taking
+            .into_iter()
+            .map(|(encoding, _)| encoding.clone())
+            .collect(),
+    })
+}
+
+/// How long the helper may wait for damage: `PICTURE_WAIT_MS`, and no
+/// longer than until `owed`, to the wire's millisecond.
+fn damage_wait(now: Instant, owed: Option<Instant>) -> u32 {
+    owed.map_or(PICTURE_WAIT_MS, |owed| {
+        let until = owed
+            .saturating_duration_since(now)
+            .as_micros()
+            .div_ceil(1000);
+        u32::try_from(until).map_or(PICTURE_WAIT_MS, |until| until.min(PICTURE_WAIT_MS))
+    })
 }
 
 /// Encodes one encoding's pictures until it stops or fails.

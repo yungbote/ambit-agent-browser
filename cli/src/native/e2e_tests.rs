@@ -13438,6 +13438,124 @@ async fn e2e_native_a_launch_that_cannot_tell_the_shown_tab_activates_none() {
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
 
+/// The file protocol's capture keeps its bound while a page is between
+/// documents: a navigating click whose page commits within it still answers
+/// with the page it went to, and one whose page does not answers
+/// `browser_navigation_pending` when the bound passes. A point taken from an
+/// image of the page being left is refused at once, before the commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_native_the_file_protocol_names_a_page_between_documents() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        while let Ok((mut connection, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0; 4096];
+                let read = connection.read(&mut request).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..read]);
+                let path = request.split_whitespace().nth(1).unwrap_or("/").to_string();
+                let body = match path.as_str() {
+                    "/quick" => {
+                        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+                        "<!doctype html><title>Quick</title><h1>Quick</h1>".to_string()
+                    }
+                    "/slow" => {
+                        tokio::time::sleep(std::time::Duration::from_millis(8000)).await;
+                        "<!doctype html><title>Slow</title><h1>Slow</h1>".to_string()
+                    }
+                    _ => "<!doctype html><title>Home</title><body style='margin:0'>\
+                          <a id=quick href=/quick style='display:block;padding:20px'>Quick</a>\
+                          <a id=slow href=/slow style='display:block;padding:20px'>Slow</a>"
+                        .to_string(),
+                };
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = connection.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    let captures = tempfile::tempdir().unwrap();
+    let mut state = DaemonState::new();
+    let feedback = |state: &DaemonState, expected: Value| {
+        json!({ "namespace": std::env::var("AGENT_BROWSER_NAMESPACE").unwrap_or_default(),
+            "session": state.session_id, "captureDirectory": captures.path(),
+            "timeoutMs": 30_000, "expectedObservation": expected })
+    };
+    let home = format!("{origin}/");
+    assert_success(
+        &control_test_command(&json!({"action":"navigate","url":home}), &mut state).await,
+    );
+
+    let started = std::time::Instant::now();
+    let quick = control_test_command(
+        &json!({"action":"click","selector":"#quick","ambitFeedback":feedback(&state, Value::Null)}),
+        &mut state,
+    )
+    .await;
+    let quick_took = started.elapsed();
+    println!(
+        "navigation-pending-file-protocol {}",
+        json!({ "clickOnA1sLinkUs": quick_took.as_micros() as u64,
+            "capture": quick["browser"]["capture"], "page": quick["browser"]["page"] })
+    );
+    assert_success(&quick);
+    assert!(quick["browser"]["capture"]["path"].is_string(), "{quick}");
+    assert_eq!(quick["browser"]["page"]["url"], format!("{origin}/quick"));
+
+    assert_success(
+        &control_test_command(&json!({"action":"navigate","url":home}), &mut state).await,
+    );
+    let observed = control_test_command(
+        &json!({"action":"title","ambitFeedback":feedback(&state, Value::Null)}),
+        &mut state,
+    )
+    .await;
+    assert_success(&observed);
+    let page = &observed["browser"]["page"];
+    let image = json!({ "targetId": page["targetId"], "loaderId": page["loaderId"],
+        "pageGeneration": page["pageGeneration"],
+        "geometrySha256": observed["browser"]["capture"]["coordinateSpace"]["geometrySha256"] });
+
+    let started = std::time::Instant::now();
+    let slow = control_test_command(
+        &json!({"action":"click","selector":"#slow","ambitFeedback":feedback(&state, Value::Null)}),
+        &mut state,
+    )
+    .await;
+    let slow_took = started.elapsed();
+    assert_success(&slow);
+    assert_eq!(
+        slow["browser"]["capture"],
+        json!({ "status": "unavailable", "code": "browser_navigation_pending" }),
+        "{slow}"
+    );
+    let started = std::time::Instant::now();
+    let point = control_test_command(
+        &json!({"action":"mousemove","x":30,"y":30,"ambitFeedback":feedback(&state, image)}),
+        &mut state,
+    )
+    .await;
+    let point_took = started.elapsed();
+    println!(
+        "navigation-pending-file-protocol {}",
+        json!({ "clickOnAn8sLinkUs": slow_took.as_micros() as u64,
+            "slowCapture": slow["browser"]["capture"],
+            "pointRefusedUs": point_took.as_micros() as u64, "point": point })
+    );
+    assert_error_code(&point, "browser_navigation_pending");
+    assert!(
+        state.active_page_between_documents(),
+        "the point was refused before the commit"
+    );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
 /// The window preparation every command meets runs before the command's
 /// launch step, when there is no browser yet. A command that launched the
 /// browser meets it after the launch, against the browser it will act on:

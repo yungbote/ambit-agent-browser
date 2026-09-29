@@ -3,7 +3,7 @@
 
 use serde_json::{json, Value};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::native::display::pictures::fake::FakeHelper;
 
@@ -70,7 +70,8 @@ impl Screen {
 
 /// The helper: each picture writes the rows painted since the previous one
 /// (every row when forced) into the slot and names them; an unchanged
-/// answer is held for the request's wait unless the screen changes.
+/// answer is held for the request's wait unless the screen changes, and a
+/// picture says how long it was held (`waitUs`), as the real helper's does.
 fn serve(
     mut helper: FakeHelper,
     mut screen: Screen,
@@ -79,6 +80,7 @@ fn serve(
 ) {
     while let Some(request) = helper.next_request() {
         let _ = requests.send(request.clone());
+        let asked = Instant::now();
         let forced = request["force"] == true;
         if !forced && !screen.dirty.contains(&true) {
             let wait = Duration::from_millis(request["waitMs"].as_u64().unwrap_or(0));
@@ -86,6 +88,7 @@ fn serve(
                 screen.apply(change);
             }
         }
+        let waited = u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX);
         while let Ok(change) = changes.try_recv() {
             screen.apply(change);
         }
@@ -114,7 +117,8 @@ fn serve(
             continue;
         }
         let mut data = json!({"changed":true,"width":width,"height":height,"stride":width * 4,
-            "rows":runs,"cursorIncluded":request["cursor"],"timings":{"waitUs":0}});
+            "rows":runs,"cursorIncluded":request["cursor"],
+            "timings":{"waitUs":waited}});
         if screen.window != screen.framebuffer {
             data["visible"] = json!({"x":0,"y":0,"width":screen.window.0,"height":screen.window.1});
         }
