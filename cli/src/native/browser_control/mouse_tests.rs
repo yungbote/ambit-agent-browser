@@ -932,28 +932,14 @@ fn wheels(inputs: &[(Instant, Value)]) -> Vec<&(Instant, Value)> {
         .collect()
 }
 
-/// Wheel events came no faster than one a frame. The fake helper stamps an
-/// event when its task reads it, so under load one late read shortens the
-/// gap after it by as much as it lengthened the gap before: single gaps are
-/// not compared. A burst is three events within one frame, and events that
-/// come faster than a frame on average are bunched.
+/// Wheel events came at least a frame apart. The fake helper stamps an
+/// event when it reads it, before it acknowledges it, and the pacer sends
+/// the next a whole frame after that acknowledgement returned: every gap
+/// the helper sees is a frame or more, however late any timer fired.
 fn assert_one_a_frame(wheels: &[&(Instant, Value)]) {
-    let gaps: Vec<Duration> = wheels
-        .windows(2)
-        .map(|pair| pair[1].0 - pair[0].0)
-        .collect();
-    for pair in gaps.windows(2) {
-        assert!(
-            pair[0] + pair[1] >= motion::FRAME,
-            "a burst of three wheel events within a frame: {gaps:?}"
-        );
-    }
-    if let Some(count) = u32::try_from(gaps.len()).ok().filter(|count| *count > 0) {
-        let mean = gaps.iter().sum::<Duration>() / count;
-        assert!(
-            mean >= motion::FRAME - Duration::from_millis(1),
-            "wheel events faster than one a frame on average: {gaps:?}"
-        );
+    for pair in wheels.windows(2) {
+        let gap = pair[1].0 - pair[0].0;
+        assert!(gap >= motion::FRAME, "{gap:?}");
     }
 }
 

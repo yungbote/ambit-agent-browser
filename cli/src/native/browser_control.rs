@@ -593,7 +593,6 @@ impl BrowserControl {
                         _ = raised.changed() => {}
                     }
                 }
-                self.key_sent_at = Some(Instant::now());
             }
             let typing = events[stroke.events.clone()]
                 .iter()
@@ -635,6 +634,11 @@ impl BrowserControl {
                     message.push_str(&release);
                 }
                 return Err(message.into());
+            }
+            // The next key is due an interval after this one's send
+            // returned, so a slow send never brings it closer.
+            if stroke.paced {
+                self.key_sent_at = Some(Instant::now());
             }
             if let Some(typing) = typing {
                 typing.acknowledged();
