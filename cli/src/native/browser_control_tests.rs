@@ -98,6 +98,43 @@ impl Drop for Browser {
 
 impl Browser {
     async fn new() -> Self {
+        Self::answering(|_| None).await
+    }
+
+    /// A browser whose page answers each read of the field that has focus
+    /// (`secret_fields`) with the next of `reads`, the last one again once
+    /// they run out; a `None` read is never answered. Every other command
+    /// reaches the test as `new`'s do.
+    async fn typing_into(reads: Vec<Option<Value>>) -> Self {
+        let reads = std::sync::Mutex::new(std::collections::VecDeque::from(reads));
+        Self::answering(move |command| {
+            let expression = command["params"]["expression"].as_str().unwrap_or_default();
+            match command["method"].as_str()? {
+                "Page.getFrameTree" => Some(json!({ "frameTree": { "frame": { "id": "F" } } })),
+                "Accessibility.enable" | "Runtime.addBinding" => Some(json!({})),
+                "Page.addScriptToEvaluateOnNewDocument" => Some(json!({ "identifier": "1" })),
+                "Page.createIsolatedWorld" => Some(json!({ "executionContextId": 7 })),
+                "Runtime.evaluate" if expression.contains("facts.frame") => {
+                    let mut reads = reads.lock().unwrap();
+                    let read = if reads.len() > 1 {
+                        reads.pop_front().flatten()
+                    } else {
+                        reads.front().cloned().flatten()
+                    };
+                    read.map(|facts| json!({ "result": { "type": "object", "value": facts } }))
+                }
+                "Runtime.evaluate" if expression.contains("__ambitSecrets") => {
+                    Some(json!({ "result": { "type": "boolean", "value": true } }))
+                }
+                _ => None,
+            }
+        })
+        .await
+    }
+
+    /// A browser that answers a command `answer` has a result for, and
+    /// passes every other one to the test.
+    async fn answering(answer: impl Fn(&Value) -> Option<Value> + Send + 'static) -> Self {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!(
             "ws://{}/devtools/browser/test",
@@ -118,7 +155,11 @@ impl Browser {
                     command = rx.next() => {
                         match command {
                             Some(Ok(Message::Text(text))) => {
-                                if commands_tx.send(serde_json::from_str(&text).unwrap()).await.is_err() { break; }
+                                let command: Value = serde_json::from_str(&text).unwrap();
+                                if let Some(result) = answer(&command) {
+                                    let reply = json!({ "id": command["id"], "result": result });
+                                    if tx.send(Message::Text(reply.to_string())).await.is_err() { break; }
+                                } else if commands_tx.send(command).await.is_err() { break; }
                             }
                             Some(Ok(Message::Ping(_))) => {}
                             _ => break,
@@ -1567,7 +1608,7 @@ async fn taking_control_ends_the_agents_held_gesture_for_layouts() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn typing_sends_one_key_per_interval() {
     let (display, mut ops, _frames) = acknowledging_display();
-    let browser = Browser::new().await;
+    let browser = Browser::typing_into(vec![Some(text_field())]).await;
     let mut activity = browser.client.subscribe();
     let mut control = BrowserControl {
         display: Some(display),
@@ -1626,7 +1667,7 @@ async fn typing_sends_one_key_per_interval() {
 async fn a_held_modifier_rides_on_every_native_event_until_its_release() {
     use super::super::interaction::{native_key_transition, native_text_events};
     let (display, mut ops, _frames) = acknowledging_display();
-    let browser = Browser::new().await;
+    let browser = Browser::typing_into(vec![Some(text_field())]).await;
     let mut control = BrowserControl {
         display: Some(display),
         ..BrowserControl::default()
@@ -1679,7 +1720,7 @@ async fn a_held_modifier_rides_on_every_native_event_until_its_release() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_held_key_is_released_when_native_input_is_cancelled() {
     let (display, mut ops, _frames) = acknowledging_display();
-    let browser = Browser::new().await;
+    let browser = Browser::typing_into(vec![Some(text_field())]).await;
     let mut control = BrowserControl {
         display: Some(display),
         ..BrowserControl::default()
@@ -1737,7 +1778,7 @@ async fn key_presses_keep_their_interval() {
         ..BrowserControl::default()
     };
     let events = super::super::interaction::native_text_events("twenty characters ok");
-    let browser = Browser::new().await;
+    let browser = Browser::typing_into(vec![Some(text_field())]).await;
     control
         .agent_native_keys(&events, motion::KEY_INTERVAL, &browser.client, "page")
         .await
@@ -1758,6 +1799,196 @@ async fn key_presses_keep_their_interval() {
     );
 }
 
+/// The field that has focus, as the page reads it in the channel's world.
+fn text_field() -> Value {
+    json!({ "kind": "field", "method": null, "inputType": "text", "multiline": false,
+        "secret": false, "frame": false })
+}
+
+fn password_field() -> Value {
+    json!({ "kind": "field", "method": "post", "inputType": "password", "multiline": false,
+        "secret": true, "frame": false })
+}
+
+/// The agent never types into a secret field that has focus: text, a paste
+/// chord, a deletion and Space are refused before anything reaches the
+/// helper, while keys that do not type (Tab, Enter, an arrow) still go.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typing_never_reaches_a_secret_field_that_has_focus() {
+    use super::super::interaction::{native_key_chord_events, native_text_events};
+    let (display, mut ops, _frames) = acknowledging_display();
+    let browser = Browser::typing_into(vec![Some(password_field())]).await;
+    let mut control = BrowserControl {
+        display: Some(display),
+        ..BrowserControl::default()
+    };
+    for events in [
+        native_text_events("hunter2"),
+        native_key_chord_events("v", Some(2)),
+        native_key_chord_events("Backspace", None),
+        native_text_events(" "),
+    ] {
+        let refused = control
+            .agent_native_keys(&events, motion::KEY_INTERVAL, &browser.client, "page")
+            .await
+            .unwrap_err();
+        assert!(
+            refused
+                .error
+                .starts_with("browser_effect_refused: The field that has focus is a password"),
+            "{}",
+            refused.error
+        );
+        assert!(ops.try_recv().is_err(), "nothing reached the helper");
+    }
+    for key in ["Tab", "Enter", "ArrowLeft"] {
+        control
+            .agent_native_keys(
+                &native_key_chord_events(key, None),
+                motion::KEY_INTERVAL,
+                &browser.client,
+                "page",
+            )
+            .await
+            .unwrap();
+        assert_eq!(ops.try_recv().unwrap()["events"][0]["key"], key);
+    }
+}
+
+/// Focus that moves into a secret field while the agent types stops the
+/// typing at that field, however the command began: the report counts
+/// exactly the characters that went in.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn typing_stops_where_focus_moves_into_a_secret_field() {
+    let (display, mut ops, _frames) = acknowledging_display();
+    // Read before 'a' and before 'b' in the name field; Tab types nothing
+    // and needs no reading; before 'c', focus is in the password field.
+    let browser = Browser::typing_into(vec![
+        Some(text_field()),
+        Some(text_field()),
+        Some(password_field()),
+    ])
+    .await;
+    let mut control = BrowserControl {
+        display: Some(display),
+        ..BrowserControl::default()
+    };
+    let events = super::super::interaction::native_text_events("ab\tcd");
+    let stopped = control
+        .agent_native_keys(&events, motion::KEY_INTERVAL, &browser.client, "page")
+        .await
+        .unwrap_err();
+    assert!(
+        stopped.error.starts_with(
+            "browser_operation_interrupted: Typing stopped after 2 of 4 characters: focus moved into a password"
+        ),
+        "{}",
+        stopped.error
+    );
+    assert_eq!(
+        stopped.data,
+        Some(
+            json!({ "executionStopped": true, "effectsMayHaveOccurred": true, "charactersTyped": 2 })
+        )
+    );
+    let mut keys = Vec::new();
+    while let Ok(request) = ops.try_recv() {
+        keys.push(request["events"][0]["key"].as_str().unwrap().to_owned());
+    }
+    assert_eq!(keys, ["a", "b", "Tab"]);
+}
+
+/// A JavaScript dialog that opens while the agent types stops the typing:
+/// the page answers nothing until someone answers the dialog, and keys
+/// would go to the dialog.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dialog_that_opens_while_typing_stops_it() {
+    let (display, mut ops, _frames) = acknowledging_display();
+    // The reading before 'b' is never answered: the dialog blocks the page.
+    let browser = Browser::typing_into(vec![Some(text_field()), None]).await;
+    let mut control = BrowserControl {
+        display: Some(display),
+        ..BrowserControl::default()
+    };
+    let events = super::super::interaction::native_text_events("abc");
+    let typing = control.agent_native_keys(&events, motion::KEY_INTERVAL, &browser.client, "page");
+    let dialog = async {
+        assert_eq!(ops.recv().await.unwrap()["events"][0]["key"], "a");
+        browser
+            .responses
+            .send(
+                json!({ "method": "Page.javascriptDialogOpening", "sessionId": "page",
+                "params": { "url": "https://example.test/", "message": "Sure?", "type": "confirm",
+                    "hasBrowserHandler": false, "defaultPrompt": "" } }),
+            )
+            .await
+            .unwrap();
+    };
+    let (stopped, ()) = tokio::join!(typing, dialog);
+    let stopped = stopped.unwrap_err();
+    assert!(
+        stopped.error.starts_with(
+            "browser_operation_interrupted: Typing stopped after 1 of 3 characters: a JavaScript dialog opened"
+        ),
+        "{}",
+        stopped.error
+    );
+    assert!(ops.try_recv().is_err());
+}
+
+/// A page that begins loading another document while the agent types stops
+/// the typing: it answers nothing until the document commits, and later keys
+/// would reach whichever document then shows.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_navigation_that_begins_while_typing_stops_it() {
+    let (display, mut ops, _frames) = acknowledging_display();
+    // The reading before 'b' is never answered: the page is between documents.
+    let browser = Browser::typing_into(vec![Some(text_field()), None]).await;
+    // The page's session belongs to its target, whose id is its main frame's.
+    browser
+        .responses
+        .send(json!({ "method": "Target.attachedToTarget", "params": { "sessionId": "page",
+            "targetInfo": { "targetId": "T", "type": "page", "title": "", "url": "https://shop.test/",
+                "attached": true, "canAccessOpener": false }, "waitingForDebugger": false } }))
+        .await
+        .unwrap();
+    while browser.client.target_for_session("page").is_none() {
+        tokio::task::yield_now().await;
+    }
+    let mut control = BrowserControl {
+        display: Some(display),
+        ..BrowserControl::default()
+    };
+    let events = super::super::interaction::native_text_events("abc");
+    let typing = control.agent_native_keys(&events, motion::KEY_INTERVAL, &browser.client, "page");
+    let navigation = async {
+        assert_eq!(ops.recv().await.unwrap()["events"][0]["key"], "a");
+        browser
+            .responses
+            .send(
+                json!({ "method": "Page.frameStartedNavigating", "sessionId": "page",
+                "params": { "frameId": "T", "url": "https://shop.test/next", "loaderId": "L2",
+                    "navigationType": "differentDocument" } }),
+            )
+            .await
+            .unwrap();
+    };
+    let (stopped, ()) = tokio::join!(typing, navigation);
+    let stopped = stopped.unwrap_err();
+    assert!(
+        stopped.error.starts_with(
+            "browser_operation_interrupted: Typing stopped after 1 of 3 characters: the page began loading another document"
+        ),
+        "{}",
+        stopped.error
+    );
+    assert!(ops.try_recv().is_err());
+}
+
 /// A takeover stops typing after the key in flight: nothing is held
 /// between keys, and the report counts exactly the characters the helper
 /// received.
@@ -1770,7 +2001,7 @@ async fn a_takeover_stops_typing_after_the_current_key_and_counts_it() {
         ..BrowserControl::default()
     };
     let interrupts = control.interrupts();
-    let browser = Browser::new().await;
+    let browser = Browser::typing_into(vec![Some(text_field())]).await;
     let text = "exactly counted text";
     let events = super::super::interaction::native_text_events(text);
     let typing = control.agent_native_keys(&events, motion::KEY_INTERVAL, &browser.client, "page");

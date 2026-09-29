@@ -13,8 +13,10 @@ use super::activity::InputSource;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
+use super::agent_channel::target::Recorders;
 use super::cdp::client::{CdpClient, PendingCommand};
 use super::input::{input_command, stream_event, HeldInputs};
+use super::secret_fields::FocusedField;
 use tokio::sync::watch;
 
 mod interrupts;
@@ -405,6 +407,9 @@ pub(crate) struct BrowserControl {
     interrupts: Interrupts,
     /// When the agent's last key press went, which paces the next one.
     key_sent_at: Option<Instant>,
+    /// The pages whose documents record their secret fields, read before
+    /// each key the agent sends (`secret_fields`).
+    recorders: std::sync::Arc<Recorders>,
 }
 
 impl Default for BrowserControl {
@@ -422,6 +427,7 @@ impl Default for BrowserControl {
             applied_input: Default::default(),
             interrupts: Interrupts::default(),
             key_sent_at: None,
+            recorders: Default::default(),
         }
     }
 }
@@ -530,6 +536,36 @@ impl BrowserControl {
         self.interrupts.clone()
     }
 
+    /// The pages whose documents record their secret fields.
+    pub(crate) fn recorders(&self) -> std::sync::Arc<Recorders> {
+        self.recorders.clone()
+    }
+
+    /// Admits one agent keyboard event (in the display helper's shape) that
+    /// a transport sends past `agent_native_keys`, as that judges each of its
+    /// strokes: never into a secret field that has focus in `session`'s page.
+    pub(crate) async fn admit_agent_key(
+        &self,
+        event: &Value,
+        client: &CdpClient,
+        session: &str,
+    ) -> Result<(), CommandError> {
+        let mut page_events = client.subscribe();
+        let refusal = FocusedField::new(self.recorders.clone())
+            .refuses(client, session, event, &mut page_events)
+            .await;
+        match refusal {
+            None => Ok(()),
+            Some(refusal) => {
+                let total = motion::strokes(std::slice::from_ref(event))
+                    .iter()
+                    .map(|stroke| stroke.characters)
+                    .sum();
+                Err(refusal.stopped(false, 0, total))
+            }
+        }
+    }
+
     fn publish_custody(&self) {
         self.applied_input
             .record(self.lease.as_ref().map_or(0, |lease| lease.last_sequence));
@@ -557,8 +593,12 @@ impl BrowserControl {
     /// that enters or deletes text is published to `session`'s viewers as
     /// typing once the helper acknowledged it. A pending interruption stops
     /// typing before the next press, and the report says exactly how many
-    /// characters went in. A stroke that may have started leaves an
-    /// uncertain outcome and releases whatever the helper holds.
+    /// characters went in. A stroke that would type into a secret field
+    /// that has focus when it is due is never sent (`secret_fields`), however
+    /// focus got there: a stroke of this command, a click or the page; and
+    /// typing stops when a dialog opens or the page begins loading another
+    /// document before such a stroke. A stroke that may have started leaves
+    /// an uncertain outcome and releases whatever the helper holds.
     pub(crate) async fn agent_native_keys(
         &mut self,
         events: &[Value],
@@ -576,6 +616,8 @@ impl BrowserControl {
         let strokes = motion::strokes(events);
         let total = strokes.iter().map(|stroke| stroke.characters).sum();
         let mut raised = self.interrupts.subscribe();
+        let mut focused = FocusedField::new(self.recorders.clone());
+        let mut page_events = client.subscribe();
         let _paced = paced::Span::begin();
         let mut typed = 0;
         for (index, stroke) in strokes.iter().enumerate() {
@@ -593,6 +635,19 @@ impl BrowserControl {
                         _ = raised.changed() => {}
                     }
                 }
+            }
+            // Read when the stroke is due, a whole interval after the one
+            // before it went, so the page has taken what came before.
+            if let Some(refusal) = focused
+                .refuses(
+                    client,
+                    session,
+                    &events[stroke.events.start],
+                    &mut page_events,
+                )
+                .await
+            {
+                return Err(refusal.stopped(index > 0, typed, total));
             }
             let typing = events[stroke.events.clone()]
                 .iter()

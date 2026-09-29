@@ -2833,9 +2833,10 @@ async fn navigation_pending(state: &mut DaemonState) -> bool {
 }
 
 /// A host-bound command once the window admitted it, as both transports run
-/// it: the custody gate, the observation gate and the caller's fence, then
-/// the operation, after the launch the request carries, under the host
-/// deadline. `cmd` still carries the host's request.
+/// it: the custody gate, the observation gate, the caller's fence and the
+/// secret field the command may name (`secret_fields`), then the operation,
+/// after the launch the request carries, under the host deadline. `cmd`
+/// still carries the host's request.
 pub(crate) async fn run_host_command(
     cmd: &Value,
     request: &super::feedback::FeedbackRequest,
@@ -2857,7 +2858,10 @@ pub(crate) async fn run_host_command(
     );
     // A person's control is reported before an observation the agent owes,
     // both before a page between documents, and the fence is asked only once
-    // every gate admitted the command.
+    // every gate admitted the command. The host path reads a page between
+    // documents for nothing: not for the fence, and not for a field the
+    // command enters, reads or types into (`secret_fields`), which is read
+    // on the page the fence admitted.
     let refusal = if let Some(error) = controlled {
         Some(
             json!({ "id": command["id"], "success": false, "code": error.code, "error": error.message }),
@@ -2866,12 +2870,16 @@ pub(crate) async fn run_host_command(
         Some(
             json!({ "id": command["id"], "success": false, "code": "browser_observation_required", "error": window_actions::OBSERVATION_REQUIRED }),
         )
-    } else if fence.reads_page() && navigation_pending(state).await {
+    } else if (fence.reads_page() || super::secret_fields::reads_page(&command))
+        && navigation_pending(state).await
+    {
         Some(json!({ "id": command["id"], "success": false,
             "code": super::documents::NAVIGATION_PENDING,
             "error": super::documents::NAVIGATION_PENDING_MESSAGE, "data": {} }))
+    } else if let Err(refusal) = fence.admit(&command, state).await {
+        Some(refusal)
     } else {
-        fence.admit(&command, state).await.err()
+        super::secret_fields::named_field_refusal(&command, state).await
     };
     let response = if let Some(refusal) = refusal {
         refusal
@@ -18052,6 +18060,68 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
         let refused = run_host_command(&point, &request, &mut state, now(), &mut fenced).await;
         assert_eq!(refused["error"], "fenced", "{refused}");
         assert_eq!(fenced.asked, 1);
+    }
+
+    /// A command the host path reads the page for before it acts (a field it
+    /// names, or the focused field before a key that may type:
+    /// `secret_fields`) is refused while the active page is between
+    /// documents, whatever its fence reads; a key that cannot type reaches
+    /// its fence.
+    #[tokio::test]
+    async fn a_command_whose_field_is_read_first_is_refused_between_documents() {
+        use super::super::cdp::types::CdpEvent;
+        let mut state = DaemonState::new();
+        state.browser = Some(
+            super::super::browser::tests::test_manager(vec![super::super::browser::PageInfo {
+                tab_id: 1,
+                label: None,
+                target_id: "T1".into(),
+                session_id: "S1".into(),
+                url: "https://shop.example/".into(),
+                title: String::new(),
+                target_type: "page".into(),
+            }])
+            .await,
+        );
+        let (events, receiver) = tokio::sync::broadcast::channel(16);
+        state.event_rx = Some(receiver);
+        events
+            .send(CdpEvent {
+                method: "Page.frameStartedNavigating".into(),
+                params: json!({ "frameId": "T1", "navigationType": "differentDocument" }),
+                session_id: Some("S1".into()),
+            })
+            .unwrap();
+        let request = super::super::feedback::FeedbackRequest {
+            namespace: String::new(),
+            session: state.session_id.clone(),
+            capture_directory: "/".into(),
+            timeout_ms: 1_000,
+            expected_observation: None,
+            launch: None,
+        };
+        let now = std::time::Instant::now;
+        let mut blind = RefusingFence {
+            points: false,
+            reads: false,
+            asked: 0,
+        };
+        let request_field = super::super::feedback::REQUEST_FIELD;
+        for mut command in [
+            json!({ "id": "f", "action": "fill", "selector": "#pw", "value": "x" }),
+            json!({ "id": "g", "action": "inputvalue", "selector": "#pw" }),
+            json!({ "id": "p", "action": "press", "key": "a" }),
+            json!({ "id": "k", "action": "keyboard", "subaction": "type", "text": "x" }),
+        ] {
+            command[request_field] = json!({});
+            let refused = run_host_command(&command, &request, &mut state, now(), &mut blind).await;
+            assert_eq!(refused["code"], "browser_navigation_pending", "{refused}");
+        }
+        assert_eq!(blind.asked, 0);
+        let tab = json!({ "id": "t", "action": "press", "key": "Tab", request_field: {} });
+        let fenced = run_host_command(&tab, &request, &mut state, now(), &mut blind).await;
+        assert_eq!(fenced["error"], "fenced", "{fenced}");
+        assert_eq!(blind.asked, 1);
     }
 
     /// A command whose fence reads the page before acting is refused while

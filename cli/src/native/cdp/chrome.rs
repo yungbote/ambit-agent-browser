@@ -949,17 +949,7 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         args.push(format!("--user-data-dir={}", dir.display()));
         (dir, None)
     } else {
-        let dir =
-            std::env::temp_dir().join(format!("agent-browser-chrome-{}", uuid::Uuid::new_v4()));
-        let mut builder = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        builder
-            .create(&dir)
-            .map_err(|e| format!("Failed to create temp profile dir: {}", e))?;
+        let dir = super::profiles::create_temporary(super::profiles::OWN)?;
         args.push(format!("--user-data-dir={}", dir.display()));
         (dir.clone(), Some(dir))
     };
@@ -2055,10 +2045,7 @@ pub fn copy_chrome_profile(
     user_data_dir: &Path,
     profile_directory: &str,
 ) -> Result<PathBuf, String> {
-    let temp_dir =
-        std::env::temp_dir().join(format!("agent-browser-profile-{}", uuid::Uuid::new_v4()));
-    std::fs::create_dir_all(&temp_dir)
-        .map_err(|e| format!("Failed to create temp profile dir: {}", e))?;
+    let temp_dir = super::profiles::create_temporary(super::profiles::COPY)?;
 
     // Copy Local State (non-fatal if missing or unreadable)
     let local_state_src = user_data_dir.join("Local State");
