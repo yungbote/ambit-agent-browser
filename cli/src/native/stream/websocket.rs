@@ -26,6 +26,7 @@ use super::http::handle_http_request;
 use super::presentation::{Presentation, PresentationConfig};
 use super::track::{self, Demand};
 use super::video::{Delivery, Feedback, VideoHub, VideoInbox, VideoTrack};
+use super::BrowserNote;
 use super::{
     is_allowed_origin, timestamp_ms, Audience, FrameNeeds, IdleActivity, StreamFrame, StreamMedia,
 };
@@ -397,6 +398,7 @@ pub(super) async fn accept_loop(
     last_tabs: Arc<RwLock<Vec<Value>>>,
     last_engine: Arc<RwLock<String>>,
     recording: Arc<Mutex<bool>>,
+    browser_notes: watch::Receiver<BrowserNote>,
     mut shutdown_rx: watch::Receiver<bool>,
     session_name: String,
 ) {
@@ -436,6 +438,7 @@ pub(super) async fn accept_loop(
                 let lt = last_tabs.clone();
                 let le = last_engine.clone();
                 let rec = recording.clone();
+                let notes = browser_notes.clone();
                 let shutdown_rx = shutdown_rx.clone();
                 let sn = session_name.clone();
 
@@ -461,6 +464,7 @@ pub(super) async fn accept_loop(
                         lt,
                         le,
                         rec,
+                        notes,
                         shutdown_rx,
                         sn,
                     )
@@ -514,6 +518,7 @@ async fn handle_connection(
     last_tabs: Arc<RwLock<Vec<Value>>>,
     last_engine: Arc<RwLock<String>>,
     recording: Arc<Mutex<bool>>,
+    browser_notes: watch::Receiver<BrowserNote>,
     shutdown_rx: watch::Receiver<bool>,
     session_name: Arc<str>,
 ) {
@@ -549,6 +554,7 @@ async fn handle_connection(
             last_tabs,
             last_engine,
             recording,
+            browser_notes,
             shutdown_rx,
         )
         .await;
@@ -569,21 +575,25 @@ struct StreamState<'a> {
     viewport_height: &'a Mutex<u32>,
     last_engine: &'a RwLock<String>,
     recording: &'a Mutex<bool>,
+    browser_notes: &'a watch::Receiver<BrowserNote>,
     last_tabs: &'a RwLock<Vec<Value>>,
     media: &'a StreamMedia,
 }
 
 impl StreamState<'_> {
     async fn messages(&self) -> Vec<String> {
-        let status = json!({
-            "type": "status",
-            "connected": super::source_connected(self.client_slot, self.display_slot).await,
-            "screencasting": *self.screencasting.lock().await,
-            "viewportWidth": *self.viewport_width.lock().await,
-            "viewportHeight": *self.viewport_height.lock().await,
-            "engine": self.last_engine.read().await.clone(),
-            "recording": *self.recording.lock().await,
-        });
+        let note = *self.browser_notes.borrow();
+        let status = super::status_record(
+            super::source_connected(self.client_slot, self.display_slot).await,
+            note,
+            *self.screencasting.lock().await,
+            (
+                *self.viewport_width.lock().await,
+                *self.viewport_height.lock().await,
+            ),
+            &self.last_engine.read().await,
+            *self.recording.lock().await,
+        );
         let mut messages = vec![status.to_string()];
         let tabs = self.last_tabs.read().await;
         if !tabs.is_empty() {
@@ -623,6 +633,7 @@ async fn handle_ws_client(
     last_tabs: Arc<RwLock<Vec<Value>>>,
     last_engine: Arc<RwLock<String>>,
     recording: Arc<Mutex<bool>>,
+    browser_notes: watch::Receiver<BrowserNote>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let callback =
@@ -720,6 +731,7 @@ async fn handle_ws_client(
         viewport_height: &viewport_height,
         last_engine: &last_engine,
         recording: &recording,
+        browser_notes: &browser_notes,
         last_tabs: &last_tabs,
         media: &media,
     };

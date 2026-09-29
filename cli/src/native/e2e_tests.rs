@@ -13,6 +13,7 @@ use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use super::stream::ClosedReason;
 use crate::test_utils::EnvGuard;
 
 use super::actions::{
@@ -6141,7 +6142,7 @@ async fn e2e_private_window_profile_survives_reopen_and_stays_owned() {
         manager.has_process_exited(),
         "the real Chrome window did not exit"
     );
-    let _ = close_current_browser(&mut state).await;
+    let _ = close_current_browser(&mut state, ClosedReason::Closed).await;
     assert_success(
         &control_test_command(&json!({"action":"navigate", "url":url}), &mut state).await,
     );
@@ -10741,7 +10742,7 @@ async fn e2e_periodic_autosave_survives_abrupt_browser_exit() {
                 .has_process_exited(),
             "browser process should have exited after Browser.close"
         );
-        let _ = close_current_browser(&mut state).await;
+        let _ = close_current_browser(&mut state, ClosedReason::Closed).await;
     }
 
     let path = super::state::find_auto_state_file(&restore_key)
@@ -12822,7 +12823,7 @@ async fn e2e_native_window_latency_measurements() {
             "capture_fps_under_load": frames as f64 / load_seconds,
         })
     );
-    let _ = close_current_browser(&mut state).await;
+    let _ = close_current_browser(&mut state, ClosedReason::Closed).await;
 }
 
 /// The owned window renders WebGL1 and WebGL2 through the explicitly
@@ -14491,7 +14492,7 @@ async fn e2e_native_motion_recording() {
     )
     .unwrap();
     println!("RECORDING {summary}");
-    let _ = close_current_browser(&mut state).await;
+    let _ = close_current_browser(&mut state, ClosedReason::Closed).await;
 }
 
 /// Input aimed inside a cross-site frame (its own renderer and session)
@@ -14632,7 +14633,7 @@ async fn e2e_native_activity_in_a_cross_site_frame_reaches_viewers() {
         "FRAME_ACTIVITY {}",
         json!({"moves": moves, "presses": presses, "typing": typing, "pointer": [pointer.0, pointer.1]})
     );
-    let _ = close_current_browser(&mut state).await;
+    let _ = close_current_browser(&mut state, ClosedReason::Closed).await;
 }
 
 /// A missed settings push heals on the next host launch envelope without
@@ -15373,5 +15374,5 @@ async fn e2e_native_motion_proof() {
     if let Ok(path) = std::env::var("AMBIT_MOTION_PROOF") {
         std::fs::write(path, serde_json::to_vec_pretty(&proof).unwrap()).unwrap();
     }
-    let _ = close_current_browser(&mut state).await;
+    let _ = close_current_browser(&mut state, ClosedReason::Closed).await;
 }

@@ -43,7 +43,7 @@ use super::screenshot::{self, ScreenshotOptions};
 use super::snapshot::{self, SnapshotOptions};
 use super::state;
 use super::storage;
-use super::stream::{self, IdleActivity, StreamServer};
+use super::stream::{self, BrowserNote, ClosedReason, IdleActivity, StreamServer};
 use super::tab_binding;
 use super::theme::{self, Theme};
 use super::tracing::{self as native_tracing, TracingState};
@@ -599,6 +599,10 @@ pub struct DaemonState {
     /// The owned window while a person signs in: the same browser without
     /// DevTools. Never set together with `browser`.
     sign_in: Option<sign_in::SignInBrowser>,
+    /// A sign-in or a hand-back is starting the view's next browser.
+    browser_restarting: bool,
+    /// Why the view's last browser closed.
+    browser_closed: ClosedReason,
     pub appium: Option<AppiumManager>,
     pub safari_driver: Option<safari::SafariDriverProcess>,
     pub webdriver_backend: Option<super::webdriver::backend::WebDriverBackend>,
@@ -832,6 +836,8 @@ impl DaemonState {
         Self {
             browser: None,
             sign_in: None,
+            browser_restarting: false,
+            browser_closed: ClosedReason::Closed,
             appium: None,
             safari_driver: None,
             webdriver_backend: None,
@@ -1254,7 +1260,6 @@ impl DaemonState {
             *guard = self.browser.as_ref().map(|m| Arc::clone(&m.client));
         }
         if let Some(ref server) = self.stream_server {
-            let connected = self.browser.is_some() || display.is_some();
             server.set_display(display).await;
             server.set_audio(self.window_audio());
             // Update the CDP page session ID so screencast commands target the right page
@@ -1273,9 +1278,30 @@ impl DaemonState {
                     .bind_cdp_session_and_broadcast_tabs(session_id, &[])
                     .await;
             }
-            server
-                .broadcast_status(connected, sc, vw, vh, &self.engine)
-                .await;
+            server.set_browser_note(self.browser_note());
+            server.broadcast_status(sc, vw, vh, &self.engine).await;
+        }
+    }
+
+    /// What the stream's sources cannot say about the view's browser. A
+    /// successor being started counts only while no browser is attached.
+    fn browser_note(&self) -> BrowserNote {
+        BrowserNote {
+            restarting: self.browser_restarting && self.browser.is_none() && self.sign_in.is_none(),
+            closed: self.browser_closed,
+            restartable: false,
+        }
+    }
+
+    /// Tells every viewer what the view's browser is doing without changing
+    /// the stream's sources: a transition keeps showing the retired window
+    /// until its successor replaces it.
+    pub(crate) async fn publish_browser_status(&self) {
+        if let Some(ref server) = self.stream_server {
+            server.set_browser_note(self.browser_note());
+            let sc = server.is_screencasting().await;
+            let (vw, vh) = server.viewport().await;
+            server.broadcast_status(sc, vw, vh, &self.engine).await;
         }
     }
 
@@ -2512,7 +2538,7 @@ async fn apply_restore_config_after_confirmation(
 
     if restore_key_changed && had_browser {
         let _ = auto_save_restore_state(state).await;
-        let _ = close_current_browser(state).await;
+        let _ = close_current_browser(state, ClosedReason::Closed).await;
     }
 
     apply_restore_config_from_command(cmd, state)?;
@@ -2538,7 +2564,21 @@ async fn close_active_provider_session(state: &mut DaemonState) {
     state.active_provider_connection = false;
 }
 
-pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(), String> {
+/// Closes the view's browser, whichever is running (automation or sign-in),
+/// and tells every viewer why (`reason`); a reason other than an intended
+/// close also goes to the session log.
+pub(crate) async fn close_current_browser(
+    state: &mut DaemonState,
+    reason: ClosedReason,
+) -> Result<(), String> {
+    state.browser_closed = reason;
+    state.browser_restarting = false;
+    if reason != ClosedReason::Closed {
+        session_log(
+            &state.session_id,
+            &format!("browser closed: {}", reason.token()),
+        );
+    }
     let close_error = if let Some(mut mgr) = state.browser.take() {
         mgr.close().await.err()
     } else {
@@ -2579,7 +2619,7 @@ fn forget_browser_session(state: &mut DaemonState) {
 /// Lifecycle shutdown paths use this instead of `close_current_browser`
 /// because Safari and iOS sessions live outside `state.browser`.
 pub(crate) async fn close_all_browser_backends(state: &mut DaemonState) -> Result<(), String> {
-    let close_result = close_current_browser(state).await;
+    let close_result = close_current_browser(state, ClosedReason::Closed).await;
     state.retained_profile = None;
 
     if let Some(ref mut webdriver) = state.webdriver_backend {
@@ -2603,7 +2643,9 @@ async fn close_after_network_control_failure(
     state: &mut DaemonState,
     error: String,
 ) -> Result<(), String> {
-    let close_error = close_current_browser(state).await.err();
+    let close_error = close_current_browser(state, ClosedReason::Closed)
+        .await
+        .err();
     Err(match close_error {
         Some(close_error) => format!(
             "Failed to install browser network controls: {} (also failed to close browser: {})",
@@ -3286,7 +3328,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
                 || state.active_provider_session.is_some();
             if state.browser.is_some() || state.active_provider_session.is_some() {
                 let _ = auto_save_restore_state(state).await;
-                let _ = close_current_browser(state).await;
+                let _ = close_current_browser(state, ClosedReason::Closed).await;
             }
             if let Err(e) = auto_launch(state, plugins_from_command_or_env(cmd)).await {
                 let context = auto_launch_error_context(env::var("AGENT_BROWSER_CDP").is_ok());
@@ -5207,7 +5249,7 @@ async fn load_storage_state(state: &mut DaemonState, path: &Option<String>) -> R
 }
 
 async fn rollback_failed_launch(state: &mut DaemonState) -> Result<(), String> {
-    let close_result = close_current_browser(state).await;
+    let close_result = close_current_browser(state, ClosedReason::Closed).await;
     state.ref_map.clear();
     close_result
 }
@@ -5491,7 +5533,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         }
         if had_browser_before_launch {
             let _ = auto_save_restore_state(state).await;
-            close_current_browser(state).await?;
+            close_current_browser(state, ClosedReason::Closed).await?;
         }
     } else {
         load_storage_state(state, &storage_state_owned).await?;
@@ -9642,6 +9684,29 @@ fn stream_file_path(session_id: &str) -> PathBuf {
     get_socket_dir().join(format!("{}.stream", session_id))
 }
 
+/// Appends one line to the session's log (`<session>.log` beside its socket)
+/// whether or not AGENT_BROWSER_DEBUG sends the daemon's stderr there: a
+/// detached daemon's stderr is otherwise discarded, and why the view's
+/// browser closed must survive for whoever reads the sandbox afterwards.
+/// The file starts over past a megabyte.
+pub(crate) fn session_log(session_id: &str, line: &str) {
+    const LARGEST: u64 = 1 << 20;
+    let path = get_socket_dir().join(format!("{}.log", session_id));
+    let full = fs::metadata(&path).is_ok_and(|metadata| metadata.len() > LARGEST);
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(!full)
+        .write(true)
+        .truncate(full)
+        .open(&path);
+    if let Ok(mut file) = file {
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis());
+        let _ = writeln!(file, "{at} {line}");
+    }
+}
+
 fn write_stream_file(session_id: &str, port: u16) -> Result<(), String> {
     let path = stream_file_path(session_id);
     fs::write(&path, port.to_string()).map_err(|e| {
@@ -10118,13 +10183,7 @@ async fn handle_screencast_start(cmd: &Value, state: &mut DaemonState) -> Result
     if let Some(ref server) = state.stream_server {
         server.set_screencasting(true).await;
         server
-            .broadcast_status(
-                true,
-                true,
-                max_width as u32,
-                max_height as u32,
-                &state.engine,
-            )
+            .broadcast_status(true, max_width as u32, max_height as u32, &state.engine)
             .await;
     }
 
@@ -10145,9 +10204,7 @@ async fn handle_screencast_stop(state: &mut DaemonState) -> Result<Value, String
     if let Some(ref server) = state.stream_server {
         server.set_screencasting(false).await;
         let (vw, vh) = server.viewport().await;
-        server
-            .broadcast_status(true, false, vw, vh, &state.engine)
-            .await;
+        server.broadcast_status(false, vw, vh, &state.engine).await;
     }
 
     Ok(json!({ "stopped": true }))
@@ -14975,7 +15032,7 @@ mod tests {
             .expect_err("invalid session should fail attachment");
         let contents_after_failure = fs::read(&output_path);
 
-        let _ = close_current_browser(&mut state).await;
+        let _ = close_current_browser(&mut state, ClosedReason::Closed).await;
 
         assert!(error.to_ascii_lowercase().contains("session"), "{error}");
         assert_eq!(
@@ -15059,7 +15116,7 @@ mod tests {
             .expect("preserved recording should still stop normally");
         let _ = ws.close(None).await;
         let _ = handle_stream_disable(&mut state).await;
-        let _ = close_current_browser(&mut state).await;
+        let _ = close_current_browser(&mut state, ClosedReason::Closed).await;
         let _ = fs::remove_file(previous_path);
 
         assert!(error.contains("ffmpeg"), "{error}");
@@ -15311,7 +15368,9 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             }],
         });
 
-        close_current_browser(&mut state).await.unwrap();
+        close_current_browser(&mut state, ClosedReason::Closed)
+            .await
+            .unwrap();
 
         assert!(state.active_provider_session.is_none());
         assert!(!state.active_provider_connection);
@@ -15348,7 +15407,9 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             .insert("frame-1".to_string(), "session-1".to_string());
         state.active_iframe_sessions.insert("session-1".to_string());
 
-        close_current_browser(&mut state).await.unwrap();
+        close_current_browser(&mut state, ClosedReason::Closed)
+            .await
+            .unwrap();
 
         assert!(state.iframe_sessions.is_empty());
         assert!(state.active_iframe_sessions.is_empty());

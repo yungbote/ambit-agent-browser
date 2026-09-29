@@ -21,7 +21,7 @@ use super::browser_control::{serve_window_input, BrowserControl, InterruptReason
 use super::cdp::client::CdpClient;
 use super::playwright::Operations;
 use super::state;
-use super::stream::{IdleActivity, StreamServer};
+use super::stream::{ClosedReason, IdleActivity, StreamServer};
 use crate::connection::{DaemonSession, INTERNAL_DAEMON_SHUTDOWN_ACTION};
 
 /// Foreground daemons retain the invoking PID and stderr for a process supervisor.
@@ -386,7 +386,7 @@ async fn maintain_browser(state: Arc<tokio::sync::Mutex<DaemonState>>, autosave_
             .map(|manager| manager.has_process_exited())
             .unwrap_or(false);
         if process_exited {
-            let _ = close_current_browser(&mut state).await;
+            let _ = close_current_browser(&mut state, ClosedReason::Exited).await;
         } else if state.browser.is_some() {
             if let Err(error) = state.drain_cdp_events_background().await {
                 let _ = writeln!(
@@ -1041,7 +1041,7 @@ mod tests {
         assert_eq!(reply(&mut release).await["success"], true);
         drop(release);
         task.await.unwrap();
-        close_current_browser(&mut *state.lock().await)
+        close_current_browser(&mut *state.lock().await, ClosedReason::Closed)
             .await
             .unwrap();
     }
@@ -1235,7 +1235,7 @@ mod tests {
                 .unwrap(),
             target
         );
-        close_current_browser(&mut *state.lock().await)
+        close_current_browser(&mut *state.lock().await, ClosedReason::Closed)
             .await
             .unwrap();
     }

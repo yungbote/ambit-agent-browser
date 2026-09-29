@@ -433,6 +433,75 @@ impl Default for FrameMetadata {
     }
 }
 
+/// Why no browser runs in the view (the status record's `reason`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum ClosedReason {
+    /// Closed on purpose: an agent's close, a relaunch for another
+    /// configuration, the end of the session.
+    #[default]
+    Closed,
+    /// The browser process ended on its own: a crash, a kill, a sign-in
+    /// window closed before the hand-back.
+    Exited,
+    /// A sign-in's or a hand-back's restart did not bring a browser back.
+    RestartFailed,
+}
+
+impl ClosedReason {
+    pub(crate) fn token(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::Exited => "exited",
+            Self::RestartFailed => "restart_failed",
+        }
+    }
+}
+
+/// What the daemon knows about the view's browser that the stream's sources
+/// do not say: that a sign-in or a hand-back is starting its successor, why
+/// the last one closed, and whether it can be started again.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct BrowserNote {
+    pub restarting: bool,
+    pub closed: ClosedReason,
+    pub restartable: bool,
+}
+
+/// The status record, the one form every producer sends. `connected` says
+/// whether a browser is the view's source (a retired window stays it while a
+/// sign-in or hand-back starts the successor); `browser` says which state it
+/// is in and, while none runs, why and whether it can be started again, so
+/// `connected` is false exactly when `browser` is `closed`.
+pub(super) fn status_record(
+    connected: bool,
+    note: BrowserNote,
+    screencasting: bool,
+    viewport: (u32, u32),
+    engine: &str,
+    recording: bool,
+) -> Value {
+    let browser = match (connected, note.restarting) {
+        (false, _) => "closed",
+        (true, true) => "restarting",
+        (true, false) => "running",
+    };
+    let mut record = json!({
+        "type": "status",
+        "connected": connected,
+        "browser": browser,
+        "screencasting": screencasting,
+        "viewportWidth": viewport.0,
+        "viewportHeight": viewport.1,
+        "engine": engine,
+        "recording": recording,
+    });
+    if !connected {
+        record["reason"] = json!(note.closed.token());
+        record["restartable"] = json!(note.restartable);
+    }
+    record
+}
+
 pub struct StreamServer {
     pub(crate) browser_control: Arc<Mutex<BrowserControl>>,
     /// The interruptions `browser_control`'s agent input obeys, reachable
@@ -464,6 +533,7 @@ pub struct StreamServer {
     last_tabs: Arc<RwLock<Vec<Value>>>,
     last_engine: Arc<RwLock<String>>,
     recording: Arc<Mutex<bool>>,
+    browser_note: watch::Sender<BrowserNote>,
     shutdown_tx: watch::Sender<bool>,
     accept_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     cdp_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -570,10 +640,15 @@ impl StreamServer {
     /// Update and broadcast the recording state.
     pub async fn set_recording(&self, active: bool, engine: &str) {
         *self.recording.lock().await = active;
-        let connected = source_connected(&self.client_slot, &self.display_slot).await;
         let sc = *self.screencasting.lock().await;
         let (vw, vh) = self.viewport().await;
-        self.broadcast_status(connected, sc, vw, vh, engine).await;
+        self.broadcast_status(sc, vw, vh, engine).await;
+    }
+
+    /// What the daemon knows of the view's browser, for every status record
+    /// from now on; the caller broadcasts one.
+    pub(crate) fn set_browser_note(&self, note: BrowserNote) {
+        self.browser_note.send_replace(note);
     }
 
     /// End this stream explicitly, then stop its listener and owned tasks.
@@ -628,6 +703,7 @@ impl StreamServer {
         let last_tabs = Arc::new(RwLock::new(Vec::<Value>::new()));
         let last_engine = Arc::new(RwLock::new("chrome".to_string()));
         let recording = Arc::new(Mutex::new(false));
+        let (browser_note, browser_notes) = watch::channel(BrowserNote::default());
         let display_slot = Arc::new(RwLock::new(None));
         let (display_changed, display_changes) = watch::channel(());
         let (audio_source, audio_accept) = watch::channel(None);
@@ -685,6 +761,7 @@ impl StreamServer {
         let last_tabs_clone = last_tabs.clone();
         let last_engine_clone = last_engine.clone();
         let recording_clone = recording.clone();
+        let browser_notes_accept = browser_notes.clone();
         let accept_shutdown_rx = shutdown_rx.clone();
         let session_name_clone = session_id.clone();
         let frame_watch_accept = frame_watch_rx.clone();
@@ -709,6 +786,7 @@ impl StreamServer {
                 last_tabs_clone,
                 last_engine_clone,
                 recording_clone,
+                browser_notes_accept,
                 accept_shutdown_rx,
                 session_name_clone,
             )
@@ -749,6 +827,7 @@ impl StreamServer {
                 last_tabs_bg,
                 last_engine_bg,
                 recording_bg,
+                browser_notes,
                 shutdown_rx,
             )
             .await;
@@ -778,6 +857,7 @@ impl StreamServer {
                 last_tabs,
                 last_engine,
                 recording,
+                browser_note,
                 shutdown_tx,
                 accept_task: Mutex::new(Some(accept_task)),
                 cdp_task: Mutex::new(Some(cdp_task)),
@@ -858,7 +938,6 @@ impl StreamServer {
     /// Broadcast a status message to all connected clients.
     pub async fn broadcast_status(
         &self,
-        connected: bool,
         screencasting: bool,
         viewport_width: u32,
         viewport_height: u32,
@@ -868,16 +947,15 @@ impl StreamServer {
             let mut guard = self.last_engine.write().await;
             *guard = engine.to_string();
         }
-        let rec = *self.recording.lock().await;
-        let msg = json!({
-            "type": "status",
-            "connected": connected,
-            "screencasting": screencasting,
-            "viewportWidth": viewport_width,
-            "viewportHeight": viewport_height,
-            "engine": engine,
-            "recording": rec,
-        });
+        let note = *self.browser_note.borrow();
+        let msg = status_record(
+            source_connected(&self.client_slot, &self.display_slot).await,
+            note,
+            screencasting,
+            (viewport_width, viewport_height),
+            engine,
+            *self.recording.lock().await,
+        );
         let _ = self.frame_tx.send(msg.to_string());
     }
 
