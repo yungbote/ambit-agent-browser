@@ -453,12 +453,30 @@ while True: signal.pause()
 "#
             ),
         );
+        // Both fixture processes must have published readable ownership
+        // before cancellation tests their reaping. Observer startup does not
+        // imply the separately scheduled daemon has written its record yet.
+        let read_owner = || {
+            fs::read_to_string(&owner_record)
+                .ok()
+                .and_then(|value| serde_json::from_str::<serde_json::Value>(&value).ok())
+                .filter(|owner| {
+                    owner["pid"].as_i64().is_some() && owner["configuration"].as_str().is_some()
+                })
+        };
+        let read_observer = || {
+            fs::read_to_string(&observer_record)
+                .ok()
+                .and_then(|value| value.parse::<i32>().ok())
+        };
         let canceled = AtomicBool::new(false);
         let started = Instant::now();
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 let deadline = Instant::now() + Duration::from_secs(1);
-                while !observer_record.exists() && Instant::now() < deadline {
+                while (read_owner().is_none() || read_observer().is_none())
+                    && Instant::now() < deadline
+                {
                     std::thread::sleep(Duration::from_millis(2));
                 }
                 canceled.store(true, Ordering::Relaxed);
@@ -474,12 +492,9 @@ while True: signal.pause()
             .is_err());
         });
         assert!(started.elapsed() < ACKNOWLEDGMENT);
-        let owner: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(owner_record).unwrap()).unwrap();
-        let observer_pid: i32 = fs::read_to_string(observer_record)
-            .unwrap()
-            .parse()
-            .unwrap();
+        let owner = read_owner().expect("fixture daemon ownership was ready before cancellation");
+        let observer_pid =
+            read_observer().expect("fixture observer ownership was ready before cancellation");
         assert_eq!(
             unsafe { libc::kill(owner["pid"].as_i64().unwrap() as i32, 0) },
             -1
