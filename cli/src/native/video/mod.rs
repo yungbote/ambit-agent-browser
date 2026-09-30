@@ -163,6 +163,8 @@ pub(crate) struct EncodeRequest {
 pub(crate) struct EncodedUnit {
     pub data: Vec<u8>,
     pub key: bool,
+    /// The key's actual codec configuration, read from its encoded header.
+    pub codec_string: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -182,22 +184,34 @@ impl std::fmt::Display for VideoError {
     }
 }
 
-/// The path's bitrate, actual picture period and payload target for keys.
+/// The path's bitrate and actual period for dependent pictures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EncoderRate {
     pub bits_per_second: u32,
     pub pictures_per_second: u32,
-    pub key_bytes: u32,
+}
+
+/// Coded pixels changed by one refinement; other blocks retain their reference pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EncoderRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// One picture in, one temporal unit out, without lookahead or reordering.
 pub(crate) trait VideoEncoder: Send {
     /// The encoded picture size.
     fn coded(&self) -> (u32, u32);
-    /// The WebCodecs codec string of this stream.
-    fn codec_string(&self) -> String;
     /// A path's explicit rate budget; absence preserves fixed-quality encoding.
     fn set_rate(&mut self, rate: Option<EncoderRate>) -> Result<(), VideoError>;
+    /// Configure a refinement and return the actual codec-aligned region it
+    /// updates. Callers reason about this region, not an assumed block size.
+    fn set_refinement_region(
+        &mut self,
+        region: Option<EncoderRegion>,
+    ) -> Result<Option<EncoderRegion>, VideoError>;
     fn encode(
         &mut self,
         picture: &Picture<'_>,

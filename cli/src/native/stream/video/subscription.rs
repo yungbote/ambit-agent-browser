@@ -19,6 +19,8 @@ use crate::native::display::{Rect, Surface};
 #[derive(Debug)]
 pub(crate) struct Unit {
     pub data: Vec<u8>,
+    /// Canonical wire header+payload bound, computed once before publication.
+    pub wire_bytes: usize,
     pub key: bool,
     /// Sandbox monotonic microseconds at capture.
     pub ts: u64,
@@ -175,7 +177,7 @@ impl Subscriber {
 
     /// Bytes waiting to be written.
     pub(crate) fn queued_bytes(&self) -> usize {
-        self.queue().units.iter().map(|unit| unit.data.len()).sum()
+        self.queue().units.iter().map(|unit| unit.wire_bytes).sum()
     }
 }
 
@@ -295,8 +297,9 @@ mod tests {
     use super::*;
 
     pub(crate) fn unit(ts: u64, key: bool, bytes: usize) -> Arc<Unit> {
-        Arc::new(Unit {
+        let mut unit = Unit {
             data: vec![0; bytes],
+            wire_bytes: 0,
             key,
             ts,
             coded: (2048, 2048),
@@ -310,7 +313,13 @@ mod tests {
             input_seq: None,
             quality: Quality::Motion,
             codec_string: key.then(|| "av01.1.12M.08".into()),
-        })
+        };
+        unit.wire_bytes = crate::native::stream::wire::video_budget_bytes(
+            &unit,
+            crate::native::video::VideoCodec::Av1Full,
+        )
+        .unwrap();
+        Arc::new(unit)
     }
 
     async fn delivered(subscriber: &Subscriber) -> Vec<String> {
@@ -388,6 +397,30 @@ mod tests {
         subscriber.end("encoder failed");
         assert!(!subscriber.push(&unit(1, true, 10)));
         assert_eq!(delivered(&subscriber).await, ["ended:encoder failed"]);
+    }
+
+    #[tokio::test]
+    async fn tiny_units_charge_their_complete_wire_cost_while_queued_and_release_it_on_pull() {
+        let subscriber = Subscriber::new(60);
+        let key = unit(1, true, 42);
+        let delta = unit(2, false, 42);
+        assert!(key.wire_bytes > key.data.len() && delta.wire_bytes > delta.data.len());
+        subscriber.push(&key);
+        subscriber.push(&delta);
+        assert_eq!(subscriber.queued_bytes(), key.wire_bytes + delta.wire_bytes);
+        let mut flow = Flow::default();
+        flow.set_link_rate(Some(LinkRate {
+            bits_per_second: 20_000,
+            burst_bytes: 100,
+        }));
+        assert!(
+            !flow.has_room(subscriber.queued_bytes()),
+            "84 raw bytes fit; complete envelopes must not"
+        );
+        assert!(matches!(subscriber.next().await, Delivery::Unit(_)));
+        assert_eq!(subscriber.queued_bytes(), delta.wire_bytes);
+        assert!(matches!(subscriber.next().await, Delivery::Unit(_)));
+        assert_eq!(subscriber.queued_bytes(), 0);
     }
 
     /// Captures are skipped while the bytes ahead exceed what the path

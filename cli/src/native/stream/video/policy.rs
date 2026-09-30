@@ -3,7 +3,9 @@
 //! viewer is served. Each is a small state machine the producer drives with
 //! its own clock.
 
+use crate::native::video::EncoderRegion;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 /// The edge's current path budget. It changes encoding, never input custody.
@@ -35,14 +37,6 @@ impl LinkRate {
     pub(super) fn capture_rate(self, requested: u32, picture_bytes: u32) -> u32 {
         let affordable = (self.bits_per_second / 8 / picture_bytes.max(1)).clamp(10, MAX_RATE);
         affordable.min(requested)
-    }
-
-    /// Payload target of a key: a quarter second of the path, within its burst after the bounded header.
-    pub(super) fn key_bytes(self) -> u32 {
-        (self.bits_per_second / 32)
-            .min(self.burst_bytes.saturating_sub(4096 + 4))
-            .min(4 * 1024 * 1024)
-            .max(1)
     }
 }
 
@@ -129,6 +123,8 @@ impl CodedSize {
 pub(crate) enum Quality {
     /// Encoded under the motion budget.
     Motion,
+    /// A dependent region of an unchanged capture, before all regions finish.
+    Refine,
     /// A re-encode of the unchanged capture at the still target.
     Final,
 }
@@ -137,6 +133,7 @@ impl Quality {
     pub(crate) const fn label(self) -> &'static str {
         match self {
             Self::Motion => "motion",
+            Self::Refine => "refine",
             Self::Final => "final",
         }
     }
@@ -148,7 +145,7 @@ impl Quality {
     pub(crate) const fn quantizer(self) -> u8 {
         match self {
             Self::Motion => 32,
-            Self::Final => 8,
+            Self::Refine | Self::Final => 8,
         }
     }
 }
@@ -160,6 +157,96 @@ impl Quality {
 /// node, media-producer/refinement-speed.md) ends within 150 ms of the last
 /// damage.
 pub(super) const STILL_AFTER: Duration = Duration::from_millis(30);
+
+/// One refinement quantum of byte credit. An indivisible update can cost
+/// more than a quantum; its complete cost becomes debt, never an increased
+/// allowance or an excuse to queue further updates.
+#[derive(Debug, Default)]
+pub(super) struct RefinementCredit {
+    accounted: Option<Instant>,
+    credit: f64,
+    rate: Option<u32>,
+}
+
+/// Finite coverage of the currently held picture. The encoder returns its
+/// actual region, so codec alignment cannot create missing or repeated work.
+pub(super) struct RefinementSweep {
+    regions: VecDeque<EncoderRegion>,
+}
+
+impl RefinementSweep {
+    pub(super) fn new(visible: EncoderRegion, edge: u32, pointer: Option<(i32, i32)>) -> Self {
+        let edge = edge.max(32);
+        let mut regions = VecDeque::new();
+        for y in (0..visible.height).step_by(edge as usize) {
+            for x in (0..visible.width).step_by(edge as usize) {
+                regions.push_back(EncoderRegion {
+                    x: visible.x + x,
+                    y: visible.y + y,
+                    width: edge.min(visible.width - x),
+                    height: edge.min(visible.height - y),
+                });
+            }
+        }
+        if let Some((x, y)) =
+            pointer.and_then(|(x, y)| Some((u32::try_from(x).ok()?, u32::try_from(y).ok()?)))
+        {
+            if let Some(index) = regions.iter().position(|region| {
+                x >= region.x
+                    && x < region.x + region.width
+                    && y >= region.y
+                    && y < region.y + region.height
+            }) {
+                let first = regions.remove(index).unwrap();
+                regions.push_front(first);
+            }
+        }
+        Self { regions }
+    }
+
+    pub(super) fn next(&mut self) -> Option<EncoderRegion> {
+        self.regions.pop_front()
+    }
+
+    pub(super) fn covered(&mut self, actual: EncoderRegion) -> bool {
+        self.regions.retain(|region| {
+            !(region.x >= actual.x
+                && region.y >= actual.y
+                && region.x + region.width <= actual.x + actual.width
+                && region.y + region.height <= actual.y + actual.height)
+        });
+        self.regions.is_empty()
+    }
+}
+
+impl RefinementCredit {
+    fn accrue(&mut self, rate: u32, now: Instant) {
+        if let Some(at) = self.accounted {
+            self.credit += now.saturating_duration_since(at).as_secs_f64()
+                * f64::from(self.rate.unwrap_or(rate))
+                / 8.0;
+        } else {
+            self.credit = f64::from(rate) / 320.0;
+        }
+        self.credit = self.credit.min(f64::from(rate) / 320.0);
+        self.accounted = Some(now);
+        self.rate = Some(rate);
+    }
+
+    pub(super) fn due(&mut self, rate: u32, now: Instant) -> Instant {
+        self.accrue(rate, now);
+        if self.credit >= 0.0 {
+            now
+        } else {
+            now + Duration::from_secs_f64(-self.credit * 8.0 / f64::from(rate))
+        }
+    }
+
+    pub(super) fn spent(&mut self, rate: u32, bytes: usize, now: Instant) {
+        self.accrue(rate, now);
+        self.credit -= bytes as f64;
+    }
+}
 
 /// Whether a stream's current picture still owes its refinement, and since
 /// when the screen has been still. A stream starts refined: nothing is owed
@@ -214,6 +301,167 @@ pub(super) fn period(rate: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn refinement_sweep_covers_each_visible_pixel_and_prioritizes_the_native_pointer() {
+        for (width, height) in [(1, 1), (33, 17), (137, 93), (1088, 1888)] {
+            let mut sweep = RefinementSweep::new(
+                EncoderRegion {
+                    x: 0,
+                    y: 0,
+                    width,
+                    height,
+                },
+                64,
+                Some((width as i32 - 1, height as i32 - 1)),
+            );
+            let mut seen = vec![0u8; (width * height) as usize];
+            let mut first = true;
+            while let Some(region) = sweep.next() {
+                if first {
+                    assert!(region.x + region.width == width && region.y + region.height == height);
+                    first = false;
+                }
+                for y in region.y..region.y + region.height {
+                    for x in region.x..region.x + region.width {
+                        seen[(y * width + x) as usize] += 1;
+                    }
+                }
+                sweep.covered(region);
+            }
+            assert!(seen.iter().all(|count| *count == 1));
+        }
+    }
+
+    #[test]
+    fn codec_alignment_covers_neighboring_requests_without_changing_the_neutral_order() {
+        let mut sweep = RefinementSweep::new(
+            EncoderRegion {
+                x: 0,
+                y: 0,
+                width: 128,
+                height: 64,
+            },
+            32,
+            Some((-1, 10)),
+        );
+        assert_eq!(
+            sweep.next().unwrap(),
+            EncoderRegion {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 32
+            }
+        );
+        assert!(!sweep.covered(EncoderRegion {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64
+        }));
+        assert_eq!(
+            sweep.next().unwrap(),
+            EncoderRegion {
+                x: 64,
+                y: 0,
+                width: 32,
+                height: 32
+            }
+        );
+        assert!(sweep.covered(EncoderRegion {
+            x: 64,
+            y: 0,
+            width: 64,
+            height: 64
+        }));
+        assert_eq!(sweep.next(), None);
+    }
+
+    #[test]
+    fn a_nonzero_visible_origin_and_native_pointer_share_framebuffer_coordinates() {
+        // Actual7c helper header: framebuffer1536x2048, visible100,80
+        // plus1418x1888, fresh signed pointer400,500; no DPR projection.
+        let visible = EncoderRegion {
+            x: 100,
+            y: 80,
+            width: 1418,
+            height: 1888,
+        };
+        for pointer in [
+            Some((400, 500)),
+            None,
+            Some((99, 500)),
+            Some((-1, 500)),
+            Some((1536, 2048)),
+        ] {
+            let mut sweep = RefinementSweep::new(visible, 64, pointer);
+            let mut seen = vec![0u8; (visible.width * visible.height) as usize];
+            let mut first = true;
+            while let Some(region) = sweep.next() {
+                assert!(region.x >= visible.x && region.y >= visible.y);
+                assert!(region.x + region.width <= visible.x + visible.width);
+                assert!(region.y + region.height <= visible.y + visible.height);
+                if first {
+                    if pointer == Some((400, 500)) {
+                        assert!((region.x..region.x + region.width).contains(&400));
+                        assert!((region.y..region.y + region.height).contains(&500));
+                    } else {
+                        assert_eq!((region.x, region.y), (visible.x, visible.y));
+                    }
+                    first = false;
+                }
+                for y in region.y..region.y + region.height {
+                    for x in region.x..region.x + region.width {
+                        seen[((y - visible.y) * visible.width + x - visible.x) as usize] += 1;
+                    }
+                }
+                sweep.covered(region);
+            }
+            assert!(seen.iter().all(|count| *count == 1));
+        }
+    }
+
+    #[test]
+    fn refinement_credit_charges_the_whole_indivisible_unit_and_never_ratchets_its_allowance() {
+        let now = Instant::now();
+        let mut credit = RefinementCredit::default();
+        assert_eq!(credit.due(500_000, now), now);
+        credit.spent(500_000, 10_000, now);
+        let at = credit.due(500_000, now);
+        assert_eq!(at.duration_since(now), Duration::from_micros(135_000));
+        assert!(
+            credit.due(500_000, now + Duration::from_millis(100))
+                > now + Duration::from_millis(100)
+        );
+        assert_eq!(credit.due(500_000, at), at);
+        credit.spent(500_000, 10_000, at);
+        assert_eq!(
+            credit.due(500_000, at).duration_since(at),
+            Duration::from_millis(160)
+        );
+        // Even a long idle tops up one quantum; it never admits a backlog.
+        let later = at + Duration::from_secs(10);
+        assert_eq!(credit.due(500_000, later), later);
+        assert_eq!(credit.credit, 1562.5);
+    }
+
+    #[test]
+    fn lowering_a_refinement_rate_does_not_erase_outstanding_byte_debt() {
+        let now = Instant::now();
+        let mut credit = RefinementCredit::default();
+        credit.spent(8_000_000, 50_000, now);
+        assert_eq!(
+            credit.due(1_000_000, now).duration_since(now),
+            Duration::from_millis(200)
+        );
+        assert_eq!(
+            credit
+                .due(1_000_000, now + Duration::from_millis(100))
+                .duration_since(now),
+            Duration::from_millis(200)
+        );
+    }
     use serde_json::json;
 
     #[test]
@@ -251,7 +499,6 @@ mod tests {
         };
         assert_eq!(rate.capture_rate(60, 25_000), 25);
         assert_eq!(rate.capture_rate(15, 25_000), 15);
-        assert_eq!(rate.key_bytes(), 156_250);
     }
 
     #[test]

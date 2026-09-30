@@ -803,6 +803,7 @@ mod tests {
         let unit = |key: bool, ts: u64| {
             Arc::new(Unit {
                 data: vec![1; 32],
+                wire_bytes: 0,
                 key,
                 ts,
                 coded: (1024, 768),

@@ -25,6 +25,34 @@ pub(super) fn binary_video(
     stream_id: &str,
     seq: u64,
 ) -> Option<Vec<u8>> {
+    let header = video_header(unit, codec, stream_id, seq)?;
+    let mut message = Vec::with_capacity(4 + header.len() + unit.data.len());
+    message.extend_from_slice(&(header.len() as u32).to_be_bytes());
+    message.extend_from_slice(&header);
+    message.extend_from_slice(&unit.data);
+    Some(message)
+}
+
+/// Before the connection assigns its epoch/sequence, the same serializer
+/// bounds the complete unit cost. Canonical UUIDs have36 bytes; the largest
+/// admitted sequence has the most decimal digits. A reset only shortens it.
+/// This is an upper bound on this protocol's header, not a payload estimate.
+pub(super) fn video_budget_bytes(unit: &super::video::Unit, codec: VideoCodec) -> Option<usize> {
+    let header = video_header(
+        unit,
+        codec,
+        "00000000-0000-0000-0000-000000000000",
+        MAX_SAFE_INTEGER,
+    )?;
+    Some(4 + header.len() + unit.data.len())
+}
+
+fn video_header(
+    unit: &super::video::Unit,
+    codec: VideoCodec,
+    stream_id: &str,
+    seq: u64,
+) -> Option<Vec<u8>> {
     let (width, height) = unit.coded;
     let visible = unit.visible;
     let inside = |offset: i32, extent: u32, bound: u32| {
@@ -62,11 +90,7 @@ pub(super) fn binary_video(
     if header.len() > MAX_VIDEO_HEADER_BYTES {
         return None;
     }
-    let mut message = Vec::with_capacity(4 + header.len() + unit.data.len());
-    message.extend_from_slice(&(header.len() as u32).to_be_bytes());
-    message.extend_from_slice(&header);
-    message.extend_from_slice(&unit.data);
-    Some(message)
+    Some(header)
 }
 
 /// Audio is one 10 ms unit; it never consumes a JPEG sequence or frame-window slot.
@@ -238,6 +262,7 @@ mod tests {
     fn video_unit(key: bool, bytes: usize) -> crate::native::stream::video::Unit {
         crate::native::stream::video::Unit {
             data: vec![7; bytes],
+            wire_bytes: 0,
             key,
             ts: 1_234_567,
             coded: (2048, 2048),
@@ -331,6 +356,43 @@ mod tests {
         let mut unit = video_unit(false, 8);
         unit.codec_string = Some("av01.1.12M.08".into());
         assert!(refused(&unit, 2), "a dependent unit with one");
+    }
+
+    #[test]
+    fn video_budget_is_the_canonical_wire_cost_including_sequence_growth_and_reset_headers() {
+        let stream = uuid::Uuid::new_v4().to_string();
+        for codec in [VideoCodec::Av1Full, VideoCodec::Av1] {
+            for key in [false, true] {
+                for bytes in [1, 42, 1562, MAX_VIDEO_BYTES] {
+                    let mut unit = video_unit(key, bytes);
+                    if key {
+                        unit.codec_string = Some(format!(
+                            "av01.{}.12M.08",
+                            u8::from(codec == VideoCodec::Av1Full)
+                        ));
+                    }
+                    let bound = video_budget_bytes(&unit, codec).unwrap();
+                    for seq in [1, 9, 10, 99, 100, 999, 1000, MAX_SAFE_INTEGER] {
+                        let actual = binary_video(&unit, codec, &stream, seq).unwrap().len();
+                        assert!(
+                            bound >= actual,
+                            "header undercount at{seq},key={key},bytes={bytes}"
+                        );
+                        assert!(
+                            bound - actual <= 15,
+                            "only sequence-digit headroom is charged"
+                        );
+                        if seq == MAX_SAFE_INTEGER {
+                            assert_eq!(bound, actual);
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            video_budget_bytes(&video_unit(true, MAX_VIDEO_BYTES + 1), VideoCodec::Av1Full)
+                .is_none()
+        );
     }
 
     fn decode(frame: &[u8]) -> (Value, &[u8]) {

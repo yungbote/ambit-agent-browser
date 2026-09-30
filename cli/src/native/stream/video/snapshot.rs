@@ -193,6 +193,7 @@ mod tests {
             cursor_included: false,
             visible: None,
             timings: None,
+            pointer: None,
         }
     }
     fn bounds() -> CaptureBounds {
