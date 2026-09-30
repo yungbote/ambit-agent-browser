@@ -207,27 +207,14 @@ pub(crate) fn notches(delta: (f64, f64)) -> Option<Vec<(f64, f64)>> {
     )
 }
 
-/// How many notches move a scroller on toward its goal, `remaining` CSS
-/// pixels away, when a scroll asked it to go `toward` (+1 or -1; 0 on an
-/// axis it was not asked to move) and a notch moves it `per_notch`: the
-/// nearest whole count, none once it is within half a notch, and none that
-/// would take it back.
-pub(crate) fn notches_toward(remaining: f64, toward: f64, per_notch: f64) -> u32 {
-    let ahead = remaining * toward;
-    if !(per_notch.is_finite() && per_notch > 0.0 && ahead.is_finite()) || ahead <= per_notch / 2.0
-    {
-        return 0;
-    }
-    (ahead / per_notch).round().min(f64::from(u32::MAX)) as u32
-}
-
 /// How a round of `notches` goes out in at most `frames` wheel events, one
 /// per frame: the first a single notch, which proves the wheel reaches its
 /// scroller before more follow, the rest as even as whole notches allow. A
 /// longer scroll speeds up by turning more notches per event, never by
 /// sending events faster, up to `MOST_NOTCHES_PER_EVENT`; the events then
 /// carry fewer than `notches` when even that cannot reach in time, and the
-/// caller finishes the rest by script. Returns the notches per event.
+/// caller checks actual displacement and refuses an unreached target.
+/// Returns the notches per event.
 pub(crate) fn wheel_events(notches: u32, frames: u32) -> Vec<u32> {
     if notches == 0 || frames == 0 {
         return Vec::new();
@@ -394,25 +381,6 @@ mod tests {
         assert_eq!(notches((0.0, 32768.5)), None);
         assert_eq!(notches((f64::NAN, 100.0)), None);
         assert_eq!(notches((0.0, f64::INFINITY)), None);
-    }
-
-    /// A scroll's notches: the nearest whole count toward its goal, none
-    /// within half a notch of it, none backward, none without an estimate.
-    #[test]
-    fn a_scroll_needs_the_nearest_whole_number_of_notches_toward_its_goal() {
-        assert_eq!(notches_toward(300.0, 1.0, 120.0), 3);
-        assert_eq!(notches_toward(500.0, 1.0, 120.0), 4);
-        assert_eq!(notches_toward(-500.0, -1.0, 120.0), 4);
-        assert_eq!(notches_toward(61.0, 1.0, 120.0), 1);
-        assert_eq!(notches_toward(60.0, 1.0, 120.0), 0);
-        // An overshoot is never scrolled back, and an axis the scroll was
-        // not asked to move is left alone.
-        assert_eq!(notches_toward(-300.0, 1.0, 120.0), 0);
-        assert_eq!(notches_toward(300.0, 0.0, 120.0), 0);
-        for per_notch in [0.0, -120.0, f64::NAN, f64::INFINITY] {
-            assert_eq!(notches_toward(300.0, 1.0, per_notch), 0);
-        }
-        assert_eq!(notches_toward(f64::INFINITY, 1.0, 120.0), 0);
     }
 
     /// A long scroll speeds up with more notches per event, never with more
