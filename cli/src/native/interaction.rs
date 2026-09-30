@@ -706,6 +706,7 @@ pub(crate) async fn native_focus(
     sessions.dedup();
     let mut seen = HashSet::new();
     let initial = native_focus_identity(client, &sessions).await?;
+    let mut previous = initial.clone();
     if !initial.is_empty() {
         seen.insert(initial);
     }
@@ -720,15 +721,32 @@ pub(crate) async fn native_focus(
                 session_id,
             )
             .await?;
-        if field_state(client, &element_session, &object_id, "", |_| true)
-            .await?
-            .focused
-        {
-            return Ok(ClickResult::default());
-        }
-        let identity = native_focus_identity(client, &sessions).await?;
+        // The native receipt proves dispatch, not that Chrome consumed Tab.
+        // An unchanged reading is not a cycle. Join frame processing until
+        // the target takes focus or the observed identity advances.
+        let deadline = tokio::time::Instant::now() + FIELD_SETTLE;
+        let identity = loop {
+            if field_state(client, &element_session, &object_id, "", |_| true)
+                .await?
+                .focused
+            {
+                return Ok(ClickResult::default());
+            }
+            let identity = native_focus_identity(client, &sessions).await?;
+            if identity != previous || identity.is_empty() {
+                break identity;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("The browser did not move keyboard focus after Tab. Inspect the current page before retrying.".into());
+            }
+            client.send_command("Runtime.evaluate",Some(json!({
+                "expression":"new Promise(resolve=>requestAnimationFrame(()=>resolve(true)))",
+                "awaitPromise":true,"returnByValue":true,
+            })),Some(session_id)).await?;
+        };
         // Chrome UI focus has no DOM node and may take several Tab strokes;
         // it is not evidence that the page's focus order cycled.
+        previous = identity.clone();
         if !identity.is_empty() && !seen.insert(identity) {
             break;
         }
