@@ -2719,6 +2719,11 @@ emulation overrides and browser theme before their first document loads.
 Tabs a person opens and popups get the same setup when the session
 discovers them.
 
+In an owned window, foreground tab new uses Chrome's native Ctrl+T and
+types the destination after session setup/network controls are installed.
+Invalid labels and addresses are refused before input; no URL opens
+about:blank. Background fan-out and headless/external adapters are unchanged.
+
 `tab new --background` opens one tab per URL (1 to 8) without leaving the
 active tab: its page, refs and frame stay. The tabs load at once, each until
 `load` or the session's timeout, and the command answers when all have

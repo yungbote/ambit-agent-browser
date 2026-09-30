@@ -7922,6 +7922,12 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     }
     let url = cmd.get("url").and_then(|v| v.as_str());
     let label = cmd.get("label").and_then(|v| v.as_str());
+    let native = state.browser_control.lock().await.has_native_display();
+    if native {
+        if let Some(url) = url {
+            super::browser::native_address(url)?;
+        }
+    }
     let domain_filter = state.domain_filter.read().await.clone();
     let has_proxy_creds = state.proxy_credentials.read().await.is_some();
     let defer_url_until_controls =
@@ -7930,17 +7936,38 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     // any are configured the tab is created blank and navigated only after
     // they are replayed onto it; otherwise the first document would miss them.
     let defer_url =
-        defer_url_until_controls || (url.is_some() && session_setup_pending(state).await);
+        native || defer_url_until_controls || (url.is_some() && session_setup_pending(state).await);
 
     state.ref_map.clear();
     state.active_iframe_sessions.clear();
     state.active_frame = None;
     state.webmcp.clear_invocations();
     let (mut result, new_session_id) = {
+        let control = state.browser_control.clone();
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-        let result = mgr
-            .tab_new(if defer_url { None } else { url }, label)
-            .await?;
+        let result = if native {
+            let client = mgr.client.clone();
+            // The shortcut addresses Chrome, even if a previously bound
+            // tab disappeared; it does not type into a page field.
+            let session = mgr.active_session_id().unwrap_or_default().to_string();
+            Box::pin(mgr.tab_new_native(label, async {
+                control
+                    .lock()
+                    .await
+                    .agent_native_browser_keys(
+                        &interaction::native_key_chord_events("t", Some(2)),
+                        super::browser_control::motion::KEY_INTERVAL,
+                        &client,
+                        &session,
+                    )
+                    .await
+                    .map_err(String::from)
+            }))
+            .await?
+        } else {
+            mgr.tab_new(if defer_url { None } else { url }, label)
+                .await?
+        };
         (result, mgr.active_session_id()?.to_string())
     };
 
@@ -7949,10 +7976,16 @@ async fn handle_tab_new(cmd: &Value, state: &mut DaemonState) -> Result<Value, S
     state.drain_cdp_events_background().await?;
 
     if defer_url {
-        if let Some(url) = url {
-            let nav = {
-                let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-                mgr.navigate(url, WaitUntil::Load).await?
+        if let Some(url) = url.or(native.then_some("about:blank")) {
+            let nav = if native {
+                Box::pin(navigate_active_page(state, url, WaitUntil::Load)).await?
+            } else {
+                state
+                    .browser
+                    .as_mut()
+                    .ok_or("Browser not launched")?
+                    .navigate(url, WaitUntil::Load)
+                    .await?
             };
             if let Some(obj) = result.as_object_mut() {
                 if let Some(value) = nav.get("url") {

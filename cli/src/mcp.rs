@@ -1370,7 +1370,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_TAB_NEW,
             "Tab new",
-            "Open a new tab after applying session setup before its first navigation.",
+            "Open a new tab after applying session setup before its first navigation. Owned windows create the foreground tab through native Ctrl+T and type its destination in Chrome's address bar.",
             json!({ "url": { "type": "string" }, "label": { "type": "string" } }),
             &[],
         ),

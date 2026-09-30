@@ -403,6 +403,26 @@ enum NativeNavigationStart {
     TimedOut,
 }
 
+pub(crate) fn native_address(url: &str) -> Result<url::Url, String> {
+    if url.chars().any(char::is_control) {
+        return Err("A browser URL cannot contain control characters".into());
+    }
+    url::Url::parse(url).map_err(|error| format!("Invalid URL: {error}"))
+}
+
+fn native_tab_target<'a>(event: &'a CdpEvent, known: &HashSet<String>) -> Option<&'a str> {
+    let target = &event.params["targetInfo"];
+    if event.method != "Target.targetCreated"
+        || target["type"] != "page"
+        || !target["openerId"].is_null()
+    {
+        return None;
+    }
+    target["targetId"]
+        .as_str()
+        .filter(|id| !id.is_empty() && !known.contains(*id))
+}
+
 /// Chrome reports the requested URL before redirects and the loader that
 /// follows them. Old-page and child-frame events cannot admit this wait.
 async fn native_navigation_start(
@@ -1566,10 +1586,7 @@ impl BrowserManager {
         wait_until: WaitUntil,
         input: impl Future<Output = Result<(), String>>,
     ) -> Result<Value, String> {
-        let requested = url::Url::parse(url).map_err(|error| format!("Invalid URL: {error}"))?;
-        if url.chars().any(char::is_control) {
-            return Err("A browser URL cannot contain control characters".into());
-        }
+        let requested = native_address(url)?;
         let session = self.active_session_id()?.to_string();
         let frame = self.active_target_id()?.to_string();
         let mut rx = self.client.subscribe();
@@ -2119,6 +2136,24 @@ impl BrowserManager {
         url: Option<&str>,
         label: Option<&str>,
     ) -> Result<Value, String> {
+        self.validate_new_tab_label(label)?;
+        let target_url = url.unwrap_or("about:blank");
+        let result: CreateTargetResult = self
+            .client
+            .send_command_typed(
+                "Target.createTarget",
+                &CreateTargetParams {
+                    url: target_url.to_string(),
+                    background: false,
+                },
+                None,
+            )
+            .await?;
+        self.attach_new_tab(result.target_id, label, target_url)
+            .await
+    }
+
+    fn validate_new_tab_label(&self, label: Option<&str>) -> Result<(), String> {
         if let Some(label) = label {
             if !is_valid_label(label) {
                 return Err(format!(
@@ -2135,27 +2170,70 @@ impl BrowserManager {
                 ));
             }
         }
+        Ok(())
+    }
 
-        let target_url = url.unwrap_or("about:blank");
-
-        let result: CreateTargetResult = self
+    /// Ctrl+T creates the tab; the manager adopts its actual Chrome target
+    /// and the caller installs setup before typing the destination URL.
+    pub(crate) async fn tab_new_native(
+        &mut self,
+        label: Option<&str>,
+        input: impl Future<Output = Result<(), String>>,
+    ) -> Result<Value, String> {
+        self.validate_new_tab_label(label)?;
+        let known = self
             .client
-            .send_command_typed(
-                "Target.createTarget",
-                &CreateTargetParams {
-                    url: target_url.to_string(),
-                    background: false,
-                },
-                None,
-            )
+            .send_command_no_params("Target.getTargets", None)
             .await?;
+        let known: HashSet<String> = known["targetInfos"]
+            .as_array()
+            .ok_or("Browser tab list is unavailable")?
+            .iter()
+            .filter_map(|target| target["targetId"].as_str().map(String::from))
+            .collect();
+        let mut events = self.client.subscribe();
+        input.await?;
+        let target = tokio::time::timeout(Duration::from_millis(self.default_timeout_ms), async {
+            loop {
+                let event = events.recv().await.map_err(|_| {
+                    "Browser tab observation was interrupted; inspect the browser before retrying"
+                })?;
+                if let Some(id) = native_tab_target(&event, &known) {
+                    return Ok::<_, String>(id.to_string());
+                }
+            }
+        })
+        .await
+        .map_err(|_| {
+            "The new browser tab did not become observable; inspect the browser before retrying"
+        })??;
+        let result = self
+            .attach_new_tab(target.clone(), label, "chrome://newtab/")
+            .await?;
+        self.synchronize_visible_page().await.map_err(|_| {
+            "The new browser tab is not the visible tab; inspect the browser before retrying"
+        })?;
+        if self.active_target_id()? != target {
+            return Err(
+                "The new browser tab is not the visible tab; inspect the browser before retrying"
+                    .into(),
+            );
+        }
+        Ok(result)
+    }
 
+    async fn attach_new_tab(
+        &mut self,
+        target_id: String,
+        label: Option<&str>,
+        target_url: &str,
+    ) -> Result<Value, String> {
         let attach: AttachToTargetResult = self
             .client
             .send_command_typed(
                 "Target.attachToTarget",
                 &AttachToTargetParams {
-                    target_id: result.target_id.clone(),
+                    target_id: target_id.clone(),
                     flatten: true,
                 },
                 None,
@@ -2168,11 +2246,10 @@ impl BrowserManager {
         self.next_tab_id += 1;
         let index = self.pages.len();
         let label = label.map(|s| s.to_string());
-        let target_id = result.target_id.clone();
         self.pages.push(PageInfo {
             tab_id,
             label: label.clone(),
-            target_id: result.target_id,
+            target_id: target_id.clone(),
             session_id: attach.session_id,
             url: target_url.to_string(),
             title: String::new(),
@@ -3343,6 +3420,65 @@ pub(crate) mod tests {
     fn test_format_tab_id() {
         assert_eq!(format_tab_id(1), "t1");
         assert_eq!(format_tab_id(42), "t42");
+    }
+
+    #[test]
+    fn native_tab_adoption_excludes_previous_targets_popups_and_nonpages() {
+        let known = HashSet::from(["existing".to_string()]);
+        for (method, info) in [
+            (
+                "Target.targetInfoChanged",
+                json!({"targetId":"new","type":"page"}),
+            ),
+            (
+                "Target.targetCreated",
+                json!({"targetId":"existing","type":"page"}),
+            ),
+            (
+                "Target.targetCreated",
+                json!({"targetId":"new","type":"worker"}),
+            ),
+            (
+                "Target.targetCreated",
+                json!({"targetId":"popup","type":"page","openerId":"existing"}),
+            ),
+            ("Target.targetCreated", json!({"targetId":"","type":"page"})),
+            ("Target.targetCreated", json!({"type":"page"})),
+        ] {
+            let event = CdpEvent {
+                method: method.into(),
+                params: json!({"targetInfo":info}),
+                session_id: None,
+            };
+            assert!(native_tab_target(&event, &known).is_none(), "{info}");
+        }
+        let new = CdpEvent {
+            method: "Target.targetCreated".into(),
+            params: json!({"targetInfo":{"targetId":"native-created","type":"page"}}),
+            session_id: None,
+        };
+        assert_eq!(native_tab_target(&new, &known), Some("native-created"));
+    }
+
+    #[tokio::test]
+    async fn native_new_tab_label_validation_sends_no_shortcut() {
+        let mut page = page(1, "existing", "about:blank");
+        page.label = Some("docs".into());
+        let mut manager = test_manager(vec![page]).await;
+        for label in ["bad label", "docs"] {
+            let sent = std::cell::Cell::new(false);
+            let result = manager
+                .tab_new_native(Some(label), async {
+                    sent.set(true);
+                    Ok(())
+                })
+                .await;
+            assert!(result.is_err(), "{label}");
+            assert!(
+                !sent.get(),
+                "invalid/duplicate label caused an input effect"
+            );
+        }
     }
 
     #[tokio::test]
