@@ -6,6 +6,31 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+#[test]
+fn a_chord_releases_only_its_synthetic_modifiers_and_preserves_explicit_holds() {
+    let mut mouse = NativeMouse::default();
+    let control = crate::native::interaction::native_key_transition("Control", "keyDown");
+    mouse.keys_acknowledged(&[control]);
+    let events = mouse.with_held_modifiers(&crate::native::interaction::native_key_chord_events(
+        "a",
+        Some(8),
+    ));
+    assert_eq!(events[0]["modifiers"], 10);
+    assert_eq!(
+        events[1]["modifiers"], 2,
+        "Ending Shift+a must keep explicitly held Control only"
+    );
+    mouse.keys_acknowledged(&events);
+    assert_eq!(mouse.held_modifiers(), 2);
+    assert!(mouse.needs_release());
+    let up = mouse.with_held_modifiers(&[crate::native::interaction::native_key_transition(
+        "Control", "keyUp",
+    )]);
+    assert_eq!(up[0]["modifiers"], 0);
+    mouse.keys_acknowledged(&up);
+    assert!(!mouse.needs_release());
+}
+
 fn mapping(scale: f64, screen_y: f64) -> Mapping {
     Mapping {
         session: "page".into(),
@@ -1061,30 +1086,36 @@ async fn a_scroll_turns_the_wheel_where_it_reaches_the_scroller_until_it_is_ther
         .await
         .unwrap();
     let inputs = fake.helper_inputs();
-    let wheels = wheels(&inputs);
-    // 300 CSS px at 120 a notch is 2.5 notches: three.
-    assert_eq!(wheels.len(), 3, "{inputs:?}");
-    assert!(wheels
-        .iter()
-        .all(|(_, event)| event["deltaY"] == 100.0 && event["deltaX"] == 0.0));
-    let point = shown(640.0, 320.0);
-    assert!(wheels.iter().all(|(_, event)| {
-        (event["x"].as_f64().unwrap(), event["y"].as_f64().unwrap()) == point
-    }));
-    let first = inputs
-        .iter()
-        .position(|(_, event)| event["eventType"] == "mouseWheel")
-        .unwrap();
-    assert!(first > 2, "the pointer travelled first: {inputs:?}");
-    let arrived = &inputs[first - 1].1;
+    assert!(
+        wheels(&inputs).is_empty(),
+        "No second input route: {inputs:?}"
+    );
+    let arrived = &inputs.last().unwrap().1;
     assert_eq!(
         (
             arrived["x"].as_f64().unwrap(),
             arrived["y"].as_f64().unwrap()
         ),
-        point
+        shown(640.0, 320.0)
     );
-    assert_one_a_frame(&wheels);
+    let page = fake.page.lock().unwrap();
+    let event = page
+        .commands
+        .iter()
+        .find(|command| {
+            command["method"] == "Input.dispatchMouseEvent"
+                && command["params"]["type"] == "mouseWheel"
+        })
+        .unwrap();
+    assert_eq!(event["params"]["deltaY"], 300.0);
+    assert_eq!(
+        (
+            event["params"]["x"].as_f64().unwrap(),
+            event["params"]["y"].as_f64().unwrap()
+        ),
+        (640.0, 320.0)
+    );
+    drop(page);
     assert_eq!(fake.page.lock().unwrap().scroller.at, 300.0);
     assert_eq!(fake.page_commands("scrollBy"), 0);
     assert_eq!(fake.page_commands("Input.dispatchMouseEvent"), 1);
@@ -1094,7 +1125,7 @@ async fn a_scroll_turns_the_wheel_where_it_reaches_the_scroller_until_it_is_ther
             .iter()
             .filter(|event| event["eventType"] == "scroll")
             .count(),
-        4
+        1
     );
     assert!(!published.iter().any(|event| event["kind"] == "scrolling"));
 }
@@ -1115,11 +1146,8 @@ async fn a_scroll_the_wheel_cannot_move_fails_without_dom_repair() {
         .await
         .unwrap_err();
     let spent = started.elapsed();
-    assert!(
-        spent >= motion::WHEEL_STALL && spent < motion::WHEEL_STALL + Duration::from_millis(500),
-        "{spent:?}"
-    );
-    assert_eq!(wheels(&fake.helper_inputs()).len(), 1);
+    assert!(spent < Duration::from_millis(300), "{spent:?}");
+    assert!(wheels(&fake.helper_inputs()).is_empty());
     assert_eq!(fake.page_commands("scrollBy"), 0);
     assert_eq!(fake.page_commands("Input.dispatchMouseEvent"), 1);
     assert_eq!(fake.page.lock().unwrap().scroller.at, 0.0);
@@ -1165,6 +1193,7 @@ async fn a_takeover_stops_a_scroll_within_a_frame_part_of_the_way() {
     let mut control = fake.control();
     let interrupts = control.interrupts();
     fake.place_pointer(shown(640.0, 320.0)).await;
+    let mut watch = fake.client.subscribe();
     let scroll = async {
         let result = control
             .agent_native_scroll(&fake.client, "page", None, (0.0, 3000.0))
@@ -1172,8 +1201,13 @@ async fn a_takeover_stops_a_scroll_within_a_frame_part_of_the_way() {
         (result, Instant::now())
     };
     let takeover = async {
-        while wheels(&fake.helper_inputs()).len() < 3 {
-            tokio::time::sleep(Duration::from_millis(2)).await;
+        loop {
+            let event = watch.recv().await.unwrap();
+            if event.method == crate::native::activity::EVENT
+                && event.params["eventType"] == "scroll"
+            {
+                break;
+            }
         }
         (
             interrupts.raise(InterruptReason::HumanControl),
@@ -1223,12 +1257,9 @@ async fn an_element_below_is_wheeled_to_the_middle_of_the_view() {
         .await
         .unwrap());
     let at = fake.page.lock().unwrap().scroller.at;
-    // 3680 px to the middle is 30.7 notches: 31, one per event.
-    assert!((at - 3680.0).abs() <= 60.0, "at {at}");
-    let inputs = fake.helper_inputs();
-    let wheels = wheels(&inputs);
-    assert_eq!(wheels.len(), 31);
-    assert!(wheels.iter().all(|(_, event)| event["deltaY"] == 100.0));
+    assert!((at - 3680.0).abs() <= 1.0, "at {at}");
+    assert!(wheels(&fake.helper_inputs()).is_empty());
+    assert_eq!(fake.page_commands("Input.dispatchMouseEvent"), 1);
     assert_eq!(fake.page_commands("scrollBy"), 0);
     assert_eq!(fake.page_commands("scrollIntoView"), 0);
 }
@@ -1252,27 +1283,16 @@ async fn a_long_way_down_turns_more_notches_per_event_within_the_budget() {
         .await
         .unwrap();
     let spent = started.elapsed();
-    let inputs = fake.helper_inputs();
-    let wheels = wheels(&inputs);
-    let notches: f64 = wheels
-        .iter()
-        .map(|(_, event)| event["deltaY"].as_f64().unwrap() / 100.0)
-        .sum();
+    // Preserve the original real wall-time budget; precision input must
+    // complete the actual displacement, not merely acknowledge dispatch.
     assert!(
         spent <= motion::WHEEL_BUDGET + Duration::from_millis(250),
         "{spent:?}"
     );
-    assert!(wheels[0].1["deltaY"] == 100.0, "a single notch first");
-    assert!(wheels
-        .iter()
-        .any(|(_, event)| event["deltaY"].as_f64().unwrap() > 100.0));
-    assert!(wheels
-        .iter()
-        .all(|(_, event)| event["deltaY"].as_f64().unwrap() <= 1000.0));
-    assert_one_a_frame(&wheels);
+    assert!(wheels(&fake.helper_inputs()).is_empty());
+    assert_eq!(fake.page_commands("Input.dispatchMouseEvent"), 1);
     let at = fake.page.lock().unwrap().scroller.at;
-    assert!((at - 29_680.0).abs() <= 60.0, "at {at}");
-    assert!(notches >= 240.0, "{notches} notches");
+    assert!((at - 29_680.0).abs() <= 1.0, "at {at}");
 }
 
 /// A distance even ten notches an event cannot carry within the budget is
@@ -1354,7 +1374,7 @@ async fn an_unreachable_target_refuses_once_the_hiding_container_cannot_advance(
         .helper_inputs()
         .iter()
         .all(|(_, event)| event["eventType"] == "mouseMoved"));
-    assert_eq!(fake.page_commands("this === next"), 1);
+    assert_eq!(fake.page_commands("Input.dispatchMouseEvent"), 0);
     assert_eq!(fake.page_commands("scrollBy"), 0);
     assert_eq!(fake.page_commands("scrollIntoView"), 0);
 }

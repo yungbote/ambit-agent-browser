@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde_json::{json, Value};
 
@@ -697,21 +697,20 @@ pub(crate) async fn native_focus(
                 .into(),
         );
     }
-    // Count tab stops across the page's frame sessions; the browser owns
-    // their actual tab order, including its toolbar and shadow trees.
+    // The browser owns tab order, including shadow trees, child frames and
+    // its toolbar. Observe actual focus identity and stop on a real cycle;
+    // a document selector count cannot bound that order.
     let mut sessions = vec![session_id, element_session.as_str()];
     sessions.extend(iframe_sessions.values().map(String::as_str));
     sessions.sort_unstable();
     sessions.dedup();
-    let mut stops = 8;
-    for session in sessions {
-        let count = client.send_command("Runtime.evaluate",Some(json!({
-            "expression":"document.querySelectorAll('a[href],button,input,select,textarea,[tabindex],[contenteditable]').length",
-            "returnByValue":true,
-        })),Some(session)).await?;
-        stops += count["result"]["value"].as_u64().unwrap_or(0) as usize;
+    let mut seen = HashSet::new();
+    let initial = native_focus_identity(client, &sessions).await?;
+    let mut previous = initial.clone();
+    if !initial.is_empty() {
+        seen.insert(initial);
     }
-    for _ in 0..stops {
+    loop {
         control
             .lock()
             .await
@@ -722,14 +721,67 @@ pub(crate) async fn native_focus(
                 session_id,
             )
             .await?;
-        if field_state(client, &element_session, &object_id, "", |_| true)
-            .await?
-            .focused
-        {
-            return Ok(ClickResult::default());
+        // The native receipt proves dispatch, not that Chrome consumed Tab.
+        // An unchanged reading is not a cycle. Join frame processing until
+        // the target takes focus or the observed identity advances.
+        let deadline = tokio::time::Instant::now() + FIELD_SETTLE;
+        let identity = loop {
+            if field_state(client, &element_session, &object_id, "", |_| true)
+                .await?
+                .focused
+            {
+                return Ok(ClickResult::default());
+            }
+            let identity = native_focus_identity(client, &sessions).await?;
+            if identity != previous || identity.is_empty() {
+                break identity;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err("The browser did not move keyboard focus after Tab. Inspect the current page before retrying.".into());
+            }
+            client.send_command("Runtime.evaluate",Some(json!({
+                "expression":"new Promise(resolve=>requestAnimationFrame(()=>resolve(true)))",
+                "awaitPromise":true,"returnByValue":true,
+            })),Some(session_id)).await?;
+        };
+        // Chrome UI focus has no DOM node and may take several Tab strokes;
+        // it is not evidence that the page's focus order cycled.
+        previous = identity.clone();
+        if !identity.is_empty() && !seen.insert(identity) {
+            break;
         }
     }
     Err("The control did not take focus through the browser's keyboard order. Inspect the current page before retrying.".into())
+}
+
+async fn native_focus_identity(
+    client: &CdpClient,
+    sessions: &[&str],
+) -> Result<Vec<(String, String, u64)>, String> {
+    let mut focused = Vec::new();
+    for session in sessions {
+        let read=client.send_command("Runtime.evaluate",Some(json!({
+            "expression":format!("document.hasFocus() ? {} : null",super::agent_channel::target::FOCUSED),
+        })),Some(session)).await?;
+        if read.get("exceptionDetails").is_some() {
+            return Err("The browser could not observe its current keyboard focus.".into());
+        }
+        let Some(object) = read["result"]["objectId"].as_str() else {
+            continue;
+        };
+        let node = client
+            .send_command(
+                "DOM.describeNode",
+                Some(json!({"objectId":object})),
+                Some(session),
+            )
+            .await?;
+        let id = node["node"]["backendNodeId"]
+            .as_u64()
+            .ok_or("The browser could not identify its current keyboard focus.")?;
+        focused.push(((*session).to_owned(), client.page_generation(session), id));
+    }
+    Ok(focused)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -883,6 +935,23 @@ async fn native_select_text(
         let pending=||Some(PendingRelease{session_id:element_session.into(),x:sx,y:sy,button:"left".into()});
         if control.lock().await.agent_native_mouse(json!({"type":"mousePressed","x":sx,"y":sy,"button":"left","buttons":1,"clickCount":1}),client,element_session,&[element_session,page_session]).await? {
             return Ok(ClickResult{dialog_opened:true,pending_release:pending()});
+        }
+        // Native dispatch acknowledgement can precede Chrome consuming the
+        // press. A precision wheel uses another browser input route, so it
+        // must not overtake that press and move its intended text anchor.
+        // Prove the actual selection start before scrolling while held.
+        let start_deadline=tokio::time::Instant::now()+FIELD_SETTLE;
+        loop {
+            if let Some(error)=control.lock().await.agent_error() {return Err(format!("{}: {}",error.code,error.message).into())}
+            let read=client.send_command("Runtime.callFunctionOn",Some(json!({
+                "objectId":first,"returnByValue":true,
+                "functionDeclaration":"function(){const selection=this.ownerDocument.getSelection();return this.node.isConnected&&selection.anchorNode===this.node&&selection.anchorOffset===this.offset}",
+            })),Some(element_session)).await?;
+            if read["result"]["value"]==true {break}
+            if read.get("exceptionDetails").is_some()||tokio::time::Instant::now()>=start_deadline {
+                return Err("The browser did not start selection at the requested text boundary. Inspect the page before selecting again.".into());
+            }
+            client.send_command("Runtime.evaluate",Some(json!({"expression":"new Promise(resolve=>requestAnimationFrame(()=>resolve(true)))","awaitPromise":true,"returnByValue":true})),Some(element_session)).await?;
         }
         if control.lock().await.agent_native_scroll_into_view(client,page_session,(&last,element_session)).await? {
             return Ok(ClickResult{dialog_opened:true,pending_release:pending()});
@@ -1344,78 +1413,139 @@ pub(crate) async fn native_select_option(
             "The requested select control or option is disabled; nothing was changed.".into(),
         );
     }
-    match click_field(
-        client,
-        control,
-        session_id,
-        ref_map,
-        selector_or_ref,
-        iframe_sessions,
-        false,
-    )
-    .await?
-    {
-        Clicked::Dialog(click) => return Ok(click),
-        Clicked::Field(_) => {}
-    }
-    let current = native_select_state(client, &element_session, &object_id).await?;
-    if !same_select_options(&before, &current) || !current.focused || current.disabled {
-        return Err("The select control changed after it was clicked. Inspect the current page before choosing again.".into());
-    }
-    let enabled: Vec<_> = current
-        .options
-        .iter()
-        .enumerate()
-        .filter_map(|(index, option)| (!option.disabled).then_some(index))
-        .collect();
-    if before.multiple {
-        type_after_click(
-            control,
+    if !before.multiple && !before.popup {
+        // A listbox press chooses its row immediately. Click the requested
+        // option itself, never the parent followed by intermediate options.
+        let option=client.send_command("Runtime.callFunctionOn",Some(json!({
+            "objectId":object_id,"functionDeclaration":"function(index){return this.options[index]}",
+            "arguments":[{"value":desired[0]}],
+        })),Some(&element_session)).await?;
+        let option = option["result"]["objectId"]
+            .as_str()
+            .ok_or("The requested option is no longer available.")?;
+        let Some((x, y)) = native_point(
             client,
+            control,
             session_id,
-            &native_key_chord_events("Home", Some(2)),
-            KEY_INTERVAL,
+            (option, &element_session),
+            selector_or_ref,
+        )
+        .await?
+        else {
+            return Ok(ClickResult {
+                dialog_opened: true,
+                pending_release: None,
+            });
+        };
+        let click = dispatch_click(
+            client,
+            control,
+            &element_session,
+            &[&element_session, session_id],
+            x,
+            y,
+            "left",
+            1,
         )
         .await?;
-        let current = native_select_state(client, &element_session, &object_id).await?;
-        if !same_select_options(&before, &current) || !current.focused {
-            return Err("The select control changed while it was taking keyboard focus. Inspect the current page before choosing again.".into());
-        }
-        for (position, index) in enabled.iter().enumerate() {
-            if position > 0 {
-                type_after_click(
-                    control,
-                    client,
-                    session_id,
-                    &native_key_chord_events("ArrowDown", Some(2)),
-                    KEY_INTERVAL,
-                )
-                .await?;
-            }
-            if current.options[*index].selected != desired.contains(index) {
-                type_after_click(
-                    control,
-                    client,
-                    session_id,
-                    &native_key_chord_events(" ", Some(2)),
-                    KEY_INTERVAL,
-                )
-                .await?;
-            }
+        if click.dialog_opened {
+            return Ok(click);
         }
     } else {
-        let position = enabled
+        if before.multiple {
+            // Physical Tab focus preserves the existing selected set. An
+            // unmodified parent click would clear it before the intended toggles.
+            let focus = native_focus(
+                client,
+                control,
+                session_id,
+                ref_map,
+                selector_or_ref,
+                iframe_sessions,
+            )
+            .await?;
+            if focus.dialog_opened {
+                return Ok(focus);
+            }
+        } else {
+            match click_field(
+                client,
+                control,
+                session_id,
+                ref_map,
+                selector_or_ref,
+                iframe_sessions,
+                false,
+            )
+            .await?
+            {
+                Clicked::Dialog(click) => return Ok(click),
+                Clicked::Field(_) => {}
+            }
+        }
+        let current = native_select_state(client, &element_session, &object_id).await?;
+        if !same_select_options(&before, &current)
+            || !current.focused
+            || current.disabled
+            || (before.multiple && selected_indices(&current) != selected_indices(&before))
+        {
+            return Err("The select control changed after it was clicked. Inspect the current page before choosing again.".into());
+        }
+        let enabled: Vec<_> = current
+            .options
             .iter()
-            .position(|index| *index == desired[0])
-            .ok_or("The requested option is no longer available.")?;
-        let mut events = native_key_chord_events("Home", None);
-        for _ in 0..position {
-            events.extend(native_key_chord_events("ArrowDown", None));
+            .enumerate()
+            .filter_map(|(index, option)| (!option.disabled).then_some(index))
+            .collect();
+        if before.multiple {
+            type_after_click(
+                control,
+                client,
+                session_id,
+                &native_key_chord_events("Home", Some(2)),
+                KEY_INTERVAL,
+            )
+            .await?;
+            let current = native_select_state(client, &element_session, &object_id).await?;
+            if !same_select_options(&before, &current) || !current.focused {
+                return Err("The select control changed while it was taking keyboard focus. Inspect the current page before choosing again.".into());
+            }
+            for (position, index) in enabled.iter().enumerate() {
+                if position > 0 {
+                    type_after_click(
+                        control,
+                        client,
+                        session_id,
+                        &native_key_chord_events("ArrowDown", Some(2)),
+                        KEY_INTERVAL,
+                    )
+                    .await?;
+                }
+                if current.options[*index].selected != desired.contains(index) {
+                    type_after_click(
+                        control,
+                        client,
+                        session_id,
+                        &native_key_chord_events(" ", Some(2)),
+                        KEY_INTERVAL,
+                    )
+                    .await?;
+                }
+            }
+        } else {
+            let position = enabled
+                .iter()
+                .position(|index| *index == desired[0])
+                .ok_or("The requested option is no longer available.")?;
+            let mut events = native_key_chord_events("Home", None);
+            for _ in 0..position {
+                events.extend(native_key_chord_events("ArrowDown", None));
+            }
+            if before.popup {
+                events.extend(native_key_chord_events("Enter", None));
+            }
+            type_after_click(control, client, session_id, &events, KEY_INTERVAL).await?;
         }
-        if before.popup {
-            events.extend(native_key_chord_events("Enter", None));
-        }
-        type_after_click(control, client, session_id, &events, KEY_INTERVAL).await?;
     }
     let deadline = tokio::time::Instant::now() + FIELD_SETTLE;
     loop {
@@ -2296,7 +2426,9 @@ pub(crate) fn native_paste_events(text: &str) -> Vec<Value> {
 }
 
 /// A single key press through the owned native window, with the CDP
-/// modifier mask (1 Alt, 2 Control, 4 Meta, 8 Shift) the helper shares.
+/// modifier mask (1 Alt, 2 Control, 4 Meta, 8 Shift) the helper shares. The
+/// final event releases the chord's synthetic modifiers; the native owner
+/// merges explicitly held modifier keys into both events independently.
 pub(crate) fn native_key_chord_events(key: &str, modifiers: Option<i32>) -> Vec<Value> {
     let (key_name, code, _) = named_key_info(key);
     native_key_events(&key_name, &code, modifiers.unwrap_or(0))
@@ -2318,7 +2450,7 @@ fn native_key_events(key: &str, code: &str, modifiers: i32) -> Vec<Value> {
         down,
         json!({
             "type": "input_keyboard", "eventType": "keyUp", "key": key, "code": code,
-            "modifiers": modifiers,
+            "modifiers": 0,
         }),
     ]
 }
@@ -2471,10 +2603,14 @@ mod tests {
         assert_eq!(events[0]["modifiers"], 2);
         assert!(events[0].get("text").is_none());
         assert_eq!(events[1]["eventType"], "keyUp");
-        assert_eq!(events[1]["modifiers"], 2);
+        assert_eq!(
+            events[1]["modifiers"], 0,
+            "A chord must release its synthetic modifiers"
+        );
         let shifted = native_key_chord_events("Enter", Some(8));
         assert_eq!(shifted[0]["code"], "Enter");
         assert_eq!(shifted[0]["modifiers"], 8);
+        assert_eq!(shifted[1]["modifiers"], 0);
         let space = native_key_chord_events("Space", None);
         assert_eq!(space[0]["key"], " ");
         assert_eq!(space[0]["text"], " ");

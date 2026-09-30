@@ -869,6 +869,40 @@ async fn e2e_native_focus_clear_selectall_use_real_input_without_button_activati
 
 #[tokio::test]
 #[ignore]
+async fn e2e_native_chord_releases_modifiers_before_returning_custody() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<input id=field value=hello><script>window.events=[];for(const type of ['keydown','keyup'])addEventListener(type,e=>events.push({type,key:e.key,ctrl:e.ctrlKey,trusted:e.isTrusted}),true)</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}),&mut state).await);
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#field"}), &mut state).await,
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"press","key":"Control+a"}), &mut state).await,
+    );
+    let browser = state.browser.as_ref().unwrap();
+    let released = tokio::time::timeout(std::time::Duration::from_secs(2), browser.client.send_command("Runtime.evaluate",Some(json!({
+        "expression":"new Promise(resolve=>{if(events.some(e=>e.type==='keyup'&&e.key==='Control'))resolve(true);else addEventListener('keyup',e=>{if(e.key==='Control')resolve(true)})})", "returnByValue":true,"awaitPromise":true,
+    })), Some(browser.active_session_id().unwrap()))).await;
+    let observed = control_test_command(&json!({"action":"evaluate","script":"({events,selection:[field.selectionStart,field.selectionEnd]})"}),&mut state).await;
+    println!("NATIVE_CHORD_RELEASE {}", observed["data"]["result"]);
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+    assert!(
+        released.is_ok(),
+        "The native chord left Control held after returning"
+    );
+    let events = observed["data"]["result"]["events"].as_array().unwrap();
+    assert!(events
+        .iter()
+        .any(|e| e["type"] == "keyup" && e["key"] == "Control" && e["ctrl"] == false));
+    assert!(events.iter().all(|e| e["trusted"] == true));
+    assert_eq!(observed["data"]["result"]["selection"], json!([0, 5]));
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_native_static_selectall_preserves_exact_scope_through_nested_scroll() {
     let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
     env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
@@ -893,7 +927,7 @@ async fn e2e_native_static_selectall_preserves_exact_scope_through_nested_scroll
             json!({"selector":selector,"commandToReturnMs":started.elapsed().as_secs_f64()*1000.0,"response":response})
         );
         if response["success"] != true {
-            let diagnostics=control_test_command(&json!({"action":"evaluate","script":"({scroll:box.scrollTop,box:box.getBoundingClientRect().toJSON(),first:long.firstChild.getBoundingClientRect().toJSON(),last:long.lastElementChild.previousElementSibling.getBoundingClientRect().toJSON(),events:events.slice(-12)})"}),&mut state).await;
+            let diagnostics=control_test_command(&json!({"action":"evaluate","script":"({scroll:box.scrollTop,box:box.getBoundingClientRect().toJSON(),first:long.firstChild.getBoundingClientRect().toJSON(),last:long.lastElementChild.previousElementSibling.getBoundingClientRect().toJSON(),selection:[getSelection().anchorNode?.textContent,getSelection().anchorOffset,getSelection().focusNode?.textContent,getSelection().focusOffset],text:getSelection().toString(),events:events.slice(-12)})"}),&mut state).await;
             println!("NATIVE_SELECTALL_FAILURE {}", diagnostics["data"]["result"]);
             if let Ok(prefix) = std::env::var("AMBIT_NATIVE_INPUT_SCREENSHOT_PREFIX") {
                 let capture=control_test_command(&json!({"action":"screenshot","path":format!("{prefix}-failure-{}.png",selector.trim_start_matches('#'))}),&mut state).await;
@@ -1286,6 +1320,252 @@ async fn e2e_native_named_input_per_action_proof() {
         )
         .await,
     );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_native_review_initial_pixel_wheel_and_clamped_noop() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<!doctype html><style>#box{width:350px;height:180px;overflow:auto}#content{height:3000px}</style><div id=box><div id=content></div></div><script>window.block=false;window.wheels=[];box.addEventListener('wheel',e=>{wheels.push({delta:e.deltaY,trusted:e.isTrusted});if(block)e.preventDefault()},{passive:false})</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}),&mut state).await);
+    for amount in [0.0, 1.0] {
+        let before = control_test_command(
+            &json!({"action":"evaluate","script":"box.scrollTop=137;wheels=[];box.scrollTop"}),
+            &mut state,
+        )
+        .await["data"]["result"]
+            .as_f64()
+            .unwrap();
+        let response = control_test_command(
+            &json!({"action":"scroll","selector":"#box","direction":"down","amount":amount}),
+            &mut state,
+        )
+        .await;
+        let read=control_test_command(&json!({"action":"evaluate","script":"({at:box.scrollTop,wheels,dpr:devicePixelRatio})"}),&mut state).await;
+        let actual = &read["data"]["result"];
+        println!(
+            "INITIAL_PIXEL_WHEEL {}",
+            json!({"before":before,"requested":amount,"response":response,"actual":actual})
+        );
+        assert_success(&response);
+        if amount == 0.0 {
+            assert_eq!(actual["at"].as_f64().unwrap(), before);
+            assert!(actual["wheels"].as_array().unwrap().is_empty());
+        } else {
+            assert!(
+                !actual["wheels"].as_array().unwrap().is_empty(),
+                "A valid initial1px request dispatched no wheel: {actual}"
+            );
+            assert!(
+                (actual["at"].as_f64().unwrap() - before - amount).abs() < 0.01,
+                "{actual}"
+            );
+        }
+    }
+    let client = state.browser.as_ref().unwrap().client.clone();
+    let session = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .active_session_id()
+        .unwrap()
+        .to_owned();
+    client
+        .send_command(
+            "Emulation.setDeviceMetricsOverride",
+            Some(json!({"width":800,"height":500,"deviceScaleFactor":2,"mobile":false})),
+            Some(&session),
+        )
+        .await
+        .unwrap();
+    let before = control_test_command(
+        &json!({"action":"evaluate","script":"box.scrollTop=137;wheels=[];box.scrollTop"}),
+        &mut state,
+    )
+    .await["data"]["result"]
+        .as_f64()
+        .unwrap();
+    let response = control_test_command(
+        &json!({"action":"scroll","selector":"#box","direction":"down","amount":0.5}),
+        &mut state,
+    )
+    .await;
+    let read = control_test_command(
+        &json!({"action":"evaluate","script":"({at:box.scrollTop,wheels,dpr:devicePixelRatio})"}),
+        &mut state,
+    )
+    .await;
+    println!(
+        "FRACTIONAL_PIXEL_WHEEL {}",
+        json!({"before":before,"response":response,"actual":read["data"]["result"]})
+    );
+    assert_success(&response);
+    assert!(!read["data"]["result"]["wheels"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert!((read["data"]["result"]["at"].as_f64().unwrap() - before - 0.5).abs() < 0.01);
+    assert_success(
+        &control_test_command(
+            &json!({"action":"evaluate","script":"box.scrollTop=0;wheels=[];0"}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"scroll","selector":"#box","direction":"up","amount":1}),
+            &mut state,
+        )
+        .await,
+    );
+    let read = control_test_command(
+        &json!({"action":"evaluate","script":"({at:box.scrollTop,wheels})"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(read["data"]["result"]["at"], 0);
+    assert!(read["data"]["result"]["wheels"]
+        .as_array()
+        .unwrap()
+        .is_empty());
+    assert_success(
+        &control_test_command(
+            &json!({"action":"evaluate","script":"box.scrollTop=137;wheels=[];block=true;0"}),
+            &mut state,
+        )
+        .await,
+    );
+    let response = control_test_command(
+        &json!({"action":"scroll","selector":"#box","direction":"down","amount":1}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(
+        response["success"], false,
+        "Blocked initial1px scroll was reported complete: {response}"
+    );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_native_review_focus_reaches_deep_shadow_tab_order_without_activation() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<!doctype html><div id=host></div><script>window.clicks=0;window.focuses=[];const root=host.attachShadow({mode:'open'});for(let n=0;n<24;n++){const b=document.createElement('button');b.id=n===23?'target':'button'+n;b.textContent='Button '+n;b.onclick=()=>clicks++;b.onfocus=()=>focuses.push(b.id);root.append(b)}</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}),&mut state).await);
+    assert_success(
+        &control_test_command(&json!({"action":"snapshot","interactive":true}), &mut state).await,
+    );
+    let target = state
+        .ref_map
+        .entries_sorted()
+        .into_iter()
+        .find(|(_, entry)| entry.name == "Button 23")
+        .expect("The real accessibility snapshot must offer the shadow button")
+        .0;
+    let response = control_test_command(
+        &json!({"action":"focus","selector":format!("@{target}")}),
+        &mut state,
+    )
+    .await;
+    let read=control_test_command(&json!({"action":"evaluate","script":"({active:host.shadowRoot.activeElement?.id,clicks,focuses})"}),&mut state).await;
+    println!(
+        "SHADOW_FOCUS_PROOF {}",
+        json!({"response":response,"actual":read["data"]["result"]})
+    );
+    assert_success(&response);
+    assert_eq!(read["data"]["result"]["active"], "target");
+    assert_eq!(read["data"]["result"]["clicks"], 0);
+    assert_success(&control_test_command(&json!({"action":"evaluate","script":"host.shadowRoot.getElementById('target').style.display='none';0"}),&mut state).await);
+    let response = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        control_test_command(
+            &json!({"action":"focus","selector":format!("@{target}")}),
+            &mut state,
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        response["success"], false,
+        "An unreachable hidden focus target did not stop on the actual cycle"
+    );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_native_review_listbox_changes_only_requested_specific_options() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<!doctype html><style>select{width:240px;font:20px sans-serif;margin:15px}</style><select id=single size=5><option value=a selected>Alpha</option><option value=b>Beta</option><option value=c>Gamma</option><option value=d>Delta</option><option value=e>Epsilon</option></select><select id=multi multiple size=5><option value=a selected>Alpha</option><option value=b>Beta</option><option value=c>Gamma</option><option value=d>Delta</option><option value=e selected>Epsilon</option></select><script>window.events=[];for(const type of ['input','change'])addEventListener(type,e=>events.push({id:e.target.id,type,values:[...e.target.selectedOptions].map(o=>o.value),trusted:e.isTrusted}),true)</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}),&mut state).await);
+    for (selector, values) in [
+        ("#multi", json!(["a", "d", "e"])),
+        ("#single", json!(["d"])),
+    ] {
+        assert_success(
+            &control_test_command(
+                &json!({"action":"evaluate","script":"events=[];0"}),
+                &mut state,
+            )
+            .await,
+        );
+        let response = control_test_command(
+            &json!({"action":"select","selector":selector,"values":values}),
+            &mut state,
+        )
+        .await;
+        let read =
+            control_test_command(&json!({"action":"evaluate","script":"events"}), &mut state).await;
+        let events = read["data"]["result"].as_array().unwrap();
+        println!(
+            "LISTBOX_EFFECT_PROOF {}",
+            json!({"selector":selector,"response":response,"events":events})
+        );
+        assert_success(&response);
+        assert!(events.iter().all(|event| event["trusted"] == true));
+        assert!(
+            events.iter().all(|event| event["values"] == values),
+            "Selection changed unintended intermediate options: {events:?}"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "change")
+                .count(),
+            1,
+            "Exactly the requested toggle must change selection"
+        );
+    }
+    assert_success(&control_test_command(&json!({"action":"evaluate","script":"events=[];single.size=3;single.innerHTML=Array.from({length:24},(_,n)=>'<option value='+n+'>'+n+'</option>').join('');0"}),&mut state).await);
+    let response = control_test_command(
+        &json!({"action":"select","selector":"#single","values":["23"]}),
+        &mut state,
+    )
+    .await;
+    let read=control_test_command(&json!({"action":"evaluate","script":"({value:single.value,events,scroll:single.scrollTop,overflow:getComputedStyle(single).overflowY})"}),&mut state).await;
+    println!(
+        "OFFSCREEN_LISTBOX_EFFECT_PROOF {}",
+        json!({"response":response,"actual":read["data"]["result"]})
+    );
+    assert_success(&response);
+    assert_eq!(read["data"]["result"]["value"], "23");
+    assert!(read["data"]["result"]["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|event| event["values"] == json!(["23"])));
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
 
@@ -15940,7 +16220,7 @@ async fn e2e_native_motion_proof() {
         .find(|event| event["type"] == "scroll")
         .and_then(|event| event["t"].as_f64());
     assert!(!by_script, "the wheel moved the page");
-    assert!(notches.len() >= 4, "{} notches", notches.len());
+    assert_eq!(notches.len(), 1, "One actual precision wheel: {notches:?}");
     assert!(
         one_a_frame(&gaps(&notches)),
         "one notch per frame: {:?}",
@@ -16112,7 +16392,7 @@ async fn e2e_native_motion_proof() {
         let command = control_test_command(&scroll, &mut state);
         let takeover = async {
             let mut seen = 0;
-            while seen < 3 {
+            while seen < 1 {
                 if let Ok(event) = watch.recv().await {
                     if event.method == crate::native::activity::EVENT
                         && event.params["eventType"] == "scroll"
