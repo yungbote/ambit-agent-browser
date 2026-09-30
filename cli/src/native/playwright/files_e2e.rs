@@ -195,6 +195,16 @@ async fn e2e_remote_staging_requires_live_program_and_exact_action_owner() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn e2e_staged_files_guard_script_resources_and_outlive_program_close() {
+    staged_file_resource_policy(true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_mandatory_host_file_policy_does_not_need_an_identity_offer() {
+    staged_file_resource_policy(false).await;
+}
+
+async fn staged_file_resource_policy(offer_identity: bool) {
     let fixture = tempfile::tempdir().unwrap();
     let base = fixture.path().join("staged");
     let scope = Scope::parse("50fac831-3be0-45ec-8b2e-ae57c3a3ddfe").unwrap();
@@ -238,24 +248,19 @@ async fn e2e_staged_files_guard_script_resources_and_outlive_program_close() {
     let browser = state.browser.as_ref().unwrap();
     let client = browser.client.clone();
     let session = browser.active_session_id().unwrap().to_owned();
-    let custody = Custody::new();
+    let custody = Custody::with_files(files.clone());
     let channel = ChannelId::parse("6825cefb-83c7-4397-86a7-085ebf0b0ad3").unwrap();
-    custody
-        .request(
-            channel,
-            Request::read("site_sessions.offer", json!({"sites":[]})).unwrap(),
-        )
-        .await
-        .unwrap();
+    if offer_identity {
+        custody
+            .request(
+                channel,
+                Request::read("site_sessions.offer", json!({"sites":[]})).unwrap(),
+            )
+            .await
+            .unwrap();
+    }
     custody
         .browser_ready(client.clone(), vec![session.clone()])
-        .await
-        .unwrap();
-    let mut context = client.site_context();
-    context.files = files.clone();
-    client.set_site_custody(Arc::downgrade(&custody), context);
-    client
-        .send_command("Fetch.enable", Some(json!({"patterns":[]})), Some(&session))
         .await
         .unwrap();
     let entered = Box::pin(execute_command(
@@ -266,6 +271,11 @@ async fn e2e_staged_files_guard_script_resources_and_outlive_program_close() {
     assert_eq!(entered["success"], true, "{entered}");
     let observed=client.send_command("Runtime.evaluate",Some(json!({"expression":"({title:document.title,secretAbsent:globalThis.hostPrivateCanary===undefined})","returnByValue":true})),Some(&session)).await.unwrap();
     assert_eq!(observed["result"]["value"]["title"], "Staged file");
+    if observed["result"]["value"]["secretAbsent"] != true {
+        let closed = Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
+        assert_eq!(closed["success"], true, "{closed}");
+        permissions(&directory, 0o755);
+    }
     assert_eq!(
         observed["result"]["value"]["secretAbsent"], true,
         "a registered HTML file cannot read an unregistered host script"
@@ -287,6 +297,7 @@ async fn e2e_staged_files_guard_script_resources_and_outlive_program_close() {
         "Runtime script bypass must fail at the actual request boundary"
     );
     files.clear(scope, owner);
+    custody.end(channel).await;
     let command = json!({"files":[page.to_str().unwrap()]});
     assert!(files
         .command("DOM.setFileInputFiles", &command)
@@ -321,7 +332,15 @@ async fn e2e_staged_files_guard_script_resources_and_outlive_program_close() {
             .is_some_and(|error| error.contains("BLOCKED")),
         "expired receipts must stay blocked after program close: {failed}"
     );
-    custody.end(channel).await;
+    let new_target = Box::pin(execute_command(
+        &json!({"action":"tab_new","url":secret_url}),
+        &mut state,
+    ))
+    .await;
+    assert_eq!(
+        new_target["success"], false,
+        "a new target retains mandatory file policy after identity channel end: {new_target}"
+    );
     let closed = Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
     assert_eq!(closed["success"], true, "{closed}");
     permissions(&directory, 0o755);

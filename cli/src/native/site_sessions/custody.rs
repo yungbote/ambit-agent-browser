@@ -92,8 +92,9 @@ impl Custody {
         );
     }
 
-    /// Runs after the canonical launch and before its first command. A new
-    /// native connection gets the same value registry, but fresh page gates.
+    /// Runs after the canonical launch and before its first command. Mandatory
+    /// file policy does not depend on an optional identity offer. A new native
+    /// connection gets the same value registry, but fresh page gates.
     pub(crate) async fn browser_ready(
         self: &Arc<Self>,
         client: Arc<CdpClient>,
@@ -104,7 +105,7 @@ impl Custody {
         }
         {
             let mut state = self.state.lock().await;
-            if state.channel.is_none() {
+            if state.channel.is_none() && !self.context.files.guarded() {
                 return Ok(());
             }
             if !state
@@ -179,7 +180,9 @@ impl Custody {
         }
         {
             let state = self.state.lock().await;
-            if state.channel.is_none() || state.prepared.contains(session) {
+            if (state.channel.is_none() && !self.context.files.guarded())
+                || state.prepared.contains(session)
+            {
                 return Ok(());
             }
         }
