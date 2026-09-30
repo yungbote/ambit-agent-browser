@@ -303,6 +303,97 @@ fn a_refinement_takes_its_own_speed_and_motion_returns_to_its_own() {
     );
 }
 
+/// A stream may change its threads and tile columns between pictures, as a
+/// key unit encoded on more of both than the motion around it would be:
+/// every unit still decodes to its picture, and the first picture after a
+/// change sets its quantizer again (libaom takes a whole configuration back,
+/// which resets the quantizer's range), so a key unit after a change is the
+/// key unit a stream opened with those threads makes.
+#[test]
+fn a_stream_changes_threads_and_tiles_between_pictures() {
+    // Eight tile columns need eight 128 px superblock columns.
+    let (width, height) = (1024u32, 128u32);
+    let codec = VideoCodec::Av1Full;
+    let pictures: Vec<Planar> = (0..3usize)
+        .map(|index| {
+            let source: Vec<u8> = (0..height as usize)
+                .flat_map(|y| {
+                    (0..width as usize).flat_map(move |x| {
+                        let value = ((x * 7 + y * 13 + index * 29) ^ (x >> 3)) as u8;
+                        [value, value.wrapping_mul(3), 255 - value, 0]
+                    })
+                })
+                .collect();
+            let mut picture = Planar::new(Chroma::Full, width, height);
+            assert!(picture.convert(
+                &source,
+                width as usize * 4,
+                (width as usize, height as usize),
+                (0, height as usize)
+            ));
+            picture
+        })
+        .collect();
+    let request = |key| EncodeRequest {
+        key,
+        quantizer: 30,
+        ..Default::default()
+    };
+    let mut opened_wide = AomEncoder::new(codec, width, height, 8).unwrap();
+    opened_wide.set_threads(8, 3).unwrap();
+    let wide_key = opened_wide
+        .encode(&pictures[2].picture(), request(true))
+        .unwrap();
+
+    let mut encoder = AomEncoder::new(codec, width, height, 4).unwrap();
+    let mut decoder = Decoder::new();
+    let mut layout = (4, 2);
+    // (threads, tile columns log2, key, picture)
+    for (step, (threads, tiles, key, picture)) in [
+        (4, 2, true, 0),
+        (4, 2, false, 1),
+        (8, 3, true, 2),
+        (4, 2, false, 0),
+        (8, 3, true, 1),
+        (4, 2, false, 2),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        if (threads, tiles) != layout {
+            encoder.set_threads(threads, tiles).unwrap();
+            assert_eq!(
+                encoder.quantizer, None,
+                "step {step}: the quantizer is set again"
+            );
+            layout = (threads, tiles);
+        }
+        let unit = encoder
+            .encode(&pictures[picture].picture(), request(key))
+            .unwrap();
+        assert_eq!(unit.key, key, "step {step}");
+        if step == 2 {
+            let (after, opened) = (unit.data.len() as f64, wide_key.data.len() as f64);
+            assert!(
+                (after / opened - 1.0).abs() < 0.05,
+                "step {step}: a key unit after the change is {after} bytes, one from a stream opened there {opened}"
+            );
+        }
+        let decoded = decoder.decode(&unit.data);
+        assert_eq!((decoded.width, decoded.height), (width, height));
+        let given = pictures[picture].picture().planes().unwrap();
+        let error: f64 = given[0]
+            .0
+            .iter()
+            .zip(&decoded.planes[0])
+            .map(|(&a, &b)| (f64::from(a) - f64::from(b)).powi(2))
+            .sum::<f64>()
+            / f64::from(width * height);
+        let psnr = 10.0 * (65025.0 / error.max(1e-9)).log10();
+        assert!(psnr > 30.0, "step {step}: luma PSNR {psnr:.1} dB");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Fixtures: text pages over colour bars and what they must look like once
 // painted, a real decoder and a sequence header reader.

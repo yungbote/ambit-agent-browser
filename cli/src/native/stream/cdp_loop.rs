@@ -204,6 +204,7 @@ pub(super) async fn cdp_event_loop(
     last_tabs: Arc<RwLock<Vec<Value>>>,
     last_engine: Arc<RwLock<String>>,
     recording: Arc<Mutex<bool>>,
+    browser_notes: watch::Receiver<super::BrowserNote>,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
     let sinks = super::window_capture::Sinks {
@@ -319,16 +320,15 @@ pub(super) async fn cdp_event_loop(
                 *sc = supports_screencast || display.is_some();
             }
 
-            let rec = *recording.lock().await;
-            let status = json!({
-                "type": "status",
-                "connected": true,
-                "screencasting": supports_screencast || display.is_some(),
-                "viewportWidth": vw,
-                "viewportHeight": vh,
-                "engine": eng,
-                "recording": rec,
-            });
+            let note = *browser_notes.borrow();
+            let status = super::status_record(
+                true,
+                note,
+                supports_screencast || display.is_some(),
+                (vw, vh),
+                &eng,
+                *recording.lock().await,
+            );
             let _ = frame_tx.send(status.to_string());
 
             let frame_tree_seed = seed_main_frame_id(
@@ -1049,6 +1049,7 @@ mod tests {
             last_tabs.clone(),
             Arc::new(RwLock::new(engine.to_string())),
             Arc::new(Mutex::new(false)),
+            watch::channel(super::super::BrowserNote::default()).1,
             shutdown_rx,
         ));
         client_notify.notify_one();
@@ -1363,6 +1364,7 @@ mod tests {
             Arc::new(RwLock::new(Vec::new())),
             Arc::new(RwLock::new("chrome".to_string())),
             Arc::new(Mutex::new(false)),
+            watch::channel(super::super::BrowserNote::default()).1,
             shutdown_rx,
         ));
         client_notify.notify_one();
@@ -1506,6 +1508,7 @@ mod tests {
             Arc::new(RwLock::new(Vec::new())),
             Arc::new(RwLock::new("chrome".to_string())),
             Arc::new(Mutex::new(false)),
+            watch::channel(super::super::BrowserNote::default()).1,
             shutdown_rx,
         ));
         client_notify.notify_one();
@@ -1591,6 +1594,7 @@ mod tests {
             Arc::new(RwLock::new(Vec::new())),
             Arc::new(RwLock::new("chrome".to_string())),
             Arc::new(Mutex::new(false)),
+            watch::channel(super::super::BrowserNote::default()).1,
             shutdown_rx,
         ));
         client_notify.notify_one();
@@ -1679,6 +1683,7 @@ mod tests {
             Arc::new(RwLock::new(Vec::new())),
             Arc::new(RwLock::new("chrome".to_string())),
             Arc::new(Mutex::new(false)),
+            watch::channel(super::super::BrowserNote::default()).1,
             shutdown_rx,
         ));
         client_notify.notify_one();
@@ -2119,6 +2124,7 @@ mod tests {
             Arc::new(RwLock::new(Vec::new())),
             Arc::new(RwLock::new("chrome".to_string())),
             Arc::new(Mutex::new(false)),
+            watch::channel(super::super::BrowserNote::default()).1,
             shutdown_rx,
         ));
         client_notify.notify_one();

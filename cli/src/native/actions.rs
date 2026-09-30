@@ -43,7 +43,7 @@ use super::screenshot::{self, ScreenshotOptions};
 use super::snapshot::{self, SnapshotOptions};
 use super::state;
 use super::storage;
-use super::stream::{self, IdleActivity, StreamServer};
+use super::stream::{self, BrowserNote, ClosedReason, IdleActivity, StreamServer};
 use super::tab_binding;
 use super::theme::{self, Theme};
 use super::tracing::{self as native_tracing, TracingState};
@@ -599,6 +599,13 @@ pub struct DaemonState {
     /// The owned window while a person signs in: the same browser without
     /// DevTools. Never set together with `browser`.
     sign_in: Option<sign_in::SignInBrowser>,
+    /// A sign-in or a hand-back is starting the view's next browser.
+    browser_restarting: bool,
+    /// Why the view's last browser closed.
+    browser_closed: ClosedReason,
+    /// The launch a person's `restart` repeats, kept when the browser closed
+    /// without being asked to.
+    restart_from: Option<sign_in::Relaunch>,
     pub appium: Option<AppiumManager>,
     pub safari_driver: Option<safari::SafariDriverProcess>,
     pub webdriver_backend: Option<super::webdriver::backend::WebDriverBackend>,
@@ -832,6 +839,9 @@ impl DaemonState {
         Self {
             browser: None,
             sign_in: None,
+            browser_restarting: false,
+            browser_closed: ClosedReason::Closed,
+            restart_from: None,
             appium: None,
             safari_driver: None,
             webdriver_backend: None,
@@ -1254,7 +1264,6 @@ impl DaemonState {
             *guard = self.browser.as_ref().map(|m| Arc::clone(&m.client));
         }
         if let Some(ref server) = self.stream_server {
-            let connected = self.browser.is_some() || display.is_some();
             server.set_display(display).await;
             server.set_audio(self.window_audio());
             // Update the CDP page session ID so screencast commands target the right page
@@ -1273,9 +1282,37 @@ impl DaemonState {
                     .bind_cdp_session_and_broadcast_tabs(session_id, &[])
                     .await;
             }
-            server
-                .broadcast_status(connected, sc, vw, vh, &self.engine)
-                .await;
+            server.set_browser_note(self.browser_note());
+            server.broadcast_status(sc, vw, vh, &self.engine).await;
+        }
+    }
+
+    /// What the stream's sources cannot say about the view's browser. A
+    /// successor being started counts only while no browser is attached.
+    fn browser_note(&self) -> BrowserNote {
+        let running = self.browser.is_some() || self.sign_in.is_some();
+        BrowserNote {
+            restarting: self.browser_restarting && !running,
+            closed: self.browser_closed,
+            restartable: !running && self.restartable(),
+        }
+    }
+
+    /// Whether a person's `restart` can relaunch the closed browser: it
+    /// closed without being asked to, and its launch is kept.
+    pub(crate) fn restartable(&self) -> bool {
+        self.restart_from.is_some() && self.launch_configuration.is_some()
+    }
+
+    /// Tells every viewer what the view's browser is doing without changing
+    /// the stream's sources: a transition keeps showing the retired window
+    /// until its successor replaces it.
+    pub(crate) async fn publish_browser_status(&self) {
+        if let Some(ref server) = self.stream_server {
+            server.set_browser_note(self.browser_note());
+            let sc = server.is_screencasting().await;
+            let (vw, vh) = server.viewport().await;
+            server.broadcast_status(sc, vw, vh, &self.engine).await;
         }
     }
 
@@ -2512,7 +2549,7 @@ async fn apply_restore_config_after_confirmation(
 
     if restore_key_changed && had_browser {
         let _ = auto_save_restore_state(state).await;
-        let _ = close_current_browser(state).await;
+        let _ = close_current_browser(state, ClosedReason::Closed).await;
     }
 
     apply_restore_config_from_command(cmd, state)?;
@@ -2538,7 +2575,27 @@ async fn close_active_provider_session(state: &mut DaemonState) {
     state.active_provider_connection = false;
 }
 
-pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(), String> {
+/// Closes the view's browser, whichever is running (automation or sign-in),
+/// and tells every viewer why (`reason`). A browser that closed without
+/// being asked to keeps its launch, which a person's `restart` or the
+/// agent's next action repeats, and its reason goes to the session log.
+pub(crate) async fn close_current_browser(
+    state: &mut DaemonState,
+    reason: ClosedReason,
+) -> Result<(), String> {
+    state.browser_closed = reason;
+    state.browser_restarting = false;
+    if reason == ClosedReason::Closed {
+        state.restart_from = None;
+    } else {
+        session_log(
+            &state.session_id,
+            &format!("browser closed: {}", reason.token()),
+        );
+        if let Some(relaunch) = sign_in::Relaunch::of_view(state) {
+            state.restart_from = Some(relaunch);
+        }
+    }
     let close_error = if let Some(mut mgr) = state.browser.take() {
         mgr.close().await.err()
     } else {
@@ -2549,7 +2606,9 @@ pub(crate) async fn close_current_browser(state: &mut DaemonState) -> Result<(),
     }
 
     close_active_provider_session(state).await;
-    state.launch_configuration = None;
+    if reason == ClosedReason::Closed {
+        state.launch_configuration = None;
+    }
     state.webmcp_enabled = false;
     forget_browser_session(state);
     state.update_stream_client().await;
@@ -2579,7 +2638,7 @@ fn forget_browser_session(state: &mut DaemonState) {
 /// Lifecycle shutdown paths use this instead of `close_current_browser`
 /// because Safari and iOS sessions live outside `state.browser`.
 pub(crate) async fn close_all_browser_backends(state: &mut DaemonState) -> Result<(), String> {
-    let close_result = close_current_browser(state).await;
+    let close_result = close_current_browser(state, ClosedReason::Closed).await;
     state.retained_profile = None;
 
     if let Some(ref mut webdriver) = state.webdriver_backend {
@@ -2603,7 +2662,9 @@ async fn close_after_network_control_failure(
     state: &mut DaemonState,
     error: String,
 ) -> Result<(), String> {
-    let close_error = close_current_browser(state).await.err();
+    let close_error = close_current_browser(state, ClosedReason::Closed)
+        .await
+        .err();
     Err(match close_error {
         Some(close_error) => format!(
             "Failed to install browser network controls: {} (also failed to close browser: {})",
@@ -2832,6 +2893,13 @@ pub(crate) trait HostFence {
 
     /// Admits the command, or refuses it with a native response.
     async fn admit(&mut self, command: &Value, state: &mut DaemonState) -> Result<(), Value>;
+
+    /// A command passed admission and its canonical launch succeeded. A
+    /// host-owned connection may prepare the current browser here before
+    /// the first operation uses it. Legacy fences keep their behavior.
+    async fn browser_ready(&mut self, _state: &mut DaemonState) -> Result<(), Value> {
+        Ok(())
+    }
 }
 
 /// Whether the active page is between documents, once the events that
@@ -2917,6 +2985,9 @@ pub(crate) async fn run_host_command(
                     }
                 }
             }
+            if let Err(refusal) = fence.browser_ready(state).await {
+                return refusal;
+            }
             Box::pin(execute_command_inner(&command, state)).await
         };
         // Playwright owns a deadline followed by process/input settlement.
@@ -2976,6 +3047,22 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         };
         // The sign-in watchdog runs before any controller operation too.
         sign_in::maintain(state).await;
+        if request.restarts() {
+            let result = sign_in::restart(state, &request).await;
+            if let (Some(server), Some(display)) =
+                (state.stream_server.as_ref(), state.window_display())
+            {
+                server
+                    .presentation
+                    .update_surface(&display.surface(), display.window());
+            }
+            state.last_command_finished = Some(std::time::Instant::now());
+            return match result {
+                Ok(data) => success_response(&id, data),
+                Err(refused) => json!({ "id": id, "success": false, "code": refused.error.code,
+                    "error": refused.error.message, "reason": refused.reason.token() }),
+            };
+        }
         if let Some(event) = request.sign_in() {
             let result = sign_in::enter(state, &request, event).await;
             if let (Some(server), Some(display)) =
@@ -3295,7 +3382,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
                 || state.active_provider_session.is_some();
             if state.browser.is_some() || state.active_provider_session.is_some() {
                 let _ = auto_save_restore_state(state).await;
-                let _ = close_current_browser(state).await;
+                let _ = close_current_browser(state, ClosedReason::Closed).await;
             }
             if let Err(e) = auto_launch(state, plugins_from_command_or_env(cmd)).await {
                 let context = auto_launch_error_context(env::var("AGENT_BROWSER_CDP").is_ok());
@@ -3427,7 +3514,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         "press" => stating(handle_press(cmd, state).await, &mut failure_data),
         "hover" => stating(handle_hover(cmd, state).await, &mut failure_data),
         "scroll" => stating(handle_scroll(cmd, state).await, &mut failure_data),
-        "select" => handle_select(cmd, state).await,
+        "select" => stating(handle_select(cmd, state).await, &mut failure_data),
         "check" => stating(handle_check(cmd, state).await, &mut failure_data),
         "uncheck" => stating(handle_uncheck(cmd, state).await, &mut failure_data),
         "wait" => handle_wait(cmd, state).await,
@@ -3481,9 +3568,9 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         "credentials_list" => handle_credentials_list().await,
         "mouse" => stating(handle_mouse(cmd, state).await, &mut failure_data),
         "keyboard" => stating(handle_keyboard(cmd, state).await, &mut failure_data),
-        "focus" => handle_focus(cmd, state).await,
-        "clear" => handle_clear(cmd, state).await,
-        "selectall" => handle_selectall(cmd, state).await,
+        "focus" => stating(handle_focus(cmd, state).await, &mut failure_data),
+        "clear" => stating(handle_clear(cmd, state).await, &mut failure_data),
+        "selectall" => stating(handle_selectall(cmd, state).await, &mut failure_data),
         "scrollintoview" => stating(handle_scrollintoview(cmd, state).await, &mut failure_data),
         "dispatch" => handle_dispatch(cmd, state).await,
         "highlight" => handle_highlight(cmd, state).await,
@@ -5216,7 +5303,7 @@ async fn load_storage_state(state: &mut DaemonState, path: &Option<String>) -> R
 }
 
 async fn rollback_failed_launch(state: &mut DaemonState) -> Result<(), String> {
-    let close_result = close_current_browser(state).await;
+    let close_result = close_current_browser(state, ClosedReason::Closed).await;
     state.ref_map.clear();
     close_result
 }
@@ -5500,7 +5587,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         }
         if had_browser_before_launch {
             let _ = auto_save_restore_state(state).await;
-            close_current_browser(state).await?;
+            close_current_browser(state, ClosedReason::Closed).await?;
         }
     } else {
         load_storage_state(state, &storage_state_owned).await?;
@@ -6783,7 +6870,7 @@ async fn handle_scroll(cmd: &Value, state: &mut DaemonState) -> Result<Value, Co
     Ok(json!({ "scrolled": true }))
 }
 
-async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
@@ -6804,6 +6891,23 @@ async fn handle_select(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             .unwrap_or_default(),
     };
 
+    if state.browser_control.lock().await.has_native_display() {
+        let selected = interaction::native_select_option(
+            &mgr.client,
+            &state.browser_control,
+            &session_id,
+            &state.ref_map,
+            selector,
+            &values,
+            &state.iframe_sessions,
+        )
+        .await?;
+        if selected.dialog_opened {
+            state.pending_pointer_release = selected.pending_release;
+            return Ok(json!({ "selected": values, "dialogOpened": true }));
+        }
+        return Ok(json!({ "selected": values }));
+    }
     interaction::select_option(
         &mgr.client,
         &session_id,
@@ -8744,7 +8848,7 @@ async fn handle_pdf(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
 // Phase 8 handlers
 // ---------------------------------------------------------------------------
 
-async fn handle_focus(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_focus(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
@@ -8752,6 +8856,22 @@ async fn handle_focus(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
+    if state.browser_control.lock().await.has_native_display() {
+        let focused = interaction::native_focus(
+            &mgr.client,
+            &state.browser_control,
+            &session_id,
+            &state.ref_map,
+            selector,
+            &state.iframe_sessions,
+        )
+        .await?;
+        if focused.dialog_opened {
+            state.pending_pointer_release = focused.pending_release;
+            return Ok(json!({ "focused": selector, "dialogOpened": true }));
+        }
+        return Ok(json!({ "focused": selector }));
+    }
     interaction::focus(
         &mgr.client,
         &session_id,
@@ -8763,7 +8883,7 @@ async fn handle_focus(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     Ok(json!({ "focused": selector }))
 }
 
-async fn handle_clear(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_clear(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
@@ -8771,6 +8891,19 @@ async fn handle_clear(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
+    if state.browser_control.lock().await.has_native_display() {
+        let cleared = fill_field(state, selector, "").await?;
+        if cleared["dialogOpened"] == true {
+            return Ok(json!({ "cleared": selector, "dialogOpened": true }));
+        }
+        if cleared["valueMatches"] == false {
+            return Err(
+                "The field did not accept clearing. Inspect its current value before retrying."
+                    .into(),
+            );
+        }
+        return Ok(json!({ "cleared": selector }));
+    }
     interaction::clear(
         &mgr.client,
         &session_id,
@@ -8782,7 +8915,7 @@ async fn handle_clear(cmd: &Value, state: &mut DaemonState) -> Result<Value, Str
     Ok(json!({ "cleared": selector }))
 }
 
-async fn handle_selectall(cmd: &Value, state: &mut DaemonState) -> Result<Value, String> {
+async fn handle_selectall(cmd: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
     let session_id = mgr.active_session_id()?.to_string();
     let selector = cmd
@@ -8790,6 +8923,22 @@ async fn handle_selectall(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         .and_then(|v| v.as_str())
         .ok_or("Missing 'selector' parameter")?;
 
+    if state.browser_control.lock().await.has_native_display() {
+        let selected = interaction::native_select_all(
+            &mgr.client,
+            &state.browser_control,
+            &session_id,
+            &state.ref_map,
+            selector,
+            &state.iframe_sessions,
+        )
+        .await?;
+        if selected.dialog_opened {
+            state.pending_pointer_release = selected.pending_release;
+            return Ok(json!({ "selected": selector, "dialogOpened": true }));
+        }
+        return Ok(json!({ "selected": selector }));
+    }
     interaction::select_all(
         &mgr.client,
         &session_id,
@@ -9804,6 +9953,29 @@ fn stream_file_path(session_id: &str) -> PathBuf {
     get_socket_dir().join(format!("{}.stream", session_id))
 }
 
+/// Appends one line to the session's log (`<session>.log` beside its socket)
+/// whether or not AGENT_BROWSER_DEBUG sends the daemon's stderr there: a
+/// detached daemon's stderr is otherwise discarded, and why the view's
+/// browser closed must survive for whoever reads the sandbox afterwards.
+/// The file starts over past a megabyte.
+pub(crate) fn session_log(session_id: &str, line: &str) {
+    const LARGEST: u64 = 1 << 20;
+    let path = get_socket_dir().join(format!("{}.log", session_id));
+    let full = fs::metadata(&path).is_ok_and(|metadata| metadata.len() > LARGEST);
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(!full)
+        .write(true)
+        .truncate(full)
+        .open(&path);
+    if let Ok(mut file) = file {
+        let at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |since| since.as_millis());
+        let _ = writeln!(file, "{at} {line}");
+    }
+}
+
 fn write_stream_file(session_id: &str, port: u16) -> Result<(), String> {
     let path = stream_file_path(session_id);
     fs::write(&path, port.to_string()).map_err(|e| {
@@ -10271,13 +10443,7 @@ async fn handle_screencast_start(cmd: &Value, state: &mut DaemonState) -> Result
     if let Some(ref server) = state.stream_server {
         server.set_screencasting(true).await;
         server
-            .broadcast_status(
-                true,
-                true,
-                max_width as u32,
-                max_height as u32,
-                &state.engine,
-            )
+            .broadcast_status(true, max_width as u32, max_height as u32, &state.engine)
             .await;
     }
 
@@ -10298,9 +10464,7 @@ async fn handle_screencast_stop(state: &mut DaemonState) -> Result<Value, String
     if let Some(ref server) = state.stream_server {
         server.set_screencasting(false).await;
         let (vw, vh) = server.viewport().await;
-        server
-            .broadcast_status(true, false, vw, vh, &state.engine)
-            .await;
+        server.broadcast_status(false, vw, vh, &state.engine).await;
     }
 
     Ok(json!({ "stopped": true }))
@@ -15128,7 +15292,7 @@ mod tests {
             .expect_err("invalid session should fail attachment");
         let contents_after_failure = fs::read(&output_path);
 
-        let _ = close_current_browser(&mut state).await;
+        let _ = close_current_browser(&mut state, ClosedReason::Closed).await;
 
         assert!(error.to_ascii_lowercase().contains("session"), "{error}");
         assert_eq!(
@@ -15212,7 +15376,7 @@ mod tests {
             .expect("preserved recording should still stop normally");
         let _ = ws.close(None).await;
         let _ = handle_stream_disable(&mut state).await;
-        let _ = close_current_browser(&mut state).await;
+        let _ = close_current_browser(&mut state, ClosedReason::Closed).await;
         let _ = fs::remove_file(previous_path);
 
         assert!(error.contains("ffmpeg"), "{error}");
@@ -15464,7 +15628,9 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             }],
         });
 
-        close_current_browser(&mut state).await.unwrap();
+        close_current_browser(&mut state, ClosedReason::Closed)
+            .await
+            .unwrap();
 
         assert!(state.active_provider_session.is_none());
         assert!(!state.active_provider_connection);
@@ -15501,7 +15667,9 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
             .insert("frame-1".to_string(), "session-1".to_string());
         state.active_iframe_sessions.insert("session-1".to_string());
 
-        close_current_browser(&mut state).await.unwrap();
+        close_current_browser(&mut state, ClosedReason::Closed)
+            .await
+            .unwrap();
 
         assert!(state.iframe_sessions.is_empty());
         assert!(state.active_iframe_sessions.is_empty());
@@ -18154,6 +18322,119 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"browser":{"cd
             Err(json!({ "id": command["id"], "success": false,
                 "code": "browser_observation_stale", "error": "fenced" }))
         }
+    }
+
+    struct ReadyFence {
+        admitted: bool,
+        ready: usize,
+        wait: bool,
+    }
+
+    impl HostFence for ReadyFence {
+        fn fences_point(&self) -> bool {
+            false
+        }
+        fn reads_page(&self) -> bool {
+            false
+        }
+
+        async fn admit(&mut self, _: &Value, _: &mut DaemonState) -> Result<(), Value> {
+            if self.admitted {
+                Ok(())
+            } else {
+                Err(json!({"success":false,"code":"test_admission"}))
+            }
+        }
+
+        async fn browser_ready(&mut self, _: &mut DaemonState) -> Result<(), Value> {
+            self.ready += 1;
+            if self.wait {
+                std::future::pending::<()>().await;
+            }
+            Err(json!({"success":false,"code":"test_browser_ready"}))
+        }
+    }
+
+    #[tokio::test]
+    async fn browser_ready_runs_after_admission_and_launch_before_the_operation() {
+        let mut state = DaemonState::new();
+        let mut request = super::super::feedback::FeedbackRequest {
+            namespace: String::new(),
+            session: state.session_id.clone(),
+            capture_directory: "/".into(),
+            timeout_ms: 1000,
+            expected_observation: None,
+            launch: None,
+        };
+        let command = json!({"id":"ready","action":"test_operation_must_not_execute"});
+        let mut fence = ReadyFence {
+            admitted: false,
+            ready: 0,
+            wait: false,
+        };
+        let refused = run_host_command(
+            &command,
+            &request,
+            &mut state,
+            std::time::Instant::now(),
+            &mut fence,
+        )
+        .await;
+        assert_eq!(refused["code"], "test_admission");
+        assert_eq!(fence.ready, 0);
+        fence.admitted = true;
+        request.launch = Some(
+            json!({"action":"launch","executablePath":"/nonexistent/ambit-browser-ready-fixture"}),
+        );
+        let refused = run_host_command(
+            &command,
+            &request,
+            &mut state,
+            std::time::Instant::now(),
+            &mut fence,
+        )
+        .await;
+        assert_eq!(refused["success"], false);
+        assert_eq!(fence.ready, 0);
+        request.launch = None;
+        let refused = run_host_command(
+            &command,
+            &request,
+            &mut state,
+            std::time::Instant::now(),
+            &mut fence,
+        )
+        .await;
+        assert_eq!(refused["code"], "test_browser_ready");
+        assert_eq!(fence.ready, 1);
+    }
+
+    #[tokio::test]
+    async fn browser_ready_obeys_the_existing_command_deadline() {
+        let mut state = DaemonState::new();
+        let request = super::super::feedback::FeedbackRequest {
+            namespace: String::new(),
+            session: state.session_id.clone(),
+            capture_directory: "/".into(),
+            timeout_ms: 1,
+            expected_observation: None,
+            launch: None,
+        };
+        let mut fence = ReadyFence {
+            admitted: true,
+            ready: 0,
+            wait: true,
+        };
+        let refused = run_host_command(
+            &json!({"id":"ready","action":"test_operation_must_not_execute"}),
+            &request,
+            &mut state,
+            std::time::Instant::now(),
+            &mut fence,
+        )
+        .await;
+        assert_eq!(refused["code"], "command_outcome_unknown");
+        assert_eq!(fence.ready, 1);
     }
 
     /// Both transports' host path asks its fence only after the custody and

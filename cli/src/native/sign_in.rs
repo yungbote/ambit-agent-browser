@@ -10,7 +10,9 @@
 //!
 //! Both transitions relaunch Chrome, so they return boxed futures: their
 //! large state machines live on the heap while they run instead of inside
-//! every command's future, which awaits the watchdog.
+//! every command's future, which awaits the watchdog. A person's `restart`
+//! of a browser that exited, or whose relaunch failed, repeats the same
+//! relaunch.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,11 +21,12 @@ use futures_util::future::{BoxFuture, FutureExt};
 use serde_json::Value;
 use tokio::time::Instant;
 
-use super::{adopt_launched_browser, close_current_browser, DaemonState};
+use super::{adopt_launched_browser, close_current_browser, session_log, DaemonState};
 use crate::native::browser::BrowserManager;
 use crate::native::browser_control::{ControlError, ControlRequest, SignInAdmission};
 use crate::native::cdp::chrome::{self, ChromeProcess, LaunchOptions};
 use crate::native::display::{DisplayClient, DEVICE_SCALE_FACTOR};
+use crate::native::stream::ClosedReason;
 
 /// Every transition answers inside the control relay's ten-second deadline.
 const TRANSITION: Duration = Duration::from_secs(8);
@@ -156,6 +159,38 @@ impl Transition {
     }
 }
 
+/// What relaunching the view's automation browser repeats: the effective
+/// launch of the browser that owned the view (with DevTools) and its
+/// window's CSS size.
+#[derive(Clone)]
+pub(crate) struct Relaunch {
+    options: LaunchOptions,
+    window: (u32, u32),
+}
+
+impl Relaunch {
+    /// The relaunch of whichever browser owns the view, if it has an owned
+    /// window whose launch can be repeated.
+    pub(crate) fn of_view(state: &DaemonState) -> Option<Self> {
+        if let Some(browser) = state.browser.as_ref() {
+            let display = browser.display_client()?;
+            return Some(Self {
+                options: browser.relaunch_options().ok()?,
+                window: window_size(&display),
+            });
+        }
+        let sign_in = state.sign_in.as_ref()?;
+        let display = sign_in.display()?;
+        Some(Self {
+            options: LaunchOptions {
+                remote_debugging: true,
+                ..sign_in.chrome.relaunch_options().ok()?
+            },
+            window: window_size(&display),
+        })
+    }
+}
+
 /// The window's CSS size. Inside a size class the display's surface is the
 /// framebuffer, larger than the window, so it is not the window's size.
 fn window_size(display: &DisplayClient) -> (u32, u32) {
@@ -193,8 +228,12 @@ pub(super) fn enter<'a>(
             .map_err(ControlError::invalid)?;
 
         // The stream keeps showing the retired window, without failing, until
-        // the sign-in window replaces it.
-        if let Some(mut browser) = state.browser.take() {
+        // the sign-in window replaces it; every viewer learns at once that a
+        // successor is starting.
+        state.browser_restarting = true;
+        let retired = state.browser.take();
+        state.publish_browser_status().await;
+        if let Some(mut browser) = retired {
             let _ = browser.close_within(STOP).await;
         }
         super::forget_browser_session(state);
@@ -215,6 +254,7 @@ pub(super) fn enter<'a>(
         .await;
         let admitted = match entered {
             Ok(_) => {
+                state.browser_restarting = false;
                 state.update_stream_client().await;
                 state.browser_control.lock().await.begin_sign_in(
                     request.controller_id(),
@@ -225,11 +265,23 @@ pub(super) fn enter<'a>(
             Err(error) => Err(ControlError::new("browser_control_unavailable", error)),
         };
         if let Err(error) = &admitted {
-            eprintln!("[sign-in] could not start: {}", error.message);
+            session_log(
+                &state.session_id,
+                &format!("sign-in could not start: {}", error.message),
+            );
             if let Some(sign_in) = state.sign_in.take() {
                 sign_in.stop().await;
             }
-            let restored = relaunch_automation(state, automation, window, started + TRANSITION).await;
+            let restored = relaunch_automation(
+                state,
+                Relaunch {
+                    options: automation,
+                    window,
+                },
+                started + TRANSITION,
+            )
+            .await;
+            state.browser_restarting = false;
             state.browser_control.lock().await.end_lease();
             return Err(ControlError::new(
                 "browser_control_unavailable",
@@ -254,6 +306,8 @@ pub(super) fn hand_back(state: &mut DaemonState) -> BoxFuture<'_, ()> {
     async move {
         let deadline = Instant::now() + TRANSITION;
         if let Some(sign_in) = state.sign_in.take() {
+            state.browser_restarting = true;
+            state.publish_browser_status().await;
             let window = sign_in.display().map(|display| window_size(&display));
             let automation = sign_in.chrome.relaunch_options();
             sign_in.stop().await;
@@ -264,12 +318,13 @@ pub(super) fn hand_back(state: &mut DaemonState) -> BoxFuture<'_, ()> {
                         theme: state.theme,
                         ..options
                     };
-                    relaunch_automation(state, options, window, deadline).await;
+                    relaunch_automation(state, Relaunch { options, window }, deadline).await;
                 }
                 _ => {
-                    let _ = close_current_browser(state).await;
+                    let _ = close_current_browser(state, ClosedReason::RestartFailed).await;
                 }
             }
+            state.browser_restarting = false;
         }
         state.browser_control.lock().await.end_lease();
     }
@@ -284,7 +339,9 @@ pub(super) async fn maintain(state: &mut DaemonState) {
         return;
     };
     if sign_in.has_exited() {
-        let _ = close_current_browser(state).boxed().await;
+        let _ = close_current_browser(state, ClosedReason::Exited)
+            .boxed()
+            .await;
     } else if state
         .browser_control
         .lock()
@@ -295,20 +352,96 @@ pub(super) async fn maintain(state: &mut DaemonState) {
     }
 }
 
+/// A person restarts the view's browser after it exited or its relaunch
+/// failed: automation relaunches into the retained profile and window, as a
+/// hand-back does. Custody stays with the agent (no lease is granted), and
+/// the agent observes the new browser before acting on the old one's pages.
+/// With a browser running it answers as a restart that happened, so a
+/// repeated or late request changes nothing.
+pub(super) fn restart<'a>(
+    state: &'a mut DaemonState,
+    request: &'a ControlRequest,
+) -> BoxFuture<'a, Result<Value, RestartRefused>> {
+    async move {
+        if state.browser.is_some() || state.sign_in.is_some() {
+            return Ok(restarted(state));
+        }
+        let refused = |state: &DaemonState, code: &'static str, message: &str| RestartRefused {
+            error: ControlError::new(code, message),
+            reason: state.browser_closed,
+        };
+        if state
+            .browser_control
+            .lock()
+            .await
+            .controlled_by_another(request.controller_id(), std::time::Instant::now())
+        {
+            return Err(refused(
+                state,
+                "browser_control_conflict",
+                "Someone else controls the browser.",
+            ));
+        }
+        let Some(relaunch) = state.restart_from.clone().filter(|_| state.restartable()) else {
+            return Err(refused(
+                state,
+                "browser_control_unavailable",
+                "This browser cannot be restarted here. The agent's next action starts it again.",
+            ));
+        };
+        state.browser_restarting = true;
+        state.publish_browser_status().await;
+        // The session's theme now, never the one this browser launched with.
+        let relaunch = Relaunch {
+            options: LaunchOptions {
+                theme: state.theme,
+                ..relaunch.options
+            },
+            window: relaunch.window,
+        };
+        let back = relaunch_automation(state, relaunch, Instant::now() + TRANSITION).await;
+        state.browser_restarting = false;
+        if !back {
+            return Err(refused(
+                state,
+                "browser_control_unavailable",
+                "The browser could not restart.",
+            ));
+        }
+        state.browser_control.lock().await.restarted();
+        Ok(restarted(state))
+    }
+    .boxed()
+}
+
+/// Why a restart brought no browser back: the control error, and the status
+/// record's reason for the browser that stays closed.
+pub(crate) struct RestartRefused {
+    pub error: ControlError,
+    pub reason: ClosedReason,
+}
+
+fn restarted(state: &DaemonState) -> Value {
+    serde_json::json!({
+        "status": "restarted",
+        "surface": state.window_display().map(|display| display.surface()),
+    })
+}
+
 /// Relaunch automation into the retained profile and display through the
 /// post-launch sequence every local launch shares, which replays the
 /// session's page setup onto the restored tabs. Storage state and
 /// auto-restore are not reloaded: the profile already holds the session. On
-/// failure nothing is left running.
+/// failure nothing is left running, and a person may `restart` the same
+/// launch.
 async fn relaunch_automation(
     state: &mut DaemonState,
-    options: LaunchOptions,
-    window: (u32, u32),
+    relaunch: Relaunch,
     deadline: Instant,
 ) -> bool {
     let relaunched = match tokio::time::timeout_at(
         deadline,
-        BrowserManager::launch_window(options, Some("chrome"), window),
+        BrowserManager::launch_window(relaunch.options.clone(), Some("chrome"), relaunch.window),
     )
     .await
     {
@@ -317,8 +450,12 @@ async fn relaunch_automation(
         Err(_) => Err("The browser did not restart in time".to_string()),
     };
     if let Err(error) = &relaunched {
-        eprintln!("[sign-in] automation relaunch failed: {error}");
-        let _ = close_current_browser(state).await;
+        session_log(
+            &state.session_id,
+            &format!("automation relaunch failed: {error}"),
+        );
+        state.restart_from = Some(relaunch);
+        let _ = close_current_browser(state, ClosedReason::RestartFailed).await;
     }
     relaunched.is_ok()
 }

@@ -217,6 +217,8 @@ type Destroy = unsafe extern "C" fn(*mut Context) -> c_int;
 type Describe = unsafe extern "C" fn(*const Context) -> *const c_char;
 type ImageWrap =
     unsafe extern "C" fn(*mut Image, c_uint, c_uint, c_uint, c_uint, *mut u8) -> *mut Image;
+#[cfg(test)]
+type ConfigSet = unsafe extern "C" fn(*mut Context, *const EncoderConfig) -> c_int;
 
 /// The functions this encoder calls, resolved once per process.
 struct Api {
@@ -231,6 +233,8 @@ struct Api {
     error: Describe,
     error_detail: Describe,
     image_wrap: ImageWrap,
+    #[cfg(test)]
+    config_set: ConfigSet,
 }
 
 impl Api {
@@ -249,6 +253,8 @@ impl Api {
                 error: library.function(c"aom_codec_error")?,
                 error_detail: library.function(c"aom_codec_error_detail")?,
                 image_wrap: library.function(c"aom_img_wrap")?,
+                #[cfg(test)]
+                config_set: library.function(c"aom_codec_enc_config_set")?,
                 _library: library,
             })
         }
@@ -316,14 +322,59 @@ fn level(width: u32, height: u32) -> u8 {
         .map_or(16, |level| level.0)
 }
 
+/// libaom's configuration of one stream: its real-time defaults, then every
+/// field this encoder sets. libaom copies it at init.
+fn configuration(
+    api: &Api,
+    codec: VideoCodec,
+    width: u32,
+    height: u32,
+    threads: u32,
+) -> Result<Box<EncoderConfig>, VideoError> {
+    // SAFETY: an all-zero config is valid input; config_default fills
+    // at most the library's 904 bytes of this 4096-byte struct.
+    let mut config: Box<EncoderConfig> = Box::new(unsafe { std::mem::zeroed() });
+    // SAFETY: the interface function has no preconditions.
+    let interface = unsafe { (api.av1_cx)() };
+    // SAFETY: interface is libaom's AV1 encoder; config is large enough.
+    if unsafe { (api.config_default)(interface, &mut *config, USAGE_REALTIME) } != CODEC_OK {
+        return Err(VideoError::Unavailable(
+            "libaom refused its real-time defaults".into(),
+        ));
+    }
+    config.threads = threads.clamp(1, 64);
+    config.profile = match codec.chroma() {
+        Chroma::Subsampled => 0,
+        Chroma::Full => 1,
+    };
+    config.width = width;
+    config.height = height;
+    config.bit_depth = BITS_8;
+    config.input_bit_depth = BITS_8;
+    config.timebase = Rational {
+        numerator: 1,
+        denominator: 1_000_000,
+    };
+    config.error_resilient = 0;
+    config.pass = RC_ONE_PASS;
+    config.lag_in_frames = 0;
+    config.dropframe_threshold = 0;
+    config.end_usage = Q;
+    config.min_quantizer = 0;
+    config.max_quantizer = 63;
+    config.keyframe_mode = KF_DISABLED;
+    config.keyframe_max_distance = u32::MAX;
+    Ok(config)
+}
+
 /// Tile columns (log2) for `threads`: one tile per thread, at most four.
 /// Measured on the production node: eight threads over eight tiles cut a
 /// full-motion frame's latency by 7% at twice the CPU of four.
-fn tile_columns_log2(threads: u32) -> c_int {
+pub(crate) fn tile_columns_log2(threads: u32) -> c_int {
     threads.clamp(1, 4).next_power_of_two().trailing_zeros() as c_int
 }
 
-pub(super) struct AomEncoder {
+pub(crate) struct AomEncoder {
     api: &'static Api,
     context: Box<Context>,
     image: Box<Image>,
@@ -343,7 +394,7 @@ pub(super) struct AomEncoder {
 unsafe impl Send for AomEncoder {}
 
 impl AomEncoder {
-    pub(super) fn new(
+    pub(crate) fn new(
         codec: VideoCodec,
         width: u32,
         height: u32,
@@ -376,39 +427,9 @@ impl AomEncoder {
                 codec.token()
             )));
         }
-        // SAFETY: an all-zero config is valid input; config_default fills
-        // at most the library's 904 bytes of this 4096-byte struct.
-        let mut config: Box<EncoderConfig> = Box::new(unsafe { std::mem::zeroed() });
+        let config = configuration(api, codec, width, height, threads)?;
         // SAFETY: the interface function has no preconditions.
         let interface = unsafe { (api.av1_cx)() };
-        // SAFETY: interface is libaom's AV1 encoder; config is large enough.
-        if unsafe { (api.config_default)(interface, &mut *config, USAGE_REALTIME) } != CODEC_OK {
-            return Err(VideoError::Unavailable(
-                "libaom refused its real-time defaults".into(),
-            ));
-        }
-        config.threads = threads.clamp(1, 64);
-        config.profile = match chroma {
-            Chroma::Subsampled => 0,
-            Chroma::Full => 1,
-        };
-        config.width = width;
-        config.height = height;
-        config.bit_depth = BITS_8;
-        config.input_bit_depth = BITS_8;
-        config.timebase = Rational {
-            numerator: 1,
-            denominator: 1_000_000,
-        };
-        config.error_resilient = 0;
-        config.pass = RC_ONE_PASS;
-        config.lag_in_frames = 0;
-        config.dropframe_threshold = 0;
-        config.end_usage = Q;
-        config.min_quantizer = 0;
-        config.max_quantizer = 63;
-        config.keyframe_mode = KF_DISABLED;
-        config.keyframe_max_distance = u32::MAX;
         let mut context = Context::new();
         // SAFETY: context is zeroed and boxed (stable address); libaom copies
         // the config at init. The interface version is libaom's to check.
@@ -471,6 +492,23 @@ impl AomEncoder {
     #[cfg(test)]
     pub(super) fn tune(&mut self, id: c_int, value: c_int) -> Result<(), String> {
         self.control(id, value)
+    }
+
+    /// Threads and tile columns (log2) for the pictures that follow, for the
+    /// measurement harnesses only. libaom sizes its workers per picture and
+    /// grows its pool when a picture needs more; it takes a whole
+    /// configuration back, which also resets the quantizer's range, so the
+    /// next picture sets its quantizer again.
+    #[cfg(test)]
+    pub(crate) fn set_threads(&mut self, threads: u32, tile_columns: c_int) -> Result<(), String> {
+        let config = configuration(self.api, self.codec, self.width, self.height, threads)
+            .map_err(|error| error.to_string())?;
+        // SAFETY: an initialized context; libaom copies the configuration.
+        if unsafe { (self.api.config_set)(&mut *self.context, &*config) } != CODEC_OK {
+            return Err(self.api.describe(&self.context));
+        }
+        self.quantizer = None;
+        self.control(control::TILE_COLUMNS, tile_columns)
     }
 
     fn control(&mut self, id: c_int, value: c_int) -> Result<(), String> {
