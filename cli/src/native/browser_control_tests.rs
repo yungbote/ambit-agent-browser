@@ -1917,11 +1917,15 @@ async fn browser_ui_shortcuts_settle_prior_agent_modifiers_first() {
     assert_eq!(ops.try_recv().unwrap()["op"], "reset");
     let input = ops.try_recv().unwrap();
     assert_eq!(input["op"], "input");
-    assert!(input["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .all(|event| event["modifiers"] == 2));
+    let events = input["events"].as_array().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0]["eventType"], "keyDown");
+    assert_eq!(events[0]["modifiers"], 2);
+    assert_eq!(events[1]["eventType"], "keyUp");
+    assert_eq!(
+        events[1]["modifiers"], 0,
+        "the completed chord releases its synthetic Control"
+    );
     assert!(!control.native_mouse.needs_release());
 }
 

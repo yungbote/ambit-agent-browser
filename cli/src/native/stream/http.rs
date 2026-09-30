@@ -540,14 +540,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn cross_origin_command_post_is_rejected_without_relaying_to_daemon() {
-        let temp_parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("t");
-        std::fs::create_dir_all(&temp_parent).unwrap();
-        let socket_dir = tempfile::Builder::new()
-            .prefix("ab-")
-            .tempdir_in(temp_parent)
-            .unwrap();
+        // A repository/worktree path can exceed the Unix socket name limit.
+        // The scoped fixture needs only a private temporary socket directory.
+        let socket_dir = tempfile::Builder::new().prefix("ab-").tempdir().unwrap();
         let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
         guard.set(
             "AGENT_BROWSER_SOCKET_DIR",
@@ -667,14 +662,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "current_thread")]
     async fn same_origin_command_post_relays_without_wildcard_cors() {
-        let temp_parent = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("target")
-            .join("t");
-        std::fs::create_dir_all(&temp_parent).unwrap();
-        let socket_dir = tempfile::Builder::new()
-            .prefix("ab-")
-            .tempdir_in(temp_parent)
-            .unwrap();
+        // A repository/worktree path can exceed the Unix socket name limit.
+        // The scoped fixture needs only a private temporary socket directory.
+        let socket_dir = tempfile::Builder::new().prefix("ab-").tempdir().unwrap();
         let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR", "XDG_RUNTIME_DIR"]);
         guard.set(
             "AGENT_BROWSER_SOCKET_DIR",
