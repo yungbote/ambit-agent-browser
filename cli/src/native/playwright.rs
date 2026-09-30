@@ -1545,8 +1545,9 @@ mod tests {
     async fn e2e_playwright_frames_popups_files_and_real_pointer_share_native_owners() {
         use crate::native::actions::execute_command;
         let mut state = DaemonState::new();
-        let artifacts =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/playwright-e2e");
+        let artifacts = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/playwright-e2e")
+            .join(format!("ordinary-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&artifacts).unwrap();
         let output = serde_json::to_string(&artifacts).unwrap();
         let opened = Box::pin(execute_command(
@@ -1564,7 +1565,7 @@ mod tests {
             .to_owned();
         let code = r#"
 const {createServer} = await import('node:http');
-const {readFile} = await import('node:fs/promises');
+const {readFile,writeFile} = await import('node:fs/promises');
 const server = createServer((request, response) => {
   if (request.url === '/file') {
     response.writeHead(200, {'Content-Type':'text/plain','Content-Disposition':'attachment; filename=report.txt'});
@@ -1576,7 +1577,7 @@ const server = createServer((request, response) => {
   else if (request.url === '/popup') response.end('<title>Popup</title><button onclick="document.title=\'Popup clicked\'">Popup action</button>');
   else response.end(`<title>Playwright qualification</title><style>body{font:18px system-ui;padding:24px;height:2500px}button,input,a{margin:8px}iframe{display:block;width:600px;height:160px}</style><h1>Shared browser</h1><input aria-label="Name"><input type=file aria-label="Upload"><button id=dom onclick="window.domClicked=true">DOM action</button><a target=_blank href=/popup>Open popup</a><a href=/file>Download</a><iframe src="http://localhost:${server.address().port}/frame"></iframe><script>window.pointers=[];addEventListener('pointermove',e=>pointers.push({x:e.clientX,y:e.clientY,screenX:e.screenX,screenY:e.screenY,trusted:e.isTrusted}),true)</script>`);
 });
-await new Promise(resolve => server.listen(0, '0.0.0.0', resolve));
+await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 try {
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   const planted = await context.addCookies([{name:'planted',value:'yes',url:page.url()}]).then(() => null, (error) => error.message);
@@ -1603,15 +1604,28 @@ try {
   await page.mouse.wheel(0, 180);
   await page.waitForFunction(() => scrollY > 0);
   await page.screenshot({path:OUTPUT + '/page.png'});
-  return {name:await page.getByRole('textbox', {name:'Name',exact:true}).inputValue(), frame:await page.frameLocator('iframe').getByRole('textbox').inputValue(), popupTitle, text, pointer, beforeDomClick, afterDomClick, uploaded:await page.getByLabel('Upload').evaluate(el=>el.files[0].name), cookies:await context.cookies(), planted, scroll:await page.evaluate(()=>scrollY)};
-} finally { await new Promise(resolve => server.close(resolve)); }
+  await writeFile(OUTPUT + '/phase.txt','before-readonly');
+  const result = {name:await page.getByRole('textbox', {name:'Name',exact:true}).inputValue(), frame:await page.frameLocator('iframe').getByRole('textbox').inputValue(), popupTitle, text, pointer, beforeDomClick, afterDomClick, uploaded:await page.getByLabel('Upload').evaluate(el=>el.files[0].name), cookies:await context.cookies(), planted, scroll:await page.evaluate(()=>scrollY)};
+  await writeFile(OUTPUT + '/phase.txt','readonly-complete');
+  return result;
+} finally {
+  await writeFile(OUTPUT + '/phase.txt','server-close-start');
+  await new Promise(resolve => {server.close(resolve);server.closeAllConnections();});
+  await writeFile(OUTPUT + '/phase.txt','server-close-complete');
+}
 "#.replace("OUTPUT", &output);
         let result = Box::pin(execute_command(
             &json!({"action":"run_playwright","code":code,"timeoutMs":45000}),
             &mut state,
         ))
         .await;
-        assert_eq!(result["success"], true, "{result}");
+        let phase = std::fs::read_to_string(artifacts.join("phase.txt"))
+            .unwrap_or_else(|_| "phase was not reached".into());
+        eprintln!(
+            "ordinary_fixture_receipt={}",
+            json!({"artifacts":artifacts,"phase":phase})
+        );
+        assert_eq!(result["success"], true, "{result}; fixture phase={phase}");
         let values = &result["data"]["result"];
         assert_eq!(values["name"], "Ada Lovelace");
         assert_eq!(values["frame"], "Frame retained");
