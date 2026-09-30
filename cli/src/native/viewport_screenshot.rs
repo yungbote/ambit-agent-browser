@@ -102,7 +102,9 @@ pub(crate) async fn capture_base64(
     }
     let rgba = picture.rgba(before.crop)?;
     let format = options.format.clone();
-    let quality = options.quality.unwrap_or(75) as u8;
+    let quality = options
+        .quality
+        .unwrap_or(super::screenshot::DEFAULT_JPEG_QUALITY) as u8;
     let bytes = tokio::task::spawn_blocking(move || {
         // Preserve decoded pixels while avoiding the general image writer's
         // slow adaptive filter search on viewport-sized pictures.

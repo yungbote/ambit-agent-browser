@@ -10,6 +10,7 @@ use super::cdp::types::*;
 use super::element::RefMap;
 
 const ANNOTATION_OVERLAY_ID: &str = "__agent_browser_annotations__";
+pub(crate) const DEFAULT_JPEG_QUALITY: i32 = 80;
 
 #[derive(Debug, Clone)]
 struct Rect {
@@ -213,7 +214,7 @@ async fn capture_params(
     let mut params = CaptureScreenshotParams {
         format: Some(options.format.clone()),
         quality: if options.format == "jpeg" {
-            options.quality.or(Some(80))
+            options.quality.or(Some(DEFAULT_JPEG_QUALITY))
         } else {
             None
         },
