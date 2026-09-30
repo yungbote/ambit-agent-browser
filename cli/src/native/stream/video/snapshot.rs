@@ -39,6 +39,33 @@ pub(crate) struct Snapshot {
 }
 
 impl Snapshot {
+    #[cfg(test)]
+    pub(crate) fn test_picture() -> Self {
+        let surface = Surface {
+            cursor_included: false,
+            ..Surface::new(2, 2)
+        };
+        Self {
+            bounds: CaptureBounds {
+                requested_us: 100,
+                received_us: 120,
+                picture_us: 110,
+            },
+            surface,
+            visible: Rect {
+                x: 0,
+                y: 0,
+                width: 2,
+                height: 2,
+            },
+            layout_epoch: 3,
+            input_seq: None,
+            width: 2,
+            height: 2,
+            stride: 8,
+            pixels: Arc::from(vec![0u8; 16]),
+        }
+    }
     fn copy(
         reply: &PictureReply,
         pixels: &[u8],

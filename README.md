@@ -96,6 +96,8 @@ Clicks fail early when another element covers the target's click point, for exam
 
 Headless Chromium screenshots hide native scrollbars for consistent image output. Pass `--hide-scrollbars false` when launching to keep native scrollbars visible.
 
+In an owned Linux browser window, default viewport screenshots, image comparisons and vision feedback share the displayed page picture when its foreground page and viewport mapping are proven. No video viewer is required. Full-page, element and annotated captures retain renderer capture; an unavailable display proof falls back to it. Screenshot pixels omit the cursor, which the browser viewer draws separately.
+
 ### Traditional Selectors (also supported)
 
 ```bash

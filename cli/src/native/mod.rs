@@ -61,6 +61,8 @@ pub(crate) mod theme;
 #[allow(dead_code)]
 pub mod tracing;
 pub(crate) mod video;
+#[cfg(target_os = "linux")]
+pub(crate) mod viewport_screenshot;
 #[allow(dead_code)]
 pub mod webdriver;
 #[allow(dead_code)]

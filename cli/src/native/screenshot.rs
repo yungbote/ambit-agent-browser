@@ -1,6 +1,7 @@
 use serde::Serialize;
 use serde_json::Value;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use std::collections::HashMap;
 
@@ -95,15 +96,36 @@ impl Serialize for ScreenshotAnnotation {
     }
 }
 
+/// Named and diff screenshots share the optional foreground picture source.
+pub(crate) async fn take_for(
+    state: &super::actions::DaemonState,
+    options: &ScreenshotOptions,
+) -> Result<ScreenshotResult, String> {
+    #[cfg(target_os = "linux")]
+    if let Some(picture) = super::viewport_screenshot::take(state, options).await? {
+        return Ok(picture);
+    }
+    let browser = state.browser.as_ref().ok_or("Browser not launched")?;
+    take_screenshot(
+        &browser.client,
+        browser.active_session_id()?,
+        &state.ref_map,
+        options,
+        &state.iframe_sessions,
+    )
+    .await
+}
+
 /// Captures a screenshot via CDP and optionally overlays numbered annotations
 /// that mirror the Node.js screenshot `annotate` mode.
 pub async fn take_screenshot(
-    client: &CdpClient,
+    client: &Arc<CdpClient>,
     session_id: &str,
     ref_map: &RefMap,
     options: &ScreenshotOptions,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<ScreenshotResult, String> {
+    let generation = client.page_generation(session_id);
     let target_rect = if options.annotate {
         match options.selector.as_deref() {
             Some(selector) => {
@@ -123,21 +145,15 @@ pub async fn take_screenshot(
     };
 
     let overlay_items = filter_annotations(raw_annotations, target_rect.as_ref());
-    let overlay_injected = if options.annotate && !overlay_items.is_empty() {
-        inject_annotation_overlay(client, session_id, &overlay_items).await?;
-        true
-    } else {
-        false
-    };
-
-    let base64 =
-        capture_screenshot_base64(client, session_id, ref_map, options, iframe_sessions).await;
-
-    if overlay_injected {
-        let _ = remove_annotation_overlay(client, session_id).await;
-    }
-
-    let base64 = base64?;
+    let params = capture_params(client, session_id, ref_map, options, iframe_sessions).await?;
+    let base64 = capture_prepared(
+        client.clone(),
+        session_id.into(),
+        generation,
+        params,
+        overlay_items.clone(),
+    )
+    .await?;
     let annotations = if options.annotate {
         let scroll = if options.full_page {
             Some(get_scroll_offsets(client, session_id).await?)
@@ -169,12 +185,31 @@ pub async fn take_screenshot(
 }
 
 pub(crate) async fn capture_screenshot_base64(
-    client: &CdpClient,
+    client: &Arc<CdpClient>,
     session_id: &str,
     ref_map: &RefMap,
     options: &ScreenshotOptions,
     iframe_sessions: &HashMap<String, String>,
 ) -> Result<String, String> {
+    let generation = client.page_generation(session_id);
+    let params = capture_params(client, session_id, ref_map, options, iframe_sessions).await?;
+    capture_prepared(
+        client.clone(),
+        session_id.into(),
+        generation,
+        params,
+        Vec::new(),
+    )
+    .await
+}
+
+async fn capture_params(
+    client: &CdpClient,
+    session_id: &str,
+    ref_map: &RefMap,
+    options: &ScreenshotOptions,
+    iframe_sessions: &HashMap<String, String>,
+) -> Result<CaptureScreenshotParams, String> {
     let mut params = CaptureScreenshotParams {
         format: Some(options.format.clone()),
         quality: if options.format == "jpeg" {
@@ -221,11 +256,113 @@ pub(crate) async fn capture_screenshot_base64(
         }
     }
 
-    let result: CaptureScreenshotResult = client
-        .send_command_typed("Page.captureScreenshot", &params, Some(session_id))
-        .await?;
+    Ok(params)
+}
 
-    Ok(result.data)
+/// The temporary presentation belongs to this cleanup task, rather than
+/// its caller's lifetime. A cancelled caller cannot strand the clip or
+/// annotation raster; source admission stays fenced until restoration.
+async fn capture_prepared(
+    client: Arc<CdpClient>,
+    session: String,
+    generation: String,
+    params: CaptureScreenshotParams,
+    overlay: Vec<RawAnnotation>,
+) -> Result<String, String> {
+    let (reply, answer) = tokio::sync::oneshot::channel();
+    tokio::spawn(async move {
+        let result = async {
+            let _order = client.presentations.order.clone().lock_owned().await;
+            // A queued cancelled request has changed nothing. Retain cleanup
+            // only once this task owns and begins the temporary presentation.
+            if reply.is_closed() {
+                return Err("The screenshot request ended before capture.".into());
+            }
+            if client.page_generation(&session) != generation {
+                return Err("The page changed before screenshot capture.".into());
+            }
+            let temporary = params.clip.is_some() || !overlay.is_empty();
+            if temporary {
+                client.presentations.begin(&session, &generation);
+            }
+            let injected = if overlay.is_empty() {
+                Ok(())
+            } else {
+                inject_annotation_overlay(&client, &session, &overlay).await
+            };
+            let captured: Result<CaptureScreenshotResult, String> = match injected {
+                Ok(()) => {
+                    client
+                        .send_command_typed("Page.captureScreenshot", &params, Some(&session))
+                        .await
+                }
+                Err(error) => Err(error),
+            };
+            // Never clean up or paint by retargeting a successor document.
+            if client.page_generation(&session) != generation {
+                return Err("The page changed during screenshot capture.".into());
+            }
+            let removed = if overlay.is_empty() {
+                Ok(())
+            } else {
+                remove_annotation_overlay(&client, &session).await
+            };
+            let painted = if temporary {
+                paint_viewport_unlocked(&client, &session).await
+            } else {
+                Ok(())
+            };
+            if (temporary || captured.is_ok())
+                && removed.is_ok()
+                && painted.is_ok()
+                && client.page_generation(&session) == generation
+            {
+                client.presentations.publish(&session, &generation);
+            }
+            let captured = captured?;
+            removed?;
+            painted?;
+            if client.page_generation(&session) != generation {
+                return Err("The page changed during screenshot capture.".into());
+            }
+            Ok(captured.data)
+        }
+        .await;
+        let _ = reply.send(result);
+    });
+    answer
+        .await
+        .map_err(|error| format!("The screenshot cleanup stopped: {error}"))?
+}
+
+/// Publish the full current viewport without creating another temporary
+/// clip. This is a rendering fence after capture-only presentation changes,
+/// and the channel's conditional first-paint guarantee before discrete input.
+pub(crate) async fn paint_viewport(
+    client: &Arc<CdpClient>,
+    session_id: &str,
+) -> Result<(), String> {
+    let _order = client.presentations.order.clone().lock_owned().await;
+    let generation = client.page_generation(session_id);
+    paint_viewport_unlocked(client, session_id).await?;
+    if client.page_generation(session_id) == generation {
+        client.presentations.publish(session_id, &generation);
+    }
+    Ok(())
+}
+
+async fn paint_viewport_unlocked(client: &CdpClient, session_id: &str) -> Result<(), String> {
+    client
+        .send_command(
+            "Page.captureScreenshot",
+            Some(serde_json::json!({
+                "format":"jpeg", "quality":1, "fromSurface":true,
+                "captureBeyondViewport":false,
+            })),
+            Some(session_id),
+        )
+        .await
+        .map(|_| ())
 }
 
 async fn collect_annotations(
@@ -551,7 +688,7 @@ fn project_annotations(
         .collect()
 }
 
-fn save_screenshot(
+pub(crate) fn save_screenshot(
     base64_data: &str,
     explicit_path: Option<&str>,
     ext: &str,
@@ -602,6 +739,237 @@ fn get_screenshot_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::{SinkExt, StreamExt};
+
+    async fn controlled_peer() -> (
+        Arc<CdpClient>,
+        tokio::sync::mpsc::Receiver<(Value, tokio::sync::oneshot::Sender<Value>)>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (send, receive) = tokio::sync::mpsc::channel(8);
+        let peer = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut ws = tokio_tungstenite::accept_async(stream).await.unwrap();
+            while let Some(Ok(message)) = ws.next().await {
+                let Ok(text) = message.to_text() else {
+                    continue;
+                };
+                let Ok(command) = serde_json::from_str::<Value>(text) else {
+                    continue;
+                };
+                let (ack, answer) = tokio::sync::oneshot::channel::<Value>();
+                if send.send((command.clone(), ack)).await.is_err() {
+                    break;
+                }
+                let Ok(mut answer) = answer.await else { break };
+                answer["id"] = command["id"].clone();
+                if ws
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        answer.to_string(),
+                    ))
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let client = Arc::new(
+            CdpClient::connect(&format!("ws://{address}"))
+                .await
+                .unwrap(),
+        );
+        (client, receive, peer)
+    }
+
+    fn clipped_params() -> CaptureScreenshotParams {
+        CaptureScreenshotParams {
+            format: Some("png".into()),
+            quality: None,
+            clip: Some(Viewport {
+                x: 10.,
+                y: 10.,
+                width: 20.,
+                height: 20.,
+                scale: 1.,
+            }),
+            from_surface: Some(true),
+            capture_beyond_viewport: Some(false),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancelled_queued_capture_starts_no_temporary_presentation() {
+        let (client, mut commands, peer) = controlled_peer().await;
+        let generation = client.page_generation("page");
+        let order = client.presentations.order.lock().await;
+        {
+            let pending = capture_prepared(
+                client.clone(),
+                "page".into(),
+                generation.clone(),
+                clipped_params(),
+                Vec::new(),
+            );
+            tokio::pin!(pending);
+            assert!(futures_util::poll!(pending.as_mut()).is_pending());
+        } // Cancels the request before the presentation lock is available.
+        drop(order);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), commands.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(client.presentations.observe("page", &generation), Some(0));
+        peer.abort();
+        client.closed().await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_a_clip_keeps_restoration_owned_and_pixels_fenced_until_ack() {
+        let (client, mut commands, peer) = controlled_peer().await;
+        let generation = client.page_generation("page");
+        let owner = client.clone();
+        let original = generation.clone();
+        let caller = tokio::spawn(async move {
+            capture_prepared(owner, "page".into(), original, clipped_params(), Vec::new()).await
+        });
+        let (clip, ack) = commands.recv().await.unwrap();
+        assert!(clip["params"].get("clip").is_some());
+        assert_eq!(client.presentations.observe("page", &generation), None);
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        ack.send(serde_json::json!({"result":{"data":"clip"}}))
+            .unwrap();
+        let (restore, ack) =
+            tokio::time::timeout(std::time::Duration::from_secs(1), commands.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        assert_eq!(restore["method"], "Page.captureScreenshot");
+        assert!(restore["params"].get("clip").is_none());
+        assert_eq!(restore["params"]["captureBeyondViewport"], false);
+        assert_eq!(client.presentations.observe("page", &generation), None);
+        ack.send(serde_json::json!({"result":{"data":"viewport"}}))
+            .unwrap();
+        let _finished = client.presentations.order.lock().await;
+        assert_eq!(client.presentations.observe("page", &generation), Some(1));
+        peer.abort();
+        client.closed().await;
+    }
+
+    #[tokio::test]
+    async fn failed_restoration_cannot_admit_native_pixels() {
+        let (client, mut commands, peer) = controlled_peer().await;
+        let generation = client.page_generation("page");
+        let owner = client.clone();
+        let original = generation.clone();
+        let caller = tokio::spawn(async move {
+            capture_prepared(owner, "page".into(), original, clipped_params(), Vec::new()).await
+        });
+        let (_, ack) = commands.recv().await.unwrap();
+        ack.send(serde_json::json!({"result":{"data":"clip"}}))
+            .unwrap();
+        let (_, ack) = commands.recv().await.unwrap();
+        ack.send(serde_json::json!({"error":{"code":-1,"message":"restored paint unavailable"}}))
+            .unwrap();
+        assert!(caller
+            .await
+            .unwrap()
+            .unwrap_err()
+            .contains("restored paint unavailable"));
+        assert_eq!(client.presentations.observe("page", &generation), None);
+        // Failed fallback capture cannot publish the stranded presentation.
+        let owner = client.clone();
+        let original = generation.clone();
+        let mut params = clipped_params();
+        params.clip = None;
+        let fallback = tokio::spawn(async move {
+            capture_prepared(owner, "page".into(), original, params, Vec::new()).await
+        });
+        let (_, ack) = commands.recv().await.unwrap();
+        ack.send(serde_json::json!({"error":{"code":-1,"message":"fallback also unavailable"}}))
+            .unwrap();
+        assert!(fallback.await.unwrap().is_err());
+        assert_eq!(client.presentations.observe("page", &generation), None);
+        peer.abort();
+        client.closed().await;
+    }
+
+    #[tokio::test]
+    async fn original_capture_cleanup_never_paints_a_successor_document() {
+        let (client, mut commands, peer) = controlled_peer().await;
+        let generation = client.page_generation("page");
+        let owner = client.clone();
+        let original = generation.clone();
+        let caller = tokio::spawn(async move {
+            capture_prepared(owner, "page".into(), original, clipped_params(), Vec::new()).await
+        });
+        let (_, ack) = commands.recv().await.unwrap();
+        client.rotate_page_generation("page");
+        ack.send(serde_json::json!({"result":{"data":"clip"}}))
+            .unwrap();
+        assert!(caller.await.unwrap().unwrap_err().contains("page changed"));
+        assert!(commands.try_recv().is_err());
+        assert_eq!(client.presentations.observe("page", &generation), None);
+        assert_eq!(
+            client
+                .presentations
+                .observe("page", &client.page_generation("page")),
+            Some(0)
+        );
+        peer.abort();
+        client.closed().await;
+    }
+
+    #[tokio::test]
+    async fn cancelling_annotation_capture_still_removes_overlay_and_publishes_viewport() {
+        let (client, mut commands, peer) = controlled_peer().await;
+        let generation = client.page_generation("page");
+        let owner = client.clone();
+        let original = generation.clone();
+        let overlay = vec![RawAnnotation {
+            ref_id: "e1".into(),
+            number: 1,
+            role: "button".into(),
+            name: None,
+            rect: Rect {
+                x: 10.,
+                y: 10.,
+                width: 20.,
+                height: 20.,
+            },
+        }];
+        let caller = tokio::spawn(async move {
+            capture_prepared(owner, "page".into(), original, clipped_params(), overlay).await
+        });
+        let (inject, ack) = commands.recv().await.unwrap();
+        assert_eq!(inject["method"], "Runtime.evaluate");
+        caller.abort();
+        assert!(caller.await.unwrap_err().is_cancelled());
+        ack.send(serde_json::json!({"result":{"result":{"type":"boolean","value":true}}}))
+            .unwrap();
+        let (_, ack) = commands.recv().await.unwrap();
+        ack.send(serde_json::json!({"result":{"data":"clip"}}))
+            .unwrap();
+        let (remove, ack) = commands.recv().await.unwrap();
+        assert!(remove["params"]["expression"]
+            .as_str()
+            .unwrap()
+            .contains("var el"));
+        ack.send(serde_json::json!({"result":{"result":{"type":"boolean","value":true}}}))
+            .unwrap();
+        let (restore, ack) = commands.recv().await.unwrap();
+        assert!(restore["params"].get("clip").is_none());
+        ack.send(serde_json::json!({"result":{"data":"viewport"}}))
+            .unwrap();
+        let _finished = client.presentations.order.lock().await;
+        assert_eq!(client.presentations.observe("page", &generation), Some(1));
+        peer.abort();
+        client.closed().await;
+    }
 
     #[test]
     fn filters_annotations_to_target_overlap() {

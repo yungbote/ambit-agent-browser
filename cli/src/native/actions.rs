@@ -6347,14 +6347,7 @@ async fn handle_screenshot(cmd: &Value, state: &mut DaemonState) -> Result<Value
         .await?;
     }
 
-    let result = screenshot::take_screenshot(
-        &mgr.client,
-        &session_id,
-        &state.ref_map,
-        &options,
-        &state.iframe_sessions,
-    )
-    .await?;
+    let result = screenshot::take_for(state, &options).await?;
 
     let mut response = json!({ "path": result.path });
     if !result.annotations.is_empty() {
@@ -11739,8 +11732,7 @@ async fn handle_window_new(cmd: &Value, state: &mut DaemonState) -> Result<Value
 }
 
 async fn handle_diff_screenshot(cmd: &Value, state: &DaemonState) -> Result<Value, String> {
-    let mgr = state.browser.as_ref().ok_or("Browser not launched")?;
-    let session_id = mgr.active_session_id()?.to_string();
+    state.browser.as_ref().ok_or("Browser not launched")?;
     let baseline_path = cmd
         .get("baseline")
         .and_then(|v| v.as_str())
@@ -11764,14 +11756,7 @@ async fn handle_diff_screenshot(cmd: &Value, state: &DaemonState) -> Result<Valu
         output_dir: None,
     };
 
-    let result = screenshot::take_screenshot(
-        &mgr.client,
-        &session_id,
-        &state.ref_map,
-        &options,
-        &state.iframe_sessions,
-    )
-    .await?;
+    let result = screenshot::take_for(state, &options).await?;
 
     let current_bytes =
         base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &result.base64)

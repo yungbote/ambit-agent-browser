@@ -3,6 +3,7 @@ pub mod client;
 pub mod discovery;
 pub mod lightpanda;
 mod pointer;
+mod presentation;
 pub(crate) mod profiles;
 #[cfg(test)]
 mod round_trip_e2e;

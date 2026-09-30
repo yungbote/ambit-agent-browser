@@ -26,6 +26,17 @@ pub(crate) mod paced;
 
 pub(crate) use interrupts::{InterruptReason, Interruption, Interrupts};
 
+/// Exact native viewport proof for a screenshot of the foreground page.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ViewportPictureBinding {
+    pub surface: super::display::Surface,
+    pub layout_epoch: u64,
+    pub page_generation: String,
+    pub presentation: u64,
+    pub context: i64,
+    pub crop: super::display::Rect,
+}
+
 pub(crate) const ACTION: &str = "ambit_browser_control";
 const MAX_LEASE_MS: u64 = 30_000;
 const MAX_REQUEST_BYTES: usize = 65_536;
@@ -740,6 +751,40 @@ impl BrowserControl {
             }
         }
         Ok(())
+    }
+
+    /// Read-only picture binding; absent native mapping or human sign-in
+    /// keeps the existing CDP screenshot source. No input is dispatched.
+    pub(crate) async fn viewport_picture_binding(
+        &self,
+        client: &CdpClient,
+        session: &str,
+    ) -> Result<Option<ViewportPictureBinding>, String> {
+        if self.signing_in() {
+            return Ok(None);
+        };
+        let Some(display) = self.display.as_ref() else {
+            return Ok(None);
+        };
+        let generation = client.page_generation(session);
+        let Some(presentation) = client.presentations.observe(session, &generation) else {
+            return Ok(None);
+        };
+        let Some((crop, context)) = self
+            .native_mouse
+            .viewport_picture_crop(client, session, display)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(ViewportPictureBinding {
+            surface: display.surface(),
+            layout_epoch: display.layout_epoch(),
+            page_generation: generation,
+            presentation,
+            context,
+            crop,
+        }))
     }
 
     /// Programs may leave explicit key/button down calls outstanding. Settle

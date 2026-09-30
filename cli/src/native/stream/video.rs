@@ -88,21 +88,16 @@ impl VideoHub {
     /// A subscription to `display`'s pictures in `codec`, from the producer
     /// that already serves it or a new one.
     #[cfg(target_os = "linux")]
-    fn subscribe(
-        &self,
-        display: &Arc<DisplayClient>,
-        codec: VideoCodec,
-        rate: u32,
-    ) -> Result<Subscription, VideoError> {
+    fn producer_for(&self, display: &Arc<DisplayClient>) -> Result<Arc<Producer>, VideoError> {
         let mut current = self
             .producer
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let producer = match current
+        match current
             .upgrade()
             .filter(|producer| producer.serves(display))
         {
-            Some(producer) => producer,
+            Some(producer) => Ok(producer),
             None => {
                 let producer = Producer::start(producer::Source {
                     display: display.clone(),
@@ -111,10 +106,57 @@ impl VideoHub {
                     runtime: tokio::runtime::Handle::current(),
                 })?;
                 *current = Arc::downgrade(&producer);
-                producer
+                Ok(producer)
             }
-        };
-        producer.subscribe(codec, rate)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn subscribe(
+        &self,
+        display: &Arc<DisplayClient>,
+        codec: VideoCodec,
+        rate: u32,
+    ) -> Result<Subscription, VideoError> {
+        self.producer_for(display)?.subscribe(codec, rate)
+    }
+
+    /// Demand on the same producer used by every video subscriber, retaining
+    /// that producer until the capture answers even when there is no viewer.
+    #[cfg(target_os = "linux")]
+    pub(super) async fn snapshot(
+        &self,
+        display: &Arc<DisplayClient>,
+        after_us: u64,
+    ) -> Result<Arc<snapshot::Snapshot>, String> {
+        let current = self.display.read().await.clone();
+        if !current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, display))
+        {
+            return Err("The display changed before screenshot capture.".into());
+        }
+        let producer = self
+            .producer_for(display)
+            .map_err(|error| error.to_string())?;
+        let receive = producer
+            .snapshot(after_us)
+            .map_err(|error| error.to_string())?;
+        let picture = tokio::time::timeout(std::time::Duration::from_secs(2), receive)
+            .await
+            .map_err(|_| "The picture producer did not capture a screenshot before its deadline.")?
+            .map_err(|_| "The picture producer ended before screenshot capture.")??;
+        drop(producer);
+        if !self
+            .display
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, display))
+        {
+            return Err("The display changed during screenshot capture.".into());
+        }
+        Ok(picture)
     }
 
     #[cfg(not(target_os = "linux"))]

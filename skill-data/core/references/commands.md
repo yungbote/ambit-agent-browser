@@ -101,6 +101,8 @@ agent-browser is checked @e1      # Check if checked
 
 ## Screenshots and PDF
 
+Default viewport screenshots and image comparisons share the displayed foreground picture in an owned Linux window when the page and viewport mapping are proven, including without a video viewer. Full-page, element and annotated captures retain renderer capture. An unavailable display proof uses the existing renderer path; cursor pixels remain excluded.
+
 ```bash
 agent-browser screenshot          # Save to temporary directory
 agent-browser screenshot path.png # Save to specific path

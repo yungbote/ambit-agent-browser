@@ -589,7 +589,7 @@ impl Landing {
 /// the same way, so the next step's input reaches the page. The check reads
 /// the page's own paint timing: a page that misreports it keeps only its
 /// own input from arriving, as it could by ignoring that input.
-async fn painted(client: &CdpClient, session: &str) {
+async fn painted(client: &Arc<CdpClient>, session: &str) {
     let paint = async {
         let read = client
             .send_command(
@@ -602,14 +602,10 @@ async fn painted(client: &CdpClient, session: &str) {
             )
             .await;
         if !read.is_ok_and(|read| read["result"]["value"] == true) {
-            let _ = client
-                .send_command(
-                    "Page.captureScreenshot",
-                    Some(json!({ "format": "jpeg", "quality": 1,
-                        "clip": { "x": 0, "y": 0, "width": 1, "height": 1, "scale": 1 } })),
-                    Some(session),
-                )
-                .await;
+            // A tiny clipped capture forces paint but leaves a temporary
+            // clip raster in the native surface until restoration paints.
+            // Use the canonical full viewport fence for the same guarantee.
+            let _ = super::super::screenshot::paint_viewport(client, session).await;
         }
     };
     let _ = tokio::time::timeout(PAINT_WAIT, paint).await;

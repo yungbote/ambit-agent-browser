@@ -2183,6 +2183,9 @@ Captures a screenshot of the current page. If no path is provided,
 saves to a temporary directory with a generated filename.
 Headless Chromium screenshots hide native scrollbars for consistent image output.
 Pass --hide-scrollbars false when launching to keep native scrollbars visible.
+Owned Linux windows share the proven foreground viewport picture for default
+screenshots and image comparisons, including without a video viewer.
+Full-page, element and annotated captures retain renderer capture.
 
 Options:
   --full, -f           Capture full page (not just viewport)
