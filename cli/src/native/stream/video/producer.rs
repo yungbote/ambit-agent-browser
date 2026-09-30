@@ -72,6 +72,7 @@ struct Inner {
 #[derive(Default)]
 struct State {
     encodings: Vec<Arc<Encoding>>,
+    snapshots: super::snapshot::Requests,
     /// The failure that ended the producer, if one did.
     failed: Option<String>,
 }
@@ -188,6 +189,27 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Producer {
+    /// Demand on the existing capture thread; no second picture reader.
+    pub(crate) fn snapshot(
+        &self,
+        after_us: u64,
+    ) -> Result<
+        tokio::sync::oneshot::Receiver<Result<Arc<super::snapshot::Snapshot>, String>>,
+        VideoError,
+    > {
+        let receive = {
+            let mut state = lock(&self.inner.state);
+            if self.inner.stopping.load(Ordering::Acquire) {
+                return Err(VideoError::Unavailable(
+                    "the picture producer has stopped".into(),
+                ));
+            }
+            state.snapshots.request(after_us)
+        };
+        self.inner.nudge();
+        Ok(receive)
+    }
+
     /// A producer of `source`'s pictures; it captures once it has a
     /// subscriber and stops when the last reference goes.
     pub(crate) fn start(source: Source) -> Result<Arc<Self>, VideoError> {
@@ -279,7 +301,11 @@ impl Inner {
 
     fn stop(&self) {
         self.stopping.store(true, Ordering::Release);
-        let encodings = std::mem::take(&mut lock(&self.state).encodings);
+        let encodings = {
+            let mut state = lock(&self.state);
+            state.snapshots.fail("the picture producer has stopped");
+            std::mem::take(&mut state.encodings)
+        };
         for encoding in encodings {
             encoding.stop();
         }
@@ -292,6 +318,7 @@ impl Inner {
         let encodings = {
             let mut state = lock(&self.state);
             state.failed.get_or_insert(reason.clone());
+            state.snapshots.fail(&reason);
             std::mem::take(&mut state.encodings)
         };
         for encoding in encodings {
@@ -589,6 +616,18 @@ fn capture_loop(inner: Weak<Inner>) {
                 surface,
                 input_seq: inner.source.media.applied_input_at(ts),
             };
+            lock(&inner.state).snapshots.captured(
+                reply,
+                pixels,
+                capture.surface.clone(),
+                inner.source.display.layout_epoch(),
+                super::snapshot::CaptureBounds {
+                    requested_us: requested,
+                    received_us: crate::native::stream::monotonic_us(),
+                    picture_us: ts,
+                },
+                capture.input_seq,
+            );
             for encoding in &encodings {
                 encoding.mark(reply);
             }
@@ -623,8 +662,28 @@ fn plan(inner: &Inner) -> Option<Plan> {
             return None;
         }
         let now = Instant::now();
+        let snapshot = state.snapshots.pending();
+        // Ready video receives the same picture at its ordinary cadence. With
+        // no scheduled capture, snapshot demand needs neither encoder nor a second reader.
         state = match decide(&state.encodings, now) {
-            Decision::Capture(plan) => return Some(plan),
+            Decision::Capture(mut plan) => {
+                if snapshot {
+                    plan.request.force = true;
+                    plan.request.wait_ms = 0;
+                }
+                return Some(plan);
+            }
+            Decision::Wait(None) if snapshot => {
+                return Some(Plan {
+                    request: PictureRequest {
+                        cursor: false,
+                        force: true,
+                        wait_ms: 0,
+                        cursor_identity: false,
+                    },
+                    encodings: Vec::new(),
+                })
+            }
             Decision::Wait(Some(at)) => {
                 inner
                     .wake
