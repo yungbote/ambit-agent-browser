@@ -1,11 +1,13 @@
 //! Exact attached/captured values at the model output boundary. The registry
 //! survives detach: a value already copied by a page must remain redacted.
 
+use std::borrow::Cow;
 use std::collections::BTreeSet;
 use std::sync::{Arc, RwLock};
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 pub(crate) const MARKER: &str = "[redacted credential]";
 
@@ -19,13 +21,6 @@ impl Redaction {
         }
         let mut values = self.0.write().unwrap_or_else(|error| error.into_inner());
         values.insert(value.to_owned());
-        values.insert(urlencoding::encode(value).into_owned());
-        values.insert(STANDARD.encode(value.as_bytes()));
-        values.insert(hex::encode(value.as_bytes()));
-        values.insert(hex::encode_upper(value.as_bytes()));
-        if let Ok(escaped) = serde_json::to_string(value) {
-            values.insert(escaped[1..escaped.len() - 1].to_owned());
-        }
     }
 
     /// Keys may carry stored values too. Never print an input in an error.
@@ -73,10 +68,27 @@ impl Redaction {
 
     pub(crate) fn scrub(&self, value: &mut Value) {
         let values = self.0.read().unwrap_or_else(|error| error.into_inner());
-        // Longer secrets first: replacing a prefix must not expose a suffix.
-        let mut values: Vec<&str> = values.iter().map(String::as_str).collect();
-        values.sort_unstable_by_key(|text| std::cmp::Reverse(text.len()));
-        scrub(value, &values);
+        let longest = longest_value(value);
+        let mut unique = BTreeSet::new();
+        let mut variants = Vec::new();
+        for raw in values.iter().filter(|raw| raw.len() <= longest) {
+            for encoding in Encoding::ALL {
+                let encoded = encoding.encode(raw);
+                if encoded.len() <= longest {
+                    let digest: [u8; 32] = Sha256::digest(encoded.as_bytes()).into();
+                    if unique.insert((encoded.len(), digest)) {
+                        variants.push((encoded.len(), raw.as_str(), encoding));
+                    }
+                }
+            }
+        }
+        // Keep the existing longest-first rule without retaining every
+        // expanded encoding beside the full browser state. A value larger
+        // than every output leaf cannot occur in that output in any encoding.
+        variants.sort_unstable_by_key(|(bytes, _, _)| std::cmp::Reverse(*bytes));
+        for (_, raw, encoding) in variants {
+            scrub(value, &[encoding.encode(raw).as_ref()]);
+        }
     }
 
     /// Native response metadata belongs to the protocol. Only model data
@@ -199,6 +211,57 @@ impl Redaction {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Encoding {
+    Plain,
+    Url,
+    Base64,
+    Hex,
+    UpperHex,
+    Json,
+}
+
+impl Encoding {
+    const ALL: [Self; 6] = [
+        Self::Plain,
+        Self::Url,
+        Self::Base64,
+        Self::Hex,
+        Self::UpperHex,
+        Self::Json,
+    ];
+
+    fn encode(self, value: &str) -> Cow<'_, str> {
+        match self {
+            Self::Plain => Cow::Borrowed(value),
+            Self::Url => urlencoding::encode(value),
+            Self::Base64 => Cow::Owned(STANDARD.encode(value.as_bytes())),
+            Self::Hex => Cow::Owned(hex::encode(value.as_bytes())),
+            Self::UpperHex => Cow::Owned(hex::encode_upper(value.as_bytes())),
+            Self::Json => {
+                let mut escaped = serde_json::to_string(value).expect("a string is JSON encodable");
+                escaped.pop();
+                escaped.remove(0);
+                Cow::Owned(escaped)
+            }
+        }
+    }
+}
+
+fn longest_value(value: &Value) -> usize {
+    match value {
+        Value::String(value) => value.len(),
+        Value::Number(_) | Value::Bool(_) => value.to_string().len(),
+        Value::Array(values) => values.iter().map(longest_value).max().unwrap_or(0),
+        Value::Object(values) => values
+            .iter()
+            .map(|(key, value)| key.len().max(longest_value(value)))
+            .max()
+            .unwrap_or(0),
+        Value::Null => 0,
+    }
+}
+
 fn text(value: &str, values: &[&str]) -> String {
     if values.contains(&value) {
         return MARKER.into();
@@ -207,7 +270,7 @@ fn text(value: &str, values: &[&str]) -> String {
     for value in values {
         // Small settings such as `1`, `a` or `true` are protected as whole
         // scalar values. Substring replacement would erase ordinary prose.
-        if value.len() >= 8 {
+        if value.len() >= 8 && result.contains(value) {
             result = result.replace(value, MARKER);
         }
     }
@@ -250,6 +313,62 @@ mod tests {
         registry.scrub(&mut output);
         assert_eq!(output[MARKER], json!(vec![MARKER; 5]));
         assert_eq!(output["safe"], "a useful answer");
+    }
+
+    #[test]
+    fn custody_registry_retains_one_copy_of_a_large_value() {
+        let registry = Redaction::default();
+        let canary = "nosecret-capacity-registry-".to_owned() + &"x".repeat(5 * 1024 * 1024);
+        registry.register(&canary);
+        registry.register(&canary);
+        let retained = registry
+            .0
+            .read()
+            .unwrap()
+            .iter()
+            .map(String::len)
+            .sum::<usize>();
+        assert_eq!(
+            retained,
+            canary.len(),
+            "encoding variants are transient output work, not permanent state copies"
+        );
+        let started = std::time::Instant::now();
+        let mut ordinary = json!({"text":"A useful ordinary browser result."});
+        registry.scrub(&mut ordinary);
+        eprintln!(
+            "registry_receipt={{\"inputBytes\":{},\"retainedBytes\":{},\"ordinaryScrubUs\":{}}}",
+            canary.len(),
+            retained,
+            started.elapsed().as_micros()
+        );
+        assert_eq!(ordinary["text"], "A useful ordinary browser result.");
+    }
+
+    #[test]
+    fn lazy_encodings_preserve_substrings_overlap_and_json_escaping() {
+        let registry = Redaction::default();
+        registry.register("nosecret-prefix");
+        registry.register("nosecret-prefix-longer");
+        registry.register("nosecret-\"quoted\"\n雪");
+        let mut output = json!([
+            "before nosecret-prefix-longer after",
+            "before nosecret-prefix after",
+            "nosecret-\\\"quoted\\\"\\n雪",
+            STANDARD.encode("nosecret-prefix-longer"),
+            "safe answer",
+        ]);
+        registry.scrub(&mut output);
+        assert_eq!(
+            output,
+            json!([
+                format!("before {MARKER} after"),
+                format!("before {MARKER} after"),
+                MARKER,
+                MARKER,
+                "safe answer",
+            ])
+        );
     }
 
     #[test]
