@@ -375,6 +375,10 @@ fn read_changed_text(payload: &str) -> Option<Value> {
         return None;
     }
     let value: Value = serde_json::from_str(payload).ok()?;
+    bounded_changed_text(&value)
+}
+
+fn bounded_changed_text(value: &Value) -> Option<Value> {
     let texts = value["texts"].as_array()?;
     if texts.len() > TEXT_ITEMS || value["omitted"].as_u64()? > MOST_CHANGES {
         return None;
@@ -388,6 +392,19 @@ fn read_changed_text(payload: &str) -> Option<Value> {
         bytes += text.len();
     }
     (bytes <= TEXT_BYTES).then(|| json!({"texts":texts,"omitted":value["omitted"]}))
+}
+
+/// Credential replacement can expand text. Apply the same representation
+/// bound after the canonical scrub and before any reply or ledger retains it.
+pub(super) fn retain_bounded_changed_text(landed: &mut Value) {
+    if landed
+        .get("changedText")
+        .is_some_and(|text| bounded_changed_text(text).is_none())
+    {
+        if let Some(landed) = landed.as_object_mut() {
+            landed.remove("changedText");
+        }
+    }
 }
 
 /// The instant a media-clock timestamp (`stream::monotonic_us`) names.

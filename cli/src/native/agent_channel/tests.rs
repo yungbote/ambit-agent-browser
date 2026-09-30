@@ -23,6 +23,9 @@ const ACTION: &str = "8c1f0e2a-3b4c-4d5e-8f60-718293a4b5c6";
 /// `agent_browser_get_html` answers with as many bytes as its selector says.
 #[derive(Default)]
 struct Scripted {
+    values: crate::native::site_sessions::redaction::Redaction,
+    landed: Option<Value>,
+    result_text: Option<String>,
     custody: Option<tokio::sync::broadcast::Sender<(ChannelId, Value)>>,
     ran: StdMutex<Vec<String>>,
     started: Notify,
@@ -42,6 +45,13 @@ impl Scripted {
 }
 
 impl Browser for Scripted {
+    fn redact(&self, value: &mut Value) {
+        self.values.scrub_protocol(value);
+    }
+
+    fn redact_step(&self, op: &str, value: &mut Value) {
+        self.values.scrub_tool(value, op);
+    }
     async fn action_files(
         &self,
         _: ChannelId,
@@ -113,6 +123,7 @@ impl Browser for Scripted {
             }
             op => op.to_string(),
         };
+        let text = self.result_text.as_ref().cloned().unwrap_or(text);
         let succeeded = step.op != "agent_browser_get_url";
         let response = if succeeded {
             json!({ "success": true, "data": { "text": text } })
@@ -125,7 +136,7 @@ impl Browser for Scripted {
                 "content": [{ "type": "text", "text": text }],
                 "structuredContent": { "response": response } }),
             succeeded,
-            landed: None,
+            landed: self.landed.clone(),
             timing: StepTiming {
                 queue_us: 10,
                 op_us: 100,
@@ -293,6 +304,126 @@ fn step(op: &str, arguments: Value) -> Value {
 
 fn title() -> Value {
     step("agent_browser_get_title", json!({}))
+}
+
+fn semantic_landing(texts: Value) -> Value {
+    json!({"changedNodes": 2, "target":{"backendNodeId":42},
+        "changedText":{"texts":texts,"omitted":0,"pageGeneration":"G","backendNodeId":42}})
+}
+
+#[tokio::test]
+async fn semantic_registry_scrubs_before_reply_ledger_and_retained_result_without_erasing_identity()
+{
+    let canary = "synthetic-credential-canary";
+    let browser = Arc::new(Scripted {
+        landed: Some(semantic_landing(json!(["Report ready", canary]))),
+        result_text: Some(format!("{} {canary}", "h".repeat(70_000))),
+        ..Scripted::default()
+    });
+    browser.values.register(canary);
+    // Even when a stored value equals an identity, typed native identity survives.
+    browser.values.register("G");
+    let endpoint = endpoint();
+    let (_d, path) = directory();
+    let (mut host, _) = Host::hello(&endpoint, &browser, json!({})).await;
+    host.send(sequence(2, "41", json!([title()]), &path)).await;
+    let reply = host.reply().await;
+    assert!(!reply.to_string().contains(canary));
+    assert_eq!(reply["browser"]["page"]["pageGeneration"], "G");
+    let landing = &reply["steps"][0]["landed"];
+    assert_eq!(landing["changedText"]["pageGeneration"], "G");
+    assert_eq!(landing["changedText"]["backendNodeId"], 42);
+    assert_eq!(
+        landing["changedText"]["texts"],
+        json!([
+            "Report ready",
+            crate::native::site_sessions::redaction::MARKER
+        ])
+    );
+    host.send(op_status(3, "41", Some((CHANNEL_A, 2)), 0)).await;
+    let status = host.reply().await;
+    assert!(!status.to_string().contains(canary));
+    let kept = &status["data"]["result"]["steps"][0];
+    assert_eq!(kept["landed"], *landing);
+    let saved = std::fs::read_to_string(kept["result"]["path"].as_str().unwrap()).unwrap();
+    assert!(!saved.contains(canary));
+    assert!(saved.contains(crate::native::site_sessions::redaction::MARKER));
+    drop(host.writer);
+    drop(host.lines);
+    tokio::time::timeout(Duration::from_secs(10), host.served)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut reopened = Host::open(&endpoint, &browser, hello(CHANNEL_B, json!({}))).await;
+    assert_eq!(reopened.reply().await["success"], true);
+    reopened
+        .send(op_status(2, "41", Some((CHANNEL_A, 2)), 0))
+        .await;
+    let recovered = reopened.reply().await;
+    assert!(!recovered.to_string().contains(canary));
+    assert_eq!(recovered["data"]["result"]["steps"][0]["landed"], *landing);
+}
+
+#[tokio::test]
+async fn semantic_registry_expansion_drops_only_optional_text_before_retention() {
+    // 4 x 113 chars / 972 UTF-8 bytes before scrub; expansion stays below
+    // each 200-char cap but exceeds the aggregate 1024-byte contract.
+    let secret = "canary88";
+    let original = format!("{}{}", secret.repeat(6), "界".repeat(65));
+    assert!(original.chars().count() <= 200 && original.len() * 4 <= 1024);
+    let browser = Arc::new(Scripted {
+        landed: Some(semantic_landing(json!([
+            original, original, original, original
+        ]))),
+        ..Scripted::default()
+    });
+    browser.values.register(secret);
+    let endpoint = endpoint();
+    let (_d, path) = directory();
+    let (mut host, _) = Host::hello(&endpoint, &browser, json!({})).await;
+    host.send(sequence(2, "41", json!([title()]), &path)).await;
+    let reply = host.reply().await;
+    assert!(
+        reply["steps"][0]["landed"].get("changedText").is_none(),
+        "{reply}"
+    );
+    assert_eq!(reply["steps"][0]["landed"]["changedNodes"], 2);
+    assert_eq!(reply["steps"][0]["landed"]["target"]["backendNodeId"], 42);
+    assert_eq!(reply["browser"]["page"]["pageGeneration"], "G");
+    host.send(op_status(3, "41", Some((CHANNEL_A, 2)), 0)).await;
+    assert!(host.reply().await["data"]["result"]["steps"][0]["landed"]
+        .get("changedText")
+        .is_none());
+}
+
+#[tokio::test]
+async fn semantic_registry_remains_scrubbed_when_a_new_owner_fences_the_running_channel() {
+    let canary = "cancelled-credential-canary";
+    let browser = Arc::new(Scripted {
+        landed: Some(semantic_landing(json!([canary]))),
+        result_text: Some(canary.into()),
+        ..Scripted::default()
+    });
+    browser.values.register(canary);
+    let endpoint = endpoint();
+    let (_d, path) = directory();
+    let (mut old, _) = Host::hello(&endpoint, &browser, json!({})).await;
+    old.send(sequence(2, "41", json!([wait(), title()]), &path))
+        .await;
+    browser.started.notified().await;
+    let mut new = Host::open(&endpoint, &browser, hello(CHANNEL_B, json!({}))).await;
+    assert_eq!(new.reply().await["success"], true);
+    new.send(op_status(2, "42", Some((CHANNEL_A, 2)), 0)).await;
+    assert_eq!(new.reply().await["data"]["state"], "running");
+    browser.go.notify_one();
+    let stopped = old.reply().await;
+    assert_eq!(stopped["steps"].as_array().unwrap().len(), 1);
+    assert!(!stopped.to_string().contains(canary));
+    new.send(op_status(3, "42", Some((CHANNEL_A, 2)), 0)).await;
+    let status = new.reply().await;
+    assert_eq!(status["data"]["state"], "settled");
+    assert!(!status.to_string().contains(canary));
+    assert_eq!(browser.ran(), ["agent_browser_wait_ms"]);
 }
 
 fn wait() -> Value {

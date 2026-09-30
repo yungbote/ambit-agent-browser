@@ -712,6 +712,7 @@ impl Endpoint {
             browser.redact_step(&record.op, &mut record.result);
             if let Some(landed) = &mut record.landed {
                 browser.redact(landed);
+                landed::retain_bounded_changed_text(landed);
             }
             let succeeded = record.succeeded;
             records.push(record);
