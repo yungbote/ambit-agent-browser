@@ -147,10 +147,20 @@ impl DaemonBrowser {
 /// is not read-only, its landing starts recording.
 struct StepFence<'a> {
     channel: ChannelId,
+    owner: Option<super::frame::Owner>,
     custody: &'a Arc<crate::native::site_sessions::custody::Custody>,
     step: &'a PreparedStep,
     recorders: &'a Recorders,
     landing: Option<Landing>,
+}
+
+/// Clear the projection even if a command future is canceled before it
+/// returns. The surrounding command mutex prevents another writer.
+struct ActionProjection(Arc<StdMutex<Option<super::frame::Owner>>>);
+impl Drop for ActionProjection {
+    fn drop(&mut self) {
+        *self.0.lock().unwrap() = None;
+    }
 }
 
 impl HostFence for StepFence<'_> {
@@ -200,6 +210,25 @@ impl HostFence for StepFence<'_> {
             ));
         }
         let node = target::check(self.step, command, state, self.recorders).await?;
+        if command["action"] == "upload" && self.custody.files().guarded() {
+            let owner=self.owner.ok_or_else(||json!({"success":false,"code":"browser_operation_rejected","error":"Native uploads require their Action staging owner."}))?;
+            let scope=crate::native::playwright::files::Scope::parse(&owner.action.to_string()).map_err(|_|json!({"success":false,"code":"browser_operation_rejected","error":"The Action staging owner is invalid."}))?;
+            let paths = command["files"]
+                .as_array()
+                .map(|files| {
+                    files
+                        .iter()
+                        .filter_map(|file| file.as_str().map(str::to_owned))
+                        .collect()
+                })
+                .unwrap_or_else(|| {
+                    command["file"]
+                        .as_str()
+                        .map(|file| vec![file.to_owned()])
+                        .unwrap_or_default()
+                });
+            self.custody.files().paths_for(scope,owner,paths).await.map_err(|_|json!({"success":false,"code":"browser_operation_rejected","error":"The upload has no current exact Action staging receipt."}))?;
+        }
         if !step::read_only(&self.step.op) {
             self.landing = Some(Landing::arm(state, self.recorders, node, !blocked).await);
         }
@@ -237,6 +266,31 @@ fn unavailable(
 }
 
 impl Browser for DaemonBrowser {
+    async fn action_files(
+        &self,
+        channel: ChannelId,
+        owner: super::frame::Owner,
+        files: Option<Vec<crate::native::playwright::files::Receipt>>,
+        ledger: &super::ledger::Ledger,
+    ) -> Result<Value, String> {
+        if !ledger.may_continue(channel) {
+            return Err("The Action staging owner was fenced before admission.".into());
+        }
+        let scope = crate::native::playwright::files::Scope::parse(&owner.action.to_string())
+            .map_err(str::to_owned)?;
+        let registry = self.custody.files();
+        if let Some(files) = files {
+            registry.admit(scope, owner).map_err(str::to_owned)?;
+            let registered = registry
+                .register(scope, owner, files)
+                .await
+                .map_err(str::to_owned)?;
+            Ok(json!({"actionId":owner.action.to_string(),"registered":registered}))
+        } else {
+            registry.release(scope, owner).map_err(str::to_owned)?;
+            Ok(json!({"actionId":owner.action.to_string(),"released":true}))
+        }
+    }
     async fn program_request(
         &self,
         channel: ChannelId,
@@ -279,6 +333,7 @@ impl Browser for DaemonBrowser {
             .await
     }
     async fn fence_program(&self, owner: super::frame::Owner) {
+        self.custody.files().fence(owner);
         self.programs.fence(owner).await;
     }
     async fn site_request(
@@ -348,13 +403,17 @@ impl Browser for DaemonBrowser {
         *self.actor() = Some(frame.channel);
         let mut fence = StepFence {
             channel: frame.channel,
+            owner: frame.owner,
             custody: &self.custody,
             step,
             recorders: &self.recorders,
             landing: None,
         };
+        *state.native_action_owner.lock().unwrap() = frame.owner;
+        let projection = ActionProjection(state.native_action_owner.clone());
         let (response, paced) =
             paced::measured(self.dispatch(&mut state, frame, step, &mut fence)).await;
+        drop(projection);
         let (landed, queued_again) = match fence.landing.filter(|_| landed::lands(&response)) {
             Some(landing) => {
                 let deadline = held + Duration::from_millis(step.call.timeout_ms);
@@ -458,5 +517,220 @@ impl Browser for DaemonBrowser {
             .await
             .finish_agent_channel(&client)
             .await;
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use crate::native::agent_channel::{
+        frame::{ActionId, Binding, Owner, Step},
+        ledger::Ledger,
+    };
+    use crate::native::playwright::files::{Receipt, Scope, StagedFiles};
+    use crate::native::site_sessions::{custody::Custody, protocol::Request};
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn canceling_command_clears_its_native_action_projection() {
+        let owner = Owner {
+            action: ActionId::for_test(230),
+            generation: 1,
+        };
+        let projected = Arc::new(StdMutex::new(None));
+        let started = Arc::new(tokio::sync::Notify::new());
+        let (field, signal) = (projected.clone(), started.clone());
+        let task = tokio::spawn(async move {
+            *field.lock().unwrap() = Some(owner);
+            let _projection = ActionProjection(field);
+            signal.notify_one();
+            std::future::pending::<()>().await;
+        });
+        started.notified().await;
+        assert_eq!(*projected.lock().unwrap(), Some(owner));
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        assert!(projected.lock().unwrap().is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn e2e_native_action_upload_keeps_scope_across_disconnect_then_releases() {
+        let env =
+            crate::test_utils::EnvGuard::new(&["AGENT_BROWSER_NAMESPACE", "AGENT_BROWSER_SESSION"]);
+        env.set("AGENT_BROWSER_NAMESPACE", "native-scope-fixture");
+        env.set("AGENT_BROWSER_SESSION", "default");
+        let temporary = tempfile::tempdir().unwrap();
+        let files = StagedFiles::with_root(temporary.path().join("staged"));
+        let owner = Owner {
+            action: ActionId::for_test(231),
+            generation: 1,
+        };
+        let scope = Scope::parse(&owner.action.to_string()).unwrap();
+        let directory = temporary
+            .path()
+            .join("staged")
+            .join(scope.to_string())
+            .join("a".repeat(64));
+        std::fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("input.txt");
+        std::fs::write(&path, b"nosecret-native").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o444)).unwrap();
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let mut state = DaemonState::new();
+        for command in [
+            json!({"action":"launch","headless":true}),
+            json!({"action":"navigate","url":"data:text/html,<title>Native scope</title><input id=files type=file>"}),
+        ] {
+            let reply = Box::pin(crate::native::actions::execute_command(
+                &command, &mut state,
+            ))
+            .await;
+            assert_eq!(reply["success"], true, "{reply}");
+        }
+        let state = Arc::new(Mutex::new(state));
+        let browser = DaemonBrowser {
+            custody: Custody::with_files(files.clone()),
+            state: state.clone(),
+            programs: Default::default(),
+            recorders: Default::default(),
+            actor: Default::default(),
+        };
+        let channel = ChannelId::parse("11111111-1111-4111-8111-111111111111").unwrap();
+        let later = ChannelId::parse("22222222-2222-4222-8222-222222222222").unwrap();
+        let ledger = Ledger::default();
+        assert!(ledger.open(channel));
+        ledger.register(channel, owner).unwrap();
+        let receipt = Receipt {
+            path: path.to_str().unwrap().into(),
+            byte_size: b"nosecret-native".len() as u64,
+            content_ref: format!("sha256:{:x}", Sha256::digest(b"nosecret-native")),
+        };
+        let registration = browser
+            .action_files(channel, owner, Some(vec![receipt.clone()]), &ledger)
+            .await
+            .unwrap();
+        assert_eq!(registration["registered"], 1);
+        browser.end(channel).await;
+        ledger.end(channel);
+        files
+            .paths_for(scope, owner, vec![receipt.path.clone()])
+            .await
+            .unwrap();
+        assert!(ledger.open(later));
+        ledger.register(later, owner).unwrap();
+        browser
+            .site_request(
+                later,
+                Request::read("site_sessions.offer", json!({"sites":[]})).unwrap(),
+            )
+            .await
+            .unwrap();
+        let binding = Binding {
+            namespace: "native-scope-fixture".into(),
+            session: "default".into(),
+            require_sandbox: false,
+            browser_host: true,
+            theme: None,
+        };
+        let context = FrameContext {
+            channel: later,
+            owner: Some(owner),
+            binding: &binding,
+            directory: temporary.path(),
+            received_at: Instant::now(),
+        };
+        let (_, observed) = crate::native::feedback::page_identity(&*state.lock().await)
+            .await
+            .unwrap();
+        let (target_client, target_session) = {
+            let state = state.lock().await;
+            let browser = state.browser.as_ref().unwrap();
+            (
+                browser.client.clone(),
+                browser.active_session_id().unwrap().to_owned(),
+            )
+        };
+        let document = target_client
+            .send_command("DOM.getDocument", Some(json!({})), Some(&target_session))
+            .await
+            .unwrap();
+        let selected = target_client
+            .send_command(
+                "DOM.querySelector",
+                Some(json!({"nodeId":document["root"]["nodeId"],"selector":"#files"})),
+                Some(&target_session),
+            )
+            .await
+            .unwrap();
+        let described = target_client
+            .send_command(
+                "DOM.describeNode",
+                Some(json!({"nodeId":selected["nodeId"]})),
+                Some(&target_session),
+            )
+            .await
+            .unwrap();
+        let steps = step::prepare(
+            &crate::mcp::host_bound::HostFlags::new(&binding.namespace, &binding.session, None)
+                .unwrap(),
+            &[Step {
+                op: "agent_browser_upload".into(),
+                arguments: json!({"selector":"#files","files":[receipt.path]}),
+                preconditions: super::super::frame::Preconditions {
+                    page_generation: observed["pageGeneration"].as_str().map(str::to_owned),
+                    backend_node_id: described["node"]["backendNodeId"].as_i64(),
+                    effects: Some(super::super::ceiling::Ceiling::Commit),
+                    ..Default::default()
+                },
+            }],
+        )
+        .unwrap();
+        let uploaded = browser.step(&context, &steps[0]).await;
+        assert!(uploaded.succeeded, "{:?}", uploaded.result);
+        assert!(
+            state
+                .lock()
+                .await
+                .native_action_owner
+                .lock()
+                .unwrap()
+                .is_none(),
+            "projection cannot escape its command"
+        );
+        let held = state.lock().await;
+        let client = held.browser.as_ref().unwrap().client.clone();
+        let session = held
+            .browser
+            .as_ref()
+            .unwrap()
+            .active_session_id()
+            .unwrap()
+            .to_owned();
+        drop(held);
+        let value=client.send_command("Runtime.evaluate",Some(json!({"expression":"document.querySelector('#files').files[0].text()","awaitPromise":true,"returnByValue":true})),Some(&session)).await.unwrap();
+        assert_eq!(value["result"]["value"], "nosecret-native");
+        browser
+            .action_files(later, owner, None, &ledger)
+            .await
+            .unwrap();
+        assert!(
+            browser
+                .action_files(later, owner, Some(vec![receipt]), &ledger)
+                .await
+                .is_err(),
+            "late registration cannot resurrect terminal authority"
+        );
+        let refused = browser.step(&context, &steps[0]).await;
+        assert!(!refused.succeeded);
+        browser.end(later).await;
+        let closed = Box::pin(crate::native::actions::execute_command(
+            &json!({"action":"close"}),
+            &mut *state.lock().await,
+        ))
+        .await;
+        assert_eq!(closed["success"], true, "{closed}");
+        std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }

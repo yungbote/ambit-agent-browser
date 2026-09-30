@@ -700,6 +700,10 @@ pub struct DaemonState {
     /// existing outer mutex. Never broadcast controller credentials.
     pub(crate) browser_control: Arc<tokio::sync::Mutex<BrowserControl>>,
     pub(crate) playwright_operations: super::playwright::Operations,
+    /// The current host sequence's existing Action owner, under command
+    /// custody only. It is never accepted from a model command or serialized.
+    pub(crate) native_action_owner:
+        Arc<std::sync::Mutex<Option<super::agent_channel::frame::Owner>>>,
     /// Exact startup configuration; never serialized in the command protocol.
     launch_configuration: Option<Arc<Value>>,
     /// Same-daemon ownership only. Chrome is dropped before these private
@@ -908,6 +912,7 @@ impl DaemonState {
             idle_activity: Arc::new(IdleActivity::new()),
             browser_control: Arc::new(tokio::sync::Mutex::new(browser_control)),
             playwright_operations,
+            native_action_owner: Arc::default(),
             launch_configuration: None,
             retained_profile: None,
             effective_ca_cert: None,
@@ -9172,6 +9177,16 @@ async fn handle_upload(cmd: &Value, state: &DaemonState) -> Result<Value, String
                 .map(|s| vec![s.to_string()])
         })
         .unwrap_or_default();
+
+    let staged = mgr.client.site_context().files;
+    if staged.guarded() {
+        let owner=(*state.native_action_owner.lock().unwrap()).ok_or("browser_operation_rejected: Native uploads require their current Action staging owner.")?;
+        let scope =
+            super::playwright::files::Scope::parse(&owner.action.to_string()).map_err(|_| {
+                "browser_operation_rejected: The native upload staging owner is invalid."
+            })?;
+        staged.paths_for(scope,owner,files.clone()).await.map_err(|_|"browser_operation_rejected: The upload has no current exact Action staging receipt.")?;
+    }
 
     mgr.upload_files(selector, &files, &state.ref_map, &state.iframe_sessions)
         .await?;

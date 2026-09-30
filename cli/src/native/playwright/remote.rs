@@ -1049,7 +1049,7 @@ impl Programs {
                 let files = attachment.owner.site_context().files;
                 let scope =
                     super::files::Scope::parse(&program.to_string()).map_err(str::to_owned)?;
-                files.activate(scope, owner);
+                files.activate(scope, owner).map_err(str::to_owned)?;
                 files.downloads(attachment.artifacts.clone());
                 drop(state);
                 let opened = json!({"programId":program.to_string(), "state":"active", "nativeInputSettled":false,

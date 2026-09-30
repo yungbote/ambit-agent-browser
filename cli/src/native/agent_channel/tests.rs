@@ -42,6 +42,19 @@ impl Scripted {
 }
 
 impl Browser for Scripted {
+    async fn action_files(
+        &self,
+        _: ChannelId,
+        owner: Owner,
+        files: Option<Vec<crate::native::playwright::files::Receipt>>,
+        _: &Ledger,
+    ) -> Result<Value, String> {
+        self.go.notify_one();
+        Ok(match files {
+            Some(files) => json!({"actionId":owner.action.to_string(),"registered":files.len()}),
+            None => json!({"actionId":owner.action.to_string(),"released":true}),
+        })
+    }
     async fn program_request(
         &self,
         _: ChannelId,
@@ -806,6 +819,30 @@ async fn remote_status_settles_independently_beside_an_unanswered_sequence() {
     );
     assert_eq!(reply["data"]["nativeInputSettled"], true);
     assert_eq!(host.reply().await["id"], 2);
+}
+
+#[tokio::test]
+async fn native_file_registration_answers_without_holding_a_program_slot_or_sequence() {
+    let endpoint = endpoint_role(true);
+    let browser = Arc::new(Scripted::default());
+    let (_directory, path) = directory();
+    let(mut host,hello)=Host::hello(&endpoint,&browser,json!({"binding":{"version":1,"namespace":"thread","session":"browser","requireSandbox":true,"browserHost":true}})).await;
+    assert_eq!(hello["success"], true);
+    host.send(sequence(2, "41", json!([wait()]), &path)).await;
+    browser.started.notified().await;
+    host.send(
+        json!({"type":"action.files","id":3,"actionId":ACTION,"ownerGeneration":"41","files":[]}),
+    )
+    .await;
+    let staged = host.reply().await;
+    assert_eq!(staged["id"], 3);
+    assert_eq!(staged["data"]["registered"], 0);
+    assert_eq!(host.reply().await["id"], 2);
+    host.send(
+        json!({"type":"action.files.release","id":4,"actionId":ACTION,"ownerGeneration":"41"}),
+    )
+    .await;
+    assert_eq!(host.reply().await["data"]["released"], true);
 }
 
 #[tokio::test]

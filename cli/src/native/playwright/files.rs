@@ -15,7 +15,7 @@ const REFUSED: &str = "The browser file has no current, exact host staging recei
 
 /// One host-admitted operation's staging identity, whether that operation is
 /// a native upload or a remote program. It confers no authority by itself.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct Scope(uuid::Uuid);
 impl Scope {
     pub(crate) fn parse(value: &str) -> Result<Self, &'static str> {
@@ -44,9 +44,16 @@ pub(crate) struct Receipt {
 struct State {
     root: PathBuf,
     guarded: bool,
-    owner: Option<(Scope, Owner)>,
-    revision: u64,
+    consumer: Option<(Scope, Owner)>,
     download_root: Option<PathBuf>,
+    scopes: BTreeMap<Scope, Entry>,
+}
+
+#[derive(Clone)]
+struct Entry {
+    owner: Owner,
+    revision: u64,
+    released: bool,
     receipts: BTreeMap<PathBuf, Receipt>,
 }
 
@@ -55,10 +62,31 @@ impl Default for State {
         Self {
             root: ROOT.into(),
             guarded: false,
-            owner: None,
-            revision: 0,
+            consumer: None,
             download_root: None,
-            receipts: BTreeMap::new(),
+            scopes: BTreeMap::new(),
+        }
+    }
+}
+
+impl State {
+    fn admit(&mut self, scope: Scope, owner: Owner) -> Result<(), &'static str> {
+        self.guarded = true;
+        match self.scopes.get(&scope) {
+            Some(entry) if entry.released || entry.owner != owner => Err(REFUSED),
+            Some(_) => Ok(()),
+            None => {
+                self.scopes.insert(
+                    scope,
+                    Entry {
+                        owner,
+                        revision: 0,
+                        released: false,
+                        receipts: BTreeMap::new(),
+                    },
+                );
+                Ok(())
+            }
         }
     }
 }
@@ -83,19 +111,62 @@ impl StagedFiles {
     pub(crate) fn guard(&self) {
         self.0.write().unwrap().guarded = true;
     }
-    pub(crate) fn activate(&self, program: Scope, owner: Owner) {
+    pub(crate) fn admit(&self, scope: Scope, owner: Owner) -> Result<(), &'static str> {
+        self.0.write().unwrap().admit(scope, owner)
+    }
+    pub(crate) fn activate(&self, scope: Scope, owner: Owner) -> Result<(), &'static str> {
         let mut state = self.0.write().unwrap();
-        state.guarded = true;
-        state.owner = Some((program, owner));
-        state.receipts.clear();
-        state.revision += 1;
+        state.admit(scope, owner)?;
+        state.consumer = Some((scope, owner));
+        Ok(())
     }
     pub(crate) fn clear(&self, program: Scope, owner: Owner) {
         let mut state = self.0.write().unwrap();
-        if state.owner == Some((program, owner)) {
-            state.owner = None;
-            state.receipts.clear();
-            state.revision += 1;
+        if state
+            .scopes
+            .get(&program)
+            .is_some_and(|entry| entry.owner == owner)
+        {
+            state.scopes.remove(&program);
+        }
+        if state.consumer == Some((program, owner)) {
+            state.consumer = None;
+        }
+    }
+    pub(crate) fn release(&self, scope: Scope, owner: Owner) -> Result<(), &'static str> {
+        let mut state = self.0.write().unwrap();
+        if !state
+            .scopes
+            .get(&scope)
+            .is_some_and(|entry| entry.owner == owner && entry.released)
+        {
+            state.admit(scope, owner)?;
+        }
+        let entry = state.scopes.get_mut(&scope).ok_or(REFUSED)?;
+        if entry.owner != owner {
+            return Err(REFUSED);
+        }
+        entry.released = true;
+        entry.receipts.clear();
+        entry.revision += 1;
+        if state.consumer == Some((scope, owner)) {
+            state.consumer = None;
+        }
+        Ok(())
+    }
+    pub(crate) fn fence(&self, owner: Owner) {
+        let mut state = self.0.write().unwrap();
+        for entry in state.scopes.values_mut() {
+            if entry.owner.action == owner.action && entry.owner.generation < owner.generation {
+                entry.owner = owner;
+                entry.receipts.clear();
+                entry.revision += 1;
+            }
+        }
+        if state.consumer.is_some_and(|(_, held)| {
+            held.action == owner.action && held.generation < owner.generation
+        }) {
+            state.consumer = None;
         }
     }
 
@@ -105,24 +176,31 @@ impl StagedFiles {
         owner: Owner,
         receipts: Vec<Receipt>,
     ) -> Result<usize, &'static str> {
-        let mut snapshot = self.0.read().unwrap().clone();
-        if snapshot.owner != Some((program, owner)) {
-            return Err(REFUSED);
-        }
+        let (root, mut snapshot) = {
+            let state = self.0.read().unwrap();
+            let entry = state
+                .scopes
+                .get(&program)
+                .filter(|entry| entry.owner == owner && !entry.released)
+                .ok_or(REFUSED)?;
+            (state.root.clone(), entry.clone())
+        };
         if receipts.is_empty() {
             let mut state = self.0.write().unwrap();
-            if state.owner != Some((program, owner)) {
-                return Err(REFUSED);
-            }
-            state.receipts.clear();
-            state.revision += 1;
+            let entry = state
+                .scopes
+                .get_mut(&program)
+                .filter(|entry| entry.owner == owner && !entry.released)
+                .ok_or(REFUSED)?;
+            entry.receipts.clear();
+            entry.revision += 1;
             return Ok(0);
         }
         let revision = snapshot.revision;
         let checked = tokio::task::spawn_blocking(move || {
             for receipt in receipts {
                 let path = PathBuf::from(&receipt.path);
-                validate_path(&path, program, &snapshot.root)?;
+                validate_path(&path, program, &root)?;
                 verify(&path, &receipt)?;
                 if snapshot.receipts.get(&path).is_some_and(|old| {
                     old.content_ref != receipt.content_ref || old.byte_size != receipt.byte_size
@@ -136,49 +214,67 @@ impl StagedFiles {
         .await
         .map_err(|_| REFUSED)??;
         let mut state = self.0.write().unwrap();
-        if state.owner != Some((program, owner)) || state.revision != revision {
-            return Err(REFUSED);
-        }
+        let entry = state
+            .scopes
+            .get_mut(&program)
+            .filter(|entry| entry.owner == owner && !entry.released && entry.revision == revision)
+            .ok_or(REFUSED)?;
         // Concurrent registrations cannot remove already admitted files.
         for (path, receipt) in &checked {
-            if state.receipts.get(path).is_some_and(|old| {
+            if entry.receipts.get(path).is_some_and(|old| {
                 old.content_ref != receipt.content_ref || old.byte_size != receipt.byte_size
             }) {
                 return Err(REFUSED);
             }
         }
         for (path, receipt) in checked {
-            state.receipts.insert(path, receipt);
+            entry.receipts.insert(path, receipt);
         }
-        state.revision += 1;
-        Ok(state.receipts.len())
+        entry.revision += 1;
+        Ok(entry.receipts.len())
     }
 
     pub(crate) async fn paths(&self, paths: Vec<String>) -> Result<(), &'static str> {
         if paths.is_empty() {
             return Ok(());
         }
-        let snapshot = self.0.read().unwrap().clone();
-        if !snapshot.guarded {
-            return Ok(());
-        }
-        let owner = snapshot.owner.ok_or(REFUSED)?;
+        let consumer = {
+            let state = self.0.read().unwrap();
+            if !state.guarded {
+                return Ok(());
+            }
+            state.consumer.ok_or(REFUSED)?
+        };
+        self.paths_for(consumer.0, consumer.1, paths).await
+    }
+    pub(crate) async fn paths_for(
+        &self,
+        scope: Scope,
+        owner: Owner,
+        paths: Vec<String>,
+    ) -> Result<(), &'static str> {
+        let (root, snapshot) = {
+            let state = self.0.read().unwrap();
+            let entry = state
+                .scopes
+                .get(&scope)
+                .filter(|entry| entry.owner == owner && !entry.released)
+                .ok_or(REFUSED)?;
+            (state.root.clone(), entry.clone())
+        };
         let revision = snapshot.revision;
         tokio::task::spawn_blocking(move || {
             for path in paths {
-                consume(
-                    &PathBuf::from(path),
-                    owner.0,
-                    &snapshot.root,
-                    &snapshot.receipts,
-                )?;
+                consume(&PathBuf::from(path), scope, &root, &snapshot.receipts)?;
             }
             Ok::<_, &'static str>(())
         })
         .await
         .map_err(|_| REFUSED)??;
         let current = self.0.read().unwrap();
-        if current.owner != Some(owner) || current.revision != revision {
+        if !current.scopes.get(&scope).is_some_and(|entry| {
+            entry.owner == owner && !entry.released && entry.revision == revision
+        }) {
             return Err(REFUSED);
         }
         Ok(())
@@ -199,8 +295,34 @@ impl StagedFiles {
             return Ok(());
         }
         let path = url.to_file_path().map_err(|_| REFUSED)?;
-        self.paths(vec![path.to_str().ok_or(REFUSED)?.to_owned()])
-            .await
+        let held = {
+            let state = self.0.read().unwrap();
+            if !state.guarded {
+                return Ok(());
+            }
+            let relative = path.strip_prefix(&state.root).map_err(|_| REFUSED)?;
+            let scope = Scope::parse(
+                relative
+                    .components()
+                    .next()
+                    .ok_or(REFUSED)?
+                    .as_os_str()
+                    .to_str()
+                    .ok_or(REFUSED)?,
+            )?;
+            let entry = state
+                .scopes
+                .get(&scope)
+                .filter(|entry| !entry.released)
+                .ok_or(REFUSED)?;
+            (scope, entry.owner)
+        };
+        self.paths_for(
+            held.0,
+            held.1,
+            vec![path.to_str().ok_or(REFUSED)?.to_owned()],
+        )
+        .await
     }
 
     pub(crate) async fn command(
@@ -380,6 +502,119 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn native_scopes_coexist_and_terminal_release_cannot_be_replayed() {
+        let temporary = tempfile::tempdir().unwrap();
+        let files = StagedFiles::with_root(temporary.path().to_path_buf());
+        let first = Scope::parse("6b87fd14-4712-45e1-829e-95ee008fd783").unwrap();
+        let second = Scope::parse("7b87fd14-4712-45e1-829e-95ee008fd783").unwrap();
+        let programme = Scope::parse("8b87fd14-4712-45e1-829e-95ee008fd783").unwrap();
+        let first_owner = owner(1);
+        let second_owner = Owner {
+            action: ActionId::for_test(94),
+            generation: 1,
+        };
+        let mut paths = Vec::new();
+        for (scope, owned) in [(first, first_owner), (second, second_owner)] {
+            let directory = temporary
+                .path()
+                .join(scope.to_string())
+                .join("1".repeat(64));
+            std::fs::create_dir_all(&directory).unwrap();
+            let path = directory.join("input.txt");
+            std::fs::write(&path, b"nosecret-scope").unwrap();
+            permissions(&path, 0o444);
+            permissions(&directory, 0o555);
+            files.admit(scope, owned).unwrap();
+            files
+                .register(scope, owned, vec![receipt(&path, b"nosecret-scope")])
+                .await
+                .unwrap();
+            paths.push((scope, owned, path, directory));
+        }
+        files
+            .activate(
+                programme,
+                Owner {
+                    action: ActionId::for_test(95),
+                    generation: 1,
+                },
+            )
+            .unwrap();
+        for (scope, owned, path, _) in &paths {
+            files
+                .paths_for(*scope, *owned, vec![path.to_str().unwrap().into()])
+                .await
+                .unwrap();
+        }
+        files.clear(
+            programme,
+            Owner {
+                action: ActionId::for_test(95),
+                generation: 1,
+            },
+        );
+        for (scope, owned, path, _) in &paths {
+            files
+                .paths_for(*scope, *owned, vec![path.to_str().unwrap().into()])
+                .await
+                .unwrap();
+        }
+        files.fence(owner(2));
+        assert!(files
+            .paths_for(
+                first,
+                first_owner,
+                vec![paths[0].2.to_str().unwrap().into()]
+            )
+            .await
+            .is_err());
+        files.admit(first, owner(2)).unwrap();
+        files
+            .register(
+                first,
+                owner(2),
+                vec![receipt(&paths[0].2, b"nosecret-scope")],
+            )
+            .await
+            .unwrap();
+        assert!(
+            files.release(first, first_owner).is_err(),
+            "stale release must not attenuate a newer owner"
+        );
+        files.release(first, owner(2)).unwrap();
+        files.release(first, owner(2)).unwrap();
+        assert!(
+            files.admit(first, owner(2)).is_err(),
+            "terminal release is not a clear followed by reactivation"
+        );
+        assert!(files
+            .register(
+                first,
+                owner(2),
+                vec![receipt(&paths[0].2, b"nosecret-scope")]
+            )
+            .await
+            .is_err());
+        files
+            .paths_for(
+                second,
+                second_owner,
+                vec![paths[1].2.to_str().unwrap().into()],
+            )
+            .await
+            .unwrap();
+        let never_started = Scope::parse("9b87fd14-4712-45e1-829e-95ee008fd783").unwrap();
+        files.release(never_started, owner(3)).unwrap();
+        assert!(
+            files.admit(never_started, owner(3)).is_err(),
+            "release arriving before registration still forbids late restoration"
+        );
+        for (_, _, _, directory) in paths {
+            permissions(&directory, 0o755);
+        }
+    }
+
+    #[tokio::test]
     async fn two_large_files_have_no_individual_or_aggregate_upload_ceiling() {
         let temporary = tempfile::tempdir().unwrap();
         let files = StagedFiles::with_root(temporary.path().to_path_buf());
@@ -411,7 +646,7 @@ mod tests {
             });
         }
         permissions(&directory, 0o555);
-        files.activate(scope, owner(1));
+        files.activate(scope, owner(1)).unwrap();
         assert_eq!(
             files
                 .register(scope, owner(1), receipts.clone())
@@ -473,7 +708,7 @@ mod tests {
         std::fs::write(&path, b"nosecret-original").unwrap();
         permissions(&path, 0o444);
         permissions(&directory, 0o555);
-        files.activate(program, owner(1));
+        files.activate(program, owner(1)).unwrap();
         assert!(
             files
                 .paths(vec![path.to_str().unwrap().into()])
@@ -547,7 +782,7 @@ mod tests {
         permissions(&path, 0o444);
         permissions(&extra, 0o444);
         permissions(&directory, 0o555);
-        files.activate(program, owner(1));
+        files.activate(program, owner(1)).unwrap();
         files
             .register(program, owner(1), vec![receipt(&path, &[])])
             .await

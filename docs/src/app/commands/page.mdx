@@ -59,6 +59,8 @@ Host configuration and channel hello bind `browserHost` to that startup role. Th
 
 The host registers exact immutable staging receipts through `program.files` for the active Action/program. Uploads, file drags and local-resource reads share one validator, including complete directory descendants and actual script-driven Chrome requests. Closing the scope revokes future file access; downloads can select only the native owner's root. The debugger HTTP control surface is also private to the host. Native Action upload binding, browser-interface reads and complete CODE/HOST file parity still require composed qualification before persistent identity admission.
 
+Native uploads use `action.files` bound to the existing Action owner, sharing the same validator without a program slot. Scopes coexist, survive disconnect for recovery and reject older generations. The backend attenuates terminal Actions with idempotent `action.files.release` after its canonical settlement commits; a late registration cannot restore released authority. Backend delivery and native chooser integration require composed qualification.
+
 ```bash
 agent-browser run-playwright --stdin <<'JS'
 await page.getByRole('textbox', { name: 'Search' }).fill('reference');

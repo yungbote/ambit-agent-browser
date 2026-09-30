@@ -57,6 +57,15 @@ pub(crate) struct Custody {
 }
 
 impl Custody {
+    #[cfg(test)]
+    pub(crate) fn with_files(files: crate::native::playwright::files::StagedFiles) -> Arc<Self> {
+        let mut owner = Self::new();
+        Arc::get_mut(&mut owner).unwrap().context.files = files;
+        owner
+    }
+    pub(crate) fn files(&self) -> crate::native::playwright::files::StagedFiles {
+        self.context.files.clone()
+    }
     pub(crate) fn new() -> Arc<Self> {
         let (events, _) = broadcast::channel(64);
         Arc::new(Self {

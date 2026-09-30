@@ -51,6 +51,11 @@ impl std::fmt::Display for ChannelId {
 /// An Action's key, which the daemon fences and files ledger entries under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ActionId(uuid::Uuid);
+impl std::fmt::Display for ActionId {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(out)
+    }
+}
 
 #[cfg(test)]
 impl ActionId {
@@ -73,6 +78,10 @@ pub(crate) enum Frame {
     OpStatus(OpStatus),
     Site(crate::native::site_sessions::protocol::Request),
     Program(Owner, crate::native::playwright::remote::Request),
+    Files(
+        Owner,
+        Option<Vec<crate::native::playwright::files::Receipt>>,
+    ),
 }
 
 /// The channel-scoped host configuration a `hello` carries: the members of
@@ -222,6 +231,13 @@ impl Frame {
                 members.as_object_mut().unwrap().remove("ownerGeneration");
                 Frame::Program(owned, crate::native::playwright::remote::Request::read(kind, members).map_err(invalid)?)
             }
+            "action.files"|"action.files.release"=>{
+                let has_files=members.get("files").is_some();
+                let wire:ActionFilesWire=serde_json::from_value(members).map_err(|_|invalid("The native Action file frame is invalid.".into()))?;
+                let owner=owner(Some(wire.action_id),Some(wire.owner_generation)).map_err(invalid)?.ok_or_else(||invalid("A native file frame needs its Action owner.".into()))?;
+                if (kind=="action.files")!=has_files || (kind=="action.files" && wire.files.is_none()) {return Err(invalid("Native file registration needs a roster; release carries no roster.".into()));}
+                Frame::Files(owner,wire.files)
+            },
             other => {
                 return Err(invalid(format!(
                     "Unknown agent frame type `{other}`: this daemon serves hello, sequence and op_status."
@@ -294,6 +310,16 @@ struct BindingWire {
     #[serde(default)]
     browser_host: bool,
     theme: Option<Theme>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ActionFilesWire {
+    #[allow(dead_code)]
+    id: u64,
+    action_id: String,
+    owner_generation: String,
+    files: Option<Vec<crate::native::playwright::files::Receipt>>,
 }
 
 impl HelloWire {
@@ -739,6 +765,34 @@ mod tests {
                 .extend(extra.as_object().unwrap().clone());
             assert!(Frame::parse(&line(frame.clone())).is_err(), "{frame}");
         }
+    }
+
+    #[test]
+    fn native_action_staging_has_no_model_selected_scope_or_program_slot() {
+        for value in [
+            json!({"type":"action.files","id":2,"actionId":ACTION,"ownerGeneration":"1","files":[]}),
+            json!({"type":"action.files.release","id":3,"actionId":ACTION,"ownerGeneration":"2"}),
+        ] {
+            assert!(matches!(
+                Frame::parse(&line(value)),
+                Ok((_, Frame::Files(_, _)))
+            ));
+        }
+        for extra in [
+            json!({"scope":"6b87fd14-4712-45e1-829e-95ee008fd783"}),
+            json!({"programId":"6b87fd14-4712-45e1-829e-95ee008fd783"}),
+            json!({"ownerGeneration":"0"}),
+            json!({"ownerGeneration":1}),
+            json!({"files":null}),
+        ] {
+            let mut value = json!({"type":"action.files","id":4,"actionId":ACTION,"ownerGeneration":"1","files":[]});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(Frame::parse(&line(value)).is_err());
+        }
+        assert!(Frame::parse(&line(json!({"type":"action.files.release","id":5,"actionId":ACTION,"ownerGeneration":"1","files":null}))).is_err());
     }
 
     #[test]

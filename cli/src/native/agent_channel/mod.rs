@@ -89,6 +89,7 @@ impl Identity {
 /// A frame's context for the steps it runs.
 pub(crate) struct FrameContext<'a> {
     pub(crate) channel: ChannelId,
+    pub(crate) owner: Option<Owner>,
     pub(crate) binding: &'a Binding,
     /// The Action's private browser directory.
     pub(crate) directory: &'a Path,
@@ -151,6 +152,15 @@ pub(crate) struct Finish {
 
 /// Where a channel's steps run.
 pub(crate) trait Browser: Sync {
+    fn action_files(
+        &self,
+        _channel: ChannelId,
+        _owner: Owner,
+        _files: Option<Vec<crate::native::playwright::files::Receipt>>,
+        _ledger: &Ledger,
+    ) -> impl Future<Output = Result<Value, String>> + Send {
+        async { Err("This browser does not serve native Action staging.".into()) }
+    }
     fn program_request(
         &self,
         _channel: ChannelId,
@@ -380,6 +390,7 @@ impl Endpoint {
                                 inbox.receive(line,&self.ledger);
                                 if inbox.frames.back().is_some_and(|received| match &received.frame {
                                     Ok((_,Frame::Site(_)))=>true,
+                                    Ok((_,Frame::Files(_,_)))=>true,
                                     Ok((_,Frame::Program(_,request)))=>request.independent(),
                                     _=>false,
                                 }) {
@@ -519,10 +530,33 @@ impl Endpoint {
                 };
                 (reply, None)
             }
+            (Frame::Files(owner, files), Some(session)) => {
+                let reply = if !session.binding.browser_host {
+                    refusal(
+                        id,
+                        BINDING_REFUSED,
+                        "Native Action staging requires the immutable browser-host role.",
+                        false,
+                    )
+                } else if self.ledger.register(session.channel, owner).is_err() {
+                    refusal(id, FENCED, FENCED_MESSAGE, false)
+                } else {
+                    browser.fence_program(owner).await;
+                    match browser
+                        .action_files(session.channel, owner, files, &self.ledger)
+                        .await
+                    {
+                        Ok(data) => json!({"id":id,"success":true,"data":data}),
+                        Err(error) => refusal(id, REJECTED, error, false),
+                    }
+                };
+                (reply, None)
+            }
             (Frame::Sequence(_), None)
             | (Frame::OpStatus(_), None)
             | (Frame::Site(_), None)
-            | (Frame::Program(_, _), None) => (
+            | (Frame::Program(_, _), None)
+            | (Frame::Files(_, _), None) => (
                 refusal(
                     id,
                     PROTOCOL_REFUSED,
@@ -663,6 +697,7 @@ impl Endpoint {
         }
         let context = FrameContext {
             channel,
+            owner,
             binding: &session.binding,
             directory: &frame.directory,
             received_at,

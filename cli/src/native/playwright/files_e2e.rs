@@ -215,7 +215,7 @@ async fn e2e_staged_files_guard_script_resources_and_outlive_program_close() {
         generation: 1,
     };
     let files = StagedFiles::with_root(base);
-    files.activate(scope, owner);
+    files.activate(scope, owner).unwrap();
     files
         .register(
             scope,
