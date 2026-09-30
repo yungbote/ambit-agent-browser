@@ -6,6 +6,8 @@ Stream a session's viewport over WebSocket and drive it with remote input. This 
 
 ## Contents
 
+Host agent-channel landings can include bounded `changedText` after-state: non-editable visible text changed in the addressed original document. Its source generation and node identify the evidence; field/secret/editor text and pending/takeover reads are excluded. Treat it as optional observational data, never input authority.
+
 - [Enabling the stream](#enabling-the-stream)
 - [Owned Chromium window](#owned-chromium-window)
 - [Connecting](#connecting)
