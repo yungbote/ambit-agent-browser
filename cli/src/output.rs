@@ -2723,6 +2723,9 @@ In an owned window, foreground tab new uses Chrome's native Ctrl+T and
 types the destination after session setup/network controls are installed.
 Invalid labels and addresses are refused before input; no URL opens
 about:blank. Background fan-out and headless/external adapters are unchanged.
+Same-window named switches use native Ctrl+PageDown and observe each actual
+visible target. Reordering never changes stable IDs. Cross-window,
+unobservable-window and blocked-dialog switches retain their existing adapter.
 
 `tab new --background` opens one tab per URL (1 to 8) without leaving the
 active tab: its page, refs and frame stay. The tabs load at once, each until

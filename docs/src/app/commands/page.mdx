@@ -276,7 +276,7 @@ agent-browser frame main                       # Back to main frame
 
 ### Stable tab ids and labels
 
-In an owned window, foreground `tab new` creates the tab with Chrome's native Ctrl+T shortcut. Session setup and network controls are installed before the address bar receives its destination. Labels and addresses are validated before input; an omitted URL opens `about:blank`. Background fan-out and headless/external CDP creation retain their existing adapters.
+In an owned window, foreground `tab new` creates the tab with Chrome's native Ctrl+T shortcut. Session setup and network controls are installed before the address bar receives its destination. Labels and addresses are validated before input; an omitted URL opens `about:blank`. Background fan-out and headless/external CDP creation retain their existing adapters. Named switches within the same owned Chrome window use native Ctrl+PageDown and observe each actual visible target, so reordered tabs keep their stable IDs. Cross-window, unobservable-window and blocked-dialog switches retain the existing adapter.
 
 Tab ids are stable strings of the form `t1`, `t2`, `t3`. They're never reused within a session, so `t2` keeps pointing at the same tab even as other tabs are opened or closed. The `t` prefix mirrors the `@e1` element-ref convention and is not interchangeable with positional integers — `agent-browser tab 2` errors with a teaching message; use `t2`.
 

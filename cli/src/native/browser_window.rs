@@ -109,6 +109,26 @@ impl BrowserManager {
         if self.display_client().is_none() {
             return Ok(false);
         }
+        let selected = self.observed_visible_page().await?;
+        if self.pin_tab && self.bound_target_id.as_deref() != Some(&self.pages[selected].target_id)
+        {
+            return Err(ACTIVE_PAGE_AMBIGUOUS);
+        }
+        let changed = self.active_page_index != selected;
+        if changed {
+            self.enable_domains(&self.pages[selected].session_id)
+                .await
+                .map_err(|_| ACTIVE_PAGE_AMBIGUOUS)?;
+        }
+        self.active_page_index = selected;
+        self.bind_active_target();
+        Ok(changed)
+    }
+
+    /// An explicit native switch may observe its intermediate tabs without
+    /// rebinding a pinned session to them. The same observation serves normal
+    /// custody reconciliation; only its caller decides whether to bind.
+    pub(super) async fn observed_visible_page(&mut self) -> Result<usize, &'static str> {
         let info = self
             .window_info()
             .await
@@ -128,21 +148,7 @@ impl BrowserManager {
         let leaving = self
             .active_page_between_documents()
             .then_some(self.active_page_index);
-        let selected =
-            visible_page(&observations, self.pages.len(), leaving).ok_or(ACTIVE_PAGE_AMBIGUOUS)?;
-        if self.pin_tab && self.bound_target_id.as_deref() != Some(&self.pages[selected].target_id)
-        {
-            return Err(ACTIVE_PAGE_AMBIGUOUS);
-        }
-        let changed = self.active_page_index != selected;
-        if changed {
-            self.enable_domains(&self.pages[selected].session_id)
-                .await
-                .map_err(|_| ACTIVE_PAGE_AMBIGUOUS)?;
-        }
-        self.active_page_index = selected;
-        self.bind_active_target();
-        Ok(changed)
+        visible_page(&observations, self.pages.len(), leaving).ok_or(ACTIVE_PAGE_AMBIGUOUS)
     }
 
     /// Lays the window out at `width` × `height` CSS pixels, exactly, and

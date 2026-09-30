@@ -8055,10 +8055,39 @@ async fn handle_tab_switch(cmd: &Value, state: &mut DaemonState) -> Result<Value
         mgr.resolve_tab_ref(&tab_ref)?
     };
     let dialog_session = state.dialog_session();
+    let interrupts = state.browser_control.lock().await.interrupts();
     let result = {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
-        mgr.tab_switch_by_id(tab_id, dialog_session.as_deref())
+        if mgr.display_client().is_some() {
+            let control = state.browser_control.clone();
+            let client = mgr.client.clone();
+            Box::pin(mgr.tab_switch_native(
+                tab_id,
+                dialog_session.as_deref(),
+                &interrupts,
+                move |session| {
+                    let control = control.clone();
+                    let client = client.clone();
+                    async move {
+                        control
+                            .lock()
+                            .await
+                            .agent_native_browser_keys(
+                                &interaction::native_key_chord_events("PageDown", Some(2)),
+                                browser_control::motion::KEY_INTERVAL,
+                                &client,
+                                &session,
+                            )
+                            .await
+                            .map_err(|error| error.error)
+                    }
+                },
+            ))
             .await?
+        } else {
+            mgr.tab_switch_by_id(tab_id, dialog_session.as_deref())
+                .await?
+        }
     };
     // Clear only after the switch commits, so a failed switch does not strand
     // the user on the old tab with dead refs and frame scope.

@@ -2294,16 +2294,29 @@ impl BrowserManager {
                     e
                 )
             })?;
-        self.enable_domains(&session_id).await?;
+        self.finish_tab_switch(index, renderer_state, true).await
+    }
+
+    async fn finish_tab_switch(
+        &mut self,
+        index: usize,
+        renderer_state: RendererState,
+        bring_to_front: bool,
+    ) -> Result<Value, String> {
+        self.enable_domains(&self.pages[index].session_id).await?;
         self.active_page_index = index;
         // An explicit switch re-binds the session and clears any tab_gone.
         self.bind_active_target();
-
-        // Bring tab to front
-        let _ = self
-            .client
-            .send_command("Page.bringToFront", None, Some(&session_id))
-            .await;
+        if bring_to_front {
+            let _ = self
+                .client
+                .send_command(
+                    "Page.bringToFront",
+                    None,
+                    Some(&self.pages[index].session_id),
+                )
+                .await;
+        }
 
         // A dialog-blocked tab cannot answer script evaluation until the dialog
         // is resolved, so fall back to the last known url/title instead of
@@ -2342,6 +2355,112 @@ impl BrowserManager {
             result["dialogBlocked"] = json!(true);
         }
         Ok(result)
+    }
+
+    /// Cycle only within the actual focused Chrome window, observing each
+    /// selected target instead of inferring strip order from stable tab IDs.
+    /// Cross-window and blocked-dialog adapters stay intact before any input;
+    /// an uncertain native effect is never retried through those adapters.
+    pub(crate) async fn tab_switch_native<F, Fut>(
+        &mut self,
+        tab_id: u32,
+        dialog_session: Option<&str>,
+        interrupts: &super::browser_control::Interrupts,
+        mut input: F,
+    ) -> Result<Value, String>
+    where
+        F: FnMut(String) -> Fut,
+        Fut: Future<Output = Result<(), String>>,
+    {
+        let index = self
+            .pages
+            .iter()
+            .position(|page| page.tab_id == tab_id)
+            .ok_or_else(|| tab_id_not_found(tab_id))?;
+        if self.display_client().is_none() || dialog_session.is_some() {
+            return self.tab_switch(index, dialog_session).await;
+        }
+        let mut selected = match self.observed_visible_page().await {
+            Ok(selected) => selected,
+            // Keep explicit-tab recovery while the current renderer/window
+            // cannot be observed. No native effect has been sent yet.
+            Err(_) => return self.tab_switch(index, dialog_session).await,
+        };
+        let requested = self.pages[index].target_id.clone();
+        let window_client = self.client.clone();
+        let window = move |target: String| {
+            let client = window_client.clone();
+            async move {
+                let result = client
+                    .send_command(
+                        "Browser.getWindowForTarget",
+                        Some(json!({"targetId":target})),
+                        None,
+                    )
+                    .await?;
+                result["windowId"]
+                    .as_i64()
+                    .filter(|id| *id > 0)
+                    .ok_or_else(|| "The browser window is unavailable".to_string())
+            }
+        };
+        let requested_window = window(requested.clone()).await;
+        let selected_window = window(self.pages[selected].target_id.clone()).await;
+        let same_window = matches!((&requested_window, &selected_window),
+            (Ok(requested), Ok(selected)) if requested == selected);
+        if !same_window {
+            return self.tab_switch(index, dialog_session).await;
+        }
+        let responsive = self
+            .renderer_responds(&self.pages[index].session_id, RENDERER_PROBE_TIMEOUT_MS)
+            .await;
+        let mut visited = HashSet::new();
+        let mut raised = interrupts.subscribe();
+        while self.pages[selected].target_id != requested {
+            if interrupts.pending().is_some() {
+                return Err("browser_operation_interrupted: Native tab selection stopped when browser control changed. Observe the browser before continuing.".into());
+            }
+            let previous = self.pages[selected].target_id.clone();
+            if !visited.insert(previous.clone()) {
+                return Err("browser_control_outcome_unknown: Native tab cycling returned to a previous tab without finding the requested one. Observe the browser before continuing.".into());
+            }
+            input(self.pages[selected].session_id.clone()).await?;
+            let changed = tokio::time::timeout(Duration::from_millis(self.default_timeout_ms), async {
+                let mut observations = tokio::time::interval(Duration::from_millis(16));
+                loop {
+                    observations.tick().await;
+                    if interrupts.pending().is_some() {
+                        return Err("browser_operation_interrupted: Native tab selection stopped when browser control changed. Observe the browser before continuing.");
+                    }
+                    let observed = tokio::select! {
+                        shown = self.observed_visible_page() => shown,
+                        _ = raised.changed() => continue,
+                    };
+                    if let Ok(shown) = observed {
+                        if self.pages[shown].target_id != previous {
+                            return Ok(shown);
+                        }
+                    }
+                }
+            }).await.map_err(|_| "browser_control_outcome_unknown: The native tab switch did not become observable. Observe the browser before continuing.")??;
+            selected = changed;
+            if window(self.pages[selected].target_id.clone()).await.ok()
+                != requested_window.as_ref().ok().copied()
+                || window(requested.clone()).await.ok() != requested_window.as_ref().ok().copied()
+            {
+                return Err("browser_control_outcome_unknown: The browser windows changed during native tab selection. Observe the browser before continuing.".into());
+            }
+        }
+        self.finish_tab_switch(
+            index,
+            if responsive {
+                RendererState::Responsive
+            } else {
+                RendererState::Revived
+            },
+            false,
+        )
+        .await
     }
 
     pub async fn tab_close(
@@ -3479,6 +3598,24 @@ pub(crate) mod tests {
                 "invalid/duplicate label caused an input effect"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn native_tab_switch_invalid_id_sends_no_chord_and_keeps_binding() {
+        let mut manager = test_manager(vec![page(1, "existing", "about:blank")]).await;
+        let sent = std::cell::Cell::new(false);
+        let interrupts = super::super::browser_control::Interrupts::default();
+        let before = manager.active_target_id().unwrap().to_string();
+        let error = manager
+            .tab_switch_native(99, None, &interrupts, |_| {
+                sent.set(true);
+                std::future::ready(Ok(()))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(error, tab_id_not_found(99));
+        assert!(!sent.get(), "invalid ID sent native input");
+        assert_eq!(manager.active_target_id().unwrap(), before);
     }
 
     #[tokio::test]

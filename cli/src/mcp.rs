@@ -1389,7 +1389,7 @@ fn parity_tools() -> Vec<Value> {
         tool(
             TOOL_TAB_SWITCH,
             "Tab switch",
-            "Switch to a tab by id (t1), label, or CDP target id. Switching also binds the session to that tab.",
+            "Switch to a tab by id (t1), label, or CDP target id. Switching also binds the session to that tab. Within an owned Chrome window, native Ctrl+PageDown cycles through actual observed targets; cross-window, unobservable-window and blocked-dialog switches retain their existing adapter.",
             json!({ "tab": { "type": "string", "description": "Tab id (t1), label, or CDP target id." } }),
             &["tab"],
         ),

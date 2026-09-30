@@ -228,7 +228,7 @@ agent-browser network har stop [output.har]    # Stop and save HAR
 
 ## Tabs and Windows
 
-In an owned window, foreground `tab new` creates the tab through native Ctrl+T, adopts its actual visible target, and installs session setup/network controls before typing the destination. Invalid/duplicate labels and invalid addresses are refused before input; no URL still means `about:blank`. Background fan-out and headless/external CDP creation retain their existing adapters.
+In an owned window, foreground `tab new` creates the tab through native Ctrl+T, adopts its actual visible target, and installs session setup/network controls before typing the destination. Invalid/duplicate labels and invalid addresses are refused before input; no URL still means `about:blank`. Background fan-out and headless/external CDP creation retain their existing adapters. Named switches within the same owned Chrome window use native Ctrl+PageDown and observe each actual visible target, so reordered tabs keep their stable IDs. Cross-window, unobservable-window and blocked-dialog switches retain the existing adapter.
 
 ```bash
 agent-browser tab                              # List tabs with tabId and label

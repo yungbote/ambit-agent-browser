@@ -383,7 +383,7 @@ agent-browser window new --shared              # New window in the signed-in pro
 
 Tab ids are stable strings of the form `t1`, `t2`, `t3`. They're never reused within a session, so scripts and agents can keep referring to the same tab even after other tabs are opened or closed. Positional integers like `tab 2` are **not** accepted; the `t` prefix disambiguates handles from indices and mirrors the `@e1` convention used for element refs.
 
-In an owned window, foreground `tab new` uses Chrome's native Ctrl+T shortcut, adopts the actual visible tab and applies session setup/network controls before typing its destination in the address bar. Invalid/duplicate labels and invalid addresses are refused before the shortcut. An omitted URL still opens `about:blank`. Background fan-out and headless/external CDP creation retain their existing adapters.
+In an owned window, foreground `tab new` uses Chrome's native Ctrl+T shortcut, adopts the actual visible tab and applies session setup/network controls before typing its destination in the address bar. Invalid/duplicate labels and invalid addresses are refused before the shortcut. An omitted URL still opens `about:blank`. Background fan-out and headless/external CDP creation retain their existing adapters. Named switches within the same owned Chrome window use native Ctrl+PageDown and observe each actual visible target, so reordered tabs keep their stable IDs. Cross-window, unobservable-window and blocked-dialog switches retain the existing adapter.
 
 You can also assign a memorable label (`docs`, `app`, `admin`) and use it interchangeably with the id. Labels are never auto-generated and never rewritten on navigation — they're yours to name and keep:
 

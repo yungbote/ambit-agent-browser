@@ -10291,6 +10291,265 @@ async fn e2e_native_tab_new_keeps_setup_and_label_admission() {
     server.abort();
 }
 
+/// Native strip order may differ from stable daemon tab IDs after a person's
+/// reorder; switching observes each actual target rather than guessing CtrlN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires installed Chromium, Xvfb and browser-display"]
+async fn e2e_native_same_window_tab_switch_observes_reordered_targets() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    assert_success(
+        &control_test_command(&json!({"action":"launch","headless":true}), &mut state).await,
+    );
+    let page = |name: &str| {
+        format!("data:text/html;base64,{}", STANDARD.encode(format!(
+        "<title>{name}</title><p>{name}</p><script>window.nativeTabKeys=[];addEventListener('keydown',e=>nativeTabKeys.push({{key:e.key,trusted:e.isTrusted}}));</script>")))
+    };
+    assert_success(
+        &control_test_command(
+            &json!({"action":"navigate","url":page("alpha")}),
+            &mut state,
+        )
+        .await,
+    );
+    let first = state.browser.as_ref().unwrap().tab_list()[0]["tabId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first_target = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .active_target_id()
+        .unwrap()
+        .to_string();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"tab_new","url":page("beta"),"label":"beta"}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"tab_new","url":page("gamma"),"label":"gamma"}),
+            &mut state,
+        )
+        .await,
+    );
+    let mgr = state.browser.as_ref().unwrap();
+    let client = mgr.client.clone();
+    let gamma_session = mgr.active_session_id().unwrap().to_string();
+    // Fixture-only native drag, with framebuffer coordinates read from the
+    // actual 2560x1440 strip screenshot. Production switching uses no points.
+    let display = state.window_display().unwrap();
+    assert_eq!(display.window(), (2560, 1440));
+    display.input(&[
+        json!({"type":"input_mouse","eventType":"mousePressed","x":1300,"y":40,"button":"left","buttons":1}),
+        json!({"type":"input_mouse","eventType":"mouseMoved","x":1200,"y":40,"buttons":1}),
+        json!({"type":"input_mouse","eventType":"mouseMoved","x":1000,"y":40,"buttons":1}),
+        json!({"type":"input_mouse","eventType":"mouseMoved","x":800,"y":40,"buttons":1}),
+        json!({"type":"input_mouse","eventType":"mouseReleased","x":800,"y":40,"button":"left","buttons":0}),
+    ]).await.unwrap();
+    // Prove the fixture actually changed strip order: from gamma, next
+    // is beta now. Original creation order would have selected alpha.
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_native_browser_keys(
+            &super::interaction::native_key_chord_events("PageDown", Some(2)),
+            super::browser_control::motion::KEY_INTERVAL,
+            &client,
+            &gamma_session,
+        )
+        .await
+        .unwrap();
+    state
+        .browser
+        .as_mut()
+        .unwrap()
+        .synchronize_visible_page()
+        .await
+        .unwrap();
+    assert_eq!(
+        state.browser.as_ref().unwrap().get_title().await.unwrap(),
+        "beta",
+        "native drag must actually change the tab strip order"
+    );
+    let beta_session = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .active_session_id()
+        .unwrap()
+        .to_string();
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_native_browser_keys(
+            &super::interaction::native_key_chord_events("PageUp", Some(2)),
+            super::browser_control::motion::KEY_INTERVAL,
+            &client,
+            &beta_session,
+        )
+        .await
+        .unwrap();
+    state
+        .browser
+        .as_mut()
+        .unwrap()
+        .synchronize_visible_page()
+        .await
+        .unwrap();
+    assert_eq!(
+        state.browser.as_ref().unwrap().get_title().await.unwrap(),
+        "gamma"
+    );
+    // Explicit fixture key-up until the independent shared generator fix is
+    // composed by root; no production cleanup path is added here.
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_native_browser_keys(
+            &[super::interaction::native_key_transition(
+                "Control", "keyUp",
+            )],
+            super::browser_control::motion::KEY_INTERVAL,
+            &client,
+            &gamma_session,
+        )
+        .await
+        .unwrap();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"evaluate","script":"nativeTabKeys.length=0"}),
+            &mut state,
+        )
+        .await,
+    );
+    if let Ok(directory) = std::env::var("AMBIT_NATIVE_TABS_ARTIFACT_DIR") {
+        let display = state.window_display().unwrap();
+        let (picture, _) = display
+            .capture(super::display::CaptureRequest {
+                cursor: true,
+                force: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .frame
+            .unwrap();
+        std::fs::write(
+            std::path::Path::new(&directory).join("reordered-strip.jpg"),
+            STANDARD.decode(picture.data.unwrap()).unwrap(),
+        )
+        .unwrap();
+    }
+    let started = std::time::Instant::now();
+    let switched =
+        control_test_command(&json!({"action":"tab_switch","tabId":first}), &mut state).await;
+    assert_success(&switched);
+    assert_eq!(switched["data"]["targetId"], first_target);
+    assert_eq!(switched["data"]["title"], "alpha");
+    println!(
+        "NATIVE_TAB_SWITCH {}",
+        json!({"selected":"alpha","elapsedMs":started.elapsed().as_millis()})
+    );
+    let native = client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({"expression":"nativeTabKeys","returnByValue":true})),
+            Some(&gamma_session),
+        )
+        .await
+        .unwrap();
+    assert!(
+        native["result"]["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["key"] == "Control" && event["trusted"] == true),
+        "native cycle reached departing page: {native}"
+    );
+    state.browser.as_mut().unwrap().set_pin_tab(true);
+    let beta =
+        control_test_command(&json!({"action":"tab_switch","tabId":"beta"}), &mut state).await;
+    assert_success(&beta);
+    assert_eq!(beta["data"]["title"], "beta");
+    let before = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .active_target_id()
+        .unwrap()
+        .to_string();
+    let denied = control_test_command(
+        &json!({"action":"tab_switch","tabId":"not-present"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(denied["success"], false);
+    assert_eq!(
+        state.browser.as_ref().unwrap().active_target_id().unwrap(),
+        before
+    );
+    let gamma_id = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .resolve_tab_ref(&super::browser::TabRef::parse("gamma").unwrap())
+        .unwrap();
+    let control = state.browser_control.clone();
+    let interrupts = control.lock().await.interrupts();
+    let raised = interrupts.clone();
+    let hold = Arc::new(Mutex::new(None));
+    let held = hold.clone();
+    let interrupted = state
+        .browser
+        .as_mut()
+        .unwrap()
+        .tab_switch_native(gamma_id, None, &interrupts, move |session| {
+            let control = control.clone();
+            let client = client.clone();
+            let raised = raised.clone();
+            let held = held.clone();
+            async move {
+                control
+                    .lock()
+                    .await
+                    .agent_native_browser_keys(
+                        &super::interaction::native_key_chord_events("PageDown", Some(2)),
+                        super::browser_control::motion::KEY_INTERVAL,
+                        &client,
+                        &session,
+                    )
+                    .await
+                    .map_err(|error| error.error)?;
+                *held.lock().unwrap() =
+                    Some(raised.raise(super::browser_control::InterruptReason::HumanControl));
+                Ok(())
+            }
+        })
+        .await
+        .unwrap_err();
+    assert!(
+        interrupted.starts_with("browser_operation_interrupted:"),
+        "{interrupted}"
+    );
+    assert_eq!(
+        state.browser.as_ref().unwrap().active_target_id().unwrap(),
+        before,
+        "an intermediate native tab never rebound the pinned session"
+    );
+    hold.lock().unwrap().take();
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
 /// `set credentials` uses target-scoped extra headers, so a new tab must send
 /// the resulting Authorization header on its first document request.
 #[tokio::test]
