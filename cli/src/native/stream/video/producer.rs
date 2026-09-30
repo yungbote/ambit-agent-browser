@@ -95,6 +95,7 @@ struct Mailbox {
     /// When a picture was last converted for this encoding; none before its
     /// first, which is then captured whole.
     pictured: Option<Instant>,
+    visible: Option<Rect>,
     /// The screen changed since this encoding's latest picture. The helper
     /// reports each change once, to whichever picture came next, so an
     /// encoding that picture was not for catches up from the slot.
@@ -108,7 +109,7 @@ struct Buffer {
     picture: Planar,
     coded: (u32, u32),
     /// The framebuffer the picture was last converted from.
-    framebuffer: (u32, u32),
+    source: Option<(u32, u32, Rect)>,
 }
 
 struct Job {
@@ -306,7 +307,7 @@ impl Encoding {
                 id,
                 picture: Planar::new(chroma, 2, 2),
                 coded: (0, 0),
-                framebuffer: (0, 0),
+                source: None,
             })
             .collect();
         Self {
@@ -318,6 +319,7 @@ impl Encoding {
                 stale: [Vec::new(), Vec::new()],
                 coded: CodedSize::new(),
                 pictured: None,
+                visible: None,
                 behind: true,
                 key_requested: false,
                 stop: false,
@@ -380,12 +382,14 @@ impl Encoding {
     /// Remembers the rows a picture wrote, for both buffers.
     fn mark(&self, reply: &PictureReply) {
         let mut mailbox = lock(&self.mailbox);
-        if !reply.rows.is_empty() {
+        let moved = mailbox.visible != Some(reply.window());
+        mailbox.visible = Some(reply.window());
+        if !reply.rows.is_empty() || moved {
             mailbox.behind = true;
         }
         let height = reply.height as usize;
         for rows in mailbox.stale.iter_mut() {
-            if rows.len() != height {
+            if rows.len() != height || moved {
                 *rows = vec![true; height];
                 continue;
             }
@@ -406,7 +410,11 @@ impl Encoding {
         let Some(mut buffer) = mailbox.free.pop() else {
             return;
         };
-        let window = (capture.visible.width, capture.visible.height);
+        // PictureChannel checked these global extents inside the framebuffer.
+        let window = (
+            capture.visible.x as u32 + capture.visible.width,
+            capture.visible.y as u32 + capture.visible.height,
+        );
         let coded = mailbox.coded.fit(window, capture.read);
         mailbox.pictured = Some(capture.read);
         mailbox.behind = false;
@@ -505,7 +513,8 @@ fn convert(
     coded: (u32, u32),
     chroma: codec::Chroma,
 ) {
-    let framebuffer = (reply.width, reply.height);
+    let window = reply.window();
+    let source = (reply.width, reply.height, window);
     let height = reply.height as usize;
     let mut whole = false;
     if buffer.coded != coded {
@@ -513,9 +522,9 @@ fn convert(
         buffer.coded = coded;
         whole = true;
     }
-    if buffer.framebuffer != framebuffer {
-        buffer.picture.clear_outside(reply.width as usize, height);
-        buffer.framebuffer = framebuffer;
+    if buffer.source != Some(source) {
+        buffer.picture.clear_outside(0, 0);
+        buffer.source = Some(source);
         whole = true;
     }
     if whole || stale.len() != height {
@@ -532,10 +541,11 @@ fn convert(
             stale[row] = false;
             row += 1;
         }
-        buffer.picture.convert(
+        buffer.picture.convert_visible(
             pixels,
             reply.stride as usize,
             (reply.width as usize, height),
+            window,
             (top, row),
         );
     }
