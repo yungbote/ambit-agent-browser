@@ -90,6 +90,9 @@ impl Custody {
         client: Arc<CdpClient>,
         sessions: Vec<String>,
     ) -> Result<(), &'static str> {
+        if crate::native::workspace_role::current().is_ok_and(|role| role.is_browser_host()) {
+            self.context.files.guard();
+        }
         {
             let mut state = self.state.lock().await;
             if state.channel.is_none() {
@@ -165,7 +168,22 @@ impl Custody {
                 return Ok(());
             }
         }
-        client.send_command("Fetch.enable",Some(json!({"patterns":[{"urlPattern":"*","resourceType":"Document","requestStage":"Request"}]})),Some(session)).await.map_err(|_|REFUSED)?;
+        let mut patterns =
+            vec![json!({"urlPattern":"*","resourceType":"Document","requestStage":"Request"})];
+        if self.context.files.guarded() {
+            patterns.push(json!({"urlPattern":"file://*","requestStage":"Request"}));
+            if let Some(pattern) = client.debugger_pattern() {
+                patterns.push(pattern);
+            }
+        }
+        client
+            .send_command(
+                "Fetch.enable",
+                Some(json!({"patterns":patterns})),
+                Some(session),
+            )
+            .await
+            .map_err(|_| REFUSED)?;
         self.state.lock().await.prepared.insert(session.into());
         Ok(())
     }

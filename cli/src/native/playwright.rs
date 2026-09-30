@@ -3,6 +3,9 @@
 //! custody remains with the daemon and human input remains with BrowserControl.
 
 mod boundary;
+pub(crate) mod files;
+#[cfg(all(test, unix))]
+mod files_e2e;
 pub(crate) mod remote;
 mod transport;
 #[cfg(test)]

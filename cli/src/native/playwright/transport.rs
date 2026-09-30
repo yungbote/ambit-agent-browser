@@ -331,6 +331,14 @@ async fn serve(
                     }
                     continue;
                 }
+                if client.site_context().files.guarded() && command.pointer("/params/url").and_then(Value::as_str).is_some_and(|url|client.debugger_resource(url)) {
+                    if outgoing.send(Message::Text(error_reply(&command,"The browser debugger is private to the browser host.").to_string())).is_err() { break Err("Playwright transport closed".into()); }
+                    continue;
+                }
+                if let Err(error)=client.site_context().files.command(method,&command["params"]).await {
+                    if outgoing.send(Message::Text(error_reply(&command,error).to_string())).is_err() { break Err("Playwright transport closed".into()); }
+                    continue;
+                }
                 if is_input(method) {
                     let queued = tokio::select! {
                         biased;

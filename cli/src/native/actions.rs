@@ -12314,6 +12314,18 @@ async fn resolve_fetch_paused(
     paused: &FetchPausedRequest,
 ) {
     let session_id = &paused.session_id;
+    if client.site_context().files.url(&paused.url).await.is_err()
+        || (client.site_context().files.guarded() && client.debugger_resource(&paused.url))
+    {
+        let _ = client
+            .send_command(
+                "Fetch.failRequest",
+                Some(json!({"requestId":paused.request_id,"errorReason":"BlockedByClient"})),
+                Some(session_id),
+            )
+            .await;
+        return;
+    }
 
     // Domain filter check (takes priority over routes and origin headers)
     if let Some(filter) = domain_filter {

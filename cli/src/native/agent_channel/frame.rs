@@ -693,6 +693,8 @@ mod tests {
             json!({"type":"program.close","id":5,"programId":program,"reason":"cancel"}),
             json!({"type":"program.close","id":6,"programId":program,"reason":"timeout"}),
             json!({"type":"program.status","id":7,"programId":program}),
+            json!({"type":"program.files","id":12,"programId":program,"files":[]}),
+            json!({"type":"program.files","id":13,"programId":program,"files":[{"path":"/workspace/.ambit/browser/staged/fixture.txt","byteSize":0,"contentRef":format!("sha256:{}","0".repeat(64))}]}),
         ] {
             let mut frame = frame;
             frame["actionId"] = json!(ACTION);

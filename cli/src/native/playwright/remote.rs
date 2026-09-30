@@ -109,6 +109,7 @@ mod tests {
                 opened: json!({}),
                 stop,
                 status,
+                files: super::super::files::StagedFiles::default(),
             });
             let mut leases = programs.leases.lock().await;
             while leases.len() >= 256 {
@@ -142,6 +143,150 @@ mod tests {
         assert!(error.contains("not restarted"));
         assert!(!state.lock().await.playwright_operations.active());
         assert!(state.lock().await.browser.is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore]
+    async fn e2e_raw_debugger_rejects_site_file_and_opaque_page_origins() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let site = format!("http://{}", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let mut input = [0u8; 2048];
+                let _ = socket.read(&mut input).await;
+                let body = "<title>Raw debugger boundary fixture</title>";
+                let reply=format!("HTTP/1.1 200 OK\r\nContent-Type:text/html\r\nContent-Length:{}\r\nConnection:close\r\n\r\n{body}",body.len());
+                let _ = socket.write_all(reply.as_bytes()).await;
+            }
+        });
+        let fixture = tempfile::tempdir().unwrap();
+        let file = fixture.path().join("opaque.html");
+        std::fs::write(&file, "<title>Opaque fixture</title>").unwrap();
+        let mut state = DaemonState::new();
+        let launched = Box::pin(execute_command(
+            &json!({"action":"launch","headless":true}),
+            &mut state,
+        ))
+        .await;
+        assert_eq!(launched["success"], true, "{launched}");
+        let endpoint = state.browser.as_ref().unwrap().get_cdp_url().to_owned();
+        let port = url::Url::parse(&endpoint).unwrap().port().unwrap();
+        let client = &state.browser.as_ref().unwrap().client;
+        for host in [
+            "127.0.0.1",
+            "127.1",
+            "2130706433",
+            "0x7f000001",
+            "localhost",
+            "localhost.",
+            "[::1]",
+            "[::ffff:127.0.0.1]",
+        ] {
+            assert!(
+                client.debugger_resource(&format!("http://{host}:{port}/json/new")),
+                "normalized debugger alias {host}"
+            );
+        }
+        assert!(
+            !client.debugger_resource(&site),
+            "an unrelated fixture service stays available"
+        );
+        assert!(
+            !client.debugger_resource(&format!("https://example.com:{port}/")),
+            "an unrelated origin using the same numeric port stays available"
+        );
+        assert!(
+            !client.debugger_resource(&format!("http://127.0.0.1@example.com:{port}/")),
+            "user-info is not the request host"
+        );
+        let discovery = format!("http://127.0.0.1:{port}/json/version");
+        let expression = format!(
+            r#"(async()=>{{const readable=await fetch({}).then(r=>r.text()).then(text=>text.includes('webSocketDebuggerUrl')).catch(()=>false);const opened=await new Promise(resolve=>{{const socket=new WebSocket({});socket.onopen=()=>{{socket.close();resolve(true)}};socket.onerror=()=>resolve(false)}});return {{readable,opened}}}})()"#,
+            serde_json::to_string(&discovery).unwrap(),
+            serde_json::to_string(&endpoint).unwrap()
+        );
+        let mut results = Vec::new();
+        for (origin, url) in [
+            ("site", site),
+            ("opaque", "data:text/html,<title>Opaque</title>".into()),
+            ("file", url::Url::from_file_path(&file).unwrap().to_string()),
+            ("debugger", discovery),
+        ] {
+            let navigation = Box::pin(execute_command(
+                &json!({"action":"navigate","url":url}),
+                &mut state,
+            ))
+            .await;
+            assert_eq!(navigation["success"], true, "{navigation}");
+            let browser = state.browser.as_ref().unwrap();
+            let result = tokio::time::timeout(
+                Duration::from_secs(5),
+                browser.client.send_command(
+                    "Runtime.evaluate",
+                    Some(json!({"expression":expression,"returnByValue":true,"awaitPromise":true})),
+                    Some(browser.active_session_id().unwrap()),
+                ),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            assert!(result.get("exceptionDetails").is_none(), "{result}");
+            results.push((origin, result["result"]["value"].clone()));
+        }
+        // The last page has the debugger's HTTP origin. A writable HTTP
+        // endpoint would be another way to open an internal UI target, even
+        // though this page's raw WebSocket was refused.
+        let browser = state.browser.as_ref().unwrap();
+        let expression="fetch('/json/new?chrome://version',{method:'PUT'}).then(async r=>({ok:r.ok,body:await r.json()})).catch(()=>({ok:false}))";
+        browser.client.site_context().files.guard();
+        browser
+            .client
+            .send_command(
+                "Fetch.enable",
+                Some(json!({"patterns":[{"urlPattern":"*","requestStage":"Request"}]})),
+                Some(browser.active_session_id().unwrap()),
+            )
+            .await
+            .unwrap();
+        let created = browser
+            .client
+            .send_command(
+                "Runtime.evaluate",
+                Some(json!({"expression":expression,"awaitPromise":true,"returnByValue":true})),
+                Some(browser.active_session_id().unwrap()),
+            )
+            .await
+            .unwrap();
+        let value = &created["result"]["value"];
+        let created_ui =
+            value["ok"] == true && value.pointer("/body/id").and_then(Value::as_str).is_some();
+        println!("DEBUGGER_HTTP_UI {}", json!({"created":created_ui}));
+        if let Some(target) = value.pointer("/body/id").and_then(Value::as_str) {
+            browser
+                .client
+                .send_command("Target.closeTarget", Some(json!({"targetId":target})), None)
+                .await
+                .unwrap();
+        }
+        let closed = Box::pin(execute_command(&json!({"action":"close"}), &mut state)).await;
+        assert_eq!(closed["success"], true, "{closed}");
+        server.abort();
+        let _ = server.await;
+        println!("RAW_DEBUGGER {}", json!(results));
+        for (origin, result) in results {
+            assert_eq!(
+                result["opened"], false,
+                "{origin}: no page origin may attach to raw Chrome"
+            );
+            if origin != "debugger" {
+                assert_eq!(
+                    result["readable"], false,
+                    "{origin}: discovery must not cross CORS"
+                );
+            }
+        }
+        assert!(!created_ui,"The model's page must not open browser-interface targets through the debugger HTTP surface");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -561,10 +706,17 @@ pub(crate) enum Request {
     Status {
         program: ProgramId,
     },
+    Files {
+        program: ProgramId,
+        files: Vec<super::files::Receipt>,
+    },
 }
 
 pub(crate) fn is_kind(kind: &str) -> bool {
-    matches!(kind, "program.open" | "program.close" | "program.status")
+    matches!(
+        kind,
+        "program.open" | "program.close" | "program.status" | "program.files"
+    )
 }
 
 #[derive(Deserialize)]
@@ -594,9 +746,21 @@ struct StatusWire {
     program_id: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct FilesWire {
+    #[allow(dead_code)]
+    id: u64,
+    program_id: String,
+    files: Vec<super::files::Receipt>,
+}
+
 impl Request {
     pub(crate) fn independent(&self) -> bool {
-        matches!(self, Self::Close { .. } | Self::Status { .. })
+        matches!(
+            self,
+            Self::Close { .. } | Self::Status { .. } | Self::Files { .. }
+        )
     }
     pub(crate) fn read(kind: &str, value: Value) -> Result<Self, String> {
         Ok(match kind {
@@ -632,6 +796,14 @@ impl Request {
                     .map_err(|_| "The program.status frame is invalid.")?;
                 Self::Status {
                     program: ProgramId::parse(&frame.program_id)?,
+                }
+            }
+            "program.files" => {
+                let frame: FilesWire = serde_json::from_value(value)
+                    .map_err(|_| "The program.files frame is invalid.")?;
+                Self::Files {
+                    program: ProgramId::parse(&frame.program_id)?,
+                    files: frame.files,
                 }
             }
             _ => return Err("Unknown remote program frame.".into()),
@@ -682,6 +854,7 @@ struct Lease {
     opened: Value,
     stop: watch::Sender<Option<StopReason>>,
     status: watch::Sender<Value>,
+    files: super::files::StagedFiles,
 }
 
 impl Lease {
@@ -873,6 +1046,11 @@ impl Programs {
                     return Err("agent_channel_fenced: A newer Action owner reached the browser; the remote transport was not published.".into());
                 }
                 let control = state.browser_control.clone();
+                let files = attachment.owner.site_context().files;
+                let scope =
+                    super::files::Scope::parse(&program.to_string()).map_err(str::to_owned)?;
+                files.activate(scope, owner);
+                files.downloads(attachment.artifacts.clone());
                 drop(state);
                 let opened = json!({"programId":program.to_string(), "state":"active", "nativeInputSettled":false,
                     "endpoint":attachment.tunnel.endpoint(), "targetId":attachment.target,
@@ -893,6 +1071,7 @@ impl Programs {
                     opened,
                     stop,
                     status,
+                    files: files.clone(),
                 });
                 leases.push_back(lease.clone());
                 self.seen.lock().unwrap().insert(program);
@@ -924,6 +1103,7 @@ impl Programs {
                         let _ = control.lock().await.cancel_native_input().await;
                     }
                     drop(tunnel);
+                    files.clear(scope, owner);
                     // The shared slot stays occupied until all admitted input
                     // settled and this private connection has gone away.
                     drop(operation);
@@ -964,6 +1144,31 @@ impl Programs {
                         as u64);
                 }
                 Ok(status)
+            }
+            Request::Files { program, files } => {
+                let lease = leases
+                    .iter()
+                    .find(|lease| lease.program == program)
+                    .cloned()
+                    .ok_or("This browser generation has no active transport for that program.")?;
+                if lease.owner != owner || lease.status.borrow()["state"] != "active" {
+                    return Err(
+                        "That program's staging custody is no longer active for this Action owner."
+                            .into(),
+                    );
+                }
+                drop(leases);
+                let scope =
+                    super::files::Scope::parse(&program.to_string()).map_err(str::to_owned)?;
+                let registered = lease
+                    .files
+                    .register(scope, owner, files)
+                    .await
+                    .map_err(str::to_owned)?;
+                if lease.status.borrow()["state"] != "active" {
+                    return Err("That program's staging custody ended before publication.".into());
+                }
+                Ok(json!({"programId":program.to_string(),"registered":registered}))
             }
         }
     }

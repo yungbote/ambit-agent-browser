@@ -14,6 +14,7 @@ use std::sync::{Arc, RwLock};
 #[derive(Clone, Default)]
 pub(crate) struct Context {
     pub(crate) values: redaction::Redaction,
+    pub(crate) files: crate::native::playwright::files::StagedFiles,
     targets: Arc<RwLock<HashSet<String>>>,
 }
 

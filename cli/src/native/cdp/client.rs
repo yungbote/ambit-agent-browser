@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use serde_json::Value;
+use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex};
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
@@ -244,6 +244,7 @@ pub struct RawCdpMessage {
 }
 
 pub struct CdpClient {
+    debugger_endpoint: Option<url::Url>,
     site_context: std::sync::RwLock<crate::native::site_sessions::Context>,
     site_custody:
         std::sync::RwLock<std::sync::Weak<crate::native::site_sessions::custody::Custody>>,
@@ -780,6 +781,7 @@ impl CdpClient {
         });
 
         Ok(Self {
+            debugger_endpoint: url::Url::parse(&normalized_url).ok(),
             site_context: std::sync::RwLock::default(),
             site_custody: std::sync::RwLock::default(),
             ws_tx,
@@ -889,12 +891,44 @@ impl CdpClient {
         session_id: Option<&str>,
         source: InputSource,
     ) -> Result<PendingCommand, String> {
+        let mut params = params;
+        let custody = self
+            .site_custody
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .upgrade();
+        let private = session_id
+            .and_then(|session| self.target_for_session(session))
+            .is_some_and(|target| self.site_context().private_target(&target));
+        let guarded = custody.is_some() && !private && self.site_context().files.guarded();
+        let method = if method == "Fetch.disable" && guarded {
+            params = Some(json!({"patterns":[]}));
+            "Fetch.enable"
+        } else {
+            method
+        };
+        if method == "Fetch.enable" && guarded {
+            let params = params.get_or_insert_with(|| json!({}));
+            if params.get("patterns").is_none() {
+                params["patterns"] = json!([]);
+            }
+            if let Some(patterns) = params["patterns"].as_array_mut() {
+                for pattern in [
+                    json!({"urlPattern":"*","resourceType":"Document","requestStage":"Request"}),
+                    json!({"urlPattern":"file://*","requestStage":"Request"}),
+                ] {
+                    if !patterns.contains(&pattern) {
+                        patterns.push(pattern);
+                    }
+                }
+                if let Some(pattern) = self.debugger_pattern() {
+                    if !patterns.contains(&pattern) {
+                        patterns.push(pattern);
+                    }
+                }
+            }
+        }
         if matches!(method, "Page.navigate" | "Runtime.runIfWaitingForDebugger") {
-            let custody = self
-                .site_custody
-                .read()
-                .unwrap_or_else(|error| error.into_inner())
-                .upgrade();
             if let (Some(custody), Some(session)) = (custody, session_id) {
                 Box::pin(custody.prepare_session(self, session))
                     .await
@@ -1277,6 +1311,49 @@ impl CdpClient {
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .clone()
+    }
+
+    /// The debugger's HTTP endpoints can mutate Chrome too. This matches
+    /// this connection's real host/port and normalized loopback aliases,
+    /// never every local service or a port retained from an earlier Chrome.
+    pub(crate) fn debugger_resource(&self, value: &str) -> bool {
+        let Some(endpoint) = &self.debugger_endpoint else {
+            return false;
+        };
+        let mut value = value.trim_start();
+        while value
+            .get(..12)
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("view-source:"))
+        {
+            value = value[12..].trim_start();
+        }
+        let Ok(candidate) = url::Url::parse(value) else {
+            return false;
+        };
+        if !matches!(candidate.scheme(), "http" | "https" | "ws" | "wss")
+            || candidate.port_or_known_default() != endpoint.port_or_known_default()
+        {
+            return false;
+        }
+        let local = |host: Option<url::Host<&str>>| match host {
+            Some(url::Host::Ipv4(ip)) => ip.is_loopback(),
+            Some(url::Host::Ipv6(ip)) => {
+                ip.is_loopback() || ip.to_ipv4_mapped().is_some_and(|ip| ip.is_loopback())
+            }
+            Some(url::Host::Domain(host)) => {
+                let host = host.trim_end_matches('.');
+                host.eq_ignore_ascii_case("localhost")
+                    || host.ends_with(".localhost")
+                    || host.eq_ignore_ascii_case("localhost.localdomain")
+            }
+            None => false,
+        };
+        candidate.host() == endpoint.host() || (local(candidate.host()) && local(endpoint.host()))
+    }
+
+    pub(crate) fn debugger_pattern(&self) -> Option<Value> {
+        let port = self.debugger_endpoint.as_ref()?.port_or_known_default()?;
+        Some(json!({"urlPattern":format!("*://*:{port}/*"),"requestStage":"Request"}))
     }
 
     pub(crate) async fn site_request_ready(self: &Arc<Self>, session: String, params: Value) {
