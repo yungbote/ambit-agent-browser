@@ -2071,12 +2071,11 @@ Usage: agent-browser scroll [direction] [amount] [options]
 
 Scrolls the page or a specific element in the specified direction.
 
-In an owned window (AGENT_BROWSER_WINDOW_STREAM=1) the pointer goes
-where the wheel reaches the scroller and the wheel turns one event per
-frame, a notch (about 120 px) each, more notches per event for a long
-way, for at most about 1.5 s. A residual pixel distance uses trusted
-precision wheel input in the already attached automation browser.
-Actual displacement is checked; a page blocking the wheel fails.
+In an owned window (AGENT_BROWSER_WINDOW_STREAM=1) the native pointer
+goes where wheel input reaches the scroller. Trusted precision input
+scrolls in CSS pixels; actual displacement is checked. Held physical
+gestures keep their native wheel device until release within the
+existing 1.5 s deadline. Blocked scrolling fails without DOM repair.
 
 Arguments:
   direction            up, down, left, right (default: down)

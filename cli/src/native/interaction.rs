@@ -936,6 +936,23 @@ async fn native_select_text(
         if control.lock().await.agent_native_mouse(json!({"type":"mousePressed","x":sx,"y":sy,"button":"left","buttons":1,"clickCount":1}),client,element_session,&[element_session,page_session]).await? {
             return Ok(ClickResult{dialog_opened:true,pending_release:pending()});
         }
+        // Native dispatch acknowledgement can precede Chrome consuming the
+        // press. A precision wheel uses another browser input route, so it
+        // must not overtake that press and move its intended text anchor.
+        // Prove the actual selection start before scrolling while held.
+        let start_deadline=tokio::time::Instant::now()+FIELD_SETTLE;
+        loop {
+            if let Some(error)=control.lock().await.agent_error() {return Err(format!("{}: {}",error.code,error.message).into())}
+            let read=client.send_command("Runtime.callFunctionOn",Some(json!({
+                "objectId":first,"returnByValue":true,
+                "functionDeclaration":"function(){const selection=this.ownerDocument.getSelection();return this.node.isConnected&&selection.anchorNode===this.node&&selection.anchorOffset===this.offset}",
+            })),Some(element_session)).await?;
+            if read["result"]["value"]==true {break}
+            if read.get("exceptionDetails").is_some()||tokio::time::Instant::now()>=start_deadline {
+                return Err("The browser did not start selection at the requested text boundary. Inspect the page before selecting again.".into());
+            }
+            client.send_command("Runtime.evaluate",Some(json!({"expression":"new Promise(resolve=>requestAnimationFrame(()=>resolve(true)))","awaitPromise":true,"returnByValue":true})),Some(element_session)).await?;
+        }
         if control.lock().await.agent_native_scroll_into_view(client,page_session,(&last,element_session)).await? {
             return Ok(ClickResult{dialog_opened:true,pending_release:pending()});
         }

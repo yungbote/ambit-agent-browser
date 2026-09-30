@@ -548,7 +548,7 @@ async fn e2e_native_static_selectall_preserves_exact_scope_through_nested_scroll
             json!({"selector":selector,"commandToReturnMs":started.elapsed().as_secs_f64()*1000.0,"response":response})
         );
         if response["success"] != true {
-            let diagnostics=control_test_command(&json!({"action":"evaluate","script":"({scroll:box.scrollTop,box:box.getBoundingClientRect().toJSON(),first:long.firstChild.getBoundingClientRect().toJSON(),last:long.lastElementChild.previousElementSibling.getBoundingClientRect().toJSON(),events:events.slice(-12)})"}),&mut state).await;
+            let diagnostics=control_test_command(&json!({"action":"evaluate","script":"({scroll:box.scrollTop,box:box.getBoundingClientRect().toJSON(),first:long.firstChild.getBoundingClientRect().toJSON(),last:long.lastElementChild.previousElementSibling.getBoundingClientRect().toJSON(),selection:[getSelection().anchorNode?.textContent,getSelection().anchorOffset,getSelection().focusNode?.textContent,getSelection().focusOffset],text:getSelection().toString(),events:events.slice(-12)})"}),&mut state).await;
             println!("NATIVE_SELECTALL_FAILURE {}", diagnostics["data"]["result"]);
             if let Ok(prefix) = std::env::var("AMBIT_NATIVE_INPUT_SCREENSHOT_PREFIX") {
                 let capture=control_test_command(&json!({"action":"screenshot","path":format!("{prefix}-failure-{}.png",selector.trim_start_matches('#'))}),&mut state).await;
@@ -15841,7 +15841,7 @@ async fn e2e_native_motion_proof() {
         .find(|event| event["type"] == "scroll")
         .and_then(|event| event["t"].as_f64());
     assert!(!by_script, "the wheel moved the page");
-    assert!(notches.len() >= 4, "{} notches", notches.len());
+    assert_eq!(notches.len(), 1, "One actual precision wheel: {notches:?}");
     assert!(
         one_a_frame(&gaps(&notches)),
         "one notch per frame: {:?}",
@@ -16013,7 +16013,7 @@ async fn e2e_native_motion_proof() {
         let command = control_test_command(&scroll, &mut state);
         let takeover = async {
             let mut seen = 0;
-            while seen < 3 {
+            while seen < 1 {
                 if let Ok(event) = watch.recv().await {
                     if event.method == crate::native::activity::EVENT
                         && event.params["eventType"] == "scroll"

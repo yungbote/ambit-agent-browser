@@ -34,13 +34,10 @@ pub(crate) const NOTCH_DELTA: f64 = 100.0;
 /// The most delta one wheel may carry on an axis: the helper's own bound.
 const MOST_WHEEL_DELTA: f64 = 32768.0;
 
-/// How long a scroll's wheel may leave its scroller unmoved before the
-/// scroll goes by script instead.
-pub(crate) const WHEEL_STALL: Duration = Duration::from_millis(400);
-
 /// The longest a scroll turns the wheel, from its first notch until the
-/// scroller settles. A longer distance turns more notches per event; what
-/// even that cannot reach in time goes by script.
+/// scroller settles. A held gesture keeps its native input device; a longer
+/// distance turns more notches per event and fails if readback cannot prove
+/// the target reached within the same deadline. No script fallback occurs.
 pub(crate) const WHEEL_BUDGET: Duration = Duration::from_millis(1500);
 
 /// The most notches one wheel event carries. Chrome scrolls exactly the

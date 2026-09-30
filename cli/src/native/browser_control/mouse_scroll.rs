@@ -1,20 +1,17 @@
-//! The agent's scrolling in the owned window, as a person scrolls: the
+//! The agent's scrolling in the owned window through trusted input: the
 //! pointer goes where the wheel reaches the scroller, and the wheel turns
-//! until the scroller is where it should be, one event per frame. Chrome's
-//! own smooth scrolling animates each notch. `scroll` asks for a distance;
+//! until readback proves the result. A held gesture's native notches remain
+//! paced per frame. `scroll` asks for a distance;
 //! bringing an element into view (`scrollintoview`, and every native pointer
 //! command before it reads its target) asks for the element's centre in the
 //! middle of what each scroller hiding it shows, outermost first.
 //!
-//! The loop is closed on the scroller. It reads the scroller (and the
-//! element) once per frame while it waits, and each round sends the notches
-//! the remaining distance needs at the distance per notch the scroller has
-//! shown. A long distance turns more notches per event rather than more
-//! events (`motion::wheel_events`), within `motion::WHEEL_BUDGET`. A residual
-//! distance uses Chrome's trusted precision wheel input at the same visible
-//! pointer, including distances smaller than an X11 notch. Actual scroller
-//! readback proves completion; blocked input fails instead of changing DOM
-//! scroll offsets. The human sign-in browser never uses this attached CDP path.
+//! The existing native mouse owner positions the visible pointer, then Chrome
+//! receives precision wheel input in CSS pixels. The loop reads actual
+//! displacement and visibility through settlement; it never changes DOM
+//! scroll offsets or reports an input acknowledgement as a painted result.
+//! Explicit wheel gestures and the human sign-in browser retain paced native
+//! display input. Sign-in never uses this attached automation CDP path.
 
 use std::time::{Duration, Instant};
 
@@ -27,26 +24,11 @@ use crate::native::browser_control::motion::{self, Glide};
 use crate::native::cdp::client::CdpClient;
 use crate::native::display::DisplayClient;
 
-/// The device-independent pixels Chrome on X11 scrolls per wheel click
-/// (measured: 120 CSS pixels a notch at 100 % zoom). Each scroll starts
-/// from it and learns the distance its scroller really moves per notch.
-const NOTCH_DIP: f64 = 120.0;
-
-/// Rounds of notches per scroll: the first, then corrections while the
-/// scroller settled short of its goal.
-const ROUNDS: usize = 3;
-
 /// A scroller that has not moved for this many frames in a row has settled.
 const SETTLED_FRAMES: u32 = 3;
 
-/// The longest a scroller may keep moving after a round's last notch.
+/// The longest an unheld precision wheel may settle before refusing.
 const SETTLE_LIMIT: Duration = Duration::from_secs(1);
-
-/// The part of `motion::WHEEL_BUDGET` kept for the scroller to settle after
-/// the last notch: Chrome's smooth scroll ends about 110 ms after the last
-/// wheel event (measured at 1, 3 and 10 notches an event), then the loop
-/// sees it still for `SETTLED_FRAMES`.
-const SETTLE_RESERVE: Duration = Duration::from_millis(250);
 
 // Selection of a hiding scroller and the distance that scroller moves must
 // read the same clipped point. Compile the one projection into both read-only
@@ -214,17 +196,6 @@ fn direction(delta: f64) -> f64 {
         -1.0
     } else {
         0.0
-    }
-}
-
-/// The distance per notch a round showed on one axis: what the scroller
-/// moved over the notches it turned, unless it stopped at an end, where the
-/// notches may have moved it less than they would elsewhere.
-fn learned(previous: f64, moved: f64, notches: u32, at: f64, most: f64) -> f64 {
-    if notches > 0 && moved != 0.0 && at > 0.0 && at < most {
-        moved.abs() / f64::from(notches)
-    } else {
-        previous
     }
 }
 
@@ -406,15 +377,6 @@ impl<'a> Course<'a> {
             goal.clamp(0.0, now.most[axis].max(0.0)) - now.at[axis]
         })
     }
-
-    /// How many notches each axis still needs, at `per_notch` CSS pixels a
-    /// notch.
-    fn wanted(&self, now: &Reading, per_notch: Axes<f64>) -> Axes<u32> {
-        let left = self.remaining(now);
-        std::array::from_fn(|axis| {
-            motion::notches_toward(left[axis], self.toward[axis], per_notch[axis])
-        })
-    }
 }
 
 /// One scroll's scroller, and the course it takes.
@@ -585,8 +547,14 @@ impl NativeMouse {
         };
         let surface = display.surface();
         let scale = mapping.scale()?;
-        let mut per_notch = [NOTCH_DIP * f64::from(surface.device_scale_factor) / scale; 2];
         if scroll.course.remaining(&first) == [0.0, 0.0] {
+            if let Goal::Into(_) = goal {
+                if first.outside.iter().any(|outside| *outside) {
+                    // Preserve the canonical visible-point refusal for a
+                    // fixed offscreen target the scroller cannot reach.
+                    return Err("The target is outside the visible page or clipped by a container the wheel could not reveal, so no input was sent to it. Inspect the page before continuing.".into());
+                }
+            }
             return Ok(false);
         }
         let pointer = display
@@ -625,120 +593,16 @@ impl NativeMouse {
                 return Ok(true);
             }
         }
-        let budget = (motion::WHEEL_BUDGET - SETTLE_RESERVE).as_nanos() / motion::FRAME.as_nanos();
-        let mut frames_until: Option<Instant> = None;
-        let mut now = first;
-        let mut acted = Acted::Nothing;
-        for round in 0..=ROUNDS {
-            let count = scroll.course.wanted(&now, per_notch);
-            if count == [0, 0] {
-                return self
-                    .precision_scroll(&scroll, &now, (x, y), &mapping, display, &mut pacing, acted)
-                    .await;
-            }
-            // The frames left for notches: the whole budget until the first
-            // notch starts its clock.
-            let frames = frames_until.map_or(budget, |until| {
-                until.saturating_duration_since(Instant::now()).as_nanos()
-                    / motion::FRAME.as_nanos()
-            });
-            let frames = u32::try_from(frames).unwrap_or(u32::MAX);
-            let events = count.map(|notches| motion::wheel_events(notches, frames));
-            // A plan already known to leave a remainder must not spend the
-            // entire native budget before starting its precision input.
-            let cannot_finish = events
-                .iter()
-                .zip(count)
-                .any(|(events, wanted)| events.iter().sum::<u32>() < wanted);
-            if round == ROUNDS || cannot_finish || events.iter().all(Vec::is_empty) {
-                return self
-                    .precision_scroll(&scroll, &now, (x, y), &mapping, display, &mut pacing, acted)
-                    .await;
-            }
-            let from = now;
-            for index in 0..events[0].len().max(events[1].len()) {
-                pacing.tick().await;
-                // The budget is time, whatever the plan counted: a wheel
-                // slower than a notch a frame stops at it, and what it has
-                // not reached uses the same browser's precision wheel input.
-                if frames_until.is_some_and(|until| Instant::now() >= until) {
-                    break;
-                }
-                if pacing.check(acted)? {
-                    return Ok(true);
-                }
-                let [delta_x, delta_y] = std::array::from_fn(|axis| {
-                    let notches = events[axis].get(index).copied().unwrap_or(0);
-                    scroll.course.toward[axis] * f64::from(notches) * motion::NOTCH_DELTA
-                });
-                let params = json!({
-                    "type": "mouseWheel", "x": x, "y": y, "deltaX": delta_x, "deltaY": delta_y,
-                });
-                let atomic = display.atomic_input().await;
-                self.turning_layout(display, acted)?;
-                self.send(&params, to, &mapping, client, display, atomic)
-                    .await?;
-                pacing.sent();
-                acted = Acted::Turned;
-                if index > 0 {
-                    continue;
-                }
-                let turned = Instant::now();
-                frames_until.get_or_insert(turned + motion::WHEEL_BUDGET - SETTLE_RESERVE);
-                // The wheel has to reach the scroller: wait for it to move.
-                loop {
-                    pacing.tick().await;
-                    if pacing.check(acted)? {
-                        return Ok(true);
-                    }
-                    let Some(read) = scroll.read(&mut pacing).await? else {
-                        return Ok(true);
-                    };
-                    if read.at != from.at {
-                        now = read;
-                        break;
-                    }
-                    if turned.elapsed() >= motion::WHEEL_STALL {
-                        return self
-                            .precision_scroll(
-                                &scroll,
-                                &read,
-                                (x, y),
-                                &mapping,
-                                display,
-                                &mut pacing,
-                                acted,
-                            )
-                            .await;
-                    }
-                }
-            }
-            let turned = Instant::now();
-            let mut still = 0;
-            while still < SETTLED_FRAMES && turned.elapsed() < SETTLE_LIMIT {
-                pacing.tick().await;
-                if pacing.check(acted)? {
-                    return Ok(true);
-                }
-                let Some(read) = scroll.read(&mut pacing).await? else {
-                    return Ok(true);
-                };
-                still = if read.at == now.at { still + 1 } else { 0 };
-                now = read;
-            }
-            per_notch = std::array::from_fn(|axis| {
-                let moved = now.at[axis] - from.at[axis];
-                let notches = events[axis].iter().sum();
-                learned(
-                    per_notch[axis],
-                    moved,
-                    notches,
-                    now.at[axis],
-                    now.most[axis],
-                )
-            });
-        }
-        Ok(false)
+        self.precision_scroll(
+            &scroll,
+            &first,
+            (x, y),
+            &mapping,
+            display,
+            &mut pacing,
+            Acted::Nothing,
+        )
+        .await
     }
 
     /// Chrome receives a real precision wheel event at the pointer the native
@@ -756,6 +620,7 @@ impl NativeMouse {
         pacing: &mut Pacing<'_>,
         acted: Acted,
     ) -> Result<bool, CommandError> {
+        let operation_started = Instant::now();
         let [delta_x, delta_y] = scroll.course.remaining(first);
         // Readback tolerance can finish an already executed wheel gesture;
         // it must not swallow a valid initial pixel/fractional request.
@@ -775,27 +640,77 @@ impl NativeMouse {
         let params = json!({"type":"mouseWheel", "x":x, "y":y,
             "deltaX":delta_x, "deltaY":delta_y, "buttons":self.buttons,
             "modifiers":self.holding(0)});
-        self.unknown = true;
-        let mut command = scroll
-            .client
-            .enqueue_command(
-                "Input.dispatchMouseEvent",
-                Some(params),
-                Some(scroll.session),
-            )
-            .await?;
-        let response = tokio::time::timeout(Duration::from_secs(5), command.acknowledgment())
+        if self.buttons != 0 {
+            // A held physical gesture stays on its input device until release.
+            // Switching a drag to CDP wheel input loses Chrome's text anchor.
+            // There is no script/selection repair and no learned retry loop.
+            let surface = display.surface();
+            let css_per_notch = 120.0 * f64::from(surface.device_scale_factor) / mapping.scale()?;
+            let frames = ((motion::WHEEL_BUDGET - Duration::from_millis(250)).as_nanos()
+                / motion::FRAME.as_nanos()) as u32;
+            let events = [delta_x, delta_y].map(|delta| {
+                motion::wheel_events((delta.abs() / css_per_notch).ceil() as u32, frames)
+            });
+            drop(atomic);
+            let began = Instant::now();
+            let point = mapping.point(x, y, &surface)?;
+            for index in 0..events[0].len().max(events[1].len()) {
+                pacing.tick().await;
+                if pacing.check(Acted::Held)? {
+                    return Ok(true);
+                };
+                if began.elapsed() >= motion::WHEEL_BUDGET - Duration::from_millis(250) {
+                    break;
+                }
+                let mut event = params.clone();
+                event["deltaX"] = json!(
+                    delta_x.signum()
+                        * f64::from(events[0].get(index).copied().unwrap_or(0))
+                        * motion::NOTCH_DELTA
+                );
+                event["deltaY"] = json!(
+                    delta_y.signum()
+                        * f64::from(events[1].get(index).copied().unwrap_or(0))
+                        * motion::NOTCH_DELTA
+                );
+                let atomic = display.atomic_input().await;
+                self.current(mapping, scroll.client, display).await?;
+                self.send(&event, point, mapping, scroll.client, display, atomic)
+                    .await?;
+                pacing.sent();
+            }
+        } else {
+            self.unknown = true;
+            let mut command = scroll
+                .client
+                .enqueue_command(
+                    "Input.dispatchMouseEvent",
+                    Some(params),
+                    Some(scroll.session),
+                )
+                .await?;
+            let response = tokio::time::timeout(Duration::from_secs(5), command.acknowledgment())
             .await.map_err(|_| "browser_control_outcome_unknown: Precision wheel acknowledgement was lost. Inspect the page before continuing; do not replay the scroll.")??;
-        if let Some(error) = response.error {
-            return Err(format!("browser_control_outcome_unknown: Precision wheel input failed ({error}). Inspect the page before continuing.").into());
+            if let Some(error) = response.error {
+                return Err(format!("browser_control_outcome_unknown: Precision wheel input failed ({error}). Inspect the page before continuing.").into());
+            }
+            self.unknown = false;
+            drop(atomic);
+            pacing.sent();
         }
-        self.unknown = false;
-        drop(atomic);
-        pacing.sent();
-        let started = Instant::now();
+        let started = if self.buttons != 0 {
+            operation_started
+        } else {
+            Instant::now()
+        };
+        let settle_limit = if self.buttons != 0 {
+            motion::WHEEL_BUDGET
+        } else {
+            SETTLE_LIMIT
+        };
         let mut now = *first;
         let mut still = 0;
-        while started.elapsed() < SETTLE_LIMIT {
+        while started.elapsed() < settle_limit {
             pacing.tick().await;
             if pacing.check(Acted::Turned)? {
                 return Ok(true);
@@ -872,7 +787,6 @@ mod tests {
         let into = Course::new(Goal::Into("element"), &first);
         assert_eq!(into.toward, [0.0, 1.0]);
         assert_eq!(into.remaining(&first), [0.0, 9000.0]);
-        assert_eq!(into.wanted(&first, [120.0; 2]), [0, 75]);
         // Part of the way there the goal is where the element is now.
         let later = reading(
             [0.0, 6000.0],
@@ -894,26 +808,5 @@ mod tests {
         let up = Course::new(Goal::Into("element"), &above);
         assert_eq!(up.toward, [0.0, -1.0]);
         assert_eq!(up.remaining(&above), [0.0, -2000.0]);
-    }
-
-    #[test]
-    fn the_distance_per_notch_is_learned_only_away_from_the_ends() {
-        assert_eq!(learned(120.0, 300.0, 3, 300.0, 2000.0), 100.0);
-        assert_eq!(learned(120.0, -240.0, 2, 760.0, 2000.0), 120.0);
-        // It stopped at an end, did not move, or turned nothing: keep the
-        // estimate.
-        assert_eq!(learned(120.0, 90.0, 3, 2000.0, 2000.0), 120.0);
-        assert_eq!(learned(120.0, -90.0, 3, 0.0, 2000.0), 120.0);
-        assert_eq!(learned(120.0, 0.0, 3, 400.0, 2000.0), 120.0);
-        assert_eq!(learned(120.0, 300.0, 0, 400.0, 2000.0), 120.0);
-    }
-
-    #[test]
-    fn directions_are_signs_with_none_for_no_movement() {
-        assert_eq!(direction(300.0), 1.0);
-        assert_eq!(direction(-0.5), -1.0);
-        assert_eq!(direction(0.0), 0.0);
-        assert_eq!(direction(-0.0), 0.0);
-        assert_eq!(direction(f64::NAN), 0.0);
     }
 }
