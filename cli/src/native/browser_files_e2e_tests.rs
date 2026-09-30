@@ -5,6 +5,170 @@ use serde_json::{json, Value};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const OWNER: &str = "aabbccdd-1111-4222-8333-123456789abc";
+
+/// Qualify the platform chooser boundary before wiring host admission:
+/// actual native click, exact CDP chooser node event, native location
+/// entry and real selected bytes after generic interception is rearmed.
+/// The fixture's English GTK mnemonic is qualified, not a universal
+/// production accept control or staged-path admission.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires installed Chromium, Xvfb and browser-display"]
+async fn browser_files_e2e_native_chooser_boundary() {
+    let env = crate::test_utils::EnvGuard::new(&[
+        "AGENT_BROWSER_WINDOW_STREAM",
+        "DISPLAY",
+        "LC_ALL",
+        "LANGUAGE",
+    ]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    env.set("LC_ALL", "C");
+    env.set("LANGUAGE", "C");
+    let (mut state, directory) = launch().await;
+    let file = directory.path().join("native-fixture.bin");
+    std::fs::write(&file, [0u8, 1, 127, 128, 255]).unwrap();
+    let browser = state.browser.as_ref().unwrap();
+    let client = browser.client.clone();
+    let session = browser.active_session_id().unwrap().to_string();
+    let mut opened = client.subscribe();
+    client
+        .send_command(
+            "Page.enable",
+            Some(json!({"enableFileChooserOpenedEvent":true})),
+            Some(&session),
+        )
+        .await
+        .unwrap();
+    client
+        .send_command(
+            "Page.setInterceptFileChooserDialog",
+            Some(json!({"enabled":false})),
+            Some(&session),
+        )
+        .await
+        .unwrap();
+    success(&command(&mut state, json!({"action":"click","selector":"#one"})).await);
+    let chooser = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let event = opened.recv().await.unwrap();
+            if event.method == "Page.fileChooserOpened"
+                && event.session_id.as_deref() == Some(&session)
+            {
+                return event.params;
+            }
+        }
+    })
+    .await
+    .expect("native chooser reports its exact input");
+    assert_eq!(chooser["mode"], "selectSingle");
+    assert!(chooser["backendNodeId"].as_i64().is_some());
+    // Once the expected chooser has opened, restoring interception must
+    // suppress any further chooser without cancelling this native result.
+    client
+        .send_command(
+            "Page.setInterceptFileChooserDialog",
+            Some(json!({"enabled":true})),
+            Some(&session),
+        )
+        .await
+        .unwrap();
+    let display = state.window_display().unwrap();
+    let info = display.info().await.unwrap();
+    println!(
+        "NATIVE_CHOOSER_WINDOW {}",
+        json!({"windows":info.windows.iter().map(|window|json!({"type":window.window_type,"focused":window.focused,"mapped":window.mapped})).collect::<Vec<_>>()})
+    );
+    capture_fixture(&state, "native-chooser-before-path").await;
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_native_browser_keys(
+            &super::interaction::native_key_chord_events("l", Some(2)),
+            super::browser_control::motion::KEY_INTERVAL,
+            &client,
+            &session,
+        )
+        .await
+        .unwrap();
+    capture_fixture(&state, "native-chooser-location-entry").await;
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_native_browser_keys(
+            &super::interaction::native_paste_events(&file.to_string_lossy()),
+            super::browser_control::motion::KEY_INTERVAL,
+            &client,
+            &session,
+        )
+        .await
+        .unwrap();
+    capture_fixture(&state, "native-chooser-location-pasted").await;
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_native_browser_keys(
+            &super::interaction::native_key_chord_events("o", Some(1)),
+            super::browser_control::motion::KEY_INTERVAL,
+            &client,
+            &session,
+        )
+        .await
+        .unwrap();
+    let selected = tokio::time::timeout(Duration::from_secs(5),evaluate(&state,"new Promise(resolve=>{const input=document.querySelector('#one');const done=()=>input.files.length&&Promise.all(Array.from(input.files,async file=>({name:file.name,bytes:Array.from(new Uint8Array(await file.arrayBuffer()))}))).then(resolve);input.addEventListener('change',done,{once:true});done()})")).await;
+    client
+        .send_command(
+            "Page.setInterceptFileChooserDialog",
+            Some(json!({"enabled":true})),
+            Some(&session),
+        )
+        .await
+        .unwrap();
+    if selected.is_err() {
+        capture_fixture(&state, "native-chooser-after-path-failed").await;
+    }
+    let files = selected.expect("native file selection reaches the actual input");
+    assert_eq!(
+        files,
+        json!([{"name":"native-fixture.bin","bytes":[0,1,127,128,255]}])
+    );
+    assert_eq!(
+        evaluate(&state, "receipts").await,
+        json!([{"kind":"one","trusted":true,"files":[{"name":"native-fixture.bin","bytes":[0,1,127,128,255]}]}])
+    );
+    capture_fixture(&state, "native-chooser-selected").await;
+    // The next generic chooser remains intercepted; the admitted native
+    // result did not leave a permissive picker behind.
+    let mut next = client.subscribe();
+    success(&command(&mut state, json!({"action":"click","selector":"#many"})).await);
+    let generic = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let event = next.recv().await.unwrap();
+            if event.method == "Page.fileChooserOpened"
+                && event.session_id.as_deref() == Some(&session)
+            {
+                return event.params;
+            }
+        }
+    })
+    .await
+    .expect("generic chooser stays intercepted");
+    assert_eq!(generic["mode"], "selectMultiple");
+    assert_eq!(
+        evaluate(&state, "document.querySelector('#many').files.length").await,
+        0
+    );
+    assert!(display
+        .info()
+        .await
+        .unwrap()
+        .windows
+        .iter()
+        .all(|window| !(window.mapped && window.focused && window.window_type == "dialog")));
+    success(&command(&mut state, json!({"action":"close"})).await);
+}
 const PAGE: &str = r#"<!doctype html><html><body style="margin:0">
 <input id="one" type="file" accept=".bin" style="position:absolute;left:20px;top:20px;width:250px;height:40px">
 <input id="many" type="file" multiple style="position:absolute;left:20px;top:80px;width:250px;height:40px">
@@ -15,6 +179,7 @@ const PAGE: &str = r#"<!doctype html><html><body style="margin:0">
 window.receipts=[];
 async function capture(files,kind,trusted){receipts.push({kind,trusted,files:await Promise.all(Array.from(files,async f=>({name:f.name,bytes:Array.from(new Uint8Array(await f.arrayBuffer()))})))})}
 for(const n of document.querySelectorAll('input'))n.addEventListener('change',e=>capture(e.target.files,n.id,e.isTrusted));
+for(const n of document.querySelectorAll('input'))n.addEventListener('cancel',e=>receipts.push({kind:'cancel',target:n.id,trusted:e.isTrusted}));
 zone.addEventListener('dragover',e=>e.preventDefault());
 zone.addEventListener('drop',e=>{e.preventDefault();capture(e.dataTransfer.files,'drop',e.isTrusted)});
 download.href=URL.createObjectURL(new Blob([new Uint8Array([0,1,127,128,255])],{type:'application/octet-stream'}));
