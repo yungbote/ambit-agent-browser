@@ -95,16 +95,45 @@ impl Snapshot {
         let pixels = pixels
             .get(..length)
             .ok_or("The producer picture has incomplete pixels")?;
+        let visible = reply.window();
+        let right = i64::from(visible.x) + i64::from(visible.width);
+        let bottom = i64::from(visible.y) + i64::from(visible.height);
+        if visible.x < 0
+            || visible.y < 0
+            || visible.width == 0
+            || visible.height == 0
+            || right > i64::from(reply.width)
+            || bottom > i64::from(reply.height)
+        {
+            return Err("The producer picture has an invalid visible window.".into());
+        }
+        // One owned allocation/copy, shared by all eligible demands. The
+        // raw slot may contain another window outside V; cached pixels must
+        // never retain it, even when the current consumer crops correctly.
+        let mut copied: Arc<[u8]> = Arc::from(pixels);
+        let owned = Arc::get_mut(&mut copied).expect("A new picture copy has one owner");
+        let (left, top, right, bottom) = (
+            visible.x as usize * 4,
+            visible.y as usize,
+            right as usize * 4,
+            bottom as usize,
+        );
+        owned[..top * stride].fill(0);
+        for row in top..bottom {
+            owned[row * stride..row * stride + left].fill(0);
+            owned[row * stride + right..(row + 1) * stride].fill(0);
+        }
+        owned[bottom * stride..].fill(0);
         Ok(Self {
             bounds,
             surface,
-            visible: reply.window(),
+            visible,
             layout_epoch,
             input_seq,
             width: reply.width,
             height: reply.height,
             stride,
-            pixels: Arc::from(pixels),
+            pixels: copied,
         })
     }
 
@@ -117,6 +146,12 @@ impl Snapshot {
             u32::try_from(crop.y).map_err(|_| "The screenshot crop starts outside the picture")?;
         if crop.width == 0
             || crop.height == 0
+            || crop.x < self.visible.x
+            || crop.y < self.visible.y
+            || i64::from(crop.x) + i64::from(crop.width)
+                > i64::from(self.visible.x) + i64::from(self.visible.width)
+            || i64::from(crop.y) + i64::from(crop.height)
+                > i64::from(self.visible.y) + i64::from(self.visible.height)
             || x.checked_add(crop.width)
                 .is_none_or(|right| right > self.width)
             || y.checked_add(crop.height)
@@ -328,6 +363,94 @@ mod tests {
             let receive = requests.request(0);
             requests.captured(&reply, &pixels, Surface::new(2, 2), 1, bounds, None);
             assert!(receive.await.unwrap().is_err());
+        }
+    }
+
+    #[test]
+    fn cached_pixels_and_crops_preserve_a_nonzero_visible_aperture() {
+        let aperture = Rect {
+            x: 1,
+            y: 1,
+            width: 1,
+            height: 1,
+        };
+        let reply = PictureReply {
+            visible: Some(aperture),
+            ..picture()
+        };
+        let snapshot =
+            Snapshot::copy(&reply, &pixels(), Surface::new(2, 2), 1, bounds(), None).unwrap();
+        assert_eq!(
+            &snapshot.pixels[..12],
+            &[0u8; 12],
+            "Cached gutters retain other-window pixels"
+        );
+        assert_eq!(
+            snapshot.rgba(aperture).unwrap().into_raw(),
+            [120, 110, 100, 255]
+        );
+        for crop in [
+            Rect {
+                x: 0,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            Rect {
+                x: 0,
+                y: 1,
+                width: 2,
+                height: 1,
+            },
+            Rect {
+                x: 1,
+                y: 0,
+                width: 1,
+                height: 2,
+            },
+        ] {
+            assert!(
+                snapshot.rgba(crop).is_err(),
+                "A crop escaped the visible window"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_visible_apertures_never_create_a_cached_picture() {
+        for visible in [
+            Rect {
+                x: -1,
+                y: 0,
+                width: 1,
+                height: 1,
+            },
+            Rect {
+                x: 1,
+                y: 1,
+                width: 2,
+                height: 1,
+            },
+            Rect {
+                x: 0,
+                y: 1,
+                width: 1,
+                height: u32::MAX,
+            },
+            Rect {
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 1,
+            },
+        ] {
+            let reply = PictureReply {
+                visible: Some(visible),
+                ..picture()
+            };
+            assert!(
+                Snapshot::copy(&reply, &pixels(), Surface::new(2, 2), 1, bounds(), None).is_err()
+            );
         }
     }
 
