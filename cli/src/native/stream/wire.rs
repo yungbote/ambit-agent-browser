@@ -12,7 +12,8 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub(super) const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 /// A video unit's bounds (contract section 2), which every hop checks.
 const MAX_VIDEO_HEADER_BYTES: usize = 4096;
-const MAX_VIDEO_BYTES: usize = 4 * 1024 * 1024;
+/// Cached viewers declare no coded-capacity extension and retain this limit.
+pub(super) const LEGACY_VIDEO_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CODED: u32 = 4096;
 
 /// One video unit: one temporal unit of one picture, in its epoch
@@ -65,7 +66,7 @@ fn video_header(
         || unit.ts > MAX_SAFE_INTEGER
         || unit.input_seq.is_some_and(|input| input > MAX_SAFE_INTEGER)
         || unit.data.is_empty()
-        || unit.data.len() > MAX_VIDEO_BYTES
+        || unit.data.len() > codec.coded_capacity(width, height).unwrap_or(0)
         || !(1..=MAX_CODED).contains(&width)
         || !(1..=MAX_CODED).contains(&height)
         || !inside(visible.x, visible.width, width)
@@ -279,6 +280,19 @@ mod tests {
         }
     }
 
+    fn small_video_unit(key: bool, bytes: usize) -> crate::native::stream::video::Unit {
+        let mut unit = video_unit(key, bytes);
+        unit.coded = (64, 64);
+        unit.visible = crate::native::display::Rect {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        };
+        unit.surface = crate::native::display::Surface::new(64, 64);
+        unit
+    }
+
     /// A video unit is the contract's closed header and the exact encoded
     /// bytes; only a key unit names the codec string.
     #[test]
@@ -318,12 +332,21 @@ mod tests {
         };
         assert!(refused(&video_unit(true, 0), 1), "an empty payload");
         assert!(
-            refused(&video_unit(true, MAX_VIDEO_BYTES + 1), 1),
-            "over 4 MiB"
+            refused(
+                &small_video_unit(
+                    true,
+                    VideoCodec::Av1Full.coded_capacity(64, 64).unwrap() + 1
+                ),
+                1
+            ),
+            "over the dimensional source allowance"
         );
         assert!(
-            !refused(&video_unit(true, MAX_VIDEO_BYTES), 1),
-            "4 MiB exactly"
+            !refused(
+                &small_video_unit(true, VideoCodec::Av1Full.coded_capacity(64, 64).unwrap()),
+                1
+            ),
+            "dimensional source allowance exactly"
         );
         assert!(refused(&video_unit(true, 8), 0), "sequence 0");
         assert!(refused(&video_unit(true, 8), MAX_SAFE_INTEGER + 1));
@@ -363,7 +386,7 @@ mod tests {
         let stream = uuid::Uuid::new_v4().to_string();
         for codec in [VideoCodec::Av1Full, VideoCodec::Av1] {
             for key in [false, true] {
-                for bytes in [1, 42, 1562, MAX_VIDEO_BYTES] {
+                for bytes in [1, 42, 1562, LEGACY_VIDEO_BYTES + 1] {
                     let mut unit = video_unit(key, bytes);
                     if key {
                         unit.codec_string = Some(format!(
@@ -389,9 +412,47 @@ mod tests {
                 }
             }
         }
-        assert!(
-            video_budget_bytes(&video_unit(true, MAX_VIDEO_BYTES + 1), VideoCodec::Av1Full)
-                .is_none()
+        assert!(video_budget_bytes(
+            &small_video_unit(
+                true,
+                VideoCodec::Av1Full.coded_capacity(64, 64).unwrap() + 1
+            ),
+            VideoCodec::Av1Full
+        )
+        .is_none());
+    }
+
+    #[test]
+    #[ignore = "composition fixture: AMBIT_LARGE_NATIVE_KEY and AMBIT_LARGE_WIRE_OUT"]
+    fn serialize_actual_large_native_key_without_changing_one_payload_byte() {
+        let data = std::fs::read(std::env::var("AMBIT_LARGE_NATIVE_KEY").unwrap()).unwrap();
+        assert_eq!(data.len(), 21_734_926);
+        let mut unit = video_unit(true, 0);
+        unit.data = data;
+        unit.coded = (4096, 4096);
+        unit.visible = crate::native::display::Rect {
+            x: 0,
+            y: 0,
+            width: 4096,
+            height: 4096,
+        };
+        unit.surface = crate::native::display::Surface::new(4096, 4096);
+        unit.codec_string = Some("av01.1.16M.08".into());
+        unit.wire_bytes = video_budget_bytes(&unit, VideoCodec::Av1Full).unwrap();
+        let body = binary_video(
+            &unit,
+            VideoCodec::Av1Full,
+            "00000000-0000-4000-8000-000000000001",
+            1,
+        )
+        .unwrap();
+        let (header, payload) = decode(&body);
+        assert_eq!(payload, unit.data);
+        assert_eq!(header["byteLength"], 21_734_926);
+        std::fs::write(std::env::var("AMBIT_LARGE_WIRE_OUT").unwrap(), &body).unwrap();
+        println!(
+            "LARGE_NATIVE_WIRE {}",
+            json!({"payloadBytes":payload.len(),"wireBytes":body.len(),"budgetBytes":unit.wire_bytes,"header":header})
         );
     }
 

@@ -71,6 +71,7 @@ struct ClientConfig {
     /// The video codecs the viewer declared (`video=<token>,...`, binary
     /// viewers only), and its newest subscription request.
     video: Option<Declared>,
+    video_coded_capacity: bool,
     video_demand: Demand,
 }
 
@@ -99,6 +100,7 @@ impl Default for ClientConfig {
             audio: None,
             audio_demand: Demand::default(),
             video: None,
+            video_coded_capacity: false,
             video_demand: Demand::default(),
         }
     }
@@ -306,6 +308,7 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
             "frames" => cfg.binary = value == "binary",
             "audio" => cfg.audio = AudioCodec::parse(value),
             "video" => cfg.video = Declared::parse(value),
+            "videoCapacity" => cfg.video_coded_capacity = value == "coded",
             "frameWindow" => {
                 if let Some(window) = value
                     .parse::<usize>()
@@ -681,12 +684,14 @@ async fn handle_ws_client(
     let (input_error_tx, mut input_error_rx) = watch::channel::<Option<Value>>(None);
     let mut audio = initial_config.audio.map(AudioTrack::new);
     let declared_video = initial_config.video.map(|declared| {
-        VideoTrack::new(
+        let (mut track, inbox, feedback) = VideoTrack::new(
             video_hub.clone(),
             declared,
             initial_config.draws_pointer,
             initial_config.max_fps,
-        )
+        );
+        track.declare_coded_capacity(initial_config.video_coded_capacity);
+        (track, inbox, feedback)
     });
     let (mut video, video_inbox, mut video_feedback) = match declared_video {
         Some((track, inbox, feedback)) => (Some(track), Some(inbox), Some(feedback)),
@@ -1201,6 +1206,24 @@ fn is_user_input_message_type(msg_type: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coded_video_capacity_is_an_optional_existing_upgrade_declaration() {
+        let legacy =
+            config_from_upgrade("GET /?frames=binary&cursor=viewer&video=av1-444 HTTP/1.1\r\n");
+        let coded = config_from_upgrade(
+            "GET /?frames=binary&cursor=viewer&video=av1-444&videoCapacity=coded HTTP/1.1\r\n",
+        );
+        assert!(!legacy.video_coded_capacity && coded.video_coded_capacity);
+        assert_eq!(legacy.video, coded.video);
+        assert_eq!(legacy.frame_needs(), coded.frame_needs());
+        for value in ["", "legacy", "unknown"] {
+            assert!(
+                !config_from_upgrade(&format!("GET /?videoCapacity={value} HTTP/1.1\r\n"))
+                    .video_coded_capacity
+            );
+        }
+    }
 
     #[test]
     fn audio_negotiation_is_fixed_to_a_supported_binary_codec() {

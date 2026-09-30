@@ -227,6 +227,8 @@ struct Epoch {
 
 /// One connection's video track: the writer's half.
 pub(super) struct VideoTrack {
+    /// The upgrade declared the dimensional source allowance; absent is legacy.
+    coded_capacity: bool,
     hub: Arc<VideoHub>,
     /// The codec offered; none when this viewer cannot be served video.
     codec: Option<VideoCodec>,
@@ -259,6 +261,7 @@ impl VideoTrack {
             feedback,
         };
         let track = Self {
+            coded_capacity: false,
             hub,
             codec,
             offer,
@@ -367,8 +370,11 @@ impl VideoTrack {
 
     pub(super) async fn next(&self) -> Delivery {
         match &self.subscription {
-            Some(subscription) => subscription.next().await,
-            None => std::future::pending().await,
+            // Capture admission includes queued bytes; delivery admission
+            // considers in-flight bytes only. It permits one indivisible
+            // picture from an empty flight without resetting its paint debt.
+            Some(subscription) if self.flow.has_room(0) => subscription.next().await,
+            _ => std::future::pending().await,
         }
     }
 
@@ -395,10 +401,18 @@ impl VideoTrack {
                 self.epoch = None;
                 self.flow.reset();
                 self.update_ready();
+                if let Some(subscription) = &self.subscription {
+                    subscription.keyframe();
+                }
                 return (Vec::new(), None);
             }
             Delivery::Ended(_) => return self.refused(),
         };
+        if !self.coded_capacity && unit.data.len() > super::wire::LEGACY_VIDEO_BYTES {
+            // Before started or any body: preserve the established track-only
+            // unsupported transition, leaving the peer's audio/input intact.
+            return self.refused();
+        }
         let mut records = Vec::new();
         if self.epoch.is_none() {
             let (Some(codec_string), true) = (unit.codec_string.as_deref(), unit.key) else {
@@ -435,6 +449,11 @@ impl VideoTrack {
     fn refused(&mut self) -> (Vec<Value>, Option<Message>) {
         drop(self.retire());
         (vec![self.offer.refuse(self.demand.generation)], None)
+    }
+
+    /// Resource capacity declared by this connection's immutable upgrade.
+    pub(super) fn declare_coded_capacity(&mut self, supported: bool) {
+        self.coded_capacity = supported;
     }
 
     /// Applies the viewer's newest feedback: its cumulative acknowledgement
@@ -494,6 +513,44 @@ mod tests {
     use crate::native::video::encodes;
     use std::time::Duration;
     use tokio::sync::broadcast;
+
+    #[test]
+    fn legacy_peer_refuses_large_picture_before_started_or_body_without_refusing_coded_peer() {
+        let make_track = |coded| {
+            let (mut track, _, _) = VideoTrack::new(hub(None), declared("av1-444"), true, 0);
+            track.codec = Some(VideoCodec::Av1Full);
+            track.offer = Offer::new("video", Some("av1-444"));
+            track.demand = demand(true, 7);
+            track.declare_coded_capacity(coded);
+            track
+        };
+        let unit = Arc::new(Unit {
+            data: vec![1; super::super::wire::LEGACY_VIDEO_BYTES + 1],
+            wire_bytes: 0,
+            key: true,
+            ts: 1,
+            coded: (4096, 4096),
+            visible: crate::native::display::Rect {
+                x: 0,
+                y: 0,
+                width: 4096,
+                height: 4096,
+            },
+            surface: crate::native::display::Surface::new(4096, 4096),
+            input_seq: None,
+            quality: Quality::Motion,
+            codec_string: Some("av01.1.16M.08".into()),
+        });
+        let (records, body) = make_track(false).deliver(Delivery::Unit(unit.clone()), true);
+        assert!(body.is_none());
+        assert_eq!(
+            records,
+            [json!({"type":"video","state":"unavailable","codec":"av1-444","generation":7})]
+        );
+        let (records, body) = make_track(true).deliver(Delivery::Unit(unit), true);
+        assert_eq!(records[0]["state"], "started");
+        assert!(body.is_some());
+    }
 
     fn hub(display: Option<Arc<DisplayClient>>) -> Arc<VideoHub> {
         let (frame_tx, _) = broadcast::channel(16);

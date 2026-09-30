@@ -1016,6 +1016,9 @@ impl Subscription {
     /// wakes both a skipped capture and a deferred refinement.
     pub(crate) fn set_ready(&self, ready: bool) {
         if self.subscriber.set_ready(ready) && ready {
+            if self.subscriber.needs_key() {
+                self.encoding.request_key();
+            }
             self.encoding.nudge();
             self.producer.inner.nudge();
         }

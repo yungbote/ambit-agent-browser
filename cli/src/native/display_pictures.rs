@@ -563,7 +563,7 @@ mod tests {
             json!({"changed":true,"width":8,"height":6,"stride":32,"rows":[[2,4],[0,1]],"cursorIncluded":false}),
             json!({"changed":true,"width":8,"height":6,"stride":32,"rows":[],"cursorIncluded":true}),
             json!({"changed":true,"width":8,"height":6,"stride":32,"rows":[],"cursorIncluded":false,
-                "visible":{"x":1,"y":0,"width":4,"height":4}}),
+                "visible":{"x":5,"y":0,"width":4,"height":4}}),
             json!({"changed":true,"width":5000,"height":6,"stride":20000,"rows":[],"cursorIncluded":false}),
         ] {
             let handover = PictureChannel::create().unwrap();

@@ -1007,6 +1007,16 @@ impl VideoEncoder for AomEncoder {
                     "libaom returned other than one picture for one picture".into(),
                 ));
             }
+            if packet.size
+                > self
+                    .codec
+                    .coded_capacity(self.width, self.height)
+                    .expect("validated native dimensions")
+            {
+                return Err(VideoError::Failed(
+                    "libaom exceeded its dimensional output storage".into(),
+                ));
+            }
             // SAFETY: libaom owns `size` bytes at `data` until the next call.
             let data = unsafe { std::slice::from_raw_parts(packet.data, packet.size) }.to_vec();
             let key = packet.flags & FRAME_IS_KEY != 0;

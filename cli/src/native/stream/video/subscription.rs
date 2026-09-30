@@ -119,15 +119,31 @@ impl Subscriber {
         let behind = queue.units.front().is_some_and(|oldest| {
             unit.ts.saturating_sub(oldest.ts) > RESYNC_AFTER.as_micros() as u64
         });
-        if behind {
+        // Age alone cannot bound a finite sweep of the same capture: all its
+        // timestamps match. One indivisible picture is allowed when empty;
+        // further queued bytes stay within the existing path's burst.
+        let queued: usize = queue.units.iter().map(|unit| unit.wire_bytes).sum();
+        let budget = self
+            .link_rate()
+            .map_or(INITIAL_BUDGET, |rate| rate.burst_bytes as usize);
+        let full = !queue.units.is_empty() && queued.saturating_add(unit.wire_bytes) > budget;
+        if behind || full {
             queue.units.clear();
             queue.awaiting_key = true;
             queue.restarted = true;
         }
-        if queue.awaiting_key && !unit.key {
+        if queue.restarted {
+            // A blocked writer has not yet retired its old epoch. Keep no
+            // additional units and ask for no repeated key; delivering the
+            // epoch transition requests exactly one replacement.
             drop(queue);
             self.notify.notify_one();
-            return true;
+            return false;
+        }
+        if queue.awaiting_key && (!self.ready() || !unit.key) {
+            drop(queue);
+            self.notify.notify_one();
+            return self.ready();
         }
         queue.awaiting_key = false;
         queue.units.push_back(unit.clone());
@@ -158,6 +174,8 @@ impl Subscriber {
                 if let Some(reason) = &queue.ended {
                     return Delivery::Ended(reason.clone());
                 }
+                // VideoTrack's existing in-flight Flow guard decides when
+                // this writer may observe/retire the old epoch.
                 if queue.restarted {
                     queue.restarted = false;
                     return Delivery::NewEpoch;
@@ -172,7 +190,16 @@ impl Subscriber {
 
     /// Publishes whether the viewer's path has room (see `Flow`).
     pub(crate) fn set_ready(&self, ready: bool) -> bool {
-        self.ready.swap(ready, Ordering::AcqRel) != ready
+        let changed = self.ready.swap(ready, Ordering::AcqRel) != ready;
+        if changed && ready {
+            self.notify.notify_one();
+        }
+        changed
+    }
+
+    pub(super) fn needs_key(&self) -> bool {
+        let queue = self.queue();
+        queue.awaiting_key && !queue.restarted && queue.ended.is_none()
     }
 
     /// Bytes waiting to be written.
@@ -361,19 +388,17 @@ mod tests {
             assert!(!subscriber.push(&unit(ts, false, 10)));
         }
         assert!(
-            subscriber.push(&unit(1_000_001, false, 10)),
-            "behind: a key unit is needed"
+            !subscriber.push(&unit(1_000_001, false, 10)),
+            "the old epoch must retire before requesting a key"
         );
         assert!(
-            subscriber.push(&unit(1_000_002, false, 10)),
-            "still waiting for one"
+            !subscriber.push(&unit(1_000_002, false, 10)),
+            "no key treadmill while the writer is blocked"
         );
+        assert!(matches!(subscriber.next().await, Delivery::NewEpoch));
         subscriber.push(&unit(1_000_003, true, 10));
         subscriber.push(&unit(1_000_004, false, 10));
-        assert_eq!(
-            delivered(&subscriber).await,
-            ["epoch", "K1000003", "p1000004"]
-        );
+        assert_eq!(delivered(&subscriber).await, ["K1000003", "p1000004"]);
     }
 
     /// A viewer that keeps up is never resynchronized, however long it runs.
@@ -421,6 +446,140 @@ mod tests {
         assert_eq!(subscriber.queued_bytes(), delta.wire_bytes);
         assert!(matches!(subscriber.next().await, Delivery::Unit(_)));
         assert_eq!(subscriber.queued_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_stalled_same_capture_queue_is_quarantined_without_repeated_keys() {
+        let subscriber = Subscriber::new(60);
+        subscriber.set_link_rate(LinkRate {
+            bits_per_second: 500_000,
+            burst_bytes: 1024,
+        });
+        let first = unit(1, true, 100);
+        subscriber.push(&first);
+        assert!(matches!(subscriber.next().await, Delivery::Unit(_)));
+        subscriber.set_ready(false);
+        for _ in 0..1000 {
+            assert!(!subscriber.push(&unit(1, false, 100)));
+            assert!(subscriber.queued_bytes() <= 1024);
+        }
+        assert!(
+            !subscriber.needs_key(),
+            "wait for the old writer epoch before requesting"
+        );
+        assert!(matches!(subscriber.next().await, Delivery::NewEpoch));
+        assert!(subscriber.needs_key());
+        assert!(
+            !subscriber.push(&unit(1, true, 100)),
+            "blocked subscriber retains no new key"
+        );
+        assert_eq!(subscriber.queued_bytes(), 0);
+        subscriber.set_ready(true);
+        let key = unit(2, true, 100);
+        subscriber.push(&key);
+        match subscriber.next().await {
+            Delivery::Unit(actual) => assert!(Arc::ptr_eq(&actual, &key)),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "actual native key ownership: AMBIT_LARGE_NATIVE_KEY"]
+    async fn eight_slow_or_stalled_viewers_share_one_native_key_and_bound_unwritten_retention() {
+        let rss = || {
+            std::fs::read_to_string("/proc/self/status")
+                .unwrap()
+                .lines()
+                .find(|line| line.starts_with("VmRSS:"))
+                .unwrap()
+                .to_owned()
+        };
+        let before = rss();
+        let mut shared = Arc::try_unwrap(unit(1, true, 1)).unwrap();
+        shared.data = std::fs::read(std::env::var("AMBIT_LARGE_NATIVE_KEY").unwrap()).unwrap();
+        shared.coded = (4096, 4096);
+        shared.visible = Rect {
+            x: 0,
+            y: 0,
+            width: 4096,
+            height: 4096,
+        };
+        shared.surface = Surface::new(4096, 4096);
+        shared.codec_string = Some("av01.1.16M.08".into());
+        shared.wire_bytes = crate::native::stream::wire::video_budget_bytes(
+            &shared,
+            crate::native::video::VideoCodec::Av1Full,
+        )
+        .unwrap();
+        let key = Arc::new(shared);
+        let viewers: Vec<_> = (0..8).map(|_| Subscriber::new(60)).collect();
+        for viewer in &viewers {
+            viewer.set_link_rate(LinkRate {
+                bits_per_second: 500_000,
+                burst_bytes: 1024,
+            });
+            assert!(!viewer.push(&key));
+            assert_eq!(
+                viewer.queued_bytes(),
+                key.wire_bytes,
+                "one indivisible key remains retained"
+            );
+        }
+        assert_eq!(
+            Arc::strong_count(&key),
+            9,
+            "all pending peers share the same actual body"
+        );
+        let retained = rss();
+        // A real writer owns its in-flight key until full paint ACK. Slow
+        // progress does not renew/quarantine that key or reset its byte debt.
+        let mut flights = Vec::new();
+        let mut flow = Flow::default();
+        flow.set_link_rate(Some(LinkRate {
+            bits_per_second: 500_000,
+            burst_bytes: 1024,
+        }));
+        for viewer in &viewers {
+            let Delivery::Unit(actual) = viewer.next().await else {
+                panic!("first key")
+            };
+            assert!(Arc::ptr_eq(&actual, &key));
+            flights.push(actual);
+            viewer.set_ready(false);
+        }
+        let at = Instant::now();
+        flow.sent(1, key.wire_bytes, at);
+        for _ in 0..1000 {
+            for viewer in &viewers {
+                assert!(!viewer.push(&unit(1, false, 100)));
+                assert!(viewer.queued_bytes() <= 1024);
+            }
+            assert!(
+                !flow.has_room(0),
+                "no partial-progress paint ACK or debt reset"
+            );
+        }
+        assert_eq!(
+            Arc::strong_count(&key),
+            9,
+            "the key remains one shared in-flight body"
+        );
+        flow.acknowledge(
+            1,
+            at + Duration::from_secs_f64(key.wire_bytes as f64 * 8.0 / 500_000.0),
+        );
+        assert!(flow.has_room(0));
+        for viewer in &viewers {
+            viewer.set_ready(true);
+            assert!(matches!(viewer.next().await, Delivery::NewEpoch));
+            assert!(viewer.needs_key());
+        }
+        drop(flights);
+        assert_eq!(Arc::strong_count(&key), 1);
+        println!(
+            "LARGE_VIEW_OWNERSHIP {}",
+            serde_json::json!({"payloadBytes":key.data.len(),"peers":8,"beforeRss":before,"retainedRss":retained,"afterRss":rss(),"distinctRetainedKeyBodies":1,"burstBytes":1024})
+        );
     }
 
     /// Captures are skipped while the bytes ahead exceed what the path
