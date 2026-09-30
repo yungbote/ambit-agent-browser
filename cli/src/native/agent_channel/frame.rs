@@ -72,6 +72,7 @@ pub(crate) enum Frame {
     Sequence(Sequence),
     OpStatus(OpStatus),
     Site(crate::native::site_sessions::protocol::Request),
+    Program(Owner, crate::native::playwright::remote::Request),
 }
 
 /// The channel-scoped host configuration a `hello` carries: the members of
@@ -81,6 +82,7 @@ pub(crate) struct Binding {
     pub(crate) namespace: String,
     pub(crate) session: String,
     pub(crate) require_sandbox: bool,
+    pub(crate) browser_host: bool,
     pub(crate) theme: Option<Theme>,
 }
 
@@ -211,6 +213,15 @@ impl Frame {
                 crate::native::site_sessions::protocol::Request::read(kind, members)
                     .map_err(|message| invalid(message.into()))?,
             ),
+            kind if crate::native::playwright::remote::is_kind(kind) => {
+                let text = |key: &str| line[key].as_str().map(str::to_owned);
+                let owned = owner(text("actionId"), text("ownerGeneration"))
+                    .map_err(invalid)?.ok_or_else(|| invalid("A remote program frame needs its Action and owner generation.".into()))?;
+                let mut members = members;
+                members.as_object_mut().unwrap().remove("actionId");
+                members.as_object_mut().unwrap().remove("ownerGeneration");
+                Frame::Program(owned, crate::native::playwright::remote::Request::read(kind, members).map_err(invalid)?)
+            }
             other => {
                 return Err(invalid(format!(
                     "Unknown agent frame type `{other}`: this daemon serves hello, sequence and op_status."
@@ -280,6 +291,8 @@ struct BindingWire {
     namespace: String,
     session: String,
     require_sandbox: bool,
+    #[serde(default)]
+    browser_host: bool,
     theme: Option<Theme>,
 }
 
@@ -297,6 +310,7 @@ impl HelloWire {
                 namespace: self.binding.namespace,
                 session: self.binding.session,
                 require_sandbox: self.binding.require_sandbox,
+                browser_host: self.binding.browser_host,
                 theme: self.binding.theme,
             },
             owner: owner(self.action_id, self.owner_generation)?,
@@ -489,6 +503,7 @@ mod tests {
                 namespace: "3f2a".into(),
                 session: "browser".into(),
                 require_sandbox: true,
+                browser_host: false,
                 theme: None,
             }
         );
@@ -666,6 +681,62 @@ mod tests {
         }
         let mut ownerless = json!({ "type": "op_status", "id": 9 });
         assert_eq!(refused(line(ownerless.take())).id, Some(9));
+    }
+
+    #[test]
+    fn remote_program_frames_accept_only_the_host_transport_contract() {
+        let program = "6b87fd14-4712-45e1-829e-95ee008fd783";
+        for frame in [
+            json!({"type":"program.open","id":2,"programId":program,"timeoutMs":1}),
+            json!({"type":"program.open","id":3,"programId":program,"timeoutMs":120000,"targetId":"tab"}),
+            json!({"type":"program.close","id":4,"programId":program,"reason":"complete"}),
+            json!({"type":"program.close","id":5,"programId":program,"reason":"cancel"}),
+            json!({"type":"program.close","id":6,"programId":program,"reason":"timeout"}),
+            json!({"type":"program.status","id":7,"programId":program}),
+        ] {
+            let mut frame = frame;
+            frame["actionId"] = json!(ACTION);
+            frame["ownerGeneration"] = json!("1");
+            assert!(Frame::parse(&line(frame.clone())).is_ok(), "{frame}");
+        }
+        for extra in [
+            json!({"timeoutMs":0}),
+            json!({"timeoutMs":120001}),
+            json!({"timeoutMs":1.5}),
+            json!({"programId":"00000000-0000-0000-0000-000000000000"}),
+            json!({"programId":"6B87FD14-4712-45E1-829E-95EE008FD783"}),
+            json!({"targetId":""}),
+            json!({"targetId":42}),
+            json!({"code":"return 1"}),
+            json!({"environment":{}}),
+            json!({"artifactsDir":"/host"}),
+        ] {
+            let mut frame = json!({"type":"program.open","id":8,"programId":program,"timeoutMs":1000,"actionId":ACTION,"ownerGeneration":"1"});
+            frame
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(Frame::parse(&line(frame.clone())).is_err(), "{frame}");
+        }
+        for frame in [
+            json!({"type":"program.close","id":9,"programId":program,"reason":"retry"}),
+            json!({"type":"program.status","id":10,"programId":program,"endpoint":"ws://foreign"}),
+        ] {
+            assert!(Frame::parse(&line(frame.clone())).is_err(), "{frame}");
+        }
+        for extra in [
+            json!({}),
+            json!({"actionId":ACTION}),
+            json!({"actionId":ACTION,"ownerGeneration":"0"}),
+            json!({"actionId":"x","ownerGeneration":"1"}),
+        ] {
+            let mut frame = json!({"type":"program.status","id":11,"programId":program});
+            frame
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(Frame::parse(&line(frame.clone())).is_err(), "{frame}");
+        }
     }
 
     #[test]

@@ -69,6 +69,7 @@ pub(crate) struct Identity {
     pub(crate) namespace: String,
     pub(crate) session: String,
     pub(crate) require_sandbox: bool,
+    pub(crate) browser_host: bool,
 }
 
 impl Identity {
@@ -79,6 +80,8 @@ impl Identity {
             namespace: std::env::var("AGENT_BROWSER_NAMESPACE").unwrap_or_default(),
             session: session.to_string(),
             require_sandbox: crate::native::actions::require_sandbox_from_env(),
+            browser_host: crate::native::workspace_role::current()
+                .is_ok_and(|role| role.is_browser_host()),
         }
     }
 }
@@ -148,6 +151,18 @@ pub(crate) struct Finish {
 
 /// Where a channel's steps run.
 pub(crate) trait Browser: Sync {
+    fn program_request(
+        &self,
+        _channel: ChannelId,
+        _owner: Owner,
+        _request: crate::native::playwright::remote::Request,
+        _ledger: &Ledger,
+    ) -> impl Future<Output = Result<Value, String>> + Send {
+        async { Err("This browser does not serve remote programs.".into()) }
+    }
+    fn fence_program(&self, _owner: Owner) -> impl Future<Output = ()> + Send {
+        async {}
+    }
     fn site_request(
         &self,
         _channel: ChannelId,
@@ -363,7 +378,11 @@ impl Endpoint {
                         line=inbox.read_line(), if !inbox.closed=>{
                             if let Some(line)=line {
                                 inbox.receive(line,&self.ledger);
-                                if inbox.frames.back().is_some_and(|received| matches!(received.frame,Ok((_,Frame::Site(_))))) {
+                                if inbox.frames.back().is_some_and(|received| match &received.frame {
+                                    Ok((_,Frame::Site(_)))=>true,
+                                    Ok((_,Frame::Program(_,request)))=>request.independent(),
+                                    _=>false,
+                                }) {
                                     let received=inbox.frames.pop_back().unwrap();
                                     inbox.queued_bytes=inbox.queued_bytes.saturating_sub(received.bytes);
                                     if let Some((reply,_))=self.process(browser,session.as_ref(),received).await {
@@ -424,7 +443,16 @@ impl Endpoint {
             Ok(frame) => frame,
         };
         Some(match (frame, session) {
-            (Frame::Hello(hello), None) => self.hello(id, hello).await,
+            (Frame::Hello(hello), None) => {
+                let owner = hello.owner;
+                let result = self.hello(id, hello).await;
+                if result.1.is_some() {
+                    if let Some(owner) = owner {
+                        browser.fence_program(owner).await;
+                    }
+                }
+                result
+            }
             (Frame::Hello(_), Some(_)) => (
                 refusal(
                     id,
@@ -447,17 +475,54 @@ impl Endpoint {
                 None,
             ),
             (Frame::OpStatus(query), Some(session)) => {
+                if self.ledger.register(session.channel, query.owner).is_ok() {
+                    browser.fence_program(query.owner).await;
+                }
                 (self.op_status(session, id, query).await, None)
             }
             (Frame::Site(request), Some(session)) => {
-                let result = browser.site_request(session.channel, request).await;
+                let result = if session.binding.browser_host {
+                    browser.site_request(session.channel, request).await
+                } else {
+                    Err("Site custody requires this daemon's immutable browser-host role.")
+                };
                 let reply = match result {
                     Ok(data) => json!({"id":id,"success":true,"data":data}),
                     Err(error) => refusal(id, "browser_site_custody_refused", error, false),
                 };
                 (reply, None)
             }
-            (Frame::Sequence(_), None) | (Frame::OpStatus(_), None) | (Frame::Site(_), None) => (
+            (Frame::Program(owner, request), Some(session)) => {
+                let reply = if !session.binding.browser_host {
+                    refusal(
+                        id,
+                        BINDING_REFUSED,
+                        "Remote programs require this daemon's immutable browser-host role.",
+                        false,
+                    )
+                } else if self.ledger.register(session.channel, owner).is_err() {
+                    refusal(id, FENCED, FENCED_MESSAGE, false)
+                } else {
+                    browser.fence_program(owner).await;
+                    match browser
+                        .program_request(session.channel, owner, request, &self.ledger)
+                        .await
+                    {
+                        Ok(data) => json!({"id":id,"success":true,"data":data}),
+                        Err(error) => {
+                            let code = crate::native::browser::error_code(&error)
+                                .unwrap_or(REJECTED)
+                                .to_owned();
+                            refusal(id, &code, error, false)
+                        }
+                    }
+                };
+                (reply, None)
+            }
+            (Frame::Sequence(_), None)
+            | (Frame::OpStatus(_), None)
+            | (Frame::Site(_), None)
+            | (Frame::Program(_, _), None) => (
                 refusal(
                     id,
                     PROTOCOL_REFUSED,
@@ -477,12 +542,13 @@ impl Endpoint {
         if binding.namespace != self.identity.namespace
             || binding.session != self.identity.session
             || binding.require_sandbox != self.identity.require_sandbox
+            || binding.browser_host != self.identity.browser_host
         {
             return (
                 refusal(
                     id,
                     BINDING_REFUSED,
-                    "The binding is not this browser's: its namespace, session or sandbox policy differ.",
+                    "The binding is not this browser's: its namespace, session, sandbox policy or workspace role differ.",
                     false,
                 ),
                 None,
@@ -578,6 +644,7 @@ impl Endpoint {
                 self.ledger.not_started(channel, id, Some(owner));
                 return refusal(id, FENCED, FENCED_MESSAGE, true);
             }
+            browser.fence_program(owner).await;
         }
         let steps = match step::prepare(&session.flags, &frame.steps) {
             Ok(steps) => steps,

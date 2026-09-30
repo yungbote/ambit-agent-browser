@@ -62,6 +62,19 @@ impl Tunnel {
         self.stop.send_replace(true);
     }
 
+    /// Wait for the program socket/browser to end. Canceling this wait keeps
+    /// the join handle available for final native-input settlement.
+    pub(super) async fn ended(&mut self) -> Result<(), String> {
+        let result = match self.task.as_mut() {
+            Some(task) => task
+                .await
+                .map_err(|_| "The Playwright transport stopped without settlement.".to_string())?,
+            None => return Ok(()),
+        };
+        self.task.take();
+        result
+    }
+
     pub(super) async fn finish(&mut self) -> Result<(), String> {
         self.stop();
         if let Some(mut task) = self.task.take() {

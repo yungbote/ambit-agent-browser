@@ -3,6 +3,7 @@
 //! custody remains with the daemon and human input remains with BrowserControl.
 
 mod boundary;
+pub(crate) mod remote;
 mod transport;
 #[cfg(test)]
 mod tunnel_e2e;
@@ -186,6 +187,22 @@ impl Operations {
             notified.await;
         }
     }
+
+    pub(crate) fn active(&self) -> bool {
+        self.state.lock().unwrap().active.is_some()
+    }
+
+    pub(crate) fn command_refusal(&self, command: &Value) -> Option<Value> {
+        if !self.active()
+            || command["action"] == crate::native::theme::ACTION
+            || command["action"] == crate::native::browser_control::ACTION
+        {
+            return None;
+        }
+        Some(
+            json!({"id":command["id"],"success":false,"code":"browser_operation_rejected","error":"A browser program holds the browser. Wait for it to settle before another browser operation."}),
+        )
+    }
 }
 
 /// Kill the process group before reaping its leader. The leader PID therefore
@@ -332,6 +349,73 @@ async fn diagnostics(mut reader: impl AsyncRead + Unpin) -> (String, bool) {
 
 /// The enclosing command retains exclusive native custody until the temporary
 /// connection, every input operation and the Node group have settled.
+struct Attachment {
+    tunnel: transport::Tunnel,
+    target: String,
+    isolated_contexts: usize,
+    artifacts: Option<std::path::PathBuf>,
+    owner: Arc<CdpClient>,
+}
+
+/// Local supervision and remote supervision attach through the same browser
+/// owner, downloads configuration and filtered, program-private connection.
+async fn attach(
+    state: &mut DaemonState,
+    target: Option<&str>,
+    deadline: tokio::time::Instant,
+    operation: &mut Operation,
+) -> Result<Attachment, String> {
+    let browser = state
+        .browser
+        .as_mut()
+        .ok_or("browser_operation_rejected: Open the browser before running Playwright.")?;
+    let target = match target {
+        Some(target) if !target.is_empty() => target,
+        Some(_) => {
+            return Err(
+                "browser_operation_rejected: targetId must identify an existing tab.".into(),
+            )
+        }
+        None => browser.active_target_id()?,
+    }
+    .to_owned();
+    let (download_context, isolated_contexts) = tokio::select! {
+        biased;
+        _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start()),
+        result = tokio::time::timeout_at(deadline, async {
+            let isolated = browser.isolated_context_ids().await?.len();
+            let context = browser.download_context_for_target(&target).await?;
+            browser.configure_downloads(context.as_deref()).await?;
+            Ok::<_, String>((context, isolated))
+        }) => result.map_err(|_| "browser_operation_rejected: Browser setup reached its deadline.")?
+            .map_err(|error| format!("browser_operation_rejected: {error}"))?,
+    };
+    let client = tokio::select! {
+        biased;
+        _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start()),
+        result = tokio::time::timeout_at(deadline, CdpClient::connect(browser.get_cdp_url())) =>
+            Arc::new(result.map_err(|_| "browser_operation_rejected: Browser attachment timed out.")?
+                .map_err(|_| "browser_operation_rejected: The existing browser could not be attached.")?),
+    };
+    client.publish_activity_as(&browser.client);
+    let observed = tokio::select! {
+        biased;
+        _ = operation.canceled.changed() => Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start()),
+        result = tokio::time::timeout_at(deadline, browser.observe_owned_downloads(&client, download_context.as_deref())) => result.map_err(|_| "browser_operation_rejected: Browser attachment setup reached its deadline.".to_string()).and_then(|result| result),
+    };
+    if let Err(error) = observed {
+        client.disconnect();
+        return Err(error);
+    }
+    Ok(Attachment {
+        tunnel: transport::Tunnel::start(client, state.browser_control.clone()).await?,
+        target,
+        isolated_contexts,
+        artifacts: browser.downloads_path().map(std::path::Path::to_path_buf),
+        owner: browser.client.clone(),
+    })
+}
+
 pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     super::workspace_role::current()?.admit_local_program()?;
     #[cfg(not(unix))]
@@ -355,56 +439,22 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
         let environment = ProgramEnvironment::read(command)?;
         let mut operation = state.playwright_operations.begin()?;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout);
-        let browser = state
-            .browser
-            .as_mut()
-            .ok_or("browser_operation_rejected: Open the browser before running Playwright.")?;
-        let target = match command.get("targetId") {
-            Some(value) => value
-                .as_str()
-                .filter(|target| !target.is_empty())
-                .ok_or("browser_operation_rejected: targetId must identify an existing tab.")?,
-            None => browser.active_target_id()?,
-        }
-        .to_owned();
-        // The runner learns how many explicit isolated contexts exist. A
-        // client without shared-context adoption would fold them into the
-        // default profile and misreport cookies, so it refuses before start.
-        let (download_context, isolated_contexts) = tokio::select! {
-            biased;
-            _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start().into()),
-            result = tokio::time::timeout_at(deadline, async {
-                let isolated = browser.isolated_context_ids().await?.len();
-                let context = browser.download_context_for_target(&target).await?;
-                browser.configure_downloads(context.as_deref()).await?;
-                Ok::<_, String>((context, isolated))
-            }) => result.map_err(|_| "browser_operation_rejected: Browser setup reached its deadline.")?
-                .map_err(|error| format!("browser_operation_rejected: {error}"))?,
-        };
-        let endpoint = browser.get_cdp_url().to_owned();
-        let artifacts = browser.downloads_path().map(std::path::Path::to_path_buf);
-        let owner = browser.client.clone();
+        let target = command
+            .get("targetId")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or("browser_operation_rejected: targetId must identify an existing tab.")
+            })
+            .transpose()?;
+        let Attachment {
+            mut tunnel,
+            target,
+            isolated_contexts,
+            artifacts,
+            owner,
+        } = attach(state, target, deadline, &mut operation).await?;
         let control = state.browser_control.clone();
-        let client = tokio::select! {
-            biased;
-            _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start().into()),
-            result = tokio::time::timeout_at(deadline, CdpClient::connect(&endpoint)) =>
-                Arc::new(result.map_err(|_| "browser_operation_rejected: Browser attachment timed out.")?
-                    .map_err(|_| "browser_operation_rejected: The existing browser could not be attached.")?),
-        };
-        // Viewers follow the owner's page sessions; program input appears
-        // there exactly as native input does.
-        client.publish_activity_as(&browser.client);
-        let observed = tokio::select! {
-            biased;
-            _ = operation.canceled.changed() => Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start()),
-            result = tokio::time::timeout_at(deadline, browser.observe_owned_downloads(&client, download_context.as_deref())) => result.map_err(|_| "browser_operation_rejected: Browser attachment setup reached its deadline.".to_string()).and_then(|result| result),
-        };
-        if let Err(error) = observed {
-            client.disconnect();
-            return Err(error.into());
-        }
-        let mut tunnel = transport::Tunnel::start(client, control.clone()).await?;
         let request = json!({ "endpoint": tunnel.endpoint(), "targetId": target, "code": code, "artifactsDir": artifacts, "environment": environment, "isolatedContexts": isolated_contexts });
         let mut node = Command::new(
             std::env::var("AGENT_BROWSER_NODE_PATH").unwrap_or_else(|_| "node".into()),

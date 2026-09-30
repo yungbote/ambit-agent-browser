@@ -21,6 +21,7 @@ use super::browser_control::{self, BrowserControl, ControlRequest};
 mod sign_in;
 #[path = "window_actions.rs"]
 mod window_actions;
+pub(crate) const OBSERVATION_REQUIRED: &str = window_actions::OBSERVATION_REQUIRED;
 use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
@@ -2830,6 +2831,9 @@ pub(crate) async fn execute_command_received(
             return error_response(cmd["id"].as_str().unwrap_or_default(), error);
         }
     }
+    if let Some(refusal) = state.playwright_operations.command_refusal(cmd) {
+        return refusal;
+    }
     // The theme is session state, not agent activity: it passes no window,
     // custody, observation or action-policy gate and captures no host
     // feedback.
@@ -2941,6 +2945,9 @@ pub(crate) async fn run_host_command(
     received_at: std::time::Instant,
     fence: &mut impl HostFence,
 ) -> Value {
+    if let Some(refusal) = state.playwright_operations.command_refusal(cmd) {
+        return refusal;
+    }
     let mut command = cmd.clone();
     command
         .as_object_mut()

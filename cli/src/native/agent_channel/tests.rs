@@ -42,6 +42,22 @@ impl Scripted {
 }
 
 impl Browser for Scripted {
+    async fn program_request(
+        &self,
+        _: ChannelId,
+        _: Owner,
+        request: crate::native::playwright::remote::Request,
+        _: &Ledger,
+    ) -> Result<Value, String> {
+        match request {
+            crate::native::playwright::remote::Request::Status { .. }
+            | crate::native::playwright::remote::Request::Close { .. } => {
+                self.go.notify_one();
+                Ok(json!({"state":"closed","nativeInputSettled":true}))
+            }
+            _ => Err("The scripted browser serves only the tested metadata request.".into()),
+        }
+    }
     fn custody_events(&self) -> Option<tokio::sync::broadcast::Receiver<(ChannelId, Value)>> {
         self.custody.as_ref().map(|events| events.subscribe())
     }
@@ -131,11 +147,16 @@ impl Browser for Scripted {
 const DIGEST: &str = "sha256:540f433f3536f8432ca701d0bfea8b176fc630ca2120ff7ac22ac1082621c4a8";
 
 fn endpoint() -> Arc<Endpoint> {
+    endpoint_role(false)
+}
+
+fn endpoint_role(browser_host: bool) -> Arc<Endpoint> {
     Arc::new(Endpoint::with_digest(
         Identity {
             namespace: "thread".into(),
             session: "browser".into(),
             require_sandbox: true,
+            browser_host,
         },
         DIGEST,
     ))
@@ -728,9 +749,9 @@ async fn a_paused_sequence_emits_need_and_accepts_the_reply_without_command_dead
         custody: Some(events),
         ..Scripted::default()
     });
-    let endpoint = endpoint();
+    let endpoint = endpoint_role(true);
     let (_directory, path) = directory();
-    let (mut host, hello) = Host::hello(&endpoint, &browser, json!({})).await;
+    let (mut host, hello) = Host::hello(&endpoint, &browser, json!({"binding":{"version":1,"namespace":"thread","session":"browser","requireSandbox":true,"browserHost":true}})).await;
     assert_eq!(hello["data"]["sessionCustody"], 3);
     assert_eq!(hello["data"]["limits"]["maxRequestBytes"], 2 << 20);
     host.send(sequence(2, "41", json!([wait()]), &path)).await;
@@ -748,6 +769,43 @@ async fn a_paused_sequence_emits_need_and_accepts_the_reply_without_command_dead
     let sequence = host.reply().await;
     assert_eq!(sequence["id"], 2);
     assert_eq!(sequence["success"], true);
+}
+
+#[tokio::test]
+async fn immutable_host_binding_gates_custody_and_remote_programs() {
+    let browser = Arc::new(Scripted::default());
+    let forged = json!({"binding":{"version":1,"namespace":"thread","session":"browser","requireSandbox":true,"browserHost":true}});
+    let (_, denied) = Host::hello(&endpoint(), &browser, forged.clone()).await;
+    assert_eq!(denied["code"], "agent_channel_binding");
+    let (_, denied) = Host::hello(&endpoint_role(true), &browser, json!({})).await;
+    assert_eq!(denied["code"], "agent_channel_binding");
+    let (mut standalone, accepted) = Host::hello(&endpoint(), &browser, json!({})).await;
+    assert_eq!(accepted["success"], true);
+    standalone
+        .send(json!({"type":"site_sessions.offer","id":2,"sites":[]}))
+        .await;
+    assert_eq!(standalone.reply().await["success"], false);
+    standalone.send(json!({"type":"program.status","id":3,"programId":"6b87fd14-4712-45e1-829e-95ee008fd783","actionId":ACTION,"ownerGeneration":"1"})).await;
+    assert_eq!(standalone.reply().await["code"], "agent_channel_binding");
+}
+
+#[tokio::test]
+async fn remote_status_settles_independently_beside_an_unanswered_sequence() {
+    let endpoint = endpoint_role(true);
+    let browser = Arc::new(Scripted::default());
+    let (_directory, path) = directory();
+    let (mut host,hello)=Host::hello(&endpoint,&browser,json!({"binding":{"version":1,"namespace":"thread","session":"browser","requireSandbox":true,"browserHost":true}})).await;
+    assert_eq!(hello["success"], true);
+    host.send(sequence(2, "41", json!([wait()]), &path)).await;
+    browser.started.notified().await;
+    host.send(json!({"type":"program.status","id":3,"programId":"6b87fd14-4712-45e1-829e-95ee008fd783","actionId":ACTION,"ownerGeneration":"41"})).await;
+    let reply = host.reply().await;
+    assert_eq!(
+        reply["id"], 3,
+        "metadata must settle without waiting behind sequence2"
+    );
+    assert_eq!(reply["data"]["nativeInputSettled"], true);
+    assert_eq!(host.reply().await["id"], 2);
 }
 
 #[tokio::test]

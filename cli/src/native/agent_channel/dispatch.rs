@@ -40,6 +40,7 @@ const CONTROLLED: &str = "browser_controlled_by_user";
 /// The daemon's browser, reached under its command custody.
 pub(crate) struct DaemonBrowser {
     custody: Arc<crate::native::site_sessions::custody::Custody>,
+    programs: crate::native::playwright::remote::Programs,
     state: Arc<Mutex<DaemonState>>,
     recorders: Recorders,
     /// The channel whose step acted last: the input its steps left held is
@@ -51,6 +52,7 @@ impl DaemonBrowser {
     pub(crate) fn new(state: Arc<Mutex<DaemonState>>) -> Self {
         Self {
             custody: crate::native::site_sessions::custody::Custody::new(),
+            programs: crate::native::playwright::remote::Programs::default(),
             state,
             recorders: Recorders::default(),
             actor: StdMutex::new(None),
@@ -235,6 +237,50 @@ fn unavailable(
 }
 
 impl Browser for DaemonBrowser {
+    async fn program_request(
+        &self,
+        channel: ChannelId,
+        owner: super::frame::Owner,
+        request: crate::native::playwright::remote::Request,
+        ledger: &super::ledger::Ledger,
+    ) -> Result<Value, String> {
+        if matches!(
+            &request,
+            crate::native::playwright::remote::Request::Open { .. }
+        ) && !self.custody.admits_channel(channel).await
+        {
+            return Err(
+                "This channel needs its host's site custody offer before using the browser.".into(),
+            );
+        }
+        if matches!(
+            &request,
+            crate::native::playwright::remote::Request::Open { .. }
+        ) {
+            let state = self.state.lock().await;
+            if let Some(browser) = &state.browser {
+                let sessions = browser
+                    .tab_list()
+                    .iter()
+                    .filter_map(|tab| {
+                        tab["targetId"]
+                            .as_str()
+                            .and_then(|target| browser.client.session_for_target(target))
+                    })
+                    .collect();
+                self.custody
+                    .browser_ready(browser.client.clone(), sessions)
+                    .await
+                    .map_err(str::to_owned)?;
+            }
+        }
+        self.programs
+            .request_current(&self.state, channel, owner, request, Some(ledger))
+            .await
+    }
+    async fn fence_program(&self, owner: super::frame::Owner) {
+        self.programs.fence(owner).await;
+    }
     async fn site_request(
         &self,
         channel: ChannelId,
@@ -394,6 +440,7 @@ impl Browser for DaemonBrowser {
     }
 
     async fn end(&self, channel: ChannelId) {
+        self.programs.end(channel).await;
         self.custody.end(channel).await;
         // Custody is held throughout: no step starts while the input its
         // channel left held is settled.
