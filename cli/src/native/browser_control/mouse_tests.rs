@@ -6,6 +6,31 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
+#[test]
+fn a_chord_releases_only_its_synthetic_modifiers_and_preserves_explicit_holds() {
+    let mut mouse = NativeMouse::default();
+    let control = crate::native::interaction::native_key_transition("Control", "keyDown");
+    mouse.keys_acknowledged(&[control]);
+    let events = mouse.with_held_modifiers(&crate::native::interaction::native_key_chord_events(
+        "a",
+        Some(8),
+    ));
+    assert_eq!(events[0]["modifiers"], 10);
+    assert_eq!(
+        events[1]["modifiers"], 2,
+        "Ending Shift+a must keep explicitly held Control only"
+    );
+    mouse.keys_acknowledged(&events);
+    assert_eq!(mouse.held_modifiers(), 2);
+    assert!(mouse.needs_release());
+    let up = mouse.with_held_modifiers(&[crate::native::interaction::native_key_transition(
+        "Control", "keyUp",
+    )]);
+    assert_eq!(up[0]["modifiers"], 0);
+    mouse.keys_acknowledged(&up);
+    assert!(!mouse.needs_release());
+}
+
 fn mapping(scale: f64, screen_y: f64) -> Mapping {
     Mapping {
         session: "page".into(),

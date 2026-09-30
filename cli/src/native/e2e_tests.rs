@@ -524,6 +524,40 @@ async fn e2e_native_focus_clear_selectall_use_real_input_without_button_activati
 
 #[tokio::test]
 #[ignore]
+async fn e2e_native_chord_releases_modifiers_before_returning_custody() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<input id=field value=hello><script>window.events=[];for(const type of ['keydown','keyup'])addEventListener(type,e=>events.push({type,key:e.key,ctrl:e.ctrlKey,trusted:e.isTrusted}),true)</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}),&mut state).await);
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#field"}), &mut state).await,
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"press","key":"Control+a"}), &mut state).await,
+    );
+    let browser = state.browser.as_ref().unwrap();
+    let released = tokio::time::timeout(std::time::Duration::from_secs(2), browser.client.send_command("Runtime.evaluate",Some(json!({
+        "expression":"new Promise(resolve=>{if(events.some(e=>e.type==='keyup'&&e.key==='Control'))resolve(true);else addEventListener('keyup',e=>{if(e.key==='Control')resolve(true)})})", "returnByValue":true,"awaitPromise":true,
+    })), Some(browser.active_session_id().unwrap()))).await;
+    let observed = control_test_command(&json!({"action":"evaluate","script":"({events,selection:[field.selectionStart,field.selectionEnd]})"}),&mut state).await;
+    println!("NATIVE_CHORD_RELEASE {}", observed["data"]["result"]);
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+    assert!(
+        released.is_ok(),
+        "The native chord left Control held after returning"
+    );
+    let events = observed["data"]["result"]["events"].as_array().unwrap();
+    assert!(events
+        .iter()
+        .any(|e| e["type"] == "keyup" && e["key"] == "Control" && e["ctrl"] == false));
+    assert!(events.iter().all(|e| e["trusted"] == true));
+    assert_eq!(observed["data"]["result"]["selection"], json!([0, 5]));
+}
+
+#[tokio::test]
+#[ignore]
 async fn e2e_native_static_selectall_preserves_exact_scope_through_nested_scroll() {
     let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
     env.set("AGENT_BROWSER_WINDOW_STREAM", "1");

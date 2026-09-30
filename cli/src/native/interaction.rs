@@ -2426,7 +2426,9 @@ pub(crate) fn native_paste_events(text: &str) -> Vec<Value> {
 }
 
 /// A single key press through the owned native window, with the CDP
-/// modifier mask (1 Alt, 2 Control, 4 Meta, 8 Shift) the helper shares.
+/// modifier mask (1 Alt, 2 Control, 4 Meta, 8 Shift) the helper shares. The
+/// final event releases the chord's synthetic modifiers; the native owner
+/// merges explicitly held modifier keys into both events independently.
 pub(crate) fn native_key_chord_events(key: &str, modifiers: Option<i32>) -> Vec<Value> {
     let (key_name, code, _) = named_key_info(key);
     native_key_events(&key_name, &code, modifiers.unwrap_or(0))
@@ -2448,7 +2450,7 @@ fn native_key_events(key: &str, code: &str, modifiers: i32) -> Vec<Value> {
         down,
         json!({
             "type": "input_keyboard", "eventType": "keyUp", "key": key, "code": code,
-            "modifiers": modifiers,
+            "modifiers": 0,
         }),
     ]
 }
@@ -2601,10 +2603,14 @@ mod tests {
         assert_eq!(events[0]["modifiers"], 2);
         assert!(events[0].get("text").is_none());
         assert_eq!(events[1]["eventType"], "keyUp");
-        assert_eq!(events[1]["modifiers"], 2);
+        assert_eq!(
+            events[1]["modifiers"], 0,
+            "A chord must release its synthetic modifiers"
+        );
         let shifted = native_key_chord_events("Enter", Some(8));
         assert_eq!(shifted[0]["code"], "Enter");
         assert_eq!(shifted[0]["modifiers"], 8);
+        assert_eq!(shifted[1]["modifiers"], 0);
         let space = native_key_chord_events("Space", None);
         assert_eq!(space[0]["key"], " ");
         assert_eq!(space[0]["text"], " ");
