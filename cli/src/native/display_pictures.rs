@@ -127,12 +127,13 @@ impl PictureReply {
                 .all(|[top, bottom]| top < bottom && *bottom <= self.height)
             && (!request.force || self.rows == [[0, self.height]])
             && self.visible.is_none_or(|visible| {
-                visible.x == 0
-                    && visible.y == 0
-                    && visible.width > 0
-                    && visible.height > 0
-                    && visible.width <= self.width
-                    && visible.height <= self.height
+                let inside = |origin: i32, extent: u32, limit: u32| {
+                    u32::try_from(origin).is_ok_and(|origin| {
+                        extent > 0 && origin.checked_add(extent).is_some_and(|end| end <= limit)
+                    })
+                };
+                inside(visible.x, visible.width, self.width)
+                    && inside(visible.y, visible.height, self.height)
             })
     }
 }
@@ -454,6 +455,29 @@ mod tests {
             reply.coherent(PictureRequest::default()),
             "off-window native position is neutral priority, not a broken picture"
         );
+    }
+
+    #[test]
+    fn aperture_admission_accepts_real_nonzero_origins_only_within_the_framebuffer() {
+        let header = json!({"width":1536,"height":2048,"stride":6144,"rows":[[0,2048]],"cursorIncluded":false,
+            "visible":{"x":100,"y":80,"width":1418,"height":1888},"pointer":{"x":400,"y":500}});
+        let reply: PictureReply = serde_json::from_value(header.clone()).unwrap();
+        assert!(reply.coherent(PictureRequest {
+            force: true,
+            ..Default::default()
+        }));
+        for invalid in [
+            json!({"x":-1,"y":80,"width":1418,"height":1888}),
+            json!({"x":119,"y":80,"width":1418,"height":1888}),
+            json!({"x":100,"y":161,"width":1418,"height":1888}),
+            json!({"x":i32::MAX,"y":80,"width":u32::MAX,"height":1888}),
+            json!({"x":100,"y":80,"width":0,"height":1888}),
+        ] {
+            let mut header = header.clone();
+            header["visible"] = invalid;
+            let reply: PictureReply = serde_json::from_value(header).unwrap();
+            assert!(!reply.coherent(PictureRequest::default()));
+        }
     }
 
     fn request() -> PictureRequest {

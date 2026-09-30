@@ -98,6 +98,9 @@ pub(crate) struct Planar {
     width: usize,
     height: usize,
     data: Vec<u8>,
+    /// At most two source rows, reused when an aperture needs masking before
+    /// subsampled chroma averaging. No full framebuffer copy is needed.
+    masked_rows: Vec<u8>,
 }
 
 impl Planar {
@@ -111,6 +114,7 @@ impl Planar {
             width,
             height,
             data,
+            masked_rows: Vec::new(),
         }
     }
 
@@ -121,6 +125,134 @@ impl Planar {
             height: self.height as u32,
             data: &self.data,
         }
+    }
+
+    /// Convert only owned visible pixels in their framebuffer coordinates.
+    /// Outside luma is black. Chroma crossing the aperture samples its nearest
+    /// owned edge, preserving inside colour without reading a neighbouring window.
+    pub(crate) fn convert_visible(
+        &mut self,
+        source: &[u8],
+        stride: usize,
+        source_size: (usize, usize),
+        visible: super::EncoderRegion,
+        rows: (usize, usize),
+    ) -> bool {
+        let (left, top) = (visible.x as usize, visible.y as usize);
+        let (Some(right), Some(bottom)) = (
+            left.checked_add(visible.width as usize),
+            top.checked_add(visible.height as usize),
+        ) else {
+            return false;
+        };
+        if visible.width == 0
+            || visible.height == 0
+            || right > source_size.0
+            || bottom > source_size.1
+            || right > self.width
+            || bottom > self.height
+        {
+            return false;
+        }
+        if left == 0 && top == 0 && (right, bottom) == source_size {
+            return self.convert(source, stride, source_size, rows);
+        }
+        let (width, height) = (
+            source_size.0.min(self.width),
+            source_size.1.min(self.height),
+        );
+        let (row_top, row_bottom) = match self.chroma {
+            Chroma::Full => rows,
+            Chroma::Subsampled => (rows.0 & !1, rows.1.saturating_add(1) & !1),
+        };
+        let (row_top, row_bottom) = (row_top.min(height), row_bottom.min(height));
+        if row_top >= row_bottom {
+            return true;
+        }
+        if stride < width * 4 || source.len() < (row_bottom - 1) * stride + width * 4 {
+            return false;
+        }
+        let chroma_width = self.chroma_width();
+        let luma_size = self.width * self.height;
+        let (luma, chroma) = self.data.split_at_mut(luma_size);
+        let (cb, cr) = chroma.split_at_mut(chroma.len() / 2);
+        match self.chroma {
+            Chroma::Full => {
+                for y in row_top..row_bottom {
+                    let at = y * self.width;
+                    luma[at..at + self.width].fill(MATRIX.black);
+                    cb[at..at + self.width].fill(NEUTRAL);
+                    cr[at..at + self.width].fill(NEUTRAL);
+                    if (top..bottom).contains(&y) {
+                        convert_full(
+                            &source[y * stride + left * 4..y * stride + right * 4],
+                            &mut luma[at + left..at + right],
+                            &mut cb[at + left..at + right],
+                            &mut cr[at + left..at + right],
+                        );
+                    }
+                }
+            }
+            Chroma::Subsampled => {
+                self.masked_rows.resize(width * 8, 0);
+                for y in (row_top..row_bottom).step_by(2) {
+                    let next = (y + 1).min(height - 1);
+                    self.masked_rows.fill(0);
+                    for (slot, source_y) in [(0, y), (1, next)] {
+                        if y < bottom && next >= top {
+                            let source_y = source_y.clamp(top, bottom - 1);
+                            let at = slot * width * 4;
+                            self.masked_rows[at + left * 4..at + right * 4].copy_from_slice(
+                                &source
+                                    [source_y * stride + left * 4..source_y * stride + right * 4],
+                            );
+                            if left % 2 == 1 {
+                                self.masked_rows[at + (left - 1) * 4..at + left * 4]
+                                    .copy_from_slice(
+                                        &source[source_y * stride + left * 4
+                                            ..source_y * stride + (left + 1) * 4],
+                                    );
+                            }
+                            if right % 2 == 1 && right < width {
+                                self.masked_rows[at + right * 4..at + (right + 1) * 4]
+                                    .copy_from_slice(
+                                        &source[source_y * stride + (right - 1) * 4
+                                            ..source_y * stride + right * 4],
+                                    );
+                            }
+                        }
+                    }
+                    let (upper, lower) = luma.split_at_mut((y + 1) * self.width);
+                    upper[y * self.width..(y + 1) * self.width].fill(MATRIX.black);
+                    if next != y {
+                        lower[..self.width].fill(MATRIX.black);
+                    }
+                    let chroma_at = y / 2 * chroma_width;
+                    cb[chroma_at..chroma_at + chroma_width].fill(NEUTRAL);
+                    cr[chroma_at..chroma_at + chroma_width].fill(NEUTRAL);
+                    convert_subsampled(
+                        &self.masked_rows[..width * 4],
+                        &self.masked_rows[width * 4..],
+                        &mut upper[y * self.width..y * self.width + width],
+                        (next != y).then(|| &mut lower[..width]),
+                        &mut cb[chroma_at..chroma_at + width.div_ceil(2).min(chroma_width)],
+                        &mut cr[chroma_at..chroma_at + width.div_ceil(2).min(chroma_width)],
+                    );
+                    // Edge extension belongs to chroma's sampling footprint;
+                    // source padding stays black in luma.
+                    for row_y in [y, next] {
+                        let at = row_y * self.width;
+                        if !(top..bottom).contains(&row_y) {
+                            luma[at..at + self.width].fill(MATRIX.black);
+                        } else {
+                            luma[at..at + left].fill(MATRIX.black);
+                            luma[at + right..at + self.width].fill(MATRIX.black);
+                        }
+                    }
+                }
+            }
+        }
+        true
     }
 
     fn chroma_width(&self) -> usize {
@@ -326,6 +458,44 @@ pub(crate) fn to_rgb(colour: Colour, y: u8, cb: u8, cr: u8) -> [u8; 3] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn aperture_boundary_sampling_keeps_the_owned_colour_at_odd_chroma_edges() {
+        let source = bgrx(&vec![[0, 255, 0]; 8 * 6]);
+        for chroma in [Chroma::Full, Chroma::Subsampled] {
+            let mut picture = Planar::new(chroma, 8, 6);
+            assert!(picture.convert_visible(
+                &source,
+                32,
+                (8, 6),
+                super::super::EncoderRegion {
+                    x: 1,
+                    y: 1,
+                    width: 5,
+                    height: 3
+                },
+                (0, 6)
+            ));
+            let planes = picture.picture().planes().unwrap();
+            for (x, y) in [(1, 1), (5, 1), (1, 3), (5, 3)] {
+                let (cx, cy) = if chroma == Chroma::Full {
+                    (x, y)
+                } else {
+                    (x / 2, y / 2)
+                };
+                let rgb = to_rgb(
+                    COLOUR,
+                    planes[0].0[y * 8 + x],
+                    planes[1].0[cy * planes[1].1 + cx],
+                    planes[2].0[cy * planes[2].1 + cx],
+                );
+                assert!(
+                    rgb[0] <= 2 && rgb[1] >= 253 && rgb[2] <= 2,
+                    "{chroma:?} at{x},{y}: {rgb:?}"
+                );
+            }
+        }
+    }
 
     fn bgrx(pixels: &[[u8; 3]]) -> Vec<u8> {
         pixels
