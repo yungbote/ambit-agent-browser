@@ -429,6 +429,135 @@ fn get_data(resp: &Value) -> &Value {
     resp.get("data").expect("Missing 'data' in response")
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore]
+async fn e2e_semantic_landing_text_only_result_and_redaction() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let recorders = super::agent_channel::target::Recorders::default();
+    let mut evidence = Vec::new();
+    for (outcome, expected) in [
+        ("ready", "Report ready"),
+        ("unchanged", "Unrelated ticker changed"),
+        ("failed", "Report failed: could not load data"),
+    ] {
+        // nosecret: explicit privacy test markers, no user data/credentials.
+        let html = format!(
+            r#"<!doctype html><style>body{{font:20px sans-serif}}textarea,input{{display:block}}#hidden{{opacity:0}}</style><h2 id=result>Report pending</h2><button id=run type=button onclick="result.textContent='{result}';ticker.textContent='Unrelated ticker changed';draft.textContent='test-only private editor';readonly.textContent='test-only private readonly field';hidden.textContent='test-only invisible text';password.type='text';password.value='test-only private password'">Generate report</button><p id=ticker>Idle</p><div id=draft contenteditable aria-label=Draft>Initial draft</div><textarea id=readonly readonly aria-label='Read only field'>Initial readonly field</textarea><input id=password type=password aria-label=Password value='test-only initial password'><p id=hidden>Hidden initial</p>"#,
+            result = if outcome == "ready" {
+                "Report ready"
+            } else if outcome == "failed" {
+                "Report failed: could not load data"
+            } else {
+                "Report pending"
+            }
+        );
+        assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(&html))}),&mut state).await);
+        let before = super::agent_channel::observe::observation(&mut state, &recorders).await;
+        let candidate = before["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "Generate report")
+            .unwrap();
+        let browser = state.browser.as_ref().unwrap();
+        let session = browser.active_session_id().unwrap();
+        let context = recorders.world(&browser.client, session).await.unwrap();
+        let target = super::agent_channel::target::node(
+            &browser.client,
+            session,
+            context,
+            candidate["backendNodeId"].as_i64().unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut landing =
+            super::agent_channel::landed::Landing::arm(&state, &recorders, Some(target), true)
+                .await;
+        assert_success(
+            &control_test_command(&json!({"action":"click","selector":"#run"}), &mut state).await,
+        );
+        let mut person = super::agent_channel::landed::PersonWatch::of(&state).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let pending = landing.wait(deadline, &mut person).await;
+        landing.stop_watching().await;
+        let landed = landing.read(&mut state, pending, deadline).await;
+        let after = super::agent_channel::observe::observation(&mut state, &recorders).await;
+        let (_, page) = super::feedback::page_identity(&state).await.unwrap();
+        let refs = |value: &Value| {
+            value["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["ref"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            refs(&before),
+            refs(&after),
+            "The fixture changed controls instead of only after-state text"
+        );
+        assert!(landed["changedNodes"].as_u64().unwrap() > 0);
+        let texts = landed["changedText"]["texts"]
+            .as_array()
+            .expect("A same-document physical action must carry its bounded text diff");
+        assert_eq!(
+            landed["changedText"]["pageGeneration"],
+            page["pageGeneration"]
+        );
+        assert_eq!(
+            landed["changedText"]["backendNodeId"],
+            landed["target"]["backendNodeId"]
+        );
+        assert!(
+            texts.iter().any(|t| t == expected),
+            "Missing actual text-only result: {landed}"
+        );
+        assert!(
+            !landed.to_string().contains("test-only"),
+            "Editable/secret/invisible text escaped: {landed}"
+        );
+        if outcome != "ready" {
+            assert!(!texts.iter().any(|t| t == "Report ready"));
+        }
+        evidence.push(
+            json!({"outcome":outcome,"landed":landed,"page":page,"before":before,"after":after}),
+        );
+        assert!(
+            landing.without_read().get("changedText").is_none(),
+            "A pending/takeover block disclosed semantic text"
+        );
+        state
+            .browser
+            .as_ref()
+            .unwrap()
+            .client
+            .rotate_page_generation(state.browser.as_ref().unwrap().active_session_id().unwrap());
+        let stale = landing
+            .read(
+                &mut state,
+                false,
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .await;
+        assert!(
+            stale.get("changedText").is_none(),
+            "A successor document reused the old semantic diff"
+        );
+        println!(
+            "SEMANTIC_LANDING_SOURCE {}",
+            json!({"case":outcome,"landed":landed,"controlCount":refs(&after).len()})
+        );
+    }
+    if let Ok(path) = std::env::var("AMBIT_BROWSER_LANDED_CASES_OUT") {
+        std::fs::write(path, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+    }
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
 fn assert_error_code(resp: &Value, code: &str) {
     assert_eq!(
         resp.get("success").and_then(Value::as_bool),
