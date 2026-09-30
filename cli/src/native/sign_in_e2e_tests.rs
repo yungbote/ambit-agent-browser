@@ -472,6 +472,229 @@ fn person_types(point: (f64, f64)) -> Value {
     ])
 }
 
+/// A synthetic password form submitted through human sign-in mode. The
+/// fixture contains no real credential; its body is never read or logged.
+/// Run in separate processes with role=code and role=browser_host to inspect
+/// the native Save prompt and prove the fresh-profile preference boundary.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_new_profile_credential_save_preference_preserves_human_signin() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let (sent, mut seen) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let server = tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            let sent = sent.clone();
+            tokio::spawn(async move {
+                let mut buffer = [0u8; 8192];
+                let size = stream.read(&mut buffer).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&buffer[..size]);
+                let first = request.lines().next().unwrap_or("");
+                let target = first.split_whitespace().nth(1).unwrap_or("/");
+                let submitted = first.starts_with("POST /signed-in ");
+                let body = if submitted {
+                    "<!doctype html><title>Fixture signed in</title><body style='background:#f0fff0'><h1>Signed in</h1><script>requestAnimationFrame(()=>requestAnimationFrame(()=>fetch('/settled')))</script>"
+                } else if target == "/" {
+                    "<!doctype html><title>Fixture sign in</title><style>body{font:20px sans-serif}input{display:block;width:400px;height:40px;margin:12px}button{margin:12px}</style><form method=post action=/signed-in><label>Username<input name=username autocomplete=username autofocus></label><label>Password<input name=password type=password autocomplete=current-password></label><button>Sign in</button></form><script>addEventListener('pointermove',()=>fetch('/pointer'),{once:true})</script>"
+                } else {
+                    ""
+                };
+                let _ = sent.send(if submitted {
+                    "submitted".into()
+                } else {
+                    target.into()
+                });
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nCache-Control: no-store\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    let mut state = DaemonState::new();
+    assert_success(&command(&json!({"action":"navigate","url":url}), &mut state).await);
+    let automation = ChromeMain::observe(&state).await;
+    let profile = automation.user_data_dir().to_string();
+    let preferences = std::fs::read(std::path::Path::new(&profile).join("Default/Preferences"))
+        .map(|bytes| serde_json::from_slice::<Value>(&bytes).unwrap())
+        .unwrap_or_else(|error| {
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+            json!({})
+        });
+    let host = super::workspace_role::current().unwrap().is_browser_host();
+    if host {
+        assert_eq!(preferences["credentials_enable_service"], false);
+    } else {
+        assert_ne!(preferences["credentials_enable_service"], false);
+    }
+    assert!(
+        preferences
+            .get("signin")
+            .is_none_or(|signin| signin.get("allowed").is_none()),
+        "no Chrome-account sign-in policy is added"
+    );
+    let (x, y, _) = window_point(&state, 100.0, 70.0).await;
+    while seen.try_recv().is_ok() {}
+    let controller = acquire(&mut state).await;
+    assert_success(&sign_in(&mut state, &controller, 1, 600_000).await.0);
+    let person = ChromeMain::observe(&state).await;
+    assert!(
+        person.automation_switches().is_empty(),
+        "human sign-in has no DevTools"
+    );
+    assert_eq!(person.user_data_dir(), profile);
+    // Real pointer receipt proves the new native window/page is ready.
+    let mut sequence = 2;
+    tokio::time::timeout(Duration::from_secs(8), async {
+        loop {
+            let mut input = control("input", &controller);
+            input["sequence"] = json!(sequence);
+            input["expectedSurfaceGeneration"] = json!(state.window_display().unwrap().surface().generation);
+            input["events"] = json!([{"type":"input_mouse","eventType":"mouseMoved","x":x + f64::from((sequence % 2) as u32)*4.0,"y":y,"button":"none","buttons":0}]);
+            assert_success(&command(&input,&mut state).await);
+            sequence += 1;
+            if let Ok(Some(path)) = tokio::time::timeout(Duration::from_millis(250),seen.recv()).await {
+                if path == "/pointer" {break;}
+            }
+        }
+    }).await.expect("sign-in page accepted a real pointer");
+    let mut input = control("input", &controller);
+    input["sequence"] = json!(sequence);
+    input["expectedSurfaceGeneration"] =
+        json!(state.window_display().unwrap().surface().generation);
+    let mut events = vec![
+        json!({"type":"input_mouse","eventType":"mousePressed","x":x,"y":y,"button":"left","buttons":1,"clickCount":1}),
+        json!({"type":"input_mouse","eventType":"mouseReleased","x":x,"y":y,"button":"left","buttons":0,"clickCount":1}),
+    ];
+    events.extend(super::interaction::native_inserted_events("fixture"));
+    events.extend(super::interaction::native_key_chord_events("Tab", None));
+    // Deliberate nosecret test fixture only.
+    events.extend(super::interaction::native_inserted_events("nosecret"));
+    events.extend(super::interaction::native_key_chord_events("Enter", None));
+    input["events"] = json!(events);
+    assert_success(&command(&input, &mut state).await);
+    tokio::time::timeout(Duration::from_secs(8), async {
+        while let Some(path) = seen.recv().await {
+            if path == "/settled" {
+                return;
+            }
+        }
+        panic!("fixture server stopped");
+    })
+    .await
+    .expect("human sign-in submitted and rendered success");
+    let display = state.window_display().unwrap();
+    let screenshot = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            let captured = display
+                .capture(super::display::CaptureRequest {
+                    patches: false,
+                    cursor: true,
+                    wait_ms: 250,
+                    budget_bytes: 4 * 1024 * 1024,
+                    ..Default::default()
+                })
+                .await
+                .unwrap();
+            let Some((capture, _)) = captured.frame else {
+                continue;
+            };
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(capture.data.unwrap())
+                .unwrap();
+            let image = image::load_from_memory(&bytes).unwrap().to_rgb8();
+            let pixel = image.get_pixel(image.width() / 2, image.height() * 3 / 4).0;
+            if pixel[1] > 250 && (234..=245).contains(&pixel[0]) && (234..=245).contains(&pixel[2])
+            {
+                return bytes;
+            }
+        }
+    })
+    .await
+    .expect("native pixels show the rendered success page");
+    if let Some(directory) = std::env::var_os("AMBIT_HOST_SAVE_EVIDENCE") {
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            std::path::PathBuf::from(directory).join(if host { "host.jpeg" } else { "code.jpeg" }),
+            screenshot,
+        )
+        .unwrap();
+    }
+    if !host {
+        // Fixture's fixed 1280px Chrome toolbar: the baseline shows its key
+        // icon; open the actual Save prompt without saving the test value.
+        let surface = display.surface();
+        let (key_x, key_y) = (f64::from(surface.width) - 278.0, 125.0);
+        let mut clicked = control("input", &controller);
+        clicked["sequence"] = json!(sequence + 1);
+        clicked["expectedSurfaceGeneration"] = json!(surface.generation);
+        clicked["events"] = json!([{"type":"input_mouse","eventType":"mouseMoved","x":key_x,"y":key_y,"button":"none","buttons":0},{"type":"input_mouse","eventType":"mousePressed","x":key_x,"y":key_y,"button":"left","buttons":1,"clickCount":1},{"type":"input_mouse","eventType":"mouseReleased","x":key_x,"y":key_y,"button":"left","buttons":0,"clickCount":1}]);
+        assert_success(&command(&clicked, &mut state).await);
+        let captured = display
+            .capture(super::display::CaptureRequest {
+                patches: false,
+                cursor: true,
+                wait_ms: 250,
+                budget_bytes: 4 * 1024 * 1024,
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        if let (Some((capture, _)), Some(directory)) =
+            (captured.frame, std::env::var_os("AMBIT_HOST_SAVE_EVIDENCE"))
+        {
+            use base64::Engine;
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(capture.data.unwrap())
+                .unwrap();
+            std::fs::write(
+                std::path::PathBuf::from(directory).join("code-save-prompt.jpeg"),
+                bytes,
+            )
+            .unwrap();
+        }
+    }
+    assert_success(&command(&control("release", &controller), &mut state).await);
+    if host {
+        let persisted: Value = serde_json::from_slice(
+            &std::fs::read(std::path::Path::new(&profile).join("Default/Preferences")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            persisted["credentials_enable_service"], false,
+            "human hand-back keeps the profile preference"
+        );
+    }
+    assert_success(&command(&json!({"action":"navigate","url":url}), &mut state).await);
+    assert_success(&command(&json!({"action":"close"}), &mut state).await);
+    // A caller-selected fixture profile is never rewritten by host defaults.
+    let selected = tempfile::tempdir().unwrap();
+    std::fs::create_dir(selected.path().join("Default")).unwrap();
+    let selected_preferences = selected.path().join("Default/Preferences");
+    std::fs::write(
+        &selected_preferences,
+        b"{\"credentials_enable_service\":true}",
+    )
+    .unwrap();
+    assert_success(
+        &command(
+            &json!({"action":"launch","headless":true,"profile":selected.path().to_string_lossy()}),
+            &mut state,
+        )
+        .await,
+    );
+    let preferences: Value =
+        serde_json::from_slice(&std::fs::read(&selected_preferences).unwrap()).unwrap();
+    assert_eq!(
+        preferences["credentials_enable_service"], true,
+        "caller-selected profile remains unchanged"
+    );
+    assert_success(&command(&json!({"action":"close"}), &mut state).await);
+    server.abort();
+}
+
 /// Automation → sign-in mode → automation on one profile, as the Product's
 /// dock drives it through the control protocol.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

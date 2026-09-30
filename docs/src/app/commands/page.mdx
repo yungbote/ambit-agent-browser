@@ -57,6 +57,8 @@ On Linux, private window streaming defaults to ANGLE software GLES for WebGL wit
 
 The platform fixes `AMBIT_WORKSPACE_ROLE` at daemon startup from the workspace manifest (`code` or `browser_host`; absent is standalone). Browser hosts reject local programs with `browser_operation_rejected`, before Chrome or Node starts and before any site-state offer. Run those programs in the conversation's code workspace. Launch and model arguments cannot change the role; standalone and code-workspace programs keep their existing behavior. The marker grants no site access.
 
+Fresh automatically owned browser-host profiles start with Chrome's new-password saving turned off. Chrome-account and website sign-in remain available, and retained or caller-selected profiles are not rewritten. This preference does not prevent filling existing account-stored passwords and can be changed by the person in Chrome; it is not a substitute for the vault or model redaction.
+
 ```bash
 agent-browser run-playwright --stdin <<'JS'
 await page.getByRole('textbox', { name: 'Search' }).fill('reference');

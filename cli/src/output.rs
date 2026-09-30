@@ -2273,6 +2273,10 @@ Browser hosts reject local programs before Chrome or Node starts; run them
 in the conversation workspace. Standalone and code-workspace use are unchanged.
 AMBIT_WORKSPACE_ROLE is reserved for the platform's workspace manifest and
 is fixed at daemon startup, not selected by a launch or model argument.
+Fresh owned browser-host profiles start with Chrome's new-password saving
+turned off. Chrome-account and website sign-in remain available; retained
+and caller-selected profiles are not rewritten. This preference can be
+changed in Chrome and does not prevent existing account-password autofill.
 
 Options:
   --target <id>        Exact existing CDP target ID (default: current native tab)

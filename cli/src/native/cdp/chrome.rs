@@ -1290,16 +1290,23 @@ fn try_launch_chrome(
     options: &LaunchOptions,
     canceled: &AtomicBool,
 ) -> Result<ChromeProcess, String> {
+    let browser_host = crate::native::workspace_role::current()
+        .map_err(String::from)?
+        .is_browser_host();
     let ChromeArgs {
         args,
         user_data_dir,
         temp_user_data_dir,
     } = build_chrome_args(options)?;
+    let new_host_profile = browser_host && temp_user_data_dir.is_some();
     let temp_user_data_dir = options
         .retained_profile
         .as_ref()
         .map(|profile| profile.directory.clone())
         .or_else(|| temp_user_data_dir.map(|path| Arc::new(TemporaryBrowserDirectory { path })));
+    if new_host_profile {
+        super::profiles::prepare_new_host_profile(&user_data_dir)?;
+    }
 
     // Mitigate stale DevToolsActivePort risk (e.g., previous crash left it behind).
     // Puppeteer does similar cleanup before spawning.

@@ -41,6 +41,30 @@ pub(crate) fn create_temporary(prefix: &str) -> Result<PathBuf, String> {
     create(&std::env::temp_dir(), prefix, machine_run())
 }
 
+/// A freshly created host-owned profile has no saved credentials to import.
+/// Disable Chrome's offer to save new passwords; the vault owns that choice.
+/// This does not restrict Chrome-account or website sign-in, or claim to
+/// disable filling credentials already available through an account store.
+pub(crate) fn prepare_new_host_profile(directory: &Path) -> Result<(), String> {
+    use std::io::Write;
+    let defaults = directory.join("Default");
+    std::fs::create_dir(&defaults)
+        .map_err(|_| "Could not initialize browser credential-save preferences".to_string())?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut preferences = options
+        .open(defaults.join("Preferences"))
+        .map_err(|_| "Could not initialize browser credential-save preferences".to_string())?;
+    preferences
+        .write_all(b"{\"credentials_enable_service\":false}\n")
+        .map_err(|_| "Could not initialize browser credential-save preferences".to_string())
+}
+
 /// This run of the machine: its kernel's boot, and the start of process 1,
 /// which a sandbox's stop ends and its next start begins again. `None` where
 /// the kernel does not say (no `/proc`).
@@ -104,6 +128,53 @@ fn owned(_: &std::fs::DirEntry) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_new_host_profile_disables_new_saving_without_account_signin_policy() {
+        let root = tempfile::tempdir().unwrap();
+        let profile = create(root.path(), OWN, None).unwrap();
+        prepare_new_host_profile(&profile).unwrap();
+        let file = profile.join("Default/Preferences");
+        let prefs: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&file).unwrap()).unwrap();
+        assert_eq!(
+            prefs,
+            serde_json::json!({"credentials_enable_service":false})
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(file).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn new_host_preparation_does_not_overwrite_a_preexisting_profile() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("Default")).unwrap();
+        let file = root.path().join("Default/Preferences");
+        std::fs::write(&file, b"{\"credentials_enable_service\":true}").unwrap();
+        assert!(prepare_new_host_profile(root.path()).is_err());
+        assert_eq!(
+            std::fs::read(file).unwrap(),
+            b"{\"credentials_enable_service\":true}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_host_preparation_never_follows_a_default_profile_link() {
+        let root = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let file = target.path().join("Preferences");
+        std::fs::write(&file, b"fixture-preserved").unwrap();
+        std::os::unix::fs::symlink(target.path(), root.path().join("Default")).unwrap();
+        assert!(prepare_new_host_profile(root.path()).is_err());
+        assert_eq!(std::fs::read(file).unwrap(), b"fixture-preserved");
+    }
 
     #[test]
     fn a_process_start_is_read_past_a_command_name_with_spaces_and_parentheses() {

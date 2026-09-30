@@ -8,6 +8,8 @@ The Unix native daemon runs one supervised Node program against its existing Chr
 
 The platform reserves `AMBIT_WORKSPACE_ROLE` for the workspace manifest: `code` or `browser_host`; absence is standalone. The daemon fixes it at startup and invalid values refuse startup. A browser host rejects local `run-playwright` with `browser_operation_rejected` before program preparation or an implicit browser launch, including before its first site-state offer. Run browser programs in the conversation's code workspace. A model or launch argument cannot change the role, and the marker grants no site access. Standalone/code local execution remains compatible.
 
+Fresh automatically owned browser-host profiles start with new-password saving disabled, preserving Chrome-account and website sign-in. Retained and caller-selected profiles are not rewritten. This preference does not prove that existing account-stored passwords cannot be filled, and a person can change it in Chrome; vault custody and model redaction are separate boundaries.
+
 ```sh
 agent-browser open https://example.test
 agent-browser run-playwright --timeout-ms 30000 --stdin <<'JS'
