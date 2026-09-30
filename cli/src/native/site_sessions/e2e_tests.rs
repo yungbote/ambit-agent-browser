@@ -454,3 +454,384 @@ async fn e2e_lazy_site_attach_applies_before_the_first_real_document_request() {
     server.abort();
     let _ = server.await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_lazy_custody_prepares_iframes_and_new_native_targets() {
+    use super::{custody::Custody, protocol::Request};
+    use crate::native::actions::{execute_command, DaemonState};
+    use crate::native::agent_channel::frame::ChannelId;
+    use std::sync::Arc;
+    use std::time::Duration;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let origin = format!("http://localhost:{port}");
+    let (requests, mut received) = tokio::sync::mpsc::unbounded_channel();
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            let requests = requests.clone();
+            tokio::spawn(async move {
+                let mut input = [0u8; 8192];
+                let count = socket.read(&mut input).await.unwrap_or(0);
+                let _ = requests.send(String::from_utf8_lossy(&input[..count]).into_owned());
+                let body = "<!doctype html><title>Target custody fixture</title>";
+                let reply=format!("HTTP/1.1 200 OK\r\nContent-Type:text/html\r\nContent-Length:{}\r\nConnection:close\r\n\r\n{body}",body.len());
+                let _ = socket.write_all(reply.as_bytes()).await;
+            });
+        }
+    });
+    let mut state = DaemonState::new();
+    for command in [
+        json!({"action":"launch","headless":true}),
+        json!({"action":"navigate","url":format!("http://localhost:{port}/top")}),
+    ] {
+        let reply = Box::pin(execute_command(&command, &mut state)).await;
+        assert_eq!(reply["success"], true, "{reply}");
+    }
+    let client = state.browser.as_ref().unwrap().client.clone();
+    let session = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .active_session_id()
+        .unwrap()
+        .to_owned();
+    let channel = ChannelId::parse("11111111-1111-4111-8111-111111111111").unwrap();
+    let custody = Custody::new();
+    let mut events = custody.subscribe();
+    custody
+        .request(
+            channel,
+            Request::read(
+                "site_sessions.offer",
+                json!({"sites":[{"site":"http://localhost","mode":"act"}]}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    custody
+        .browser_ready(client.clone(), vec![session.clone()])
+        .await
+        .unwrap();
+    let expression=format!("(()=>{{const iframe=document.createElement('iframe');iframe.src={};document.body.append(iframe);return true}})()",serde_json::to_string(&format!("{origin}/frame")).unwrap());
+    client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({"expression":expression,"returnByValue":true})),
+            Some(&session),
+        )
+        .await
+        .unwrap();
+    let (_, need) = tokio::time::timeout(Duration::from_secs(3), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(need["site"], "http://localhost");
+    while let Ok(request) = received.try_recv() {
+        assert!(
+            !request.starts_with("GET /frame "),
+            "iframe document must not reach the server before custody"
+        );
+    }
+    let snapshot = json!({"format":"ambit.browser-site-state.v1","site":"http://localhost","capturedAt":"2026-09-30T00:00:00.000Z","chromeMajor":154,
+        "cookies":[{"name":"target_fixture","value":"nosecret-target-cookie","domain":"localhost","path":"/","expires":1900000000,"httpOnly":true,"secure":false,"sameSite":"lax","priority":"medium","sourceScheme":"non_secure","partitionKey":null}],
+        "origins":[{"origin":origin,"localStorage":[["target","nosecret-target-storage"]],"indexedDB":[]}],"omitted":[]});
+    custody.request(channel,Request::read("site_session.attach",json!({"requestId":need["requestId"],"useId":"22222222-2222-4222-8222-222222222222","site":"http://localhost","mode":"act","state":snapshot})).unwrap()).await.unwrap();
+    let first = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let request = received.recv().await.unwrap();
+            if request.starts_with("GET /frame ") {
+                break request;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert!(
+        first.contains("target_fixture=nosecret-target-cookie"),
+        "first iframe request carries the imported cookie"
+    );
+    custody
+        .request(
+            channel,
+            Request::read(
+                "site_session.detach",
+                json!({"sites":["http://localhost"],"reason":"revoked"}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    // Leave the prior frame behind before offering again: detach reloads
+    // matching pages, and its document must not supply the new tab's need.
+    let blank = Box::pin(execute_command(
+        &json!({"action":"navigate","url":"about:blank"}),
+        &mut state,
+    ))
+    .await;
+    assert_eq!(blank["success"], true, "{blank}");
+    custody
+        .request(
+            channel,
+            Request::read(
+                "site_sessions.offer",
+                json!({"sites":[{"site":"http://localhost","mode":"act"}]}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let state = Arc::new(tokio::sync::Mutex::new(state));
+    let opening = {
+        let state = state.clone();
+        let url = format!("{origin}/popup");
+        tokio::spawn(async move {
+            Box::pin(execute_command(
+                &json!({"action":"tab_new","url":url}),
+                &mut *state.lock().await,
+            ))
+            .await
+        })
+    };
+    let (_, need) = tokio::time::timeout(Duration::from_secs(3), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(need["type"], "site_session.need");
+    let mut before_attach = None;
+    while let Ok(request) = received.try_recv() {
+        if request.starts_with("GET /popup ") {
+            before_attach = Some(request);
+        }
+    }
+    custody.request(channel,Request::read("site_session.attach",json!({"requestId":need["requestId"],"useId":"33333333-3333-4333-8333-333333333333","site":"http://localhost","mode":"act","state":snapshot})).unwrap()).await.unwrap();
+    let opened = tokio::time::timeout(Duration::from_secs(3), opening)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(opened["success"], true, "{opened}");
+    let reached_before_attach = before_attach.is_some();
+    let first = match before_attach {
+        Some(request) => request,
+        None => tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let request = received.recv().await.unwrap();
+                if request.starts_with("GET /popup ") {
+                    break request;
+                }
+            }
+        })
+        .await
+        .unwrap(),
+    };
+    // A distinct site creates an actual out-of-process iframe. Its native
+    // auto-attach consumer must prepare it without blocking the CDP reader;
+    // ending the channel then releases the pending document signed out.
+    custody
+        .request(
+            channel,
+            Request::read(
+                "site_sessions.offer",
+                json!({"sites":[
+                    {"site":"http://localhost","mode":"act","useId":"33333333-3333-4333-8333-333333333333"},
+                    {"site":"http://127.0.0.1","mode":"act"}
+                ]}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let parent = state
+        .lock()
+        .await
+        .browser
+        .as_ref()
+        .unwrap()
+        .active_session_id()
+        .unwrap()
+        .to_owned();
+    let mut targets = client.subscribe();
+    client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({"expression":format!("(()=>{{const iframe=document.createElement('iframe');iframe.src='http://127.0.0.1:{port}/oop-frame';document.body.append(iframe);return true}})()"),"returnByValue":true})),
+            Some(&parent),
+        )
+        .await
+        .unwrap();
+    let (_, iframe_need) = tokio::time::timeout(Duration::from_secs(3), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(iframe_need["site"], "http://127.0.0.1");
+    while let Ok(request) = received.try_recv() {
+        assert!(
+            !request.starts_with("GET /oop-frame "),
+            "OOP iframe reached the server before custody refusal"
+        );
+    }
+    custody
+        .request(
+            channel,
+            Request::read(
+                "site_session.refuse",
+                json!({"requestId":iframe_need["requestId"],"site":"http://127.0.0.1","reason":"denied"}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let child = tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            let event = targets.recv().await.unwrap();
+            if event.method == "Target.attachedToTarget"
+                && event
+                    .params
+                    .pointer("/targetInfo/type")
+                    .and_then(Value::as_str)
+                    == Some("iframe")
+            {
+                break event.params["sessionId"].as_str().unwrap().to_owned();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    assert_ne!(
+        child, parent,
+        "the fixture exercised a separate iframe session"
+    );
+    client
+        .send_command_no_params("Runtime.enable", Some(&child))
+        .await
+        .unwrap();
+    wait_default_context(&mut targets, &child).await;
+    let responsive = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.send_command(
+            "Runtime.evaluate",
+            Some(json!({"expression":"1","returnByValue":true})),
+            Some(&child),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(responsive.pointer("/result/value"), Some(&json!(1)));
+    custody.request(channel,Request::read("site_sessions.offer",json!({"sites":[
+        {"site":"http://localhost","mode":"act","useId":"33333333-3333-4333-8333-333333333333"},
+        {"site":"http://127.0.0.1","mode":"act"}
+    ]})).unwrap()).await.unwrap();
+    let mut contexts = client.subscribe();
+    let navigating = {
+        let client = client.clone();
+        let child = child.clone();
+        tokio::spawn(async move {
+            client
+                .send_command(
+                    "Page.navigate",
+                    Some(json!({"url":format!("http://127.0.0.1:{port}/cancel-frame")})),
+                    Some(&child),
+                )
+                .await
+        })
+    };
+    let (_, cancelled_need) = tokio::time::timeout(Duration::from_secs(3), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cancelled_need["site"], "http://127.0.0.1");
+    while let Ok(request) = received.try_recv() {
+        assert!(
+            !request.starts_with("GET /cancel-frame "),
+            "OOP iframe reached the server before custody cancellation"
+        );
+    }
+    custody.end(channel).await;
+    tokio::time::timeout(Duration::from_secs(3), navigating)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(
+        custody
+            .request(
+                channel,
+                Request::read(
+                    "site_session.refuse",
+                    json!({"requestId":cancelled_need["requestId"],"site":"http://127.0.0.1","reason":"denied"})
+                )
+                .unwrap()
+            )
+            .await
+            .is_err(),
+        "the ended channel cannot resolve a stale need"
+    );
+    tokio::time::timeout(Duration::from_secs(3), async {
+        loop {
+            if received
+                .recv()
+                .await
+                .unwrap()
+                .starts_with("GET /cancel-frame ")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .unwrap();
+    wait_default_context(&mut contexts, &child).await;
+    let responsive = tokio::time::timeout(
+        Duration::from_secs(3),
+        client.send_command(
+            "Runtime.evaluate",
+            Some(json!({"expression":"1","returnByValue":true})),
+            Some(&child),
+        ),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(responsive.pointer("/result/value"), Some(&json!(1)));
+    let closed = Box::pin(execute_command(
+        &json!({"action":"close"}),
+        &mut *state.lock().await,
+    ))
+    .await;
+    assert_eq!(closed["success"], true, "{closed}");
+    server.abort();
+    let _ = server.await;
+    assert!(
+        !reached_before_attach,
+        "new-target document reached the server before custody was attached"
+    );
+    assert!(
+        first.contains("target_fixture=nosecret-target-cookie"),
+        "first new-target request carries the imported cookie"
+    );
+}
+
+async fn wait_default_context(
+    events: &mut tokio::sync::broadcast::Receiver<crate::native::cdp::types::CdpEvent>,
+    session: &str,
+) {
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.method == "Runtime.executionContextCreated"
+                && event.session_id.as_deref() == Some(session)
+                && event
+                    .params
+                    .pointer("/context/auxData/isDefault")
+                    .and_then(Value::as_bool)
+                    == Some(true)
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the iframe publishes its actual default execution context");
+}

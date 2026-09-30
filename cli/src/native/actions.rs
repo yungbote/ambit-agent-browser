@@ -4392,12 +4392,16 @@ async fn install_network_controls_or_resume_prepared_session(
     }
 }
 
-/// True when [`apply_session_setup`] has anything to replay onto a new tab.
+/// True when a new tab needs preparation before its first destination.
 async fn session_setup_pending(state: &DaemonState) -> bool {
     !state.session_setup.is_empty()
         || state.theme.is_some()
         || !state.routes.read().await.is_empty()
         || !state.origin_headers.read().await.is_empty()
+        || state
+            .browser
+            .as_ref()
+            .is_some_and(|browser| browser.client.site_preparation_required())
 }
 
 /// Replay the session-scoped setup the user configured on the active page

@@ -1064,18 +1064,7 @@ impl BrowserManager {
     }
 
     pub async fn enable_browser_auto_attach_pub(&self) -> Result<(), String> {
-        self.client
-            .send_command(
-                "Target.setAutoAttach",
-                Some(json!({
-                    "autoAttach": true,
-                    "waitForDebuggerOnStart": true,
-                    "flatten": true
-                })),
-                None,
-            )
-            .await?;
-        Ok(())
+        self.client.enable_browser_auto_attach().await
     }
 
     async fn enable_domains(&self, session_id: &str) -> Result<(), String> {

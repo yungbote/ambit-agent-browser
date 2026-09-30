@@ -61,6 +61,8 @@ The host registers exact immutable staging receipts through `program.files` for 
 
 Native uploads use `action.files` bound to the existing Action owner, sharing the same validator without a program slot. Scopes coexist, survive disconnect for recovery and reject older generations. The backend attenuates terminal Actions with idempotent `action.files.release` after its canonical settlement commits; a late registration cannot restore released authority. Backend delivery and native chooser integration require composed qualification.
 
+Host site custody also prepares new tabs and auto-attached frames before their first document request. Native resume commands share that preparation boundary even when they do not await a resume reply. A pending document can receive its attach, refusal or channel cancellation while the browser operation waits.
+
 ```bash
 agent-browser run-playwright --stdin <<'JS'
 await page.getByRole('textbox', { name: 'Search' }).fill('reference');

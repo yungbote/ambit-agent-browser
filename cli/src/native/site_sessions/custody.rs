@@ -151,6 +151,12 @@ impl Custody {
                 }));
             }
         }
+        // Page-created targets must wait for the same native preparation as
+        // daemon-created tabs, before their first document can escape.
+        client
+            .enable_browser_auto_attach()
+            .await
+            .map_err(|_| REFUSED)?;
         for session in sessions {
             self.prepare_session(&client, &session).await?;
         }

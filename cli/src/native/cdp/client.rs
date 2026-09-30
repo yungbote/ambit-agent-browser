@@ -881,16 +881,14 @@ impl CdpClient {
         self.enqueue_with_id(id, method, params, session_id, InputSource::Agent)
     }
 
-    // The observation is built here rather than passed in: an async fn keeps
-    // a moved-in argument twice, and every CDP command awaits this future.
-    async fn enqueue_with_id(
+    /// Both acknowledged and fire-and-forget native commands share the
+    /// preparation boundary before anything is written to Chrome.
+    async fn prepare_command<'a>(
         &self,
-        id: u64,
-        method: &str,
+        method: &'a str,
         params: Option<Value>,
         session_id: Option<&str>,
-        source: InputSource,
-    ) -> Result<PendingCommand, String> {
+    ) -> Result<(&'a str, Option<Value>), String> {
         let mut params = params;
         let custody = self
             .site_custody
@@ -935,6 +933,20 @@ impl CdpClient {
                     .map_err(str::to_owned)?;
             }
         }
+        Ok((method, params))
+    }
+
+    // The observation is built here rather than passed in: an async fn keeps
+    // a moved-in argument twice, and every CDP command awaits this future.
+    async fn enqueue_with_id(
+        &self,
+        id: u64,
+        method: &str,
+        params: Option<Value>,
+        session_id: Option<&str>,
+        source: InputSource,
+    ) -> Result<PendingCommand, String> {
+        let (method, params) = self.prepare_command(method, params, session_id).await?;
         let mut observation = session_id.and_then(|session| {
             activity::from_command(method, params.as_ref()?).map(|value| {
                 self.observe_activity(value, session, self.page_generation(session), source)
@@ -1367,6 +1379,24 @@ impl CdpClient {
         }
     }
 
+    pub(crate) fn site_preparation_required(&self) -> bool {
+        self.site_custody
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .strong_count()
+            > 0
+    }
+
+    pub(crate) async fn enable_browser_auto_attach(&self) -> Result<(), String> {
+        self.send_command(
+            "Target.setAutoAttach",
+            Some(json!({"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true})),
+            None,
+        )
+        .await?;
+        Ok(())
+    }
+
     pub(crate) fn set_site_custody(
         &self,
         owner: std::sync::Weak<crate::native::site_sessions::custody::Custody>,
@@ -1453,6 +1483,7 @@ impl CdpClient {
         params: Option<Value>,
         session_id: Option<&str>,
     ) -> Result<(), String> {
+        let (method, params) = self.prepare_command(method, params, session_id).await?;
         let id = self.next_id.fetch_add(1, Ordering::SeqCst);
         let cmd = CdpCommand {
             id,
@@ -1528,6 +1559,135 @@ impl InspectProxyHandle {
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn no_wait_resume_prepares_custody_before_writing_the_resume() {
+        use crate::native::agent_channel::frame::ChannelId;
+        use crate::native::site_sessions::{custody::Custody, protocol::Request};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for expected in ["Fetch.enable", "Runtime.runIfWaitingForDebugger"] {
+                let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                    panic!("a command");
+                };
+                let command: Value = serde_json::from_str(&text).unwrap();
+                assert_eq!(command["method"], expected);
+                assert_eq!(command["sessionId"], "new-session");
+                if expected == "Fetch.enable" {
+                    socket
+                        .send(Message::Text(
+                            json!({"id":command["id"],"result":{}}).to_string(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let client = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        let custody = Custody::new();
+        custody
+            .request(
+                ChannelId::parse("11111111-1111-4111-8111-111111111111").unwrap(),
+                Request::read("site_sessions.offer", json!({"sites":[]})).unwrap(),
+            )
+            .await
+            .unwrap();
+        client.set_site_custody(Arc::downgrade(&custody), Default::default());
+        client
+            .send_command_no_wait("Runtime.runIfWaitingForDebugger", None, Some("new-session"))
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(
+            client.pending_len().await,
+            0,
+            "the resume awaits no CDP reply"
+        );
+        client.disconnect();
+    }
+
+    #[tokio::test]
+    async fn cancelled_no_wait_preparation_never_writes_the_resume() {
+        use crate::native::agent_channel::frame::ChannelId;
+        use crate::native::site_sessions::{custody::Custody, protocol::Request};
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (paused, reached) = oneshot::channel();
+        let (release, released) = oneshot::channel();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                panic!("a command");
+            };
+            let command: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(command["method"], "Fetch.enable");
+            paused.send(()).unwrap();
+            released.await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"id":command["id"],"result":{}}).to_string(),
+                ))
+                .await
+                .unwrap();
+            let Message::Text(text) = socket.next().await.unwrap().unwrap() else {
+                panic!("a command");
+            };
+            let command: Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(
+                command["method"], "Runtime.evaluate",
+                "no cancelled resume precedes the barrier"
+            );
+            socket
+                .send(Message::Text(
+                    json!({"id":command["id"],"result":{}}).to_string(),
+                ))
+                .await
+                .unwrap();
+        });
+        let client = Arc::new(
+            CdpClient::connect(&format!("ws://{address}"))
+                .await
+                .unwrap(),
+        );
+        let custody = Custody::new();
+        custody
+            .request(
+                ChannelId::parse("11111111-1111-4111-8111-111111111111").unwrap(),
+                Request::read("site_sessions.offer", json!({"sites":[]})).unwrap(),
+            )
+            .await
+            .unwrap();
+        client.set_site_custody(Arc::downgrade(&custody), Default::default());
+        let pending = {
+            let client = client.clone();
+            tokio::spawn(async move {
+                client
+                    .send_command_no_wait(
+                        "Runtime.runIfWaitingForDebugger",
+                        None,
+                        Some("new-session"),
+                    )
+                    .await
+            })
+        };
+        reached.await.unwrap();
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        client
+            .send_command_no_params("Runtime.evaluate", None)
+            .await
+            .unwrap();
+        server.await.unwrap();
+        assert_eq!(client.pending_len().await, 0);
+        client.disconnect();
+    }
 
     #[tokio::test]
     async fn explicit_attach_replies_share_the_target_session_association_writer() {
