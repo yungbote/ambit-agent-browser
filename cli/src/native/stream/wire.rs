@@ -12,6 +12,8 @@ const MAX_HEADER_BYTES: usize = 64 * 1024;
 pub(super) const MAX_SAFE_INTEGER: u64 = (1 << 53) - 1;
 /// A video unit's bounds (contract section 2), which every hop checks.
 const MAX_VIDEO_HEADER_BYTES: usize = 4096;
+/// One application fragment; independent of the logical coded-picture allowance.
+pub(super) const MAX_VIDEO_PART_BYTES: usize = 16 * 1024;
 /// Cached viewers declare no coded-capacity extension and retain this limit.
 pub(super) const LEGACY_VIDEO_BYTES: usize = 4 * 1024 * 1024;
 const MAX_CODED: u32 = 4096;
@@ -54,6 +56,20 @@ fn video_header(
     stream_id: &str,
     seq: u64,
 ) -> Option<Vec<u8>> {
+    encode_video_header(video_description(unit, codec, stream_id, seq)?)
+}
+
+fn encode_video_header(header: Value) -> Option<Vec<u8>> {
+    let header = serde_json::to_vec(&header).ok()?;
+    (header.len() <= MAX_VIDEO_HEADER_BYTES).then_some(header)
+}
+
+fn video_description(
+    unit: &super::video::Unit,
+    codec: VideoCodec,
+    stream_id: &str,
+    seq: u64,
+) -> Option<Value> {
     let (width, height) = unit.coded;
     let visible = unit.visible;
     let inside = |offset: i32, extent: u32, bound: u32| {
@@ -87,10 +103,67 @@ fn video_header(
     if let Some(input_seq) = unit.input_seq {
         header["inputSeq"] = json!(input_seq);
     }
-    let header = serde_json::to_vec(&header).ok()?;
-    if header.len() > MAX_VIDEO_HEADER_BYTES {
+    Some(header)
+}
+
+/// The first fragment reuses the canonical picture descriptor; later ones
+/// carry only its identity and contiguous payload offset. The caller owns
+/// the offset and commits it only after the message is actually written.
+pub(super) fn binary_video_part(
+    unit: &super::video::Unit,
+    codec: VideoCodec,
+    stream_id: &str,
+    seq: u64,
+    offset: usize,
+    max_wire_bytes: usize,
+) -> Option<(Vec<u8>, usize)> {
+    let header = video_part_header(unit, codec, stream_id, seq, offset)?;
+    let payload_bytes = max_wire_bytes
+        .min(MAX_VIDEO_PART_BYTES)
+        .checked_sub(4 + header.len())?
+        .min(unit.data.len() - offset);
+    if payload_bytes == 0 {
         return None;
     }
+    let end = offset.checked_add(payload_bytes)?;
+    let mut message = Vec::with_capacity(4 + header.len() + payload_bytes);
+    message.extend_from_slice(&(header.len() as u32).to_be_bytes());
+    message.extend_from_slice(&header);
+    message.extend_from_slice(&unit.data[offset..end]);
+    Some((message, end))
+}
+
+/// The smallest legal nonempty fragment, using the same canonical header.
+pub(super) fn video_part_minimum(
+    unit: &super::video::Unit,
+    codec: VideoCodec,
+    stream_id: &str,
+    seq: u64,
+    offset: usize,
+) -> Option<usize> {
+    Some(4 + video_part_header(unit, codec, stream_id, seq, offset)?.len() + 1)
+}
+
+fn video_part_header(
+    unit: &super::video::Unit,
+    codec: VideoCodec,
+    stream_id: &str,
+    seq: u64,
+    offset: usize,
+) -> Option<Vec<u8>> {
+    if offset >= unit.data.len() || seq == 0 || seq > MAX_SAFE_INTEGER {
+        return None;
+    }
+    let header = if offset == 0 {
+        let mut header = video_description(unit, codec, stream_id, seq)?;
+        header["offset"] = json!(0);
+        encode_video_header(header)?
+    } else {
+        encode_video_header(json!({
+            "type":"media", "track":"video", "streamId":stream_id,
+            "seq":seq, "offset":offset,
+        }))?
+    };
     Some(header)
 }
 
@@ -418,6 +491,115 @@ mod tests {
                 VideoCodec::Av1Full.coded_capacity(64, 64).unwrap() + 1
             ),
             VideoCodec::Av1Full
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn video_parts_reuse_the_picture_descriptor_and_exact_contiguous_payload() {
+        let stream = "00000000-0000-4000-8000-000000000001";
+        let mut unit = video_unit(true, 48_123);
+        for (offset, byte) in unit.data.iter_mut().enumerate() {
+            *byte = (offset % 251) as u8;
+        }
+        let whole = binary_video(&unit, VideoCodec::Av1Full, stream, 999).unwrap();
+        let (whole_header, _) = decode(&whole);
+        for ceiling in [1024, 3125, MAX_VIDEO_PART_BYTES, usize::MAX] {
+            let mut offset = 0;
+            let mut rebuilt = Vec::new();
+            let mut wire_bytes = 0;
+            let mut count = 0;
+            while offset < unit.data.len() {
+                let (part, end) =
+                    binary_video_part(&unit, VideoCodec::Av1Full, stream, 999, offset, ceiling)
+                        .unwrap();
+                assert!(part.len() <= ceiling.min(MAX_VIDEO_PART_BYTES));
+                let (mut header, payload) = decode(&part);
+                assert_eq!(header["offset"], offset);
+                assert_eq!(header["seq"], 999);
+                assert_eq!(payload, &unit.data[offset..end]);
+                assert!(!payload.is_empty());
+                if offset == 0 {
+                    header.as_object_mut().unwrap().remove("offset");
+                    assert_eq!(header, whole_header);
+                } else {
+                    assert_eq!(
+                        header,
+                        json!({"type":"media","track":"video",
+                        "streamId":stream,"seq":999,"offset":offset})
+                    );
+                }
+                wire_bytes += part.len();
+                rebuilt.extend_from_slice(payload);
+                offset = end;
+                count += 1;
+            }
+            assert_eq!(rebuilt, unit.data);
+            assert!(count >= 3);
+            assert!(
+                wire_bytes > whole.len(),
+                "every repeated envelope has a cost"
+            );
+            assert!(
+                binary_video_part(&unit, VideoCodec::Av1Full, stream, 999, offset, ceiling)
+                    .is_none(),
+                "no empty final fragment"
+            );
+        }
+    }
+
+    #[test]
+    fn video_parts_refuse_invalid_first_descriptors_and_too_small_envelopes() {
+        let stream = "00000000-0000-4000-8000-000000000001";
+        let unit = video_unit(true, 100);
+        for seq in [0, MAX_SAFE_INTEGER + 1] {
+            assert!(binary_video_part(
+                &unit,
+                VideoCodec::Av1Full,
+                stream,
+                seq,
+                0,
+                MAX_VIDEO_PART_BYTES
+            )
+            .is_none());
+        }
+        for offset in [unit.data.len(), usize::MAX] {
+            assert!(binary_video_part(
+                &unit,
+                VideoCodec::Av1Full,
+                stream,
+                1,
+                offset,
+                MAX_VIDEO_PART_BYTES
+            )
+            .is_none());
+        }
+        let (first, _) = binary_video_part(
+            &unit,
+            VideoCodec::Av1Full,
+            stream,
+            1,
+            0,
+            MAX_VIDEO_PART_BYTES,
+        )
+        .unwrap();
+        let header_bytes = 4 + u32::from_be_bytes(first[..4].try_into().unwrap()) as usize;
+        for ceiling in [0, 4, header_bytes] {
+            assert!(binary_video_part(&unit, VideoCodec::Av1Full, stream, 1, 0, ceiling).is_none());
+        }
+        let (minimum, end) =
+            binary_video_part(&unit, VideoCodec::Av1Full, stream, 1, 0, header_bytes + 1).unwrap();
+        assert_eq!(end, 1);
+        assert_eq!(minimum.len(), header_bytes + 1);
+        let mut invalid = video_unit(true, 10);
+        invalid.visible.x = -1;
+        assert!(binary_video_part(
+            &invalid,
+            VideoCodec::Av1Full,
+            stream,
+            1,
+            0,
+            MAX_VIDEO_PART_BYTES
         )
         .is_none());
     }

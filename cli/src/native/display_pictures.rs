@@ -414,6 +414,16 @@ pub(crate) mod fake {
             }
         }
 
+        /// Writes an exact test framebuffer through the same shared slot.
+        pub(crate) fn paint_image(&mut self, width: u32, height: u32, bgrx: &[u8]) {
+            let bytes = width as usize * height as usize * 4;
+            assert_eq!(bgrx.len(), bytes);
+            assert!(bytes <= SLOT_BYTES);
+            // SAFETY: the test owns SLOT_BYTES of writable mapped memory.
+            let slot = unsafe { std::slice::from_raw_parts_mut(self.pixels.as_ptr(), bytes) };
+            slot.copy_from_slice(bgrx);
+        }
+
         pub(crate) fn answer(&mut self, request: &Value, data: Value) {
             let reply = json!({"id": request["id"], "success": true, "data": data});
             self.socket

@@ -33,6 +33,16 @@ pub(crate) struct Unit {
     pub codec_string: Option<String>,
 }
 
+impl Unit {
+    /// Raster geometry of the actual applied owned window. Cursor inclusion
+    /// changes pixels, not the source's coordinate/identity contract.
+    pub(super) fn follows(&self, surface: &Surface, window: (u32, u32)) -> bool {
+        let mut expected = surface.clone();
+        expected.cursor_included = self.surface.cursor_included;
+        self.surface == expected && (self.visible.width, self.visible.height) == window
+    }
+}
+
 /// How far behind a viewer may fall before it is resynchronized.
 pub(super) const RESYNC_AFTER: Duration = Duration::from_secs(1);
 

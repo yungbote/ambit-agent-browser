@@ -526,8 +526,8 @@ fn aligned_regional_updates_bound_noisy_steps_on_the_measured_consumer_link() {
 }
 
 /// A native key's bytes are observed independently of replenishment credit.
-/// Above-cap output stays an honest wire refusal; no preview or quantizer
-/// reduction is allowed to turn it into a false latency/quality success.
+/// Native quality stays unchanged; legacy and coded-capacity admission are
+/// distinct from the first key's physical serialization time.
 #[test]
 #[ignore = "qualification: wide high-entropy native keys"]
 fn wide_fixed_quality_keys_preserve_native_pixels_and_report_the_wire_boundary() {
@@ -579,7 +579,8 @@ fn wide_fixed_quality_keys_preserve_native_pixels_and_report_the_wire_boundary()
         let after = decoder.decode(&key.data);
         assert_eq!(after.rgb(), Decoder::new().decode(&before.data).rgb());
         let bytes = key.data.len();
-        let fits_wire_cap = bytes <= 4 * 1024 * 1024;
+        let capacity = VideoCodec::Av1Full.coded_capacity(width, height).unwrap();
+        assert!(bytes <= capacity);
         if let Ok(directory) = std::env::var("AMBIT_NATIVE_KEY_EVIDENCE") {
             let directory = std::path::Path::new(&directory);
             std::fs::create_dir_all(directory).unwrap();
@@ -591,10 +592,10 @@ fn wide_fixed_quality_keys_preserve_native_pixels_and_report_the_wire_boundary()
         }
         println!(
             "NATIVE_WIDE_KEY {}",
-            serde_json::json!({"width":width,"height":height,"rate":bits_per_second,"codecString":key.codec_string,"keyBytes":bytes,"fitsWireCap":fits_wire_cap,"serializationFloorMs":bytes as f64*8000.0/f64::from(bits_per_second),"codedFrameBytesEqual":true,"pixelsEqual":true})
+            serde_json::json!({"width":width,"height":height,"rate":bits_per_second,"codecString":key.codec_string,"keyBytes":bytes,"fitsLegacyEnvelope":bytes <= 4*1024*1024,"codedCapacity":capacity,"fitsCodedCapacity":true,"serializationFloorMs":bytes as f64*8000.0/f64::from(bits_per_second),"codedFrameBytesEqual":true,"pixelsEqual":true})
         );
-        // Refusal does not poison native state: a valid dependent unit still
-        // decodes. The track itself owns refusal/retirement and recovery.
+        // Transport admission does not poison native state: a valid dependent
+        // unit still decodes. The track owns legacy refusal and retirement.
         let delta = candidate
             .encode(
                 &planar.picture(),

@@ -72,6 +72,7 @@ struct ClientConfig {
     /// viewers only), and its newest subscription request.
     video: Option<Declared>,
     video_coded_capacity: bool,
+    video_chunks: bool,
     video_demand: Demand,
 }
 
@@ -101,6 +102,7 @@ impl Default for ClientConfig {
             audio_demand: Demand::default(),
             video: None,
             video_coded_capacity: false,
+            video_chunks: false,
             video_demand: Demand::default(),
         }
     }
@@ -309,6 +311,7 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
             "audio" => cfg.audio = AudioCodec::parse(value),
             "video" => cfg.video = Declared::parse(value),
             "videoCapacity" => cfg.video_coded_capacity = value == "coded",
+            "videoFraming" => cfg.video_chunks = value == "chunks",
             "frameWindow" => {
                 if let Some(window) = value
                     .parse::<usize>()
@@ -691,6 +694,7 @@ async fn handle_ws_client(
             initial_config.max_fps,
         );
         track.declare_coded_capacity(initial_config.video_coded_capacity);
+        track.declare_chunks(initial_config.video_chunks);
         (track, inbox, feedback)
     });
     let (mut video, video_inbox, mut video_feedback) = match declared_video {
@@ -921,7 +925,9 @@ async fn handle_ws_client(
                     && !video_display.has_changed().unwrap_or(true);
                 let (records, message) = track.deliver(delivery, fresh);
                 if !send_records(&mut ws_tx, records).await { break; }
-                if let Some(message) = message {
+                let fresh = track.current(config_rx.borrow().video_demand)
+                    && !video_display.has_changed().unwrap_or(true);
+                if let Some(message) = message.filter(|_| fresh) {
                     if ws_tx.send(message).await.is_err() { break; }
                 }
             }
@@ -931,13 +937,23 @@ async fn handle_ws_client(
                 }
                 pending_frame = true;
             }
-            changed = presentation_rx.changed(), if initial_config.presentation.is_some() => {
+            changed = presentation_rx.changed(), if initial_config.presentation.is_some()
+                || (initial_config.video_chunks && initial_config.video_coded_capacity) => {
                 if changed.is_err() { break; }
-                let config = config_rx.borrow().presentation.unwrap();
-                presentation.claim_if_available(connection_id, config);
+                let config = config_rx.borrow().presentation;
+                if let Some(config) = config {
+                    presentation.claim_if_available(connection_id, config);
+                }
                 presentation_rx.borrow_and_update();
+                let records = match (video.as_mut(), presentation.applied()) {
+                    (Some(track), Some(applied)) => track.applied(&applied),
+                    _ => Vec::new(),
+                };
                 next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, config_rx.borrow().max_fps, controlled));
-                if ws_tx.send(Message::Text(presentation.acknowledgment(connection_id, config).to_string())).await.is_err() { break; }
+                if let Some(config) = config {
+                    if ws_tx.send(Message::Text(presentation.acknowledgment(connection_id, config).to_string())).await.is_err() { break; }
+                }
+                if !send_records(&mut ws_tx, records).await { break; }
             }
             changed = custody_rx.changed() => {
                 if changed.is_err() { break; }
@@ -960,6 +976,18 @@ async fn handle_ws_client(
                 // Painting it also settles every earlier delivered frame.
                 in_flight.acknowledge(acked, Instant::now(), true);
                 byte_blocked = false;
+            }
+            _ = next_video_part(&video) => {
+                let Some(track) = video.as_mut() else { continue };
+                // Return through this priority loop after each bounded part:
+                // source/config, audio, records and feedback can all progress.
+                let fresh = track.current(config_rx.borrow().video_demand)
+                    && !video_display.has_changed().unwrap_or(true);
+                if !fresh { continue; }
+                if let Some(message) = track.part() {
+                    if ws_tx.send(message).await.is_err() { break; }
+                    track.part_sent();
+                }
             }
             _ = tokio::time::sleep_until(next_allowed), if framed && pending_frame && !byte_blocked && (!config_rx.borrow().ack_pacing || in_flight.has_slot(config_rx.borrow().frame_window)) => {
                 // Invariant: read at send time, not arrival time. That is what
@@ -1028,6 +1056,13 @@ async fn send_records(
 async fn next_video(track: &Option<VideoTrack>) -> Delivery {
     match track {
         Some(track) => track.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn next_video_part(track: &Option<VideoTrack>) {
+    match track {
+        Some(track) => track.part_ready().await,
         None => std::future::pending().await,
     }
 }
@@ -1160,6 +1195,12 @@ async fn reader_loop(
                     }
                     continue;
                 }
+                if msg_type == "received" {
+                    if let Some(video) = &video {
+                        video.received(&parsed);
+                    }
+                    continue;
+                }
                 if !is_user_input_message_type(msg_type) {
                     continue;
                 }
@@ -1222,6 +1263,23 @@ mod tests {
                 !config_from_upgrade(&format!("GET /?videoCapacity={value} HTTP/1.1\r\n"))
                     .video_coded_capacity
             );
+        }
+    }
+
+    #[test]
+    fn chunk_framing_is_an_explicit_upgrade_and_never_inferred_from_capacity() {
+        for (query, capacity, chunks) in [
+            ("", false, false),
+            ("videoCapacity=coded", true, false),
+            ("videoFraming=chunks", false, true),
+            ("videoCapacity=coded&videoFraming=chunks", true, true),
+            ("videoCapacity=coded&videoFraming=unknown", true, false),
+        ] {
+            let cfg = config_from_upgrade(&format!(
+                "GET /?frames=binary&cursor=viewer&video=av1-444&{query} HTTP/1.1\r\n"
+            ));
+            assert_eq!(cfg.video_coded_capacity, capacity);
+            assert_eq!(cfg.video_chunks, chunks);
         }
     }
 

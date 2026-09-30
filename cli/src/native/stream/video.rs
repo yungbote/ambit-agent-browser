@@ -15,6 +15,9 @@
 
 #[cfg(all(test, target_os = "linux"))]
 mod cpu_bench;
+#[cfg(all(test, target_os = "linux"))]
+mod native_channel_tests;
+mod parts;
 mod policy;
 #[cfg(target_os = "linux")]
 mod producer;
@@ -38,6 +41,7 @@ use super::track::{self, Demand, Offer};
 use super::StreamMedia;
 use crate::native::display::DisplayClient;
 use crate::native::video::{Declared, VideoCodec, VideoError};
+use parts::Parts;
 use policy::LinkRate;
 #[cfg(test)]
 pub(super) use policy::Quality;
@@ -166,6 +170,9 @@ mod producer {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) struct Feedback {
     pub ack: Option<(Uuid, u64)>,
+    pub acks: u64,
+    pub received: Option<(Uuid, u64, usize)>,
+    pub receipts: u64,
     pub keyframes: u64,
     pub rate: Option<(u64, LinkRate)>,
 }
@@ -211,8 +218,36 @@ impl VideoInbox {
             .and_then(|id| Uuid::parse_str(id).ok());
         let seq = message.get("seq").and_then(Value::as_u64);
         if let (Some(stream), Some(seq)) = (stream, seq) {
-            self.feedback
-                .send_modify(|feedback| feedback.ack = Some((stream, seq)));
+            self.feedback.send_modify(|feedback| {
+                feedback.ack = Some((stream, seq));
+                feedback.acks += 1;
+            });
+        }
+    }
+
+    /// Byte progress on one negotiated active picture, never a paint ACK.
+    pub(super) fn received(&self, message: &Value) {
+        let Some(fields) = message.as_object() else {
+            return;
+        };
+        if fields.len() != 5 || message["type"] != "received" || message["track"] != "video" {
+            return;
+        }
+        let stream = message["streamId"]
+            .as_str()
+            .and_then(|id| Uuid::parse_str(id).ok());
+        let seq = message["seq"]
+            .as_u64()
+            .filter(|seq| (1..=super::wire::MAX_SAFE_INTEGER).contains(seq));
+        let offset = message["offset"]
+            .as_u64()
+            .filter(|offset| (1..=super::wire::MAX_SAFE_INTEGER).contains(offset))
+            .and_then(|offset| usize::try_from(offset).ok());
+        if let (Some(stream), Some(seq), Some(offset)) = (stream, seq, offset) {
+            self.feedback.send_modify(|feedback| {
+                feedback.received = Some((stream, seq, offset));
+                feedback.receipts += 1;
+            });
         }
     }
 }
@@ -229,6 +264,11 @@ struct Epoch {
 pub(super) struct VideoTrack {
     /// The upgrade declared the dimensional source allowance; absent is legacy.
     coded_capacity: bool,
+    chunked: bool,
+    parts: Option<Parts>,
+    layout: Option<super::presentation::Applied>,
+    acks: u64,
+    receipts: u64,
     hub: Arc<VideoHub>,
     /// The codec offered; none when this viewer cannot be served video.
     codec: Option<VideoCodec>,
@@ -262,6 +302,11 @@ impl VideoTrack {
         };
         let track = Self {
             coded_capacity: false,
+            chunked: false,
+            parts: None,
+            layout: None,
+            acks: 0,
+            receipts: 0,
             hub,
             codec,
             offer,
@@ -294,6 +339,7 @@ impl VideoTrack {
     /// and hands back its subscription: dropped after a successor is taken,
     /// the producer and its encoder stay up in between.
     fn retire(&mut self) -> Option<Subscription> {
+        self.parts = None;
         self.epoch = None;
         self.flow.reset();
         self.subscription.take()
@@ -331,6 +377,7 @@ impl VideoTrack {
     /// under its own generation.
     pub(super) fn bind(&mut self, display: Option<Arc<DisplayClient>>) -> Vec<Value> {
         drop(self.retire());
+        self.layout = None;
         self.display = display;
         let mut records = Vec::new();
         self.serve(&mut records);
@@ -373,7 +420,9 @@ impl VideoTrack {
             // Capture admission includes queued bytes; delivery admission
             // considers in-flight bytes only. It permits one indivisible
             // picture from an empty flight without resetting its paint debt.
-            Some(subscription) if self.flow.has_room(0) => subscription.next().await,
+            Some(subscription) if self.parts.is_none() && self.flow.has_room(0) => {
+                subscription.next().await
+            }
             _ => std::future::pending().await,
         }
     }
@@ -398,6 +447,7 @@ impl VideoTrack {
             Delivery::Unit(_) if !fresh => return (Vec::new(), None),
             Delivery::Unit(unit) => unit,
             Delivery::NewEpoch => {
+                self.parts = None;
                 self.epoch = None;
                 self.flow.reset();
                 self.update_ready();
@@ -408,6 +458,16 @@ impl VideoTrack {
             }
             Delivery::Ended(_) => return self.refused(),
         };
+        // A key that was already encoding before an applied layout must not
+        // start its replacement epoch. End that subscription's chain and ask
+        // the same producer for the actual current geometry instead.
+        if self
+            .layout
+            .as_ref()
+            .is_some_and(|applied| !unit.follows(&applied.surface, applied.window))
+        {
+            return (self.restart(), None);
+        }
         if !self.coded_capacity && unit.data.len() > super::wire::LEGACY_VIDEO_BYTES {
             // Before started or any body: preserve the established track-only
             // unsupported transition, leaving the peer's audio/input intact.
@@ -435,6 +495,23 @@ impl VideoTrack {
             return self.refused();
         };
         epoch.seq += 1;
+        if self.chunked {
+            if super::wire::video_part_minimum(&unit, codec, &epoch.stream_id, epoch.seq, 0)
+                .is_none()
+            {
+                return self.refused();
+            }
+            let mut parts = Parts::new(unit, codec, epoch.stream_id.clone(), epoch.seq);
+            if let Some(rate) = self.link_rate {
+                parts.set_rate(rate, Instant::now());
+            }
+            self.parts = Some(parts);
+            self.update_ready();
+            // The same priority loop schedules every fragment, including
+            // the first after started. No payload is copied/reserved while
+            // that causal record is still being written.
+            return (records, None);
+        }
         let Some(message) = super::wire::binary_video(&unit, codec, &epoch.stream_id, epoch.seq)
         else {
             return self.refused();
@@ -456,6 +533,78 @@ impl VideoTrack {
         self.coded_capacity = supported;
     }
 
+    /// Fragment framing requires its own explicit capability and the coded
+    /// allowance. Old peers keep whole-unit video and established fallback.
+    pub(super) fn declare_chunks(&mut self, supported: bool) {
+        self.chunked = supported && self.coded_capacity;
+    }
+
+    /// An actual layout can make a partial picture obsolete before it could
+    /// paint. Retake the same standing subscription, retaining its producer
+    /// while the replacement is taken; started/seq1 names the new key epoch.
+    pub(super) fn applied(&mut self, applied: &super::presentation::Applied) -> Vec<Value> {
+        if !self.chunked
+            || self
+                .display
+                .as_ref()
+                .is_some_and(|display| display.surface().generation != applied.surface.generation)
+        {
+            return Vec::new();
+        }
+        self.layout = Some(applied.clone());
+        if self
+            .parts
+            .as_ref()
+            .is_none_or(|parts| parts.follows(&applied.surface, applied.window))
+        {
+            return Vec::new();
+        }
+        self.restart()
+    }
+
+    fn restart(&mut self) -> Vec<Value> {
+        let previous = self.retire();
+        let mut records = Vec::new();
+        self.serve(&mut records);
+        drop(previous);
+        records
+    }
+
+    pub(super) async fn part_ready(&self) {
+        match self.parts.as_ref().and_then(Parts::deadline) {
+            Some(deadline) => {
+                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
+            }
+            None => std::future::pending().await,
+        }
+    }
+
+    pub(super) fn part(&mut self) -> Option<Message> {
+        let parts = self.parts.as_mut()?;
+        let (quantum, window) = parts.limits();
+        parts
+            .prepare(quantum, window, Instant::now())
+            .map(Message::Binary)
+    }
+
+    /// Called after successful I/O. Only the complete logical picture enters
+    /// paint Flow, charged once with every actual fragment and native WS header.
+    pub(super) fn part_sent(&mut self) {
+        let Some(parts) = self.parts.as_mut() else {
+            return;
+        };
+        if parts.sent().is_some() && parts.complete() {
+            if let Some(epoch) = self.epoch.as_ref() {
+                self.flow.sent(
+                    epoch.seq,
+                    parts.costs().1,
+                    parts.first_at().expect("issued picture"),
+                );
+            }
+        }
+        self.update_ready();
+    }
+
     /// Applies the viewer's newest feedback: its cumulative acknowledgement
     /// of the current epoch, and any key unit it asked for.
     pub(super) fn feedback(&mut self, feedback: Feedback) {
@@ -466,18 +615,38 @@ impl VideoTrack {
             {
                 self.link_rate = Some(rate);
                 self.flow.set_link_rate(Some(rate));
+                if let Some(parts) = self.parts.as_mut() {
+                    parts.set_rate(rate, Instant::now());
+                }
                 if let Some(subscription) = &self.subscription {
                     subscription.set_link_rate(rate);
                 }
                 self.update_ready();
             }
         }
-        if let (Some((stream, seq)), Some(epoch)) = (feedback.ack, self.epoch.as_ref()) {
-            // An acknowledgement of a retired epoch, or beyond what was
-            // written, releases nothing.
-            if stream == epoch.id && seq <= epoch.seq {
-                self.flow.acknowledge(seq, Instant::now());
-                self.update_ready();
+        if feedback.receipts > self.receipts {
+            self.receipts = feedback.receipts;
+            if let (Some((stream, seq, offset)), Some(parts)) =
+                (feedback.received, self.parts.as_mut())
+            {
+                parts.receive(&stream.to_string(), seq, offset);
+            }
+        }
+        if feedback.acks > self.acks {
+            self.acks = feedback.acks;
+            if let (Some((stream, seq)), Some(epoch)) = (feedback.ack, self.epoch.as_ref()) {
+                // An acknowledgement of a retired epoch, or beyond what was
+                // written, releases nothing.
+                if stream == epoch.id
+                    && seq <= epoch.seq
+                    && self.parts.as_ref().is_none_or(Parts::complete)
+                {
+                    self.flow.acknowledge(seq, Instant::now());
+                    if self.chunked && self.flow.last_sent().is_none() {
+                        self.parts = None;
+                    }
+                    self.update_ready();
+                }
             }
         }
         if feedback.keyframes > self.keyframes {
@@ -491,7 +660,8 @@ impl VideoTrack {
     /// Tells the producer whether this viewer's path has room.
     fn update_ready(&self) {
         if let Some(subscription) = &self.subscription {
-            subscription.set_ready(self.flow.has_room(subscription.queued_bytes()));
+            subscription
+                .set_ready(self.parts.is_none() && self.flow.has_room(subscription.queued_bytes()));
         }
     }
 }
@@ -513,6 +683,170 @@ mod tests {
     use crate::native::video::encodes;
     use std::time::Duration;
     use tokio::sync::broadcast;
+
+    fn chunk_track() -> (VideoTrack, VideoInbox, watch::Receiver<Feedback>) {
+        let (mut track, inbox, feedback) = VideoTrack::new(hub(None), declared("av1-444"), true, 0);
+        track.demand = demand(true, 7);
+        track.declare_coded_capacity(true);
+        track.declare_chunks(true);
+        (track, inbox, feedback)
+    }
+
+    fn chunk_unit() -> Arc<Unit> {
+        Arc::new(Unit {
+            data: (0..48_000).map(|offset| (offset % 251) as u8).collect(),
+            wire_bytes: 0,
+            key: true,
+            ts: 1,
+            coded: (2048, 2048),
+            visible: crate::native::display::Rect {
+                x: 0,
+                y: 0,
+                width: 1840,
+                height: 1888,
+            },
+            surface: crate::native::display::Surface::new(2048, 2048),
+            input_seq: Some(4411),
+            quality: Quality::Motion,
+            codec_string: Some("av01.1.12M.08".into()),
+        })
+    }
+
+    fn part_payload(message: &Message) -> &[u8] {
+        let Message::Binary(bytes) = message else {
+            panic!("binary part")
+        };
+        let end = 4 + u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+        &bytes[end..]
+    }
+
+    #[test]
+    fn partial_picture_progress_never_becomes_paint_or_reapplies_an_early_ack() {
+        let (mut track, inbox, feedback) = chunk_track();
+        let source = chunk_unit();
+        let (records, first) = track.deliver(Delivery::Unit(source.clone()), true);
+        assert!(first.is_none());
+        let first = track.part().unwrap();
+        assert_eq!(records[0]["state"], "started");
+        assert_eq!(header(&first)["offset"], 0);
+        assert_eq!(header(&first)["byteLength"], source.data.len());
+        assert_eq!(header(&first)["inputSeq"], 4411);
+        let stream = records[0]["streamId"].as_str().unwrap().to_owned();
+        let mut rebuilt = part_payload(&first).to_vec();
+        let mut envelopes = first.len();
+        let framing = tokio_tungstenite::tungstenite::protocol::frame::FrameHeader::default();
+        let mut socket = envelopes + framing.len(envelopes as u64);
+        // Receipt is allowed before the send callback, but cannot issue the
+        // next message while I/O for this reservation is still outstanding.
+        inbox.received(&json!({"type":"received","track":"video","streamId":stream,
+            "seq":1,"offset":rebuilt.len()}));
+        track.feedback(*feedback.borrow());
+        assert!(track.part().is_none());
+        track.part_sent();
+        assert_eq!(
+            track.flow.last_sent(),
+            None,
+            "partial bytes aren't paint debt settlement"
+        );
+        inbox.acknowledge(&json!({"type":"ack","track":"video","streamId":stream,"seq":1}));
+        track.feedback(*feedback.borrow());
+        assert!(
+            track.parts.is_some(),
+            "early complete-picture ACK releases nothing"
+        );
+        while !track.parts.as_ref().unwrap().complete() {
+            let part = track.part().unwrap();
+            let payload = part_payload(&part);
+            assert_eq!(header(&part)["offset"], rebuilt.len());
+            rebuilt.extend_from_slice(payload);
+            envelopes += part.len();
+            socket += part.len() + framing.len(part.len() as u64);
+            track.part_sent();
+            inbox.received(&json!({"type":"received","track":"video","streamId":stream,
+                "seq":1,"offset":rebuilt.len()}));
+            track.feedback(*feedback.borrow());
+            assert!(
+                track.parts.is_some(),
+                "unchanged mailbox ACK never becomes valid later"
+            );
+        }
+        assert_eq!(rebuilt, source.data);
+        assert_eq!(track.parts.as_ref().unwrap().costs(), (envelopes, socket));
+        assert_eq!(track.flow.last_sent(), Some(1));
+        assert!(track.part().is_none());
+        inbox.acknowledge(&json!({"type":"ack","track":"video","streamId":stream,"seq":1}));
+        track.feedback(*feedback.borrow());
+        assert!(track.parts.is_none());
+        assert_eq!(track.flow.last_sent(), None);
+        assert_eq!(Arc::strong_count(&source), 1);
+    }
+
+    #[test]
+    fn retired_partial_picture_releases_storage_and_late_progress_cannot_resurrect_it() {
+        for position in [0, 1, 2] {
+            let (mut track, inbox, feedback) = chunk_track();
+            let source = chunk_unit();
+            let (records, _) = track.deliver(Delivery::Unit(source.clone()), true);
+            track.part().unwrap();
+            let old = records[0]["streamId"].as_str().unwrap().to_owned();
+            for _ in 0..position {
+                track.part_sent();
+                let issued = track.parts.as_ref().unwrap().in_flight();
+                assert!(issued > 0);
+                if let Some(part) = track.part() {
+                    assert!(part.len() <= super::super::wire::MAX_VIDEO_PART_BYTES);
+                }
+            }
+            assert_eq!(Arc::strong_count(&source), 2);
+            assert_eq!(track.request(demand(false, 8))[0]["state"], "stopped");
+            assert!(track.parts.is_none());
+            assert_eq!(Arc::strong_count(&source), 1);
+            inbox.received(&json!({"type":"received","track":"video","streamId":old,
+                "seq":1,"offset":48_000}));
+            inbox.acknowledge(&json!({"type":"ack","track":"video","streamId":old,"seq":1}));
+            track.feedback(*feedback.borrow());
+            assert!(track.parts.is_none());
+            track.demand = demand(true, 9);
+            let (records, _) = track.deliver(Delivery::Unit(source.clone()), true);
+            assert_ne!(records[0]["streamId"], old);
+            let pending = track.parts.as_ref().unwrap().in_flight();
+            inbox.received(&json!({"type":"received","track":"video","streamId":old,
+                "seq":1,"offset":48_000}));
+            track.feedback(*feedback.borrow());
+            assert_eq!(track.parts.as_ref().unwrap().in_flight(), pending);
+            assert_eq!(track.flow.last_sent(), None);
+        }
+    }
+
+    #[test]
+    fn received_receipt_is_closed_safe_positive_and_separate_from_paint() {
+        let (_, inbox, feedback) = chunk_track();
+        let valid = json!({"type":"received","track":"video",
+            "streamId":Uuid::new_v4().to_string(),"seq":1,"offset":10});
+        for (field, value) in [
+            ("type", json!("ack")),
+            ("track", json!("audio")),
+            ("streamId", json!("invalid")),
+            ("seq", json!(0)),
+            ("seq", json!(super::super::wire::MAX_SAFE_INTEGER + 1)),
+            ("offset", json!(0)),
+            ("offset", json!(-1)),
+            ("offset", json!("10")),
+            ("offset", json!(1.5)),
+            ("offset", json!(super::super::wire::MAX_SAFE_INTEGER + 1)),
+            ("extra", json!(true)),
+        ] {
+            let mut invalid = valid.clone();
+            invalid[field] = value;
+            inbox.received(&invalid);
+            assert_eq!(*feedback.borrow(), Feedback::default());
+        }
+        inbox.received(&valid);
+        assert_eq!(feedback.borrow().receipts, 1);
+        assert_eq!(feedback.borrow().received.unwrap().2, 10);
+        assert_eq!(feedback.borrow().ack, None);
+        assert_eq!(feedback.borrow().acks, 0);
+    }
 
     #[test]
     fn legacy_peer_refuses_large_picture_before_started_or_body_without_refusing_coded_peer() {
@@ -745,15 +1079,19 @@ mod tests {
             sent,
             Feedback {
                 ack: Some((stream, 1)),
+                acks: 1,
                 keyframes: 1,
                 rate: None,
+                ..Default::default()
             }
         );
         assert_eq!(track.flow.last_sent(), Some(1));
         track.feedback(Feedback {
             ack: Some((Uuid::new_v4(), 1)),
+            acks: 1,
             keyframes: 0,
             rate: None,
+            ..Default::default()
         });
         assert_eq!(
             track.flow.last_sent(),
@@ -762,15 +1100,17 @@ mod tests {
         );
         track.feedback(Feedback {
             ack: Some((stream, 9)),
+            acks: 2,
             keyframes: 0,
             rate: None,
+            ..Default::default()
         });
         assert_eq!(
             track.flow.last_sent(),
             Some(1),
             "nothing beyond what was written"
         );
-        track.feedback(sent);
+        track.feedback(Feedback { acks: 3, ..sent });
         assert_eq!(track.flow.last_sent(), None, "painted: nothing in flight");
         // A refinement encoded before the request may come first.
         let asked = loop {
