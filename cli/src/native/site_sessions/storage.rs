@@ -1,11 +1,14 @@
 //! Chrome adaptation. A hidden synthetic document imports/exports one origin
 //! without running its scripts, loading remote content or altering a real tab.
 
+use std::io::Write;
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::{engine::general_purpose::STANDARD, Engine};
 use serde_json::{json, Value};
 
+use super::bytes::Bytes;
 use super::state::{self, Cookie, SiteState};
 use crate::native::cdp::client::CdpClient;
 
@@ -50,13 +53,12 @@ fn cookie_to_chrome(cookie: &Cookie) -> Value {
     value
 }
 
-pub(crate) async fn import(client: &CdpClient, state: &SiteState) -> Result<(), &'static str> {
+pub(crate) async fn import(client: &Arc<CdpClient>, state: &SiteState) -> Result<(), &'static str> {
     let values = client.site_context();
     state.register(&values.values);
     let applying = async {
         for origin in &state.origins {
-            let input = serde_json::to_value(origin).map_err(|_| FAILED)?;
-            synthetic(client, &origin.origin, "import", &input).await?;
+            synthetic(client, &origin.origin, "import", origin).await?;
         }
         command(
             client,
@@ -102,7 +104,7 @@ async fn cookies(client: &CdpClient, site: &str) -> Result<Vec<Value>, &'static 
 }
 
 pub(crate) async fn capture(
-    client: &CdpClient,
+    client: &Arc<CdpClient>,
     site: &str,
     origins: &[String],
 ) -> Result<SiteState, &'static str> {
@@ -114,12 +116,22 @@ pub(crate) async fn capture(
         if !state::origin_in_site(origin, &boundary) {
             return Err(state::INVALID);
         }
-        let result = synthetic(client, origin, "export", &json!({})).await?;
+        let mut result = synthetic(
+            client,
+            origin,
+            "export",
+            &json!({"chunkCharacters":super::bytes::CHUNK_BYTES / 4}),
+        )
+        .await?;
         for omission in result["omitted"].as_array().ok_or(FAILED)? {
             omitted
                 .push(json!({"origin":origin,"what":omission["what"],"bytes":omission["bytes"]}));
         }
-        stored.push(json!({"origin":origin,"localStorage":result["localStorage"],"indexedDB":result["indexedDB"]}));
+        stored.push(Value::Object(serde_json::Map::from_iter([
+            ("origin".into(), Value::String(origin.clone())),
+            ("localStorage".into(), result["localStorage"].take()),
+            ("indexedDB".into(), result["indexedDB"].take()),
+        ])));
     }
     let version = command(client, "Browser.getVersion", json!({}), None).await?;
     let chrome_major = version["product"]
@@ -130,44 +142,16 @@ pub(crate) async fn capture(
         .ok_or("The browser could not identify its Chrome version for site capture.")?;
     let mut value = json!({"format":state::FORMAT,"site":site,
         "capturedAt":chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
-        "chromeMajor":chrome_major,"cookies":cookies,"origins":stored,"omitted":omitted});
-    // Register before omitting oversized storage: a captured value can also
-    // appear in the page while its persistence is refused by the size cap.
-    let unbounded: SiteState = serde_json::from_value(value.clone()).map_err(|_| FAILED)?;
-    unbounded.register(&client.site_context().values);
-    bound_storage(&mut value)?;
-    let state = SiteState::read(value, site)?;
+        "chromeMajor":chrome_major,"cookies":[],"origins":[],"omitted":[]});
+    value["cookies"] = Value::Array(cookies);
+    value["origins"] = Value::Array(stored);
+    value["omitted"] = Value::Array(omitted);
+    let state = SiteState::read_streamed(value, site)?;
     state.register(&client.site_context().values);
     Ok(state)
 }
 
-fn bound_storage(value: &mut Value) -> Result<(), &'static str> {
-    let origins = value["origins"].as_array().ok_or(FAILED)?.len();
-    for index in (0..origins).rev() {
-        for (field, what) in [
-            ("indexedDB", "indexed_db"),
-            ("localStorage", "local_storage"),
-        ] {
-            if serde_json::to_vec(value).map_err(|_| FAILED)?.len() <= state::MAX_BYTES {
-                return Ok(());
-            }
-            let origin = value["origins"][index]["origin"].clone();
-            let bytes = serde_json::to_vec(&value["origins"][index][field])
-                .map_err(|_| FAILED)?
-                .len();
-            value["origins"][index][field] = json!([]);
-            value["omitted"]
-                .as_array_mut()
-                .ok_or(FAILED)?
-                .push(json!({"origin":origin,"what":what,"bytes":bytes}));
-        }
-    }
-    (serde_json::to_vec(value).map_err(|_| FAILED)?.len() <= state::MAX_BYTES)
-        .then_some(())
-        .ok_or(FAILED)
-}
-
-pub(crate) async fn clear(client: &CdpClient, state: &SiteState) -> Result<(), &'static str> {
+pub(crate) async fn clear(client: &Arc<CdpClient>, state: &SiteState) -> Result<(), &'static str> {
     clear_site(
         client,
         &state.site,
@@ -241,11 +225,11 @@ pub(crate) async fn clear_site(
     Ok(())
 }
 
-async fn synthetic(
-    client: &CdpClient,
+async fn synthetic<T: serde::Serialize + Sync>(
+    client: &Arc<CdpClient>,
     origin: &str,
     mode: &str,
-    input: &Value,
+    input: &T,
 ) -> Result<Value, &'static str> {
     let target = command(
         client,
@@ -255,9 +239,9 @@ async fn synthetic(
     )
     .await?;
     let target = target["targetId"].as_str().ok_or(FAILED)?.to_owned();
-    let context = client.site_context();
-    context.hold_target(&target);
-    let outcome = tokio::time::timeout(Duration::from_secs(8), async {
+    let mut held = SyntheticTarget::new(client.clone(), target.clone());
+    let outcome = async {
+        let session = tokio::time::timeout(Duration::from_secs(8), async {
         let attached = command(client, "Target.attachToTarget", json!({"targetId":target,"flatten":true}), None).await?;
         let session = attached["sessionId"].as_str().ok_or(FAILED)?;
         let mut events = client.subscribe_session(session);
@@ -285,22 +269,98 @@ async fn synthetic(
             }
         }
         command(client, "Fetch.disable", json!({}), Some(session)).await?;
-        let expression = format!("({SCRIPT})({},{})", serde_json::to_string(mode).map_err(|_| FAILED)?, input);
-        let result = command(client, "Runtime.evaluate", json!({"expression":expression,"awaitPromise":true,"returnByValue":true}), Some(session)).await?;
-        client.unsubscribe_session(session);
+        Ok::<_, &'static str>(session.to_owned())
+        }).await.map_err(|_| FAILED)??;
+        let expression = if mode == "export" {
+            format!("({SCRIPT})(\"export\",{})", serde_json::to_string(input).map_err(|_| FAILED)?)
+        } else { "({decoder:new TextDecoder('utf-8',{fatal:true}),parts:[]})".into() };
+        let result = tokio::time::timeout(Duration::from_secs(8), command(client, "Runtime.evaluate", json!({"expression":expression,"awaitPromise":true,"returnByValue":false}), Some(&session))).await.map_err(|_| FAILED)??;
+        client.unsubscribe_session(&session);
         if result.get("exceptionDetails").is_some() { return Err(FAILED); }
-        result["result"].get("value").cloned().ok_or(FAILED)
-    }).await.map_err(|_| FAILED).and_then(|result| result);
-    let closed = command(
-        client,
-        "Target.closeTarget",
-        json!({"targetId":target}),
-        None,
-    )
-    .await;
-    context.release_target(&target);
-    if closed.is_err() {
-        return Err(FAILED);
-    }
+        let iterator = result["result"]["objectId"].as_str().ok_or(FAILED)?;
+        let mut bytes = Bytes::new().map_err(|_| FAILED)?;
+        if mode == "import" {
+            serde_json::to_writer(&mut bytes,input).map_err(|_| FAILED)?;
+            let mut offset = 0;
+            while offset < bytes.length() {
+                let chunk = bytes.chunk(offset, super::bytes::CHUNK_BYTES).map_err(|_| FAILED)?;
+                let appended = tokio::time::timeout(Duration::from_secs(8), command(client,"Runtime.callFunctionOn",json!({
+                    "objectId":iterator,"functionDeclaration":"function(data){const bytes=Uint8Array.from(atob(data),character=>character.charCodeAt(0));this.parts.push(this.decoder.decode(bytes,{stream:true}));return bytes.length}",
+                    "arguments":[{"value":STANDARD.encode(&chunk)}],"returnByValue":true}),Some(&session))).await.map_err(|_| FAILED)??;
+                if appended.get("exceptionDetails").is_some() || appended["result"]["value"] != chunk.len() { return Err(FAILED); }
+                offset += chunk.len() as u64;
+            }
+            let applying = format!("async function(){{this.parts.push(this.decoder.decode());this.decoder=null;const input=JSON.parse(this.parts.join(''));this.parts=null;return await ({SCRIPT})(\"import\",input)}}");
+            let applied = tokio::time::timeout(Duration::from_secs(8),command(client,"Runtime.callFunctionOn",json!({
+                "objectId":iterator,"functionDeclaration":applying,"awaitPromise":true,"returnByValue":true}),Some(&session))).await.map_err(|_| FAILED)??;
+            if applied.get("exceptionDetails").is_some() { return Err(FAILED); }
+            return applied["result"].get("value").cloned().ok_or(FAILED);
+        }
+        loop {
+            let next = tokio::time::timeout(Duration::from_secs(8), command(client, "Runtime.callFunctionOn",
+                json!({"objectId":iterator,"functionDeclaration":"async function(){return await this.next()}","awaitPromise":true,"returnByValue":true}), Some(&session)))
+                .await.map_err(|_| FAILED)??;
+            if next.get("exceptionDetails").is_some() { return Err(FAILED); }
+            let next = &next["result"]["value"];
+            if next["done"] == true { break; }
+            let chunk = next["value"].as_str().ok_or(FAILED)?;
+            if chunk.len() > super::bytes::CHUNK_BYTES { return Err(FAILED); }
+            bytes.write_all(chunk.as_bytes()).map_err(|_| FAILED)?;
+        }
+        serde_json::from_reader(bytes.reader().map_err(|_| FAILED)?).map_err(|_| FAILED)
+    }.await;
+    held.close().await?;
     outcome
+}
+
+/// Cancellation closes the private document and aborts its readonly storage
+/// transaction. Keep masking the target until Chrome confirms its closure.
+struct SyntheticTarget {
+    client: Arc<CdpClient>,
+    target: Option<String>,
+}
+
+impl SyntheticTarget {
+    fn new(client: Arc<CdpClient>, target: String) -> Self {
+        client.site_context().hold_target(&target);
+        Self {
+            client,
+            target: Some(target),
+        }
+    }
+
+    async fn close(&mut self) -> Result<(), &'static str> {
+        let target = self.target.as_ref().ok_or(FAILED)?;
+        command(
+            &self.client,
+            "Target.closeTarget",
+            json!({"targetId":target}),
+            None,
+        )
+        .await?;
+        self.client.site_context().release_target(target);
+        self.target = None;
+        Ok(())
+    }
+}
+
+impl Drop for SyntheticTarget {
+    fn drop(&mut self) {
+        if let Some(target) = self.target.take() {
+            let client = self.client.clone();
+            tokio::spawn(async move {
+                if command(
+                    &client,
+                    "Target.closeTarget",
+                    json!({"targetId":target}),
+                    None,
+                )
+                .await
+                .is_ok()
+                {
+                    client.site_context().release_target(&target);
+                }
+            });
+        }
+    }
 }

@@ -253,9 +253,16 @@ fn required_shape(value: &Value) -> bool {
 
 impl SiteState {
     pub(crate) fn read(value: Value, expected: &str) -> Result<Self, &'static str> {
-        if !required_shape(&value)
-            || serde_json::to_vec(&value).map_err(|_| INVALID)?.len() > MAX_BYTES
-        {
+        if serde_json::to_vec(&value).map_err(|_| INVALID)?.len() > MAX_BYTES {
+            return Err(INVALID);
+        }
+        Self::read_streamed(value, expected)
+    }
+
+    /// Canonical data validation is independent from the legacy whole-frame
+    /// budget. Bounded streaming owns byte admission for the successor path.
+    pub(crate) fn read_streamed(value: Value, expected: &str) -> Result<Self, &'static str> {
+        if !required_shape(&value) {
             return Err(INVALID);
         }
         let state: Self = serde_json::from_value(value).map_err(|_| INVALID)?;

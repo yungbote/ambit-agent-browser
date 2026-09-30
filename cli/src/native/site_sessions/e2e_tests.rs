@@ -835,3 +835,234 @@ async fn wait_default_context(
     .await
     .expect("the iframe publishes its actual default execution context");
 }
+
+/// Capacity is state data, not the control-frame budget. This deliberately
+/// exceeds the legacy envelope using valid ordinary IndexedDB string rows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[cfg(target_os = "linux")]
+#[ignore]
+async fn e2e_site_state_capacity_retains_valid_data_above_legacy_wire_bound() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type:text/html\r\nContent-Length:38\r\nConnection:close\r\n\r\n<!doctype html><title>Capacity</title>").await;
+            });
+        }
+    });
+    let mut owned = browser().await;
+    owned.navigate(&origin, WaitUntil::Load).await.unwrap();
+    let session = owned.active_session_id().unwrap().to_owned();
+    let populated = owned.client.send_command("Runtime.evaluate",Some(json!({
+        "expression":r#"new Promise((resolve,reject)=>{const opening=indexedDB.open('capacity-fixture',1);opening.onupgradeneeded=()=>opening.result.createObjectStore('rows',{autoIncrement:true});opening.onerror=()=>reject(opening.error);opening.onsuccess=()=>{const db=opening.result;const transaction=db.transaction('rows','readwrite');const store=transaction.objectStore('rows');store.put('nosecret-capacity-first-'+ 'x'.repeat(5*1024*1024));store.put('nosecret-capacity-second-'+ 'y'.repeat(5*1024*1024));transaction.oncomplete=()=>{db.close();resolve(2)};transaction.onerror=()=>reject(transaction.error)}})"#,
+        "awaitPromise":true,"returnByValue":true
+    })),Some(&session)).await.unwrap();
+    assert_eq!(populated.pointer("/result/value"), Some(&json!(2)));
+    let before = native_memory_kib();
+    let started = std::time::Instant::now();
+    let captured = storage::capture(
+        &owned.client,
+        "http://127.0.0.1",
+        std::slice::from_ref(&origin),
+    )
+    .await
+    .unwrap();
+    let elapsed_ms = started.elapsed().as_millis();
+    let after = native_memory_kib();
+    let records = captured
+        .origins
+        .iter()
+        .flat_map(|origin| &origin.indexed_db)
+        .flat_map(|database| &database.stores)
+        .map(|store| store.records.len())
+        .sum::<usize>();
+    let omitted_bytes = captured
+        .omitted
+        .iter()
+        .map(|omission| omission.bytes)
+        .sum::<u64>();
+    eprintln!(
+        "capacity_receipt={}",
+        json!({"inputRecords":2,"inputStringBytes":10*1024*1024+"nosecret-capacity-first-".len()+"nosecret-capacity-second-".len(),"capturedRecords":records,"omissions":captured.omitted.len(),"omittedSerializedBytes":omitted_bytes,"nativeBefore":before,"nativeAfter":after,"elapsedMs":elapsed_ms})
+    );
+    storage::clear_site(
+        &owned.client,
+        "http://127.0.0.1",
+        std::slice::from_ref(&origin),
+    )
+    .await
+    .unwrap();
+    let cleared = owned.client.send_command("Runtime.evaluate",Some(json!({"expression":"indexedDB.databases().then(rows=>rows.length)","awaitPromise":true,"returnByValue":true})),Some(&session)).await.unwrap();
+    let complete = records == 2 && captured.omitted.is_empty();
+    let restored = if complete {
+        storage::import(&owned.client, &captured).await
+    } else {
+        Err("The capacity capture was incomplete.")
+    };
+    let restored_receipt = if restored.is_ok() {
+        owned.client.send_command("Runtime.evaluate", Some(json!({
+            "expression":r#"new Promise((resolve,reject)=>{const opening=indexedDB.open('capacity-fixture');opening.onerror=()=>reject(opening.error);opening.onsuccess=()=>{const db=opening.result;const writing=db.transaction('rows','readwrite');const store=writing.objectStore('rows');const values=store.getAll();const added=store.add('nosecret-next-generator');let next;added.onsuccess=()=>{next=added.result};writing.oncomplete=()=>{db.close();resolve({rows:values.result.map(value=>({bytes:new TextEncoder().encode(value).length,prefix:value.slice(0,24),last:value.slice(-1)})),next})};writing.onerror=()=>reject(writing.error)}})"#,
+            "awaitPromise":true,"returnByValue":true
+        })), Some(&session)).await.unwrap()["result"]["value"].clone()
+    } else {
+        Value::Null
+    };
+    eprintln!(
+        "capacity_restore_receipt={}",
+        json!({"restored":restored.is_ok(),"browser":restored_receipt,"nativeAfterRestore":native_memory_kib()})
+    );
+    storage::clear_site(
+        &owned.client,
+        "http://127.0.0.1",
+        std::slice::from_ref(&origin),
+    )
+    .await
+    .unwrap();
+    let closed = owned.close().await;
+    server.abort();
+    let _ = server.await;
+    assert!(closed.is_ok());
+    assert_eq!(
+        cleared.pointer("/result/value"),
+        Some(&json!(0)),
+        "the fixture's complete database was cleared before its browser closed"
+    );
+    assert_eq!(
+        records, 2,
+        "valid state above the legacy wire bound must be preserved"
+    );
+    assert!(
+        captured.omitted.is_empty(),
+        "valid encodable state is not a resource omission"
+    );
+    assert!(
+        restored.is_ok(),
+        "complete large state restores through the native adapter"
+    );
+    assert_eq!(
+        restored_receipt["rows"][0]["bytes"],
+        5 * 1024 * 1024 + "nosecret-capacity-first-".len()
+    );
+    assert_eq!(
+        restored_receipt["rows"][1]["bytes"],
+        5 * 1024 * 1024 + "nosecret-capacity-second-".len()
+    );
+    assert_eq!(
+        restored_receipt["rows"][0]["prefix"],
+        "nosecret-capacity-first-"
+    );
+    assert_eq!(
+        restored_receipt["rows"][1]["prefix"],
+        "nosecret-capacity-second"
+    );
+    assert_eq!(restored_receipt["rows"][0]["last"], "x");
+    assert_eq!(restored_receipt["rows"][1]["last"], "y");
+    assert_eq!(
+        restored_receipt["next"], 3,
+        "large capture preserves the generator"
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn native_memory_kib() -> Value {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    let field = |key: &str| {
+        status.lines().find_map(|line| {
+            line.strip_prefix(key)
+                .and_then(|value| value.split_whitespace().next())
+                .and_then(|value| value.parse::<u64>().ok())
+        })
+    };
+    json!({"rssKiB":field("VmRSS:"),"peakRssKiB":field("VmHWM:")})
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_site_state_capacity_cancel_closes_its_private_document() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type:text/html\r\nContent-Length:38\r\nConnection:close\r\n\r\n<!doctype html><title>Capacity</title>").await;
+            });
+        }
+    });
+    let mut owned = browser().await;
+    owned.navigate(&origin, WaitUntil::Load).await.unwrap();
+    assert_eq!(evaluate(&owned,r#"new Promise((resolve,reject)=>{const opening=indexedDB.open('cancel-fixture',1);opening.onupgradeneeded=()=>opening.result.createObjectStore('rows');opening.onerror=()=>reject(opening.error);opening.onsuccess=()=>{const db=opening.result;const writing=db.transaction('rows','readwrite');const store=writing.objectStore('rows');store.put('nosecret-cancel-value',1);let stopped=false;globalThis.stopCapacityWriter=()=>{stopped=true};const hold=()=>{const pending=store.count();pending.onsuccess=()=>{if(!stopped)hold()}};hold();writing.oncomplete=()=>db.close();resolve(true)}})"#).await,true);
+    let mut events = owned.client.subscribe();
+    let client = owned.client.clone();
+    let capture_origin = origin.clone();
+    let capturing = tokio::spawn(async move {
+        storage::capture(&client, "http://127.0.0.1", &[capture_origin]).await
+    });
+    let target = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.method == "Target.targetInfoChanged"
+                && event.params["targetInfo"]["url"]
+                    .as_str()
+                    .is_some_and(|url| url.contains("/.ambit-site-custody-"))
+            {
+                break event.params["targetInfo"]["targetId"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    capturing.abort();
+    match capturing.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(_) => panic!("the held fixture capture was cancelled"),
+    }
+    let retired = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.method == "Target.targetDestroyed" && event.params["targetId"] == target {
+                break;
+            }
+        }
+    })
+    .await
+    .is_ok();
+    let targets = owned
+        .client
+        .send_command("Target.getTargets", Some(json!({})), None)
+        .await
+        .unwrap();
+    let remains = targets["targetInfos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["targetId"] == target);
+    assert_eq!(evaluate(&owned, "stopCapacityWriter(); true").await, true);
+    let database = evaluate(&owned,"new Promise((resolve,reject)=>{const opening=indexedDB.open('cancel-fixture');opening.onerror=()=>reject(opening.error);opening.onsuccess=()=>{const db=opening.result;const reading=db.transaction('rows').objectStore('rows').get(1);reading.onsuccess=()=>{db.close();resolve(reading.result==='nosecret-cancel-value')};reading.onerror=()=>reject(reading.error)}})").await;
+    storage::clear_site(
+        &owned.client,
+        "http://127.0.0.1",
+        std::slice::from_ref(&origin),
+    )
+    .await
+    .unwrap();
+    let closed = owned.close().await;
+    server.abort();
+    let _ = server.await;
+    assert!(closed.is_ok());
+    assert_eq!(
+        database, true,
+        "cancellation neither corrupts the site nor retains a storage transaction"
+    );
+    assert!(
+        retired && !remains,
+        "cancelled capture closes the private document before completion"
+    );
+}

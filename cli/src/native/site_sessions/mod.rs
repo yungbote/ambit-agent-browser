@@ -1,5 +1,6 @@
 //! Host-only site state, outside the model's browser operation vocabulary.
 
+pub(crate) mod bytes;
 pub(crate) mod custody;
 pub(crate) mod protocol;
 pub(crate) mod redaction;

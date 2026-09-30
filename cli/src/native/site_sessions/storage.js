@@ -153,44 +153,107 @@ async function custodyStorage(mode, input) {
     }
     return { imported: true };
   }
-  const result = { localStorage: [], indexedDB: [], omitted: [] };
-  for (let index = 0; index < localStorage.length; index++) {
-    const key = localStorage.key(index);
-    result.localStorage.push([key, localStorage.getItem(key)]);
-  }
-  for (const info of await indexedDB.databases()) {
-    const opened = await request(indexedDB.open(info.name));
+  // One cursor value is held while its encoding drains. IndexedDB commits
+  // a transaction with no pending requests; a cheap count request keeps the
+  // same readonly snapshot alive across Blob encoding and host backpressure.
+  // Closing the synthetic target also aborts this readonly transaction.
+  async function* rows(database, name) {
+    const reading = database.transaction(name, 'readonly');
+    const store = reading.objectStore(name);
+    const cursor = store.openCursor();
+    let current;
+    let ready = false;
+    let advance = false;
+    let stopped = false;
+    let failure;
+    let wake;
+    const failed = () => { failure = new Error('Storage cursor failed'); wake?.(); };
+    cursor.onerror = failed;
+    cursor.onsuccess = () => {
+      current = cursor.result;
+      ready = true;
+      if (!current) stopped = true;
+      wake?.();
+    };
+    reading.onerror = failed;
+    reading.onabort = () => { if (!stopped) failed(); };
+    const keepReading = () => {
+      if (stopped || failure) return;
+      const pending = store.count(IDBKeyRange.only(0));
+      pending.onerror = failed;
+      pending.onsuccess = () => {
+        if (stopped || failure) return;
+        if (advance) { advance = false; current.continue(); }
+        keepReading();
+      };
+    };
+    keepReading();
     try {
-      const database = { name: opened.name, version: opened.version, stores: [] };
-      for (const name of opened.objectStoreNames) {
-        const reading = opened.transaction(name, 'readonly');
-        const store = reading.objectStore(name);
-        const records = await new Promise((resolve, reject) => {
-          const records = [];
-          const cursor = store.openCursor();
-          cursor.onerror = () => reject(new Error('Storage cursor failed'));
-          cursor.onsuccess = () => {
-            const current = cursor.result;
-            if (!current) { resolve(records); return; }
-            records.push({ key: current.key, value: current.value });
-            current.continue();
-          };
-        });
-        const encoded = [];
-        for (const record of records) {
-          try { encoded.push({ ...(store.keyPath === null ? { key: await encode(record.key) } : {}),
-            value: await encode(record.value) }); }
-          catch { result.omitted.push({ what: 'indexed_db', bytes: 0 }); }
-        }
-        database.stores.push({ name, keyPath: store.keyPath, autoIncrement: store.autoIncrement,
-          nextKey: store.autoIncrement ? await nextKey(opened, name) : null,
-          indexes: [...store.indexNames].map(name => {
+      while (true) {
+        if (!ready && !failure) await new Promise(resolve => { wake = resolve; });
+        wake = undefined;
+        if (failure) throw failure;
+        if (!current) return;
+        yield { key: current.key, value: current.value };
+        ready = false;
+        advance = true;
+      }
+    } finally {
+      stopped = true;
+      try { reading.abort(); } catch { /* Already finished. */ }
+    }
+  }
+  async function* exporting() {
+    const omitted = [];
+    yield '{"localStorage":[';
+    for (let index = 0; index < localStorage.length; index++) {
+      const key = localStorage.key(index);
+      yield (index ? ',' : '') + JSON.stringify([key, localStorage.getItem(key)]);
+    }
+    yield '],"indexedDB":[';
+    let databaseIndex = 0;
+    for (const info of await indexedDB.databases()) {
+      const opened = await request(indexedDB.open(info.name));
+      try {
+        yield (databaseIndex++ ? ',' : '') + '{"name":' + JSON.stringify(opened.name)
+          + ',"version":' + opened.version + ',"stores":[';
+        let storeIndex = 0;
+        for (const name of opened.objectStoreNames) {
+          const store = opened.transaction(name, 'readonly').objectStore(name);
+          const indexes = [...store.indexNames].map(name => {
             const index = store.index(name);
             return { name, keyPath: index.keyPath, unique: index.unique, multiEntry: index.multiEntry };
-          }), records: encoded });
-      }
-      result.indexedDB.push(database);
-    } finally { opened.close(); }
+          });
+          yield (storeIndex++ ? ',' : '') + '{"name":' + JSON.stringify(name)
+            + ',"keyPath":' + JSON.stringify(store.keyPath) + ',"autoIncrement":' + store.autoIncrement
+            + ',"indexes":' + JSON.stringify(indexes) + ',"records":[';
+          let recordIndex = 0;
+          for await (const record of rows(opened, name)) {
+            let encoded;
+            try {
+              encoded = { ...(store.keyPath === null ? { key: await encode(record.key) } : {}),
+                value: await encode(record.value) };
+            } catch { omitted.push({ what: 'indexed_db', bytes: 0 }); continue; }
+            yield (recordIndex++ ? ',' : '') + JSON.stringify(encoded);
+          }
+          yield '],"nextKey":' + JSON.stringify(store.autoIncrement ? await nextKey(opened, name) : null) + '}';
+        }
+        yield ']}';
+      } finally { opened.close(); }
+    }
+    yield '],"omitted":' + JSON.stringify(omitted) + '}';
   }
-  return result;
+  async function* chunks() {
+    for await (const text of exporting()) {
+      for (let start = 0; start < text.length;) {
+        let end = Math.min(start + input.chunkCharacters, text.length);
+        // A JSON document may contain literal non-BMP characters. Keep
+        // each CDP string valid rather than emitting a lone surrogate.
+        if (end < text.length && text.charCodeAt(end - 1) >= 0xd800 && text.charCodeAt(end - 1) <= 0xdbff) end++;
+        yield text.slice(start, end);
+        start = end;
+      }
+    }
+  }
+  return chunks();
 }
