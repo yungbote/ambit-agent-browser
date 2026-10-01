@@ -46,6 +46,7 @@ pub mod recording;
 pub mod screenshot;
 pub(crate) mod secret_fields;
 pub(crate) mod selection;
+pub(crate) mod site_sessions;
 #[allow(dead_code)]
 pub mod snapshot;
 pub(crate) mod socket;

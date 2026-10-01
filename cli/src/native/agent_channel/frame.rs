@@ -51,6 +51,11 @@ impl std::fmt::Display for ChannelId {
 /// An Action's key, which the daemon fences and files ledger entries under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct ActionId(uuid::Uuid);
+impl std::fmt::Display for ActionId {
+    fn fmt(&self, out: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.0.fmt(out)
+    }
+}
 
 #[cfg(test)]
 impl ActionId {
@@ -71,6 +76,12 @@ pub(crate) enum Frame {
     Hello(Hello),
     Sequence(Sequence),
     OpStatus(OpStatus),
+    Site(crate::native::site_sessions::protocol::Request),
+    Program(Owner, crate::native::playwright::remote::Request),
+    Files(
+        Owner,
+        Option<Vec<crate::native::playwright::files::Receipt>>,
+    ),
 }
 
 /// The channel-scoped host configuration a `hello` carries: the members of
@@ -80,6 +91,7 @@ pub(crate) struct Binding {
     pub(crate) namespace: String,
     pub(crate) session: String,
     pub(crate) require_sandbox: bool,
+    pub(crate) browser_host: bool,
     pub(crate) theme: Option<Theme>,
 }
 
@@ -206,6 +218,26 @@ impl Frame {
                     .check()
                     .map_err(invalid)?,
             ),
+            kind if crate::native::site_sessions::protocol::is_kind(kind) => Frame::Site(
+                crate::native::site_sessions::protocol::Request::read(kind, members)
+                    .map_err(|message| invalid(message.into()))?,
+            ),
+            kind if crate::native::playwright::remote::is_kind(kind) => {
+                let text = |key: &str| line[key].as_str().map(str::to_owned);
+                let owned = owner(text("actionId"), text("ownerGeneration"))
+                    .map_err(invalid)?.ok_or_else(|| invalid("A remote program frame needs its Action and owner generation.".into()))?;
+                let mut members = members;
+                members.as_object_mut().unwrap().remove("actionId");
+                members.as_object_mut().unwrap().remove("ownerGeneration");
+                Frame::Program(owned, crate::native::playwright::remote::Request::read(kind, members).map_err(invalid)?)
+            }
+            "action.files"|"action.files.release"=>{
+                let has_files=members.get("files").is_some();
+                let wire:ActionFilesWire=serde_json::from_value(members).map_err(|_|invalid("The native Action file frame is invalid.".into()))?;
+                let owner=owner(Some(wire.action_id),Some(wire.owner_generation)).map_err(invalid)?.ok_or_else(||invalid("A native file frame needs its Action owner.".into()))?;
+                if (kind=="action.files")!=has_files || (kind=="action.files" && wire.files.is_none()) {return Err(invalid("Native file registration needs a roster; release carries no roster.".into()));}
+                Frame::Files(owner,wire.files)
+            },
             other => {
                 return Err(invalid(format!(
                     "Unknown agent frame type `{other}`: this daemon serves hello, sequence and op_status."
@@ -275,7 +307,19 @@ struct BindingWire {
     namespace: String,
     session: String,
     require_sandbox: bool,
+    #[serde(default)]
+    browser_host: bool,
     theme: Option<Theme>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ActionFilesWire {
+    #[allow(dead_code)]
+    id: u64,
+    action_id: String,
+    owner_generation: String,
+    files: Option<Vec<crate::native::playwright::files::Receipt>>,
 }
 
 impl HelloWire {
@@ -292,6 +336,7 @@ impl HelloWire {
                 namespace: self.binding.namespace,
                 session: self.binding.session,
                 require_sandbox: self.binding.require_sandbox,
+                browser_host: self.binding.browser_host,
                 theme: self.binding.theme,
             },
             owner: owner(self.action_id, self.owner_generation)?,
@@ -484,6 +529,7 @@ mod tests {
                 namespace: "3f2a".into(),
                 session: "browser".into(),
                 require_sandbox: true,
+                browser_host: false,
                 theme: None,
             }
         );
@@ -661,6 +707,92 @@ mod tests {
         }
         let mut ownerless = json!({ "type": "op_status", "id": 9 });
         assert_eq!(refused(line(ownerless.take())).id, Some(9));
+    }
+
+    #[test]
+    fn remote_program_frames_accept_only_the_host_transport_contract() {
+        let program = "6b87fd14-4712-45e1-829e-95ee008fd783";
+        for frame in [
+            json!({"type":"program.open","id":2,"programId":program,"timeoutMs":1}),
+            json!({"type":"program.open","id":3,"programId":program,"timeoutMs":120000,"targetId":"tab"}),
+            json!({"type":"program.close","id":4,"programId":program,"reason":"complete"}),
+            json!({"type":"program.close","id":5,"programId":program,"reason":"cancel"}),
+            json!({"type":"program.close","id":6,"programId":program,"reason":"timeout"}),
+            json!({"type":"program.status","id":7,"programId":program}),
+            json!({"type":"program.files","id":12,"programId":program,"files":[]}),
+            json!({"type":"program.files","id":13,"programId":program,"files":[{"path":"/workspace/.ambit/browser/staged/fixture.txt","byteSize":0,"contentRef":format!("sha256:{}","0".repeat(64))}]}),
+        ] {
+            let mut frame = frame;
+            frame["actionId"] = json!(ACTION);
+            frame["ownerGeneration"] = json!("1");
+            assert!(Frame::parse(&line(frame.clone())).is_ok(), "{frame}");
+        }
+        for extra in [
+            json!({"timeoutMs":0}),
+            json!({"timeoutMs":120001}),
+            json!({"timeoutMs":1.5}),
+            json!({"programId":"00000000-0000-0000-0000-000000000000"}),
+            json!({"programId":"6B87FD14-4712-45E1-829E-95EE008FD783"}),
+            json!({"targetId":""}),
+            json!({"targetId":42}),
+            json!({"code":"return 1"}),
+            json!({"environment":{}}),
+            json!({"artifactsDir":"/host"}),
+        ] {
+            let mut frame = json!({"type":"program.open","id":8,"programId":program,"timeoutMs":1000,"actionId":ACTION,"ownerGeneration":"1"});
+            frame
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(Frame::parse(&line(frame.clone())).is_err(), "{frame}");
+        }
+        for frame in [
+            json!({"type":"program.close","id":9,"programId":program,"reason":"retry"}),
+            json!({"type":"program.status","id":10,"programId":program,"endpoint":"ws://foreign"}),
+        ] {
+            assert!(Frame::parse(&line(frame.clone())).is_err(), "{frame}");
+        }
+        for extra in [
+            json!({}),
+            json!({"actionId":ACTION}),
+            json!({"actionId":ACTION,"ownerGeneration":"0"}),
+            json!({"actionId":"x","ownerGeneration":"1"}),
+        ] {
+            let mut frame = json!({"type":"program.status","id":11,"programId":program});
+            frame
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(Frame::parse(&line(frame.clone())).is_err(), "{frame}");
+        }
+    }
+
+    #[test]
+    fn native_action_staging_has_no_model_selected_scope_or_program_slot() {
+        for value in [
+            json!({"type":"action.files","id":2,"actionId":ACTION,"ownerGeneration":"1","files":[]}),
+            json!({"type":"action.files.release","id":3,"actionId":ACTION,"ownerGeneration":"2"}),
+        ] {
+            assert!(matches!(
+                Frame::parse(&line(value)),
+                Ok((_, Frame::Files(_, _)))
+            ));
+        }
+        for extra in [
+            json!({"scope":"6b87fd14-4712-45e1-829e-95ee008fd783"}),
+            json!({"programId":"6b87fd14-4712-45e1-829e-95ee008fd783"}),
+            json!({"ownerGeneration":"0"}),
+            json!({"ownerGeneration":1}),
+            json!({"files":null}),
+        ] {
+            let mut value = json!({"type":"action.files","id":4,"actionId":ACTION,"ownerGeneration":"1","files":[]});
+            value
+                .as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            assert!(Frame::parse(&line(value)).is_err());
+        }
+        assert!(Frame::parse(&line(json!({"type":"action.files.release","id":5,"actionId":ACTION,"ownerGeneration":"1","files":null}))).is_err());
     }
 
     #[test]

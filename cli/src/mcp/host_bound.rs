@@ -200,6 +200,8 @@ struct HostConfig {
     namespace: String,
     session: String,
     require_sandbox: bool,
+    #[serde(default)]
+    browser_host: bool,
     capture_directory: PathBuf,
     expected_observation: Option<ObservationId>,
     semantic_judgement_config_path: Option<PathBuf>,
@@ -341,6 +343,15 @@ impl HostBinding {
         {
             return Err(
                 "Invalid host browser session, sandbox policy or capture directory.".into(),
+            );
+        }
+        if crate::native::workspace_role::current()
+            .map_err(str::to_owned)?
+            .is_browser_host()
+            != config.browser_host
+        {
+            return Err(
+                "Host browser configuration differs from the immutable workspace role.".into(),
             );
         }
         config.capture_directory = config

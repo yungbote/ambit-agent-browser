@@ -23,8 +23,10 @@ const ACTION: &str = "8c1f0e2a-3b4c-4d5e-8f60-718293a4b5c6";
 /// `agent_browser_get_html` answers with as many bytes as its selector says.
 #[derive(Default)]
 struct Scripted {
+    custody: Option<tokio::sync::broadcast::Sender<(ChannelId, Value)>>,
     ran: StdMutex<Vec<String>>,
     started: Notify,
+    custody_closed: Notify,
     go: Notify,
     /// Each channel told it ended, with how many steps had run by then.
     ended: StdMutex<Vec<(String, usize)>>,
@@ -41,8 +43,63 @@ impl Scripted {
 }
 
 impl Browser for Scripted {
-    async fn step(&self, _: &FrameContext<'_>, step: &PreparedStep) -> StepRecord {
+    async fn action_files(
+        &self,
+        _: ChannelId,
+        owner: Owner,
+        files: Option<Vec<crate::native::playwright::files::Receipt>>,
+        _: &Ledger,
+    ) -> Result<Value, String> {
+        self.go.notify_one();
+        Ok(match files {
+            Some(files) => json!({"actionId":owner.action.to_string(),"registered":files.len()}),
+            None => json!({"actionId":owner.action.to_string(),"released":true}),
+        })
+    }
+    async fn program_request(
+        &self,
+        _: ChannelId,
+        _: Owner,
+        request: crate::native::playwright::remote::Request,
+        _: &Ledger,
+    ) -> Result<Value, String> {
+        match request {
+            crate::native::playwright::remote::Request::Status { .. }
+            | crate::native::playwright::remote::Request::Close { .. } => {
+                self.go.notify_one();
+                Ok(json!({"state":"closed","nativeInputSettled":true}))
+            }
+            _ => Err("The scripted browser serves only the tested metadata request.".into()),
+        }
+    }
+    fn custody_events(&self) -> Option<tokio::sync::broadcast::Receiver<(ChannelId, Value)>> {
+        self.custody.as_ref().map(|events| events.subscribe())
+    }
+
+    async fn site_request(
+        &self,
+        _: ChannelId,
+        request: SiteRequest,
+        _: Arc<Ledger>,
+    ) -> Result<Value, &'static str> {
+        match request {
+            SiteRequest::Refuse { site, .. } => {
+                self.go.notify_one();
+                Ok(json!({"site":site,"attached":false}))
+            }
+            SiteRequest::Attach { site, .. } => Ok(json!({"site":site,"attached":true})),
+            _ => Err("The scripted browser serves only the tested custody request."),
+        }
+    }
+
+    async fn step(&self, frame: &FrameContext<'_>, step: &PreparedStep) -> StepRecord {
         self.ran.lock().unwrap().push(step.op.clone());
+        if step.op == "agent_browser_wait_ms" {
+            if let Some(events) = &self.custody {
+                let _=events.send((frame.channel,json!({"type":"site_session.need",
+                    "requestId":"11111111-1111-4111-8111-111111111111","site":"https://example.com","pageGeneration":"g"})));
+            }
+        }
         let text = match step.op.as_str() {
             "agent_browser_wait_ms" => {
                 self.started.notify_one();
@@ -96,6 +153,10 @@ impl Browser for Scripted {
         }
     }
 
+    async fn channel_closed(&self, _: ChannelId) {
+        self.custody_closed.notify_one();
+    }
+
     async fn end(&self, channel: ChannelId) {
         let ran = self.ran.lock().unwrap().len();
         self.ended.lock().unwrap().push((channel.to_string(), ran));
@@ -105,11 +166,16 @@ impl Browser for Scripted {
 const DIGEST: &str = "sha256:540f433f3536f8432ca701d0bfea8b176fc630ca2120ff7ac22ac1082621c4a8";
 
 fn endpoint() -> Arc<Endpoint> {
+    endpoint_role(false)
+}
+
+fn endpoint_role(browser_host: bool) -> Arc<Endpoint> {
     Arc::new(Endpoint::with_digest(
         Identity {
             namespace: "thread".into(),
             session: "browser".into(),
             require_sandbox: true,
+            browser_host,
         },
         DIGEST,
     ))
@@ -253,6 +319,7 @@ async fn a_hello_answers_the_catalog_the_driver_digest_and_the_channels_bounds()
     assert_eq!(reply["success"], true, "{reply}");
     let data = &reply["data"];
     assert_eq!(data["protocol"], 1);
+    assert_eq!(data["sessionCustody"], 4);
     assert_eq!(data["catalog"], crate::mcp::host_bound::catalog_identity());
     assert!(data["catalog"].get("tools").is_none());
     assert_eq!(data["driverArtifactDigest"], DIGEST);
@@ -260,7 +327,7 @@ async fn a_hello_answers_the_catalog_the_driver_digest_and_the_channels_bounds()
     assert_eq!(data["excludedOps"], json!(["agent_browser_run_playwright"]));
     assert_eq!(
         data["limits"],
-        json!({ "maxInFlight": 4, "maxRequestBytes": 2097152, "maxReplyBytes": 4194304,
+        json!({ "maxInFlight": 4, "maxRequestBytes": 2097152, "maxReplyBytes": 4194304,"maxCustodyBytes":8389632,"maxCustodyChunkBytes":1048576,
             "ledgerEntries": 256, "ledgerBytes": 16777216, "candidates": 60, "resolve": 30 })
     );
 }
@@ -695,6 +762,116 @@ async fn frames_past_the_read_ahead_bound_close_the_connection() {
 }
 
 #[tokio::test]
+async fn a_paused_sequence_emits_need_and_accepts_the_reply_without_command_deadlock() {
+    let (events, _) = tokio::sync::broadcast::channel(16);
+    let browser = Arc::new(Scripted {
+        custody: Some(events),
+        ..Scripted::default()
+    });
+    let endpoint = endpoint_role(true);
+    let (_directory, path) = directory();
+    let (mut host, hello) = Host::hello(&endpoint, &browser, json!({"binding":{"version":1,"namespace":"thread","session":"browser","requireSandbox":true,"browserHost":true}})).await;
+    assert_eq!(hello["data"]["sessionCustody"], 4);
+    assert_eq!(hello["data"]["limits"]["maxRequestBytes"], 2 << 20);
+    host.send(sequence(2, "41", json!([wait()]), &path)).await;
+    let need = host.reply().await;
+    assert_eq!(need["type"], "site_session.need");
+    assert!(need.get("id").is_none());
+    host.send(
+        json!({"type":"site_session.refuse","id":3,"requestId":need["requestId"],
+        "site":need["site"],"reason":"denied"}),
+    )
+    .await;
+    let attached = host.reply().await;
+    assert_eq!(attached["id"], 3);
+    assert_eq!(attached["success"], true);
+    let sequence = host.reply().await;
+    assert_eq!(sequence["id"], 2);
+    assert_eq!(sequence["success"], true);
+}
+
+#[tokio::test]
+async fn immutable_host_binding_gates_custody_and_remote_programs() {
+    let browser = Arc::new(Scripted::default());
+    let forged = json!({"binding":{"version":1,"namespace":"thread","session":"browser","requireSandbox":true,"browserHost":true}});
+    let (_, denied) = Host::hello(&endpoint(), &browser, forged.clone()).await;
+    assert_eq!(denied["code"], "agent_channel_binding");
+    let (_, denied) = Host::hello(&endpoint_role(true), &browser, json!({})).await;
+    assert_eq!(denied["code"], "agent_channel_binding");
+    let (mut standalone, accepted) = Host::hello(&endpoint(), &browser, json!({})).await;
+    assert_eq!(accepted["success"], true);
+    standalone
+        .send(json!({"type":"site_sessions.offer","id":2,"sites":[]}))
+        .await;
+    assert_eq!(standalone.reply().await["success"], false);
+    standalone.send(json!({"type":"program.status","id":3,"programId":"6b87fd14-4712-45e1-829e-95ee008fd783","actionId":ACTION,"ownerGeneration":"1"})).await;
+    assert_eq!(standalone.reply().await["code"], "agent_channel_binding");
+}
+
+#[tokio::test]
+async fn remote_status_settles_independently_beside_an_unanswered_sequence() {
+    let endpoint = endpoint_role(true);
+    let browser = Arc::new(Scripted::default());
+    let (_directory, path) = directory();
+    let (mut host,hello)=Host::hello(&endpoint,&browser,json!({"binding":{"version":1,"namespace":"thread","session":"browser","requireSandbox":true,"browserHost":true}})).await;
+    assert_eq!(hello["success"], true);
+    host.send(sequence(2, "41", json!([wait()]), &path)).await;
+    browser.started.notified().await;
+    host.send(json!({"type":"program.status","id":3,"programId":"6b87fd14-4712-45e1-829e-95ee008fd783","actionId":ACTION,"ownerGeneration":"41"})).await;
+    let reply = host.reply().await;
+    assert_eq!(
+        reply["id"], 3,
+        "metadata must settle without waiting behind sequence2"
+    );
+    assert_eq!(reply["data"]["nativeInputSettled"], true);
+    assert_eq!(host.reply().await["id"], 2);
+}
+
+#[tokio::test]
+async fn native_file_registration_answers_without_holding_a_program_slot_or_sequence() {
+    let endpoint = endpoint_role(true);
+    let browser = Arc::new(Scripted::default());
+    let (_directory, path) = directory();
+    let(mut host,hello)=Host::hello(&endpoint,&browser,json!({"binding":{"version":1,"namespace":"thread","session":"browser","requireSandbox":true,"browserHost":true}})).await;
+    assert_eq!(hello["success"], true);
+    host.send(sequence(2, "41", json!([wait()]), &path)).await;
+    browser.started.notified().await;
+    host.send(
+        json!({"type":"action.files","id":3,"actionId":ACTION,"ownerGeneration":"41","files":[]}),
+    )
+    .await;
+    let staged = host.reply().await;
+    assert_eq!(staged["id"], 3);
+    assert_eq!(staged["data"]["registered"], 0);
+    assert_eq!(host.reply().await["id"], 2);
+    host.send(
+        json!({"type":"action.files.release","id":4,"actionId":ACTION,"ownerGeneration":"41"}),
+    )
+    .await;
+    assert_eq!(host.reply().await["data"]["released"], true);
+}
+
+#[tokio::test]
+async fn a_need_while_the_channel_is_idle_is_delivered_only_to_its_owner() {
+    let (events, _) = tokio::sync::broadcast::channel(16);
+    let browser = Arc::new(Scripted {
+        custody: Some(events.clone()),
+        ..Scripted::default()
+    });
+    let endpoint = endpoint();
+    let (mut host, _) = Host::hello(&endpoint, &browser, json!({})).await;
+    let _ = events.send((
+        ChannelId::parse(CHANNEL_B).unwrap(),
+        json!({"type":"site_session.need","site":"https://other.com"}),
+    ));
+    let _ = events.send((
+        ChannelId::parse(CHANNEL_A).unwrap(),
+        json!({"type":"site_session.need","site":"https://example.com"}),
+    ));
+    assert_eq!(host.reply().await["site"], "https://example.com");
+}
+
+#[tokio::test]
 async fn a_channel_that_ends_is_told_to_the_browser_after_its_last_step() {
     let (endpoint, browser) = (endpoint(), Arc::new(Scripted::default()));
     let (_d, path) = directory();
@@ -710,4 +887,26 @@ async fn a_channel_that_ends_is_told_to_the_browser_after_its_last_step() {
         .unwrap()
         .unwrap();
     assert_eq!(browser.ended(), [(CHANNEL_A.to_string(), 2)]);
+}
+
+#[tokio::test]
+async fn channel_eof_fences_custody_before_the_running_step_settles() {
+    let (endpoint, browser) = (endpoint(), Arc::new(Scripted::default()));
+    let (_directory, path) = directory();
+    let (mut host, _) = Host::hello(&endpoint, &browser, json!({})).await;
+    host.send(sequence(2, "41", json!([wait()]), &path)).await;
+    browser.started.notified().await;
+    drop(host.writer);
+    drop(host.lines);
+    let fenced =
+        tokio::time::timeout(Duration::from_secs(1), browser.custody_closed.notified()).await;
+    browser.go.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), host.served)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        fenced.is_ok(),
+        "custody authority must end on EOF while ordinary input still settles"
+    );
 }

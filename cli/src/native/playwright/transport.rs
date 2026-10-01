@@ -62,6 +62,19 @@ impl Tunnel {
         self.stop.send_replace(true);
     }
 
+    /// Wait for the program socket/browser to end. Canceling this wait keeps
+    /// the join handle available for final native-input settlement.
+    pub(super) async fn ended(&mut self) -> Result<(), String> {
+        let result = match self.task.as_mut() {
+            Some(task) => task
+                .await
+                .map_err(|_| "The Playwright transport stopped without settlement.".to_string())?,
+            None => return Ok(()),
+        };
+        self.task.take();
+        result
+    }
+
     pub(super) async fn finish(&mut self) -> Result<(), String> {
         self.stop();
         if let Some(mut task) = self.task.take() {
@@ -223,14 +236,18 @@ async fn serve(
                 serde_json::from_str(&message.text).map_err(|error| error.to_string())?;
             let text = match value.get("id") {
                 None => {
+                    if value.pointer("/params/targetInfo/targetId").and_then(Value::as_str)
+                        .is_some_and(|target| connection.site_context().private_target(target)) {
+                        continue;
+                    }
                     let carries = value["method"]
                         .as_str()
                         .is_some_and(boundary::carries_credentials);
-                    if carries && boundary::scrub(&mut value["params"]) {
-                        value.to_string()
-                    } else {
-                        message.text
+                    if let Some(params)=value.get_mut("params") {
+                        if carries { boundary::scrub(params); }
+                        connection.site_context().values.scrub_protocol(params);
                     }
+                    value.to_string()
                 }
                 Some(id) => {
                     let program = id
@@ -241,8 +258,13 @@ async fn serve(
                     let Some((program, carries)) = program else { continue };
                     value["id"] = program;
                     if carries {
-                        boundary::scrub(&mut value["result"]);
+                        if let Some(result)=value.get_mut("result") { boundary::scrub(result); }
                     }
+                    if let Some(targets) = value.pointer_mut("/result/targetInfos").and_then(Value::as_array_mut) {
+                        targets.retain(|target| !target["targetId"].as_str().is_some_and(|target| connection.site_context().private_target(target)));
+                    }
+                    if let Some(result)=value.get_mut("result") { connection.site_context().values.scrub_protocol(result); }
+                    if let Some(error)=value.get_mut("error") { connection.site_context().values.scrub(error); }
                     value.to_string()
                 }
             };
@@ -296,10 +318,25 @@ async fn serve(
                     Err(_) => break Err("Invalid Playwright protocol message.".into()),
                 };
                 let Some(method) = command["method"].as_str() else { break Err("Missing Playwright protocol method.".into()); };
+                if command.pointer("/params/targetId").and_then(Value::as_str)
+                    .is_some_and(|target| client.site_context().private_target(target)) {
+                    if outgoing.send(Message::Text(error_reply(&command, "Site custody targets are private to the browser host.").to_string())).is_err() {
+                        break Err("Playwright transport closed".into());
+                    }
+                    continue;
+                }
                 if let Some(refusal) = boundary::refusal(method, &command["params"]) {
                     if outgoing.send(Message::Text(error_reply(&command, &refusal).to_string())).is_err() {
                         break Err("Playwright transport closed".into());
                     }
+                    continue;
+                }
+                if client.site_context().files.guarded() && command.pointer("/params/url").and_then(Value::as_str).is_some_and(|url|client.debugger_resource(url)) {
+                    if outgoing.send(Message::Text(error_reply(&command,"The browser debugger is private to the browser host.").to_string())).is_err() { break Err("Playwright transport closed".into()); }
+                    continue;
+                }
+                if let Err(error)=client.site_context().files.command(method,&command["params"]).await {
+                    if outgoing.send(Message::Text(error_reply(&command,error).to_string())).is_err() { break Err("Playwright transport closed".into()); }
                     continue;
                 }
                 if is_input(method) {

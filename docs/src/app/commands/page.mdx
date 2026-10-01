@@ -59,6 +59,16 @@ The platform fixes `AMBIT_WORKSPACE_ROLE` at daemon startup from the workspace m
 
 Fresh automatically owned browser-host profiles start with Chrome's new-password saving turned off. Chrome-account and website sign-in remain available, and retained or caller-selected profiles are not rewritten. This preference does not prevent filling existing account-stored passwords and can be changed by the person in Chrome; it is not a substitute for the vault or model redaction.
 
+Host configuration and channel hello bind `browserHost` to that startup role. The host-only `program.open`, `program.close` and `program.status` frames lease the existing filtered transport, returning the binary's embedded runner and its digest for supervision in CODE. No model code, environment or filesystem path enters these frames. Native status proves transport and input settlement; CODE owns program start and results. A program ID never restarts, and cancellation, timeout, takeover, shutdown or originating-channel loss settles native input before another browser operation is admitted. Persistent identity admission additionally requires composed CODE/HOST file qualification.
+
+The host registers exact immutable staging receipts through `program.files` for the active Action/program. Uploads, file drags and local-resource reads share one validator, including complete directory descendants and actual script-driven Chrome requests. Closing the scope revokes future file access; downloads can select only the native owner's root. The debugger HTTP control surface is also private to the host. Native Action upload binding, browser-interface reads and complete CODE/HOST file parity still require composed qualification before persistent identity admission.
+
+Browser hosts prepare the mandatory file and debugger boundary before any identity offer and retain it when identity custody ends. Unguarded standalone and code-workspace browsers keep their existing file behavior.
+
+Native uploads use `action.files` bound to the existing Action owner, sharing the same validator without a program slot. Scopes coexist, survive disconnect for recovery and reject older generations. The backend attenuates terminal Actions with idempotent `action.files.release` after its canonical settlement commits; a late registration cannot restore released authority. Backend delivery and native chooser integration require composed qualification.
+
+Host site custody also prepares new tabs and auto-attached frames before their first document request. Native resume commands share that preparation boundary even when they do not await a resume reply. A pending document can receive its attach, refusal or channel cancellation while the browser operation waits.
+
 ```bash
 agent-browser run-playwright --stdin <<'JS'
 await page.getByRole('textbox', { name: 'Search' }).fill('reference');

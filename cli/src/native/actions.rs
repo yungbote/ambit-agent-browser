@@ -21,6 +21,7 @@ use super::browser_control::{self, BrowserControl, ControlRequest};
 mod sign_in;
 #[path = "window_actions.rs"]
 mod window_actions;
+pub(crate) const OBSERVATION_REQUIRED: &str = window_actions::OBSERVATION_REQUIRED;
 use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
@@ -699,6 +700,10 @@ pub struct DaemonState {
     /// existing outer mutex. Never broadcast controller credentials.
     pub(crate) browser_control: Arc<tokio::sync::Mutex<BrowserControl>>,
     pub(crate) playwright_operations: super::playwright::Operations,
+    /// The current host sequence's existing Action owner, under command
+    /// custody only. It is never accepted from a model command or serialized.
+    pub(crate) native_action_owner:
+        Arc<std::sync::Mutex<Option<super::agent_channel::frame::Owner>>>,
     /// Exact startup configuration; never serialized in the command protocol.
     launch_configuration: Option<Arc<Value>>,
     /// Same-daemon ownership only. Chrome is dropped before these private
@@ -907,6 +912,7 @@ impl DaemonState {
             idle_activity: Arc::new(IdleActivity::new()),
             browser_control: Arc::new(tokio::sync::Mutex::new(browser_control)),
             playwright_operations,
+            native_action_owner: Arc::default(),
             launch_configuration: None,
             retained_profile: None,
             effective_ca_cert: None,
@@ -1015,8 +1021,17 @@ impl DaemonState {
         let include_browser_ui = browser.display_client().is_some();
 
         self.fetch_handler_task = Some(tokio::spawn(async move {
+            // A document awaiting host custody cannot hold up target attach,
+            // authentication or another request. This remains the sole
+            // responder after custody admits each paused request.
+            let mut requests = tokio::task::JoinSet::new();
             loop {
-                match rx.recv().await {
+                let event = tokio::select! {
+                    _=client.closed()=>break,
+                    completed=requests.join_next(),if !requests.is_empty()=>{ let _=completed;continue; },
+                    event=rx.recv()=>event,
+                };
+                match event {
                     Ok(event) if event.method == "Fetch.authRequired" => {
                         let request_id = event
                             .params
@@ -1134,6 +1149,7 @@ impl DaemonState {
                         }
                     }
                     Ok(event) if event.method == "Fetch.requestPaused" => {
+                        let params = event.params.clone();
                         let request_id = event
                             .params
                             .get("requestId")
@@ -1169,11 +1185,22 @@ impl DaemonState {
                             request_headers,
                         };
 
-                        let df = domain_filter.read().await;
-                        let rt = routes.read().await;
-                        let oh = origin_headers.read().await;
-
-                        resolve_fetch_paused(&client, df.as_ref(), &rt, &oh, &paused).await;
+                        let (client, domain_filter, routes, origin_headers) = (
+                            client.clone(),
+                            domain_filter.clone(),
+                            routes.clone(),
+                            origin_headers.clone(),
+                        );
+                        requests.spawn(async move {
+                            if !client.site_request_ready(paused.session_id.clone(),params).await {
+                                let _=client.send_command("Fetch.failRequest",Some(json!({"requestId":paused.request_id,"errorReason":"Aborted"})),Some(&paused.session_id)).await;
+                                return;
+                            }
+                            let df = domain_filter.read().await;
+                            let rt = routes.read().await;
+                            let oh = origin_headers.read().await;
+                            resolve_fetch_paused(&client, df.as_ref(), &rt, &oh, &paused).await;
+                        });
                     }
                     Ok(_) => continue,
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -2810,6 +2837,9 @@ pub(crate) async fn execute_command_received(
             return error_response(cmd["id"].as_str().unwrap_or_default(), error);
         }
     }
+    if let Some(refusal) = state.playwright_operations.command_refusal(cmd) {
+        return refusal;
+    }
     // The theme is session state, not agent activity: it passes no window,
     // custody, observation or action-policy gate and captures no host
     // feedback.
@@ -2921,6 +2951,9 @@ pub(crate) async fn run_host_command(
     received_at: std::time::Instant,
     fence: &mut impl HostFence,
 ) -> Value {
+    if let Some(refusal) = state.playwright_operations.command_refusal(cmd) {
+        return refusal;
+    }
     let mut command = cmd.clone();
     command
         .as_object_mut()
@@ -3024,6 +3057,232 @@ pub(crate) async fn run_host_command(
         state.browser_control.lock().await.observed();
     }
     response
+}
+
+/// Select one allocated handler before polling it. Admission, confirmation,
+/// restore and response ownership remain in execute_command_inner; the
+/// dispatcher performs no command effects until its selected future is polled.
+fn dispatch_command<'a>(
+    action: &'a str,
+    cmd: &'a Value,
+    state: &'a mut DaemonState,
+    failure_data: &'a mut Option<Value>,
+) -> futures_util::future::BoxFuture<'a, Result<Value, String>> {
+    match action {
+        "launch" => Box::pin(async move {
+            let webmcp_enabled = cmd
+                .get("webmcp")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| launch_options_from_env().webmcp);
+            let result = handle_launch(cmd, state).await;
+            if result.is_ok() {
+                state.webmcp_enabled = webmcp_enabled;
+            }
+            result
+        }),
+        "navigate" => Box::pin(async move { handle_navigate(cmd, state).await }),
+        "read" => Box::pin(async move { handle_read(cmd, state).await }),
+        "url" => Box::pin(async move { handle_url(state).await }),
+        "cdp_url" => Box::pin(async move { handle_cdp_url(state) }),
+        "inspect" => Box::pin(async move { handle_inspect(state).await }),
+        "title" => Box::pin(async move { handle_title(state).await }),
+        "content" => Box::pin(async move { handle_content(state).await }),
+        "evaluate" => Box::pin(async move { handle_evaluate(cmd, state).await }),
+        "run_playwright" => {
+            Box::pin(async move { stating(super::playwright::run(cmd, state).await, failure_data) })
+        }
+        "close" => Box::pin(async move { handle_close(state).await }),
+        "snapshot" => Box::pin(async move { handle_snapshot(cmd, state).await }),
+        "screenshot" => Box::pin(async move { handle_screenshot(cmd, state).await }),
+        "click" => Box::pin(async move { stating(handle_click(cmd, state).await, failure_data) }),
+        "dblclick" => {
+            Box::pin(async move { stating(handle_dblclick(cmd, state).await, failure_data) })
+        }
+        "fill" => Box::pin(async move { stating(handle_fill(cmd, state).await, failure_data) }),
+        "type" => Box::pin(async move { stating(handle_type(cmd, state).await, failure_data) }),
+        "press" => Box::pin(async move { stating(handle_press(cmd, state).await, failure_data) }),
+        "hover" => Box::pin(async move { stating(handle_hover(cmd, state).await, failure_data) }),
+        "scroll" => Box::pin(async move { stating(handle_scroll(cmd, state).await, failure_data) }),
+        "select" => Box::pin(async move { stating(handle_select(cmd, state).await, failure_data) }),
+        "check" => Box::pin(async move { stating(handle_check(cmd, state).await, failure_data) }),
+        "uncheck" => {
+            Box::pin(async move { stating(handle_uncheck(cmd, state).await, failure_data) })
+        }
+        "wait" => Box::pin(async move { handle_wait(cmd, state).await }),
+        "gettext" => Box::pin(async move { handle_gettext(cmd, state).await }),
+        "getattribute" => Box::pin(async move { handle_getattribute(cmd, state).await }),
+        "isvisible" => Box::pin(async move { handle_isvisible(cmd, state).await }),
+        "isenabled" => Box::pin(async move { handle_isenabled(cmd, state).await }),
+        "ischecked" => Box::pin(async move { handle_ischecked(cmd, state).await }),
+        "back" => Box::pin(async move { handle_back(state).await }),
+        "forward" => Box::pin(async move { handle_forward(state).await }),
+        "reload" => Box::pin(async move { handle_reload(state).await }),
+        "cookies_get" => Box::pin(async move { handle_cookies_get(cmd, state).await }),
+        "cookies_set" => Box::pin(async move { handle_cookies_set(cmd, state).await }),
+        "cookies_clear" => Box::pin(async move { handle_cookies_clear(state).await }),
+        "storage_get" => Box::pin(async move { handle_storage_get(cmd, state).await }),
+        "storage_set" => Box::pin(async move { handle_storage_set(cmd, state).await }),
+        "storage_clear" => Box::pin(async move { handle_storage_clear(cmd, state).await }),
+        "setcontent" => Box::pin(async move { handle_setcontent(cmd, state).await }),
+        "headers" => Box::pin(async move { handle_headers(cmd, state).await }),
+        "offline" => Box::pin(async move { handle_offline(cmd, state).await }),
+        "console" => Box::pin(async move { handle_console(cmd, state).await }),
+        "errors" => Box::pin(async move { handle_errors(state).await }),
+        "session_info" => Box::pin(async move { handle_session_info(state).await }),
+        "state_save" => Box::pin(async move { handle_state_save(cmd, state).await }),
+        "state_load" => Box::pin(async move { handle_state_load(cmd, state).await }),
+        "state_list" | "state_show" | "state_clear" | "state_clean" | "state_rename" => {
+            Box::pin(async move {
+                state::dispatch_state_command(cmd)
+                    .expect("dispatch_state_command must handle all state_* actions matched here")
+            })
+        }
+        "trace_start" => Box::pin(async move { handle_trace_start(state).await }),
+        "trace_stop" => Box::pin(async move { handle_trace_stop(cmd, state).await }),
+        "profiler_start" => Box::pin(async move { handle_profiler_start(cmd, state).await }),
+        "profiler_stop" => Box::pin(async move { handle_profiler_stop(cmd, state).await }),
+        "recording_start" => Box::pin(async move { handle_recording_start(cmd, state).await }),
+        "recording_stop" => Box::pin(async move { handle_recording_stop(state).await }),
+        "recording_restart" => Box::pin(async move { handle_recording_restart(cmd, state).await }),
+        "pdf" => Box::pin(async move { handle_pdf(cmd, state).await }),
+        "tab_list" => Box::pin(async move { handle_tab_list(state).await }),
+        "tab_new" => Box::pin(async move { handle_tab_new(cmd, state).await }),
+        "tab_switch" => Box::pin(async move { handle_tab_switch(cmd, state).await }),
+        "tab_close" => Box::pin(async move { handle_tab_close(cmd, state).await }),
+        "viewport" => Box::pin(async move { handle_viewport(cmd, state).await }),
+        "useragent" | "user_agent" => Box::pin(async move { handle_user_agent(cmd, state).await }),
+        "set_media" => Box::pin(async move { handle_set_media(cmd, state).await }),
+        "download" => Box::pin(async move { handle_download(cmd, state).await }),
+        "diff_snapshot" => Box::pin(async move { handle_diff_snapshot(cmd, state).await }),
+        "diff_url" => Box::pin(async move { handle_diff_url(cmd, state).await }),
+        "credentials_set" => Box::pin(async move { handle_credentials_set(cmd).await }),
+        "credentials_get" => Box::pin(async move { handle_credentials_get(cmd).await }),
+        "credentials_delete" => Box::pin(async move { handle_credentials_delete(cmd).await }),
+        "credentials_list" => Box::pin(async move { handle_credentials_list().await }),
+        "mouse" => Box::pin(async move { stating(handle_mouse(cmd, state).await, failure_data) }),
+        "keyboard" => {
+            Box::pin(async move { stating(handle_keyboard(cmd, state).await, failure_data) })
+        }
+        "focus" => Box::pin(async move { stating(handle_focus(cmd, state).await, failure_data) }),
+        "clear" => Box::pin(async move { stating(handle_clear(cmd, state).await, failure_data) }),
+        "selectall" => {
+            Box::pin(async move { stating(handle_selectall(cmd, state).await, failure_data) })
+        }
+        "scrollintoview" => {
+            Box::pin(async move { stating(handle_scrollintoview(cmd, state).await, failure_data) })
+        }
+        "dispatch" => Box::pin(async move { handle_dispatch(cmd, state).await }),
+        "highlight" => Box::pin(async move { handle_highlight(cmd, state).await }),
+        "tap" => Box::pin(async move { stating(handle_tap(cmd, state).await, failure_data) }),
+        "boundingbox" => Box::pin(async move { handle_boundingbox(cmd, state).await }),
+        "innertext" => Box::pin(async move { handle_innertext(cmd, state).await }),
+        "innerhtml" => Box::pin(async move { handle_innerhtml(cmd, state).await }),
+        "inputvalue" => Box::pin(async move { handle_inputvalue(cmd, state).await }),
+        "setvalue" => Box::pin(async move { handle_setvalue(cmd, state).await }),
+        "count" => Box::pin(async move { handle_count(cmd, state).await }),
+        "styles" => Box::pin(async move { handle_styles(cmd, state).await }),
+        "bringtofront" => Box::pin(async move { handle_bringtofront(state).await }),
+        "timezone" => Box::pin(async move { handle_timezone(cmd, state).await }),
+        "locale" => Box::pin(async move { handle_locale(cmd, state).await }),
+        "geolocation" => Box::pin(async move { handle_geolocation(cmd, state).await }),
+        "permissions" => Box::pin(async move { handle_permissions(cmd, state).await }),
+        "dialog" => Box::pin(async move { handle_dialog(cmd, state).await }),
+        "upload" => Box::pin(async move { handle_upload(cmd, state).await }),
+        "addscript" => Box::pin(async move { handle_addscript(cmd, state).await }),
+        "addinitscript" => Box::pin(async move { handle_addinitscript(cmd, state).await }),
+        "removeinitscript" => Box::pin(async move { handle_removeinitscript(cmd, state).await }),
+        "addstyle" => Box::pin(async move { handle_addstyle(cmd, state).await }),
+        "react_tree" => Box::pin(async move { handle_react_tree(cmd, state).await }),
+        "react_inspect" => Box::pin(async move { handle_react_inspect(cmd, state).await }),
+        "react_renders_start" => {
+            Box::pin(async move { handle_react_renders_start(cmd, state).await })
+        }
+        "react_renders_stop" => {
+            Box::pin(async move { handle_react_renders_stop(cmd, state).await })
+        }
+        "react_suspense" => Box::pin(async move { handle_react_suspense(cmd, state).await }),
+        "vitals" => Box::pin(async move { handle_vitals(cmd, state).await }),
+        "a11y" => Box::pin(async move { handle_a11y(cmd, state).await }),
+        "pushstate" => Box::pin(async move { handle_pushstate(cmd, state).await }),
+        "clipboard" => Box::pin(async move { handle_clipboard(cmd, state).await }),
+        "wheel" => Box::pin(async move { stating(handle_wheel(cmd, state).await, failure_data) }),
+        "device" => Box::pin(async move { handle_device(cmd, state).await }),
+        "screencast_start" => Box::pin(async move { handle_screencast_start(cmd, state).await }),
+        "screencast_stop" => Box::pin(async move { handle_screencast_stop(state).await }),
+        "stream_enable" => Box::pin(async move { handle_stream_enable(cmd, state).await }),
+        "stream_disable" => Box::pin(async move { handle_stream_disable(state).await }),
+        "stream_status" => Box::pin(async move { handle_stream_status(state).await }),
+        "webmcp_list" => Box::pin(async move { handle_webmcp_list(state).await }),
+        "webmcp_invoke" => Box::pin(async move { handle_webmcp_invoke(cmd, state).await }),
+        "webmcp_result" => Box::pin(async move { handle_webmcp_result(cmd, state).await }),
+        "webmcp_cancel" => Box::pin(async move { handle_webmcp_cancel(cmd, state).await }),
+        "waitforurl" => Box::pin(async move { handle_waitforurl(cmd, state).await }),
+        "waitforloadstate" => Box::pin(async move { handle_waitforloadstate(cmd, state).await }),
+        "waitforfunction" => Box::pin(async move { handle_waitforfunction(cmd, state).await }),
+        "frame" => Box::pin(async move { handle_frame(cmd, state).await }),
+        "mainframe" => Box::pin(async move { handle_mainframe(state).await }),
+        "getbyrole" => Box::pin(async move { handle_getbyrole(cmd, state).await }),
+        "getbytext" => Box::pin(async move { handle_getbytext(cmd, state).await }),
+        "getbylabel" => Box::pin(async move { handle_getbylabel(cmd, state).await }),
+        "getbyplaceholder" => Box::pin(async move { handle_getbyplaceholder(cmd, state).await }),
+        "getbyalttext" => Box::pin(async move { handle_getbyalttext(cmd, state).await }),
+        "getbytitle" => Box::pin(async move { handle_getbytitle(cmd, state).await }),
+        "getbytestid" => Box::pin(async move { handle_getbytestid(cmd, state).await }),
+        "nth" => Box::pin(async move { handle_nth(cmd, state).await }),
+        "find" => Box::pin(async move { handle_find(cmd, state).await }),
+        "evalhandle" => Box::pin(async move { handle_evalhandle(cmd, state).await }),
+        "drag" => Box::pin(async move { stating(handle_drag(cmd, state).await, failure_data) }),
+        "expose" => Box::pin(async move { handle_expose(cmd, state).await }),
+        "pause" => Box::pin(async move { handle_pause(state).await }),
+        "multiselect" => Box::pin(async move { handle_multiselect(cmd, state).await }),
+        "responsebody" => Box::pin(async move { handle_responsebody(cmd, state).await }),
+        "waitfordownload" => Box::pin(async move { handle_waitfordownload(cmd, state).await }),
+        "window_new" => Box::pin(async move { handle_window_new(cmd, state).await }),
+        "diff_screenshot" => Box::pin(async move { handle_diff_screenshot(cmd, state).await }),
+        "video_start" => Box::pin(async move { handle_video_start(cmd, state).await }),
+        "video_stop" => Box::pin(async move { handle_video_stop(state).await }),
+        "har_start" => Box::pin(async move { handle_har_start(cmd, state).await }),
+        "har_stop" => Box::pin(async move { handle_har_stop(cmd, state).await }),
+        "route" => Box::pin(async move { handle_route(cmd, state).await }),
+        "unroute" => Box::pin(async move { handle_unroute(cmd, state).await }),
+        "requests" => Box::pin(async move { handle_requests(cmd, state).await }),
+        "request_detail" => Box::pin(async move { handle_request_detail(cmd, state).await }),
+        "credentials" => Box::pin(async move { handle_http_credentials(cmd, state).await }),
+        "emulatemedia" => Box::pin(async move { handle_set_media(cmd, state).await }),
+        "auth_save" => Box::pin(async move { handle_auth_save(cmd).await }),
+        "auth_login" => Box::pin(async move { handle_auth_login(cmd, state).await }),
+        "auth_list" => Box::pin(async move { handle_credentials_list().await }),
+        "auth_delete" => Box::pin(async move { handle_credentials_delete(cmd).await }),
+        "auth_show" => Box::pin(async move { handle_auth_show(cmd).await }),
+        "confirm" => Box::pin(async move { handle_confirm(cmd, state).await }),
+        "deny" => Box::pin(async move { handle_deny(cmd, state).await }),
+        "swipe" => Box::pin(async move { handle_swipe(cmd, state).await }),
+        "device_list" => Box::pin(async move { handle_device_list().await }),
+        "input_mouse" => {
+            Box::pin(async move { stating(handle_input_mouse(cmd, state).await, failure_data) })
+        }
+        "input_keyboard" => {
+            Box::pin(async move { stating(handle_input_keyboard(cmd, state).await, failure_data) })
+        }
+        "input_touch" => Box::pin(async move { handle_input_touch(cmd, state).await }),
+        "keydown" => {
+            Box::pin(async move { stating(handle_keydown(cmd, state).await, failure_data) })
+        }
+        "keyup" => Box::pin(async move { stating(handle_keyup(cmd, state).await, failure_data) }),
+        "inserttext" => {
+            Box::pin(async move { stating(handle_inserttext(cmd, state).await, failure_data) })
+        }
+        "mousemove" => {
+            Box::pin(async move { stating(handle_mousemove(cmd, state).await, failure_data) })
+        }
+        "mousedown" => {
+            Box::pin(async move { stating(handle_mousedown(cmd, state).await, failure_data) })
+        }
+        "mouseup" => {
+            Box::pin(async move { stating(handle_mouseup(cmd, state).await, failure_data) })
+        }
+        _ => Box::pin(async move { Err(format!("Not yet implemented: {}", action)) }),
+    }
 }
 
 async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
@@ -3484,196 +3743,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
     // produced it (see `CommandError`).
     let mut failure_data = None;
     // Keep the handler match out of the admission/confirmation poll frame.
-    // A confirmation re-enters this owner to recheck policy; debug builds
-    // otherwise retain every handler's stack temporaries in both polls.
-    let result = Box::pin(async {
-        match action {
-            "launch" => {
-                let webmcp_enabled = cmd
-                    .get("webmcp")
-                    .and_then(Value::as_bool)
-                    .unwrap_or_else(|| launch_options_from_env().webmcp);
-                let result = handle_launch(cmd, state).await;
-                if result.is_ok() {
-                    state.webmcp_enabled = webmcp_enabled;
-                }
-                result
-            }
-            "navigate" => handle_navigate(cmd, state).await,
-            "read" => handle_read(cmd, state).await,
-            "url" => handle_url(state).await,
-            "cdp_url" => handle_cdp_url(state),
-            "inspect" => handle_inspect(state).await,
-            "title" => handle_title(state).await,
-            "content" => handle_content(state).await,
-            "evaluate" => handle_evaluate(cmd, state).await,
-            "run_playwright" => {
-                stating(super::playwright::run(cmd, state).await, &mut failure_data)
-            }
-            "close" => handle_close(state).await,
-            "snapshot" => handle_snapshot(cmd, state).await,
-            "screenshot" => handle_screenshot(cmd, state).await,
-            "click" => stating(handle_click(cmd, state).await, &mut failure_data),
-            "dblclick" => stating(handle_dblclick(cmd, state).await, &mut failure_data),
-            "fill" => stating(handle_fill(cmd, state).await, &mut failure_data),
-            "type" => stating(handle_type(cmd, state).await, &mut failure_data),
-            "press" => stating(handle_press(cmd, state).await, &mut failure_data),
-            "hover" => stating(handle_hover(cmd, state).await, &mut failure_data),
-            "scroll" => stating(handle_scroll(cmd, state).await, &mut failure_data),
-            "select" => stating(handle_select(cmd, state).await, &mut failure_data),
-            "check" => stating(handle_check(cmd, state).await, &mut failure_data),
-            "uncheck" => stating(handle_uncheck(cmd, state).await, &mut failure_data),
-            "wait" => handle_wait(cmd, state).await,
-            "gettext" => handle_gettext(cmd, state).await,
-            "getattribute" => handle_getattribute(cmd, state).await,
-            "isvisible" => handle_isvisible(cmd, state).await,
-            "isenabled" => handle_isenabled(cmd, state).await,
-            "ischecked" => handle_ischecked(cmd, state).await,
-            "back" => handle_back(state).await,
-            "forward" => handle_forward(state).await,
-            "reload" => handle_reload(state).await,
-            "cookies_get" => handle_cookies_get(cmd, state).await,
-            "cookies_set" => handle_cookies_set(cmd, state).await,
-            "cookies_clear" => handle_cookies_clear(state).await,
-            "storage_get" => handle_storage_get(cmd, state).await,
-            "storage_set" => handle_storage_set(cmd, state).await,
-            "storage_clear" => handle_storage_clear(cmd, state).await,
-            "setcontent" => handle_setcontent(cmd, state).await,
-            "headers" => handle_headers(cmd, state).await,
-            "offline" => handle_offline(cmd, state).await,
-            "console" => handle_console(cmd, state).await,
-            "errors" => handle_errors(state).await,
-            "session_info" => handle_session_info(state).await,
-            "state_save" => handle_state_save(cmd, state).await,
-            "state_load" => handle_state_load(cmd, state).await,
-            "state_list" | "state_show" | "state_clear" | "state_clean" | "state_rename" => {
-                state::dispatch_state_command(cmd)
-                    .expect("dispatch_state_command must handle all state_* actions matched here")
-            }
-            "trace_start" => handle_trace_start(state).await,
-            "trace_stop" => handle_trace_stop(cmd, state).await,
-            "profiler_start" => handle_profiler_start(cmd, state).await,
-            "profiler_stop" => handle_profiler_stop(cmd, state).await,
-            "recording_start" => handle_recording_start(cmd, state).await,
-            "recording_stop" => handle_recording_stop(state).await,
-            "recording_restart" => handle_recording_restart(cmd, state).await,
-            "pdf" => handle_pdf(cmd, state).await,
-            "tab_list" => handle_tab_list(state).await,
-            "tab_new" => handle_tab_new(cmd, state).await,
-            "tab_switch" => handle_tab_switch(cmd, state).await,
-            "tab_close" => handle_tab_close(cmd, state).await,
-            "viewport" => handle_viewport(cmd, state).await,
-            "useragent" | "user_agent" => handle_user_agent(cmd, state).await,
-            "set_media" => handle_set_media(cmd, state).await,
-            "download" => handle_download(cmd, state).await,
-            "diff_snapshot" => handle_diff_snapshot(cmd, state).await,
-            "diff_url" => handle_diff_url(cmd, state).await,
-            "credentials_set" => handle_credentials_set(cmd).await,
-            "credentials_get" => handle_credentials_get(cmd).await,
-            "credentials_delete" => handle_credentials_delete(cmd).await,
-            "credentials_list" => handle_credentials_list().await,
-            "mouse" => stating(handle_mouse(cmd, state).await, &mut failure_data),
-            "keyboard" => stating(handle_keyboard(cmd, state).await, &mut failure_data),
-            "focus" => stating(handle_focus(cmd, state).await, &mut failure_data),
-            "clear" => stating(handle_clear(cmd, state).await, &mut failure_data),
-            "selectall" => stating(handle_selectall(cmd, state).await, &mut failure_data),
-            "scrollintoview" => stating(handle_scrollintoview(cmd, state).await, &mut failure_data),
-            "dispatch" => handle_dispatch(cmd, state).await,
-            "highlight" => handle_highlight(cmd, state).await,
-            "tap" => stating(handle_tap(cmd, state).await, &mut failure_data),
-            "boundingbox" => handle_boundingbox(cmd, state).await,
-            "innertext" => handle_innertext(cmd, state).await,
-            "innerhtml" => handle_innerhtml(cmd, state).await,
-            "inputvalue" => handle_inputvalue(cmd, state).await,
-            "setvalue" => handle_setvalue(cmd, state).await,
-            "count" => handle_count(cmd, state).await,
-            "styles" => handle_styles(cmd, state).await,
-            "bringtofront" => handle_bringtofront(state).await,
-            "timezone" => handle_timezone(cmd, state).await,
-            "locale" => handle_locale(cmd, state).await,
-            "geolocation" => handle_geolocation(cmd, state).await,
-            "permissions" => handle_permissions(cmd, state).await,
-            "dialog" => handle_dialog(cmd, state).await,
-            "upload" => handle_upload(cmd, state).await,
-            "addscript" => handle_addscript(cmd, state).await,
-            "addinitscript" => handle_addinitscript(cmd, state).await,
-            "removeinitscript" => handle_removeinitscript(cmd, state).await,
-            "addstyle" => handle_addstyle(cmd, state).await,
-            "react_tree" => handle_react_tree(cmd, state).await,
-            "react_inspect" => handle_react_inspect(cmd, state).await,
-            "react_renders_start" => handle_react_renders_start(cmd, state).await,
-            "react_renders_stop" => handle_react_renders_stop(cmd, state).await,
-            "react_suspense" => handle_react_suspense(cmd, state).await,
-            "vitals" => handle_vitals(cmd, state).await,
-            "a11y" => handle_a11y(cmd, state).await,
-            "pushstate" => handle_pushstate(cmd, state).await,
-            "clipboard" => handle_clipboard(cmd, state).await,
-            "wheel" => stating(handle_wheel(cmd, state).await, &mut failure_data),
-            "device" => handle_device(cmd, state).await,
-            "screencast_start" => handle_screencast_start(cmd, state).await,
-            "screencast_stop" => handle_screencast_stop(state).await,
-            "stream_enable" => handle_stream_enable(cmd, state).await,
-            "stream_disable" => handle_stream_disable(state).await,
-            "stream_status" => handle_stream_status(state).await,
-            "webmcp_list" => handle_webmcp_list(state).await,
-            "webmcp_invoke" => handle_webmcp_invoke(cmd, state).await,
-            "webmcp_result" => handle_webmcp_result(cmd, state).await,
-            "webmcp_cancel" => handle_webmcp_cancel(cmd, state).await,
-            "waitforurl" => handle_waitforurl(cmd, state).await,
-            "waitforloadstate" => handle_waitforloadstate(cmd, state).await,
-            "waitforfunction" => handle_waitforfunction(cmd, state).await,
-            "frame" => handle_frame(cmd, state).await,
-            "mainframe" => handle_mainframe(state).await,
-            "getbyrole" => handle_getbyrole(cmd, state).await,
-            "getbytext" => handle_getbytext(cmd, state).await,
-            "getbylabel" => handle_getbylabel(cmd, state).await,
-            "getbyplaceholder" => handle_getbyplaceholder(cmd, state).await,
-            "getbyalttext" => handle_getbyalttext(cmd, state).await,
-            "getbytitle" => handle_getbytitle(cmd, state).await,
-            "getbytestid" => handle_getbytestid(cmd, state).await,
-            "nth" => handle_nth(cmd, state).await,
-            "find" => handle_find(cmd, state).await,
-            "evalhandle" => handle_evalhandle(cmd, state).await,
-            "drag" => stating(handle_drag(cmd, state).await, &mut failure_data),
-            "expose" => handle_expose(cmd, state).await,
-            "pause" => handle_pause(state).await,
-            "multiselect" => handle_multiselect(cmd, state).await,
-            "responsebody" => handle_responsebody(cmd, state).await,
-            "waitfordownload" => handle_waitfordownload(cmd, state).await,
-            "window_new" => handle_window_new(cmd, state).await,
-            "diff_screenshot" => handle_diff_screenshot(cmd, state).await,
-            "video_start" => handle_video_start(cmd, state).await,
-            "video_stop" => handle_video_stop(state).await,
-            "har_start" => handle_har_start(cmd, state).await,
-            "har_stop" => handle_har_stop(cmd, state).await,
-            "route" => handle_route(cmd, state).await,
-            "unroute" => handle_unroute(cmd, state).await,
-            "requests" => handle_requests(cmd, state).await,
-            "request_detail" => handle_request_detail(cmd, state).await,
-            "credentials" => handle_http_credentials(cmd, state).await,
-            "emulatemedia" => handle_set_media(cmd, state).await,
-            "auth_save" => handle_auth_save(cmd).await,
-            "auth_login" => handle_auth_login(cmd, state).await,
-            "auth_list" => handle_credentials_list().await,
-            "auth_delete" => handle_credentials_delete(cmd).await,
-            "auth_show" => handle_auth_show(cmd).await,
-            "confirm" => handle_confirm(cmd, state).await,
-            "deny" => handle_deny(cmd, state).await,
-            "swipe" => handle_swipe(cmd, state).await,
-            "device_list" => handle_device_list().await,
-            "input_mouse" => stating(handle_input_mouse(cmd, state).await, &mut failure_data),
-            "input_keyboard" => stating(handle_input_keyboard(cmd, state).await, &mut failure_data),
-            "input_touch" => handle_input_touch(cmd, state).await,
-            "keydown" => stating(handle_keydown(cmd, state).await, &mut failure_data),
-            "keyup" => stating(handle_keyup(cmd, state).await, &mut failure_data),
-            "inserttext" => stating(handle_inserttext(cmd, state).await, &mut failure_data),
-            "mousemove" => stating(handle_mousemove(cmd, state).await, &mut failure_data),
-            "mousedown" => stating(handle_mousedown(cmd, state).await, &mut failure_data),
-            "mouseup" => stating(handle_mouseup(cmd, state).await, &mut failure_data),
-            _ => Err(format!("Not yet implemented: {}", action)),
-        }
-    })
-    .await;
+    let result = dispatch_command(action, cmd, state, &mut failure_data).await;
 
     if result.is_ok() && should_validate_restore_after_action(action) {
         validate_restore_if_pending(state).await;
@@ -4368,12 +4438,16 @@ async fn install_network_controls_or_resume_prepared_session(
     }
 }
 
-/// True when [`apply_session_setup`] has anything to replay onto a new tab.
+/// True when a new tab needs preparation before its first destination.
 async fn session_setup_pending(state: &DaemonState) -> bool {
     !state.session_setup.is_empty()
         || state.theme.is_some()
         || !state.routes.read().await.is_empty()
         || !state.origin_headers.read().await.is_empty()
+        || state
+            .browser
+            .as_ref()
+            .is_some_and(|browser| browser.client.site_preparation_required())
 }
 
 /// Replay the session-scoped setup the user configured on the active page
@@ -4997,6 +5071,7 @@ fn launch_options_from_env() -> LaunchOptions {
         ca_cert_digest: None,
         prepared_nss_home: None,
         retained_profile: None,
+        site_profile: None,
         color_scheme: env::var("AGENT_BROWSER_COLOR_SCHEME").ok(),
         theme: None,
         download_path: env::var("AGENT_BROWSER_DOWNLOAD_PATH").ok(),
@@ -5479,6 +5554,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         ca_cert_digest: None,
         prepared_nss_home: None,
         retained_profile: None,
+        site_profile: None,
         color_scheme: cmd
             .get("colorScheme")
             .and_then(|v| v.as_str())
@@ -9369,6 +9445,16 @@ async fn handle_upload(cmd: &Value, state: &DaemonState) -> Result<Value, String
         })
         .unwrap_or_default();
 
+    let staged = mgr.client.site_context().files;
+    if staged.guarded() {
+        let owner=(*state.native_action_owner.lock().unwrap()).ok_or("browser_operation_rejected: Native uploads require their current Action staging owner.")?;
+        let scope =
+            super::playwright::files::Scope::parse(&owner.action.to_string()).map_err(|_| {
+                "browser_operation_rejected: The native upload staging owner is invalid."
+            })?;
+        staged.paths_for(scope,owner,files.clone()).await.map_err(|_|"browser_operation_rejected: The upload has no current exact Action staging receipt.")?;
+    }
+
     mgr.upload_files(selector, &files, &state.ref_map, &state.iframe_sessions)
         .await?;
     Ok(json!({ "uploaded": files.len(), "selector": selector }))
@@ -12501,6 +12587,18 @@ async fn resolve_fetch_paused(
     paused: &FetchPausedRequest,
 ) {
     let session_id = &paused.session_id;
+    if client.site_context().files.url(&paused.url).await.is_err()
+        || (client.site_context().files.guarded() && client.debugger_resource(&paused.url))
+    {
+        let _ = client
+            .send_command(
+                "Fetch.failRequest",
+                Some(json!({"requestId":paused.request_id,"errorReason":"BlockedByClient"})),
+                Some(session_id),
+            )
+            .await;
+        return;
+    }
 
     // Domain filter check (takes priority over routes and origin headers)
     if let Some(filter) = domain_filter {

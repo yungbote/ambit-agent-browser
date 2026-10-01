@@ -3,6 +3,10 @@
 //! custody remains with the daemon and human input remains with BrowserControl.
 
 mod boundary;
+pub(crate) mod files;
+#[cfg(all(test, unix))]
+mod files_e2e;
+pub(crate) mod remote;
 mod transport;
 #[cfg(test)]
 mod tunnel_e2e;
@@ -186,6 +190,22 @@ impl Operations {
             notified.await;
         }
     }
+
+    pub(crate) fn active(&self) -> bool {
+        self.state.lock().unwrap().active.is_some()
+    }
+
+    pub(crate) fn command_refusal(&self, command: &Value) -> Option<Value> {
+        if !self.active()
+            || command["action"] == crate::native::theme::ACTION
+            || command["action"] == crate::native::browser_control::ACTION
+        {
+            return None;
+        }
+        Some(
+            json!({"id":command["id"],"success":false,"code":"browser_operation_rejected","error":"A browser program holds the browser. Wait for it to settle before another browser operation."}),
+        )
+    }
 }
 
 /// Kill the process group before reaping its leader. The leader PID therefore
@@ -332,6 +352,73 @@ async fn diagnostics(mut reader: impl AsyncRead + Unpin) -> (String, bool) {
 
 /// The enclosing command retains exclusive native custody until the temporary
 /// connection, every input operation and the Node group have settled.
+struct Attachment {
+    tunnel: transport::Tunnel,
+    target: String,
+    isolated_contexts: usize,
+    artifacts: Option<std::path::PathBuf>,
+    owner: Arc<CdpClient>,
+}
+
+/// Local supervision and remote supervision attach through the same browser
+/// owner, downloads configuration and filtered, program-private connection.
+async fn attach(
+    state: &mut DaemonState,
+    target: Option<&str>,
+    deadline: tokio::time::Instant,
+    operation: &mut Operation,
+) -> Result<Attachment, String> {
+    let browser = state
+        .browser
+        .as_mut()
+        .ok_or("browser_operation_rejected: Open the browser before running Playwright.")?;
+    let target = match target {
+        Some(target) if !target.is_empty() => target,
+        Some(_) => {
+            return Err(
+                "browser_operation_rejected: targetId must identify an existing tab.".into(),
+            )
+        }
+        None => browser.active_target_id()?,
+    }
+    .to_owned();
+    let (download_context, isolated_contexts) = tokio::select! {
+        biased;
+        _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start()),
+        result = tokio::time::timeout_at(deadline, async {
+            let isolated = browser.isolated_context_ids().await?.len();
+            let context = browser.download_context_for_target(&target).await?;
+            browser.configure_downloads(context.as_deref()).await?;
+            Ok::<_, String>((context, isolated))
+        }) => result.map_err(|_| "browser_operation_rejected: Browser setup reached its deadline.")?
+            .map_err(|error| format!("browser_operation_rejected: {error}"))?,
+    };
+    let client = tokio::select! {
+        biased;
+        _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start()),
+        result = tokio::time::timeout_at(deadline, CdpClient::connect(browser.get_cdp_url())) =>
+            Arc::new(result.map_err(|_| "browser_operation_rejected: Browser attachment timed out.")?
+                .map_err(|_| "browser_operation_rejected: The existing browser could not be attached.")?),
+    };
+    client.publish_activity_as(&browser.client);
+    let observed = tokio::select! {
+        biased;
+        _ = operation.canceled.changed() => Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start()),
+        result = tokio::time::timeout_at(deadline, browser.observe_owned_downloads(&client, download_context.as_deref())) => result.map_err(|_| "browser_operation_rejected: Browser attachment setup reached its deadline.".to_string()).and_then(|result| result),
+    };
+    if let Err(error) = observed {
+        client.disconnect();
+        return Err(error);
+    }
+    Ok(Attachment {
+        tunnel: transport::Tunnel::start(client, state.browser_control.clone()).await?,
+        target,
+        isolated_contexts,
+        artifacts: browser.downloads_path().map(std::path::Path::to_path_buf),
+        owner: browser.client.clone(),
+    })
+}
+
 pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Value, CommandError> {
     super::workspace_role::current()?.admit_local_program()?;
     #[cfg(not(unix))]
@@ -355,56 +442,22 @@ pub(crate) async fn run(command: &Value, state: &mut DaemonState) -> Result<Valu
         let environment = ProgramEnvironment::read(command)?;
         let mut operation = state.playwright_operations.begin()?;
         let deadline = tokio::time::Instant::now() + Duration::from_millis(timeout);
-        let browser = state
-            .browser
-            .as_mut()
-            .ok_or("browser_operation_rejected: Open the browser before running Playwright.")?;
-        let target = match command.get("targetId") {
-            Some(value) => value
-                .as_str()
-                .filter(|target| !target.is_empty())
-                .ok_or("browser_operation_rejected: targetId must identify an existing tab.")?,
-            None => browser.active_target_id()?,
-        }
-        .to_owned();
-        // The runner learns how many explicit isolated contexts exist. A
-        // client without shared-context adoption would fold them into the
-        // default profile and misreport cookies, so it refuses before start.
-        let (download_context, isolated_contexts) = tokio::select! {
-            biased;
-            _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start().into()),
-            result = tokio::time::timeout_at(deadline, async {
-                let isolated = browser.isolated_context_ids().await?.len();
-                let context = browser.download_context_for_target(&target).await?;
-                browser.configure_downloads(context.as_deref()).await?;
-                Ok::<_, String>((context, isolated))
-            }) => result.map_err(|_| "browser_operation_rejected: Browser setup reached its deadline.")?
-                .map_err(|error| format!("browser_operation_rejected: {error}"))?,
-        };
-        let endpoint = browser.get_cdp_url().to_owned();
-        let artifacts = browser.downloads_path().map(std::path::Path::to_path_buf);
-        let owner = browser.client.clone();
+        let target = command
+            .get("targetId")
+            .map(|value| {
+                value
+                    .as_str()
+                    .ok_or("browser_operation_rejected: targetId must identify an existing tab.")
+            })
+            .transpose()?;
+        let Attachment {
+            mut tunnel,
+            target,
+            isolated_contexts,
+            artifacts,
+            owner,
+        } = attach(state, target, deadline, &mut operation).await?;
         let control = state.browser_control.clone();
-        let client = tokio::select! {
-            biased;
-            _ = operation.canceled.changed() => return Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start().into()),
-            result = tokio::time::timeout_at(deadline, CdpClient::connect(&endpoint)) =>
-                Arc::new(result.map_err(|_| "browser_operation_rejected: Browser attachment timed out.")?
-                    .map_err(|_| "browser_operation_rejected: The existing browser could not be attached.")?),
-        };
-        // Viewers follow the owner's page sessions; program input appears
-        // there exactly as native input does.
-        client.publish_activity_as(&browser.client);
-        let observed = tokio::select! {
-            biased;
-            _ = operation.canceled.changed() => Err(operation.canceled.borrow().unwrap_or(InterruptReason::Shutdown).before_start()),
-            result = tokio::time::timeout_at(deadline, browser.observe_owned_downloads(&client, download_context.as_deref())) => result.map_err(|_| "browser_operation_rejected: Browser attachment setup reached its deadline.".to_string()).and_then(|result| result),
-        };
-        if let Err(error) = observed {
-            client.disconnect();
-            return Err(error.into());
-        }
-        let mut tunnel = transport::Tunnel::start(client, control.clone()).await?;
         let request = json!({ "endpoint": tunnel.endpoint(), "targetId": target, "code": code, "artifactsDir": artifacts, "environment": environment, "isolatedContexts": isolated_contexts });
         let mut node = Command::new(
             std::env::var("AGENT_BROWSER_NODE_PATH").unwrap_or_else(|_| "node".into()),
@@ -1492,8 +1545,9 @@ mod tests {
     async fn e2e_playwright_frames_popups_files_and_real_pointer_share_native_owners() {
         use crate::native::actions::execute_command;
         let mut state = DaemonState::new();
-        let artifacts =
-            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("target/playwright-e2e");
+        let artifacts = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target/playwright-e2e")
+            .join(format!("ordinary-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&artifacts).unwrap();
         let output = serde_json::to_string(&artifacts).unwrap();
         let opened = Box::pin(execute_command(
@@ -1511,7 +1565,7 @@ mod tests {
             .to_owned();
         let code = r#"
 const {createServer} = await import('node:http');
-const {readFile} = await import('node:fs/promises');
+const {readFile,writeFile} = await import('node:fs/promises');
 const server = createServer((request, response) => {
   if (request.url === '/file') {
     response.writeHead(200, {'Content-Type':'text/plain','Content-Disposition':'attachment; filename=report.txt'});
@@ -1523,7 +1577,7 @@ const server = createServer((request, response) => {
   else if (request.url === '/popup') response.end('<title>Popup</title><button onclick="document.title=\'Popup clicked\'">Popup action</button>');
   else response.end(`<title>Playwright qualification</title><style>body{font:18px system-ui;padding:24px;height:2500px}button,input,a{margin:8px}iframe{display:block;width:600px;height:160px}</style><h1>Shared browser</h1><input aria-label="Name"><input type=file aria-label="Upload"><button id=dom onclick="window.domClicked=true">DOM action</button><a target=_blank href=/popup>Open popup</a><a href=/file>Download</a><iframe src="http://localhost:${server.address().port}/frame"></iframe><script>window.pointers=[];addEventListener('pointermove',e=>pointers.push({x:e.clientX,y:e.clientY,screenX:e.screenX,screenY:e.screenY,trusted:e.isTrusted}),true)</script>`);
 });
-await new Promise(resolve => server.listen(0, '0.0.0.0', resolve));
+await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
 try {
   await page.goto(`http://127.0.0.1:${server.address().port}/`);
   const planted = await context.addCookies([{name:'planted',value:'yes',url:page.url()}]).then(() => null, (error) => error.message);
@@ -1550,15 +1604,28 @@ try {
   await page.mouse.wheel(0, 180);
   await page.waitForFunction(() => scrollY > 0);
   await page.screenshot({path:OUTPUT + '/page.png'});
-  return {name:await page.getByRole('textbox', {name:'Name',exact:true}).inputValue(), frame:await page.frameLocator('iframe').getByRole('textbox').inputValue(), popupTitle, text, pointer, beforeDomClick, afterDomClick, uploaded:await page.getByLabel('Upload').evaluate(el=>el.files[0].name), cookies:await context.cookies(), planted, scroll:await page.evaluate(()=>scrollY)};
-} finally { await new Promise(resolve => server.close(resolve)); }
+  await writeFile(OUTPUT + '/phase.txt','before-readonly');
+  const result = {name:await page.getByRole('textbox', {name:'Name',exact:true}).inputValue(), frame:await page.frameLocator('iframe').getByRole('textbox').inputValue(), popupTitle, text, pointer, beforeDomClick, afterDomClick, uploaded:await page.getByLabel('Upload').evaluate(el=>el.files[0].name), cookies:await context.cookies(), planted, scroll:await page.evaluate(()=>scrollY)};
+  await writeFile(OUTPUT + '/phase.txt','readonly-complete');
+  return result;
+} finally {
+  await writeFile(OUTPUT + '/phase.txt','server-close-start');
+  await new Promise(resolve => {server.close(resolve);server.closeAllConnections();});
+  await writeFile(OUTPUT + '/phase.txt','server-close-complete');
+}
 "#.replace("OUTPUT", &output);
         let result = Box::pin(execute_command(
             &json!({"action":"run_playwright","code":code,"timeoutMs":45000}),
             &mut state,
         ))
         .await;
-        assert_eq!(result["success"], true, "{result}");
+        let phase = std::fs::read_to_string(artifacts.join("phase.txt"))
+            .unwrap_or_else(|_| "phase was not reached".into());
+        eprintln!(
+            "ordinary_fixture_receipt={}",
+            json!({"artifacts":artifacts,"phase":phase})
+        );
+        assert_eq!(result["success"], true, "{result}; fixture phase={phase}");
         let values = &result["data"]["result"];
         assert_eq!(values["name"], "Ada Lovelace");
         assert_eq!(values["frame"], "Frame retained");

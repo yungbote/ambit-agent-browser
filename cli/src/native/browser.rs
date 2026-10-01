@@ -423,6 +423,19 @@ fn native_tab_target<'a>(event: &'a CdpEvent, known: &HashSet<String>) -> Option
         .filter(|id| !id.is_empty() && !known.contains(*id))
 }
 
+fn native_created_target_is_unique(target: &str, known: &HashSet<String>, current: &Value) -> bool {
+    let Some(targets) = current["targetInfos"].as_array() else {
+        return false;
+    };
+    let created = targets
+        .iter()
+        .filter(|info| info["type"] == "page" && info["openerId"].is_null())
+        .filter_map(|info| info["targetId"].as_str())
+        .filter(|id| !id.is_empty() && !known.contains(*id))
+        .collect::<HashSet<_>>();
+    created.len() == 1 && created.contains(target)
+}
+
 /// Chrome reports the requested URL before redirects and the loader that
 /// follows them. Old-page and child-frame events cannot admit this wait.
 async fn native_navigation_start(
@@ -923,6 +936,9 @@ impl BrowserManager {
             initialize_lightpanda_manager(ws_url, process).await?
         } else {
             let client = Arc::new(CdpClient::connect(&ws_url).await?);
+            if let BrowserProcess::Chrome(chrome) = &process {
+                client.bind_site_profile(chrome.site_profile());
+            }
             let mut manager = Self {
                 client,
                 browser_process: Some(process),
@@ -944,6 +960,15 @@ impl BrowserManager {
                 documents: Default::default(),
             };
             manager.discover_and_attach_targets().await?;
+            for page in &manager.pages {
+                manager
+                    .client
+                    .site_profile()
+                    .documents
+                    .seed_fresh(&manager.client, &page.session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
             manager
         };
 
@@ -1194,18 +1219,7 @@ impl BrowserManager {
     }
 
     pub async fn enable_browser_auto_attach_pub(&self) -> Result<(), String> {
-        self.client
-            .send_command(
-                "Target.setAutoAttach",
-                Some(json!({
-                    "autoAttach": true,
-                    "waitForDebuggerOnStart": true,
-                    "flatten": true
-                })),
-                None,
-            )
-            .await?;
-        Ok(())
+        self.client.enable_browser_auto_attach().await
     }
 
     async fn enable_domains(&self, session_id: &str) -> Result<(), String> {
@@ -2218,6 +2232,22 @@ impl BrowserManager {
                 "The new browser tab is not the visible tab; inspect the browser before retrying"
                     .into(),
             );
+        }
+        // Input/visibility already prove which tab this operation selected.
+        // A second birth, replacement, or foreign attachment cannot lend it
+        // complete history/emulation custody. Ordinary tab behavior remains.
+        if let Ok(current) = self
+            .client
+            .send_command_no_params("Target.getTargets", None)
+            .await
+        {
+            let session = self.active_session_id()?;
+            if native_created_target_is_unique(&target, &known, &current)
+                && self.client.target_for_session(session).as_deref() == Some(target.as_str())
+            {
+                self.client.site_profile().documents.created(&target);
+                self.client.seed_script_enabled(session);
+            }
         }
         Ok(result)
     }
@@ -3577,6 +3607,30 @@ pub(crate) mod tests {
             session_id: None,
         };
         assert_eq!(native_tab_target(&new, &known), Some("native-created"));
+    }
+
+    #[test]
+    fn native_birth_custody_requires_one_current_same_target() {
+        let known = HashSet::from(["existing".to_string()]);
+        let page = |id: &str| json!({"targetId":id,"type":"page"});
+        assert!(native_created_target_is_unique(
+            "new",
+            &known,
+            &json!({"targetInfos":[page("existing"),page("new")]})
+        ));
+        for current in [
+            json!({}),
+            json!({"targetInfos":[]}),
+            json!({"targetInfos":[page("existing")]}),
+            json!({"targetInfos":[page("replacement")]}),
+            json!({"targetInfos":[page("new"),page("second-birth")]}),
+            json!({"targetInfos":[{"targetId":"new","type":"page","openerId":"existing"}]}),
+        ] {
+            assert!(
+                !native_created_target_is_unique("new", &known, &current),
+                "{current}"
+            );
+        }
     }
 
     #[tokio::test]

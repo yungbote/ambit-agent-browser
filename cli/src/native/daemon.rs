@@ -517,7 +517,7 @@ async fn handle_connection<S>(
                 let admitted_at = std::time::Instant::now();
                 let mut response = match admitted {
                     Ok(mut s) => {
-                        let response = if action == "run_playwright" {
+                        let mut response = if action == "run_playwright" {
                             let execution = execute_command_received(&cmd, &mut s, received_at);
                             tokio::pin!(execution);
                             tokio::select! {
@@ -534,6 +534,14 @@ async fn handle_connection<S>(
                         };
                         // Refresh while command custody is still held.
                         idle_activity.mark();
+                        if let Some(browser) = &s.browser {
+                            let values = browser.client.site_context().values;
+                            if matches!(action.as_str(), "evaluate" | "run_playwright") {
+                                values.scrub_response(&mut response);
+                            } else {
+                                values.scrub_browser_response(&mut response);
+                            }
+                        }
                         response
                     }
                     Err(response) => response,
@@ -640,10 +648,21 @@ async fn command_state<'a>(
         let _stop = super::browser_control::ControlRequest::parse(command)
             .ok()
             .map(|_| operations.interrupt(InterruptReason::HumanControl));
-        tokio::time::timeout(Duration::from_secs(2), state.lock()).await.map_err(|_| serde_json::json!({
+        tokio::time::timeout(Duration::from_secs(2),async {
+            operations.settled().await;
+            state.lock().await
+        }).await.map_err(|_| serde_json::json!({
             "id": command["id"], "success": false, "code": "browser_control_unavailable",
             "error": "The browser is finishing its current operation. Try taking control again when it finishes.",
         }))
+    } else if matches!(command["action"].as_str(), Some("close"))
+        || command["action"] == INTERNAL_DAEMON_SHUTDOWN_ACTION
+    {
+        let _stop = operations.interrupt(InterruptReason::Shutdown);
+        tokio::time::timeout(Duration::from_secs(7),async {
+            operations.settled().await;
+            state.lock().await
+        }).await.map_err(|_|serde_json::json!({"id":command["id"],"success":false,"code":"browser_operation_rejected","error":"The browser program has not settled; the browser was not closed."}))
     } else {
         Ok(state.lock().await)
     }

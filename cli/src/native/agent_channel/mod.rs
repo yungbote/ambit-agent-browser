@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -42,6 +43,7 @@ use reply::{Retained, Slot, MAX_REPLY_BYTES, MAX_REQUEST_BYTES, RETAINED_ABOVE};
 use step::{PreparedStep, EXCLUDED_OPS};
 
 use crate::mcp::host_bound::{catalog_identity, HostFlags};
+use crate::native::site_sessions::protocol::{self as site_protocol, Request as SiteRequest};
 use crate::native::stream::IdleActivity;
 
 /// The daemon action the toolbox's agent route names on every line.
@@ -68,6 +70,7 @@ pub(crate) struct Identity {
     pub(crate) namespace: String,
     pub(crate) session: String,
     pub(crate) require_sandbox: bool,
+    pub(crate) browser_host: bool,
 }
 
 impl Identity {
@@ -78,6 +81,8 @@ impl Identity {
             namespace: std::env::var("AGENT_BROWSER_NAMESPACE").unwrap_or_default(),
             session: session.to_string(),
             require_sandbox: crate::native::actions::require_sandbox_from_env(),
+            browser_host: crate::native::workspace_role::current()
+                .is_ok_and(|role| role.is_browser_host()),
         }
     }
 }
@@ -85,6 +90,7 @@ impl Identity {
 /// A frame's context for the steps it runs.
 pub(crate) struct FrameContext<'a> {
     pub(crate) channel: ChannelId,
+    pub(crate) owner: Option<Owner>,
     pub(crate) binding: &'a Binding,
     /// The Action's private browser directory.
     pub(crate) directory: &'a Path,
@@ -147,6 +153,43 @@ pub(crate) struct Finish {
 
 /// Where a channel's steps run.
 pub(crate) trait Browser: Sync {
+    fn action_files(
+        &self,
+        _channel: ChannelId,
+        _owner: Owner,
+        _files: Option<Vec<crate::native::playwright::files::Receipt>>,
+        _ledger: &Ledger,
+    ) -> impl Future<Output = Result<Value, String>> + Send {
+        async { Err("This browser does not serve native Action staging.".into()) }
+    }
+    fn program_request(
+        &self,
+        _channel: ChannelId,
+        _owner: Owner,
+        _request: crate::native::playwright::remote::Request,
+        _ledger: &Ledger,
+    ) -> impl Future<Output = Result<Value, String>> + Send {
+        async { Err("This browser does not serve remote programs.".into()) }
+    }
+    fn fence_program(&self, _owner: Owner) -> impl Future<Output = ()> + Send {
+        async {}
+    }
+    fn site_request(
+        &self,
+        _channel: ChannelId,
+        _request: SiteRequest,
+        _ledger: Arc<Ledger>,
+    ) -> impl Future<Output = Result<Value, &'static str>> + Send {
+        async { Err("This browser does not serve site custody.") }
+    }
+
+    fn custody_events(&self) -> Option<tokio::sync::broadcast::Receiver<(ChannelId, Value)>> {
+        None
+    }
+    fn redact(&self, _value: &mut Value) {}
+    fn redact_step(&self, _op: &str, value: &mut Value) {
+        self.redact(value);
+    }
     /// Runs one prepared step under command custody taken for it alone.
     fn step(
         &self,
@@ -161,6 +204,12 @@ pub(crate) trait Browser: Sync {
         frame: &FrameContext<'_>,
         asks: &Asks<'_>,
     ) -> impl Future<Output = Finish> + Send;
+
+    /// Immediate authority fence when the connection ends. Ordinary input
+    /// settlement remains in end after its currently executing step finishes.
+    fn channel_closed(&self, _channel: ChannelId) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 
     /// `channel` ended and starts nothing more: the input its steps left
     /// held is released, unless another channel's step acted since.
@@ -255,7 +304,7 @@ impl ArtifactDigest {
 
 /// The daemon's agent channels: what outlives any one connection.
 pub(crate) struct Endpoint {
-    ledger: Ledger,
+    ledger: Arc<Ledger>,
     identity: Identity,
     artifact: ArtifactDigest,
 }
@@ -263,7 +312,7 @@ pub(crate) struct Endpoint {
 impl Endpoint {
     pub(crate) fn new(identity: Identity) -> Self {
         Self {
-            ledger: Ledger::default(),
+            ledger: Arc::new(Ledger::default()),
             identity,
             artifact: ArtifactDigest::of_executable(),
         }
@@ -311,15 +360,73 @@ impl Endpoint {
             inbox.receive(line, &self.ledger);
         }
         let mut session: Option<Session> = None;
-        while let Some(received) = inbox.next(&self.ledger).await {
+        let mut events = browser.custody_events();
+        loop {
+            let received = loop {
+                tokio::select! {
+                    received=inbox.next(&self.ledger)=>break received,
+                    event=async { events.as_mut().unwrap().recv().await }, if events.is_some()=>{
+                        if let Ok((channel,event))=event {
+                            if session.as_ref().is_some_and(|session|session.channel==channel) && write_line(writer,&event).await.is_err() {inbox.close(&self.ledger);}
+                        }
+                    }
+                }
+            };
+            let Some(received) = received else {
+                if let Some(session) = &session {
+                    browser.channel_closed(session.channel).await;
+                }
+                break;
+            };
             idle.mark();
             let sequence = received.sequence;
-            let outcome = with_read_ahead(
-                self.process(browser, session.as_ref(), received),
-                &mut inbox,
-                &self.ledger,
-            )
-            .await;
+            let outcome = {
+                let work = self.process(browser, session.as_ref(), received);
+                tokio::pin!(work);
+                let mut completed = None;
+                let mut independent = FuturesUnordered::new();
+                loop {
+                    if independent.is_empty() {
+                        if let Some(output) = completed.take() {
+                            break output;
+                        }
+                    }
+                    tokio::select! {
+                        biased;
+                        output=&mut work, if completed.is_none()=> { completed=Some(output); }
+                        output=independent.next(), if !independent.is_empty()=> {
+                            if let Some(Some((reply,_)))=output {
+                                if write_line(writer,&reply).await.is_err() { inbox.close(&self.ledger); }
+                            }
+                        }
+                        event=async { events.as_mut().unwrap().recv().await }, if events.is_some()=>{
+                            if let Ok((channel,event))=event {
+                                if session.as_ref().is_some_and(|session|session.channel==channel) && write_line(writer,&event).await.is_err() {inbox.close(&self.ledger);}
+                            }
+                        }
+                        line=inbox.read_line(), if !inbox.closed=>{
+                            if let Some(line)=line {
+                                inbox.receive(line,&self.ledger);
+                                if inbox.frames.back().is_some_and(|received| match &received.frame {
+                                    Ok((_,Frame::Site(_)))=>true,
+                                    Ok((_,Frame::Files(_,_)))=>true,
+                                    Ok((_,Frame::Program(_,request)))=>request.independent(),
+                                    _=>false,
+                                }) && independent.len()<MAX_IN_FLIGHT {
+                                    let received=inbox.frames.pop_back().unwrap();
+                                    inbox.queued_bytes=inbox.queued_bytes.saturating_sub(received.bytes);
+                                    independent.push(self.process(browser,session.as_ref(),received).boxed());
+                                }
+                            } else { inbox.close(&self.ledger); }
+                        }
+                    }
+                    if inbox.closed {
+                        if let Some(session) = &session {
+                            browser.channel_closed(session.channel).await;
+                        }
+                    }
+                }
+            };
             // A line without a usable id cannot be answered in step.
             let Some((reply, established)) = outcome else {
                 break;
@@ -369,7 +476,16 @@ impl Endpoint {
             Ok(frame) => frame,
         };
         Some(match (frame, session) {
-            (Frame::Hello(hello), None) => self.hello(id, hello).await,
+            (Frame::Hello(hello), None) => {
+                let owner = hello.owner;
+                let result = self.hello(id, hello).await;
+                if result.1.is_some() {
+                    if let Some(owner) = owner {
+                        browser.fence_program(owner).await;
+                    }
+                }
+                result
+            }
             (Frame::Hello(_), Some(_)) => (
                 refusal(
                     id,
@@ -392,9 +508,80 @@ impl Endpoint {
                 None,
             ),
             (Frame::OpStatus(query), Some(session)) => {
+                if self.ledger.register(session.channel, query.owner).is_ok() {
+                    browser.fence_program(query.owner).await;
+                }
                 (self.op_status(session, id, query).await, None)
             }
-            (Frame::Sequence(_), None) | (Frame::OpStatus(_), None) => (
+            (Frame::Site(request), Some(session)) => {
+                let result =
+                    if session.binding.browser_host && self.ledger.may_continue(session.channel) {
+                        browser
+                            .site_request(session.channel, request, self.ledger.clone())
+                            .await
+                    } else {
+                        Err("Site custody requires this daemon's immutable browser-host role.")
+                    };
+                let reply = match result {
+                    Ok(data) => json!({"id":id,"success":true,"data":data}),
+                    Err(error) => refusal(id, "browser_site_custody_refused", error, false),
+                };
+                (reply, None)
+            }
+            (Frame::Program(owner, request), Some(session)) => {
+                let reply = if !session.binding.browser_host {
+                    refusal(
+                        id,
+                        BINDING_REFUSED,
+                        "Remote programs require this daemon's immutable browser-host role.",
+                        false,
+                    )
+                } else if self.ledger.register(session.channel, owner).is_err() {
+                    refusal(id, FENCED, FENCED_MESSAGE, false)
+                } else {
+                    browser.fence_program(owner).await;
+                    match browser
+                        .program_request(session.channel, owner, request, &self.ledger)
+                        .await
+                    {
+                        Ok(data) => json!({"id":id,"success":true,"data":data}),
+                        Err(error) => {
+                            let code = crate::native::browser::error_code(&error)
+                                .unwrap_or(REJECTED)
+                                .to_owned();
+                            refusal(id, &code, error, false)
+                        }
+                    }
+                };
+                (reply, None)
+            }
+            (Frame::Files(owner, files), Some(session)) => {
+                let reply = if !session.binding.browser_host {
+                    refusal(
+                        id,
+                        BINDING_REFUSED,
+                        "Native Action staging requires the immutable browser-host role.",
+                        false,
+                    )
+                } else if self.ledger.register(session.channel, owner).is_err() {
+                    refusal(id, FENCED, FENCED_MESSAGE, false)
+                } else {
+                    browser.fence_program(owner).await;
+                    match browser
+                        .action_files(session.channel, owner, files, &self.ledger)
+                        .await
+                    {
+                        Ok(data) => json!({"id":id,"success":true,"data":data}),
+                        Err(error) => refusal(id, REJECTED, error, false),
+                    }
+                };
+                (reply, None)
+            }
+            (Frame::Sequence(_), None)
+            | (Frame::OpStatus(_), None)
+            | (Frame::Site(_), None)
+            | (Frame::Program(_, _), None)
+            | (Frame::Files(_, _), None) => (
                 refusal(
                     id,
                     PROTOCOL_REFUSED,
@@ -414,12 +601,13 @@ impl Endpoint {
         if binding.namespace != self.identity.namespace
             || binding.session != self.identity.session
             || binding.require_sandbox != self.identity.require_sandbox
+            || binding.browser_host != self.identity.browser_host
         {
             return (
                 refusal(
                     id,
                     BINDING_REFUSED,
-                    "The binding is not this browser's: its namespace, session or sandbox policy differ.",
+                    "The binding is not this browser's: its namespace, session, sandbox policy or workspace role differ.",
                     false,
                 ),
                 None,
@@ -466,10 +654,13 @@ impl Endpoint {
             "catalog": catalog_identity(),
             "driverArtifactDigest": digest,
             "features": FEATURES,
+            "sessionCustody": site_protocol::VERSION,
             "excludedOps": EXCLUDED_OPS,
             "limits": {
                 "maxInFlight": MAX_IN_FLIGHT, "maxRequestBytes": MAX_REQUEST_BYTES,
                 "maxReplyBytes": MAX_REPLY_BYTES, "ledgerEntries": ledger::ENTRIES,
+                "maxCustodyBytes":site_protocol::MAX_FRAME_BYTES,
+                "maxCustodyChunkBytes":crate::native::site_sessions::bytes::CHUNK_BYTES,
                 "ledgerBytes": ledger::BYTES, "candidates": CANDIDATES,
                 "resolve": frame::MAX_RESOLVE,
             },
@@ -513,6 +704,7 @@ impl Endpoint {
                 self.ledger.not_started(channel, id, Some(owner));
                 return refusal(id, FENCED, FENCED_MESSAGE, true);
             }
+            browser.fence_program(owner).await;
         }
         let steps = match step::prepare(&session.flags, &frame.steps) {
             Ok(steps) => steps,
@@ -531,6 +723,7 @@ impl Endpoint {
         }
         let context = FrameContext {
             channel,
+            owner,
             binding: &session.binding,
             directory: &frame.directory,
             received_at,
@@ -540,7 +733,12 @@ impl Endpoint {
             if !self.ledger.may_continue(channel) {
                 break;
             }
-            let record = browser.step(&context, step).await;
+            let mut record = browser.step(&context, step).await;
+            // Redact before either the ledger or a retained result can keep it.
+            browser.redact_step(&record.op, &mut record.result);
+            if let Some(landed) = &mut record.landed {
+                browser.redact(landed);
+            }
             let succeeded = record.succeeded;
             records.push(record);
             if !succeeded {
@@ -550,7 +748,7 @@ impl Endpoint {
         // A channel that stopped asks for nothing more than the page it
         // left: nobody will act on an observation.
         let live = self.ledger.may_continue(channel);
-        let finish = browser
+        let mut finish = browser
             .finish(
                 &context,
                 &Asks {
@@ -560,6 +758,13 @@ impl Endpoint {
                 },
             )
             .await;
+        browser.redact(&mut finish.browser);
+        if let Some(observation) = &mut finish.observation {
+            browser.redact(observation);
+        }
+        if let Some(resolved) = &mut finish.resolved {
+            browser.redact(resolved);
+        }
         let success = records.iter().all(|record| record.succeeded);
         let retained = |step: usize| Retained {
             directory: frame.directory.clone(),
@@ -768,7 +973,32 @@ impl<R: AsyncRead + Unpin> Inbox<'_, R> {
             Ok(value) => {
                 let sequence = value["type"] == "sequence";
                 let owner = frame::lenient_owner(&value);
-                let frame = if value["action"] != ACTION {
+                let kind = value["type"].as_str().unwrap_or_default();
+                if !site_protocol::is_kind(kind)
+                    && (line.len() > MAX_REQUEST_BYTES + 1
+                        || self
+                            .frames
+                            .iter()
+                            .filter(|received| !matches!(received.frame, Ok((_, Frame::Site(_)))))
+                            .map(|received| received.bytes)
+                            .sum::<usize>()
+                            + line.len()
+                            > MAX_REQUEST_BYTES + 1)
+                {
+                    self.close(ledger);
+                    return;
+                }
+                let limit = if matches!(kind, "site_session.attach" | "site_session.export") {
+                    site_protocol::MAX_FRAME_BYTES
+                } else {
+                    MAX_REQUEST_BYTES
+                };
+                let frame = if line.len() > limit + 1 {
+                    Err(Invalid {
+                        id: frame::id_of(&value),
+                        message: "The agent frame exceeds its byte limit.".into(),
+                    })
+                } else if value["action"] != ACTION {
                     Err(Invalid {
                         id: frame::id_of(&value),
                         message: "An agent channel carries agent frames only.".into(),
@@ -821,17 +1051,6 @@ impl<R: AsyncRead + Unpin> Inbox<'_, R> {
         Some(received)
     }
 
-    /// Reads frames while one runs, until the connection ends. Safe to
-    /// cancel between reads: a partial line is kept.
-    async fn read_ahead(&mut self, ledger: &Ledger) {
-        while !self.closed {
-            match self.read_line().await {
-                Some(line) => self.receive(line, ledger),
-                None => self.close(ledger),
-            }
-        }
-    }
-
     fn close(&mut self, ledger: &Ledger) {
         self.closed = true;
         if let Some(channel) = self.channel {
@@ -851,7 +1070,9 @@ impl<R: AsyncRead + Unpin> Inbox<'_, R> {
                 .iter()
                 .position(|byte| *byte == b'\n')
                 .map_or(available.len(), |index| index + 1);
-            if self.queued_bytes + self.partial.len() + count > MAX_REQUEST_BYTES + 1 {
+            if self.queued_bytes + self.partial.len() + count
+                > MAX_REQUEST_BYTES + site_protocol::MAX_FRAME_BYTES + 1
+            {
                 return None;
             }
             self.partial.extend_from_slice(&available[..count]);
@@ -863,20 +1084,11 @@ impl<R: AsyncRead + Unpin> Inbox<'_, R> {
     }
 }
 
-/// Runs `work` while the connection keeps being read.
-async fn with_read_ahead<T, R: AsyncRead + Unpin>(
-    work: impl Future<Output = T>,
-    inbox: &mut Inbox<'_, R>,
-    ledger: &Ledger,
-) -> T {
-    tokio::pin!(work);
-    loop {
-        tokio::select! {
-            biased;
-            output = &mut work => return output,
-            _ = inbox.read_ahead(ledger), if !inbox.closed => {}
-        }
-    }
+async fn write_line<W: AsyncWrite + Unpin>(writer: &mut W, value: &Value) -> std::io::Result<()> {
+    let mut line = value.to_string();
+    line.push('\n');
+    writer.write_all(line.as_bytes()).await?;
+    writer.flush().await
 }
 
 /// A frame refused before any step ran. A refused `sequence` answers with
