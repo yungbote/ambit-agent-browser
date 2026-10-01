@@ -410,14 +410,15 @@ async fn e2e_lazy_site_attach_applies_before_the_first_real_document_request() {
                     .params
                     .pointer("/frame/url")
                     .and_then(Value::as_str)
-                    .is_some_and(|url| url.starts_with(&origin))
+                    .is_some_and(|url| url == "about:blank")
             {
                 break;
             }
         }
     })
     .await
-    .expect("expiry clears the site and reloads its real page");
+    .expect("expiry retires the site's current document in its retained tab");
+    browser.navigate(&origin, WaitUntil::Load).await.unwrap();
     let expired = custody
         .request(
             foreign,
@@ -1065,4 +1066,288 @@ async fn e2e_site_state_capacity_cancel_closes_its_private_document() {
         retired && !remains,
         "cancelled capture closes the private document before completion"
     );
+}
+
+/// Retired documents must not rewrite cleared credentials from retained JS.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_site_state_clear_does_not_repopulate_from_retired_document() {
+    use super::custody::Custody;
+    use super::protocol::Request;
+    use crate::native::agent_channel::frame::ChannelId;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0; 4096];
+                let _ = socket.read(&mut request).await;
+                let body = "<!doctype html><title>Retirement</title>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length:{}\r\nConnection:close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    let mut owned = browser().await;
+    let owner = Custody::new();
+    owner
+        .browser_ready(
+            owned.client.clone(),
+            vec![owned.active_session_id().unwrap().to_owned()],
+        )
+        .await
+        .unwrap();
+    owned.navigate(&origin, WaitUntil::Load).await.unwrap();
+    let session = owned.active_session_id().unwrap().to_owned();
+    assert_eq!(evaluate(&owned,r#"(()=>{globalThis.nosecretRetiredWriter=()=>{localStorage.setItem('retired-state','nosecret-from-retired-document');document.cookie='retired_cookie=nosecret-retired;path=/';};addEventListener('pagehide',nosecretRetiredWriter);localStorage.setItem('before-clear','nosecret-before-clear');return true})()"#).await,true);
+    let channel = ChannelId::parse("11111111-1111-4111-8111-111111111111").unwrap();
+    owner
+        .request(
+            channel,
+            Request::read(
+                "site_session.detach",
+                json!({"sites":["http://127.0.0.1"],"reason":"revoked"}),
+            )
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    // If the old execution context survived, deterministically invoke its
+    // retained writer after the receipt instead of relying on interval timing.
+    let still_live = evaluate(&owned, "typeof nosecretRetiredWriter==='function'").await;
+    if still_live == true {
+        evaluate(&owned, "nosecretRetiredWriter();true").await;
+    }
+    owned.navigate(&origin, WaitUntil::Load).await.unwrap();
+    let restored=evaluate(&owned,"({storage:localStorage.getItem('retired-state'),cookie:document.cookie.includes('retired_cookie')})").await;
+    let targets = owned
+        .client
+        .send_command_no_params("Target.getTargets", None)
+        .await
+        .unwrap();
+    eprintln!(
+        "retired_writer_receipt={}",
+        json!({"oldWriterLiveAfterClear":still_live,"restoredCanary":restored["storage"].is_string(),"cookieRestored":restored["cookie"],"nativeTargets":targets["targetInfos"].as_array().unwrap().len()})
+    );
+    storage::clear_site(&owned.client, "http://127.0.0.1", &[origin])
+        .await
+        .unwrap();
+    owned.close().await.unwrap();
+    server.abort();
+    let _ = server.await;
+    assert_eq!(
+        still_live, false,
+        "a successful cleanup must retire the old writer before returning"
+    );
+    assert_eq!(restored["storage"], Value::Null);
+    assert_eq!(restored["cookie"], false);
+    let _ = session;
+}
+
+/// Task-only mechanism comparison: no product history policy is changed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_site_state_document_retirement_history_spike() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0; 4096];
+                let _ = socket.read(&mut request).await;
+                let body = "<!doctype html><title>History spike</title>";
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length:{}\r\nConnection:close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    let mut receipts = Vec::new();
+    for (clear, reset_history, mechanism) in [
+        (false, false, "blank"),
+        (true, false, "blank"),
+        (true, true, "blank"),
+        (true, false, "terminate"),
+        (true, false, "cached-evaluate"),
+        (true, false, "target"),
+    ] {
+        let mut owned = browser().await;
+        let prior = format!("{origin}/prior");
+        let current = format!("{origin}/current");
+        owned.navigate(&prior, WaitUntil::Load).await.unwrap();
+        owned.navigate(&current, WaitUntil::Load).await.unwrap();
+        let target = owned.active_target_id().unwrap().to_owned();
+        let session = owned.active_session_id().unwrap().to_owned();
+        let cached_context = if mechanism == "cached-evaluate" {
+            owned
+                .client
+                .send_command_no_params("Runtime.disable", Some(&session))
+                .await
+                .unwrap();
+            let mut events = owned.client.subscribe();
+            owned
+                .client
+                .send_command_no_params("Runtime.enable", Some(&session))
+                .await
+                .unwrap();
+            Some(
+                tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                    loop {
+                        let event = events.recv().await.unwrap();
+                        if event.method == "Runtime.executionContextCreated"
+                            && event.session_id.as_deref() == Some(&session)
+                            && event.params.pointer("/context/auxData/isDefault")
+                                == Some(&json!(true))
+                            && event.params.pointer("/context/origin") == Some(&json!(origin))
+                        {
+                            break event.params["context"]["uniqueId"]
+                                .as_str()
+                                .unwrap()
+                                .to_owned();
+                        }
+                    }
+                })
+                .await
+                .unwrap(),
+            )
+        } else {
+            None
+        };
+        evaluate(&owned,r#"(()=>{globalThis.nosecretHistoryWriter=()=>{localStorage.setItem('history-state','nosecret-retained-history');document.cookie='history_cookie=nosecret-retained;path=/'};addEventListener('pagehide',nosecretHistoryWriter);return true})()"#).await;
+        let history = owned
+            .client
+            .send_command_no_params("Page.getNavigationHistory", Some(&session))
+            .await
+            .unwrap();
+        let old_entry = history["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["url"] == current)
+            .unwrap()["id"]
+            .clone();
+        if mechanism == "terminate" {
+            owned
+                .client
+                .send_command_no_params("Runtime.terminateExecution", Some(&session))
+                .await
+                .unwrap();
+        }
+        if mechanism == "target" {
+            owned.tab_new(None, None).await.unwrap();
+            let index = owned
+                .tab_list()
+                .iter()
+                .position(|page| page["targetId"] == target)
+                .unwrap();
+            owned.tab_close(Some(index), None).await.unwrap();
+        } else {
+            owned
+                .navigate("about:blank", WaitUntil::Load)
+                .await
+                .unwrap();
+        }
+        if reset_history {
+            owned
+                .client
+                .send_command_no_params("Page.resetNavigationHistory", Some(&session))
+                .await
+                .unwrap();
+        }
+        let cached_evaluation = if let Some(context) = cached_context {
+            // Blink's cached-frame hook evicts attempted script execution. This
+            // spike checks whether CDP can address that exact inactive context.
+            Some(
+                owned
+                    .client
+                    .send_command(
+                        "Runtime.evaluate",
+                        Some(json!({
+                            "expression":"void 0", "uniqueContextId":context,
+                            "returnByValue":true
+                        })),
+                        Some(&session),
+                    )
+                    .await
+                    .map(|reply| reply.get("exceptionDetails").is_none())
+                    .map_err(|_| "unavailable"),
+            )
+        } else {
+            None
+        };
+        if clear {
+            storage::clear_site(
+                &owned.client,
+                "http://127.0.0.1",
+                std::slice::from_ref(&origin),
+            )
+            .await
+            .unwrap();
+        }
+        let current_session = owned.active_session_id().unwrap().to_owned();
+        let after = owned
+            .client
+            .send_command_no_params("Page.getNavigationHistory", Some(&current_session))
+            .await
+            .unwrap();
+        let retained_entry = after["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|entry| entry["id"] == old_entry);
+        let old_writer_restored = if retained_entry {
+            let mut events = owned.client.subscribe();
+            owned
+                .client
+                .send_command(
+                    "Page.navigateToHistoryEntry",
+                    Some(json!({"entryId":old_entry})),
+                    Some(&session),
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                loop {
+                    let event = events.recv().await.unwrap();
+                    if event.method == "Page.frameNavigated"
+                        && event.params["frame"]["url"] == current
+                    {
+                        break;
+                    }
+                }
+            })
+            .await
+            .unwrap();
+            let restored = evaluate(&owned, "typeof nosecretHistoryWriter==='function'").await;
+            if restored == true {
+                evaluate(&owned, "nosecretHistoryWriter();true").await;
+            }
+            restored
+        } else {
+            owned.navigate(&current, WaitUntil::Load).await.unwrap();
+            Value::Bool(false)
+        };
+        let value=evaluate(&owned,"({storage:localStorage.getItem('history-state')!==null,cookie:document.cookie.includes('history_cookie')})").await;
+        receipts.push(json!({"mechanism":mechanism,"clear":clear,"resetHistory":reset_history,"cachedEvaluation":cached_evaluation,"beforeEntries":history["entries"].as_array().unwrap().len(),"afterEntries":after["entries"].as_array().unwrap().len(),"priorRetained":after["entries"].as_array().unwrap().iter().any(|entry|entry["url"]==prior),"currentEntryRetained":retained_entry,"oldWriterRestored":old_writer_restored,"statePresentAfterBack":value["storage"],"cookiePresentAfterBack":value["cookie"],"targetPreserved":owned.active_target_id().is_ok_and(|current|current==target)}));
+        storage::clear_site(
+            &owned.client,
+            "http://127.0.0.1",
+            std::slice::from_ref(&origin),
+        )
+        .await
+        .unwrap();
+        owned.close().await.unwrap();
+    }
+    server.abort();
+    let _ = server.await;
+    eprintln!("retirement_history_spike_receipt={}", json!(receipts));
+    assert!(receipts
+        .iter()
+        .filter(|receipt| receipt["mechanism"] != "target")
+        .all(|receipt| receipt["targetPreserved"] == true));
 }

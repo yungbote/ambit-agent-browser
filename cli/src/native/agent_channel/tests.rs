@@ -26,6 +26,7 @@ struct Scripted {
     custody: Option<tokio::sync::broadcast::Sender<(ChannelId, Value)>>,
     ran: StdMutex<Vec<String>>,
     started: Notify,
+    custody_closed: Notify,
     go: Notify,
     /// Each channel told it ended, with how many steps had run by then.
     ended: StdMutex<Vec<(String, usize)>>,
@@ -79,6 +80,7 @@ impl Browser for Scripted {
         &self,
         _: ChannelId,
         request: SiteRequest,
+        _: Arc<Ledger>,
     ) -> Result<Value, &'static str> {
         match request {
             SiteRequest::Refuse { site, .. } => {
@@ -149,6 +151,10 @@ impl Browser for Scripted {
             queue_us: 5,
             observe_us: 50,
         }
+    }
+
+    async fn channel_closed(&self, _: ChannelId) {
+        self.custody_closed.notify_one();
     }
 
     async fn end(&self, channel: ChannelId) {
@@ -313,7 +319,7 @@ async fn a_hello_answers_the_catalog_the_driver_digest_and_the_channels_bounds()
     assert_eq!(reply["success"], true, "{reply}");
     let data = &reply["data"];
     assert_eq!(data["protocol"], 1);
-    assert_eq!(data["sessionCustody"], 3);
+    assert_eq!(data["sessionCustody"], 4);
     assert_eq!(data["catalog"], crate::mcp::host_bound::catalog_identity());
     assert!(data["catalog"].get("tools").is_none());
     assert_eq!(data["driverArtifactDigest"], DIGEST);
@@ -321,7 +327,7 @@ async fn a_hello_answers_the_catalog_the_driver_digest_and_the_channels_bounds()
     assert_eq!(data["excludedOps"], json!(["agent_browser_run_playwright"]));
     assert_eq!(
         data["limits"],
-        json!({ "maxInFlight": 4, "maxRequestBytes": 2097152, "maxReplyBytes": 4194304,"maxCustodyBytes":8389632,
+        json!({ "maxInFlight": 4, "maxRequestBytes": 2097152, "maxReplyBytes": 4194304,"maxCustodyBytes":8389632,"maxCustodyChunkBytes":1048576,
             "ledgerEntries": 256, "ledgerBytes": 16777216, "candidates": 60, "resolve": 30 })
     );
 }
@@ -765,7 +771,7 @@ async fn a_paused_sequence_emits_need_and_accepts_the_reply_without_command_dead
     let endpoint = endpoint_role(true);
     let (_directory, path) = directory();
     let (mut host, hello) = Host::hello(&endpoint, &browser, json!({"binding":{"version":1,"namespace":"thread","session":"browser","requireSandbox":true,"browserHost":true}})).await;
-    assert_eq!(hello["data"]["sessionCustody"], 3);
+    assert_eq!(hello["data"]["sessionCustody"], 4);
     assert_eq!(hello["data"]["limits"]["maxRequestBytes"], 2 << 20);
     host.send(sequence(2, "41", json!([wait()]), &path)).await;
     let need = host.reply().await;
@@ -881,4 +887,26 @@ async fn a_channel_that_ends_is_told_to_the_browser_after_its_last_step() {
         .unwrap()
         .unwrap();
     assert_eq!(browser.ended(), [(CHANNEL_A.to_string(), 2)]);
+}
+
+#[tokio::test]
+async fn channel_eof_fences_custody_before_the_running_step_settles() {
+    let (endpoint, browser) = (endpoint(), Arc::new(Scripted::default()));
+    let (_directory, path) = directory();
+    let (mut host, _) = Host::hello(&endpoint, &browser, json!({})).await;
+    host.send(sequence(2, "41", json!([wait()]), &path)).await;
+    browser.started.notified().await;
+    drop(host.writer);
+    drop(host.lines);
+    let fenced =
+        tokio::time::timeout(Duration::from_secs(1), browser.custody_closed.notified()).await;
+    browser.go.notify_one();
+    tokio::time::timeout(Duration::from_secs(10), host.served)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        fenced.is_ok(),
+        "custody authority must end on EOF while ordinary input still settles"
+    );
 }

@@ -1,11 +1,12 @@
 //! Closed host-only frames. Invalid input names a rule, never a state value.
 
+use base64::{engine::general_purpose::STANDARD, Engine};
 use serde::Deserialize;
 use serde_json::Value;
 
 use super::state::{self, SiteState};
 
-pub(crate) const VERSION: u64 = 3;
+pub(crate) const VERSION: u64 = 4;
 /// A native state is already JSON. Its enclosing fields have a pinned bound;
 /// neither base64 nor a JSON string wrapping another JSON document is used.
 pub(crate) const MAX_FRAME_BYTES: usize = state::MAX_BYTES + 1024;
@@ -39,6 +40,7 @@ pub(crate) enum Request {
         expires_at: Option<String>,
         state: SiteState,
     },
+    Transfer(TransferRequest),
     Refuse {
         request_id: String,
         site: String,
@@ -46,6 +48,45 @@ pub(crate) enum Request {
     Export(String),
     Detach {
         sites: Vec<String>,
+        revoked: bool,
+    },
+}
+
+pub(crate) enum TransferRequest {
+    Begin {
+        request_id: String,
+        use_id: String,
+        site: String,
+        mode: Mode,
+        page_generation: String,
+        deadline: chrono::DateTime<chrono::Utc>,
+        expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    },
+    Finish {
+        transfer_id: String,
+        bytes: u64,
+        sha256: String,
+    },
+    Part {
+        transfer_id: String,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    Read {
+        transfer_id: String,
+        offset: u64,
+    },
+    Close {
+        transfer_id: String,
+    },
+    Export {
+        site: String,
+        expected_use: Option<String>,
+        deadline: chrono::DateTime<chrono::Utc>,
+    },
+    Detach {
+        site: String,
+        expected_use: Option<String>,
         revoked: bool,
     },
 }
@@ -63,6 +104,11 @@ pub(crate) fn is_kind(kind: &str) -> bool {
             | "site_session.refuse"
             | "site_session.export"
             | "site_session.detach"
+            | "site_session.attach.begin"
+            | "site_session.attach.finish"
+            | "site_session.state.part"
+            | "site_session.state.read"
+            | "site_session.state.close"
     )
 }
 
@@ -113,7 +159,140 @@ impl Request {
                 })
                 .collect()
         };
+        let identifier = |key: &str| {
+            let value = text(key)?;
+            if uuid(&value) {
+                Ok(value)
+            } else {
+                Err(REFUSED)
+            }
+        };
+        let integer = |key: &str| {
+            fields
+                .get(key)
+                .and_then(Value::as_u64)
+                .filter(|value| *value <= 9_007_199_254_740_991)
+                .ok_or(REFUSED)
+        };
+        let expected_use = || match fields.get("expectedUseId") {
+            Some(Value::Null) => Ok(None),
+            Some(Value::String(value)) if uuid(value) => Ok(Some(value.clone())),
+            _ => Err(REFUSED),
+        };
+        let deadline = || expiry(Some(&text("deadlineAt")?))?.ok_or(REFUSED);
+        let one_site = || {
+            let mut values = sites()?;
+            if values.len() != 1 {
+                return Err(REFUSED);
+            }
+            Ok(values.remove(0))
+        };
         match kind {
+            "site_session.attach.begin"
+                if exact(&[
+                    "requestId",
+                    "useId",
+                    "site",
+                    "mode",
+                    "pageGeneration",
+                    "deadlineAt",
+                ]) || exact(&[
+                    "requestId",
+                    "useId",
+                    "site",
+                    "mode",
+                    "pageGeneration",
+                    "deadlineAt",
+                    "expiresAt",
+                ]) =>
+            {
+                let site = text("site")?;
+                state::site_url(&site)?;
+                let page_generation = text("pageGeneration")?;
+                if page_generation.is_empty() || page_generation.len() > 256 {
+                    return Err(REFUSED);
+                }
+                let expires_at = match fields.get("expiresAt") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(value)) => expiry(Some(value))?,
+                    _ => return Err(REFUSED),
+                };
+                Ok(Self::Transfer(TransferRequest::Begin {
+                    request_id: identifier("requestId")?,
+                    use_id: identifier("useId")?,
+                    site,
+                    mode: serde_json::from_value(fields["mode"].clone()).map_err(|_| REFUSED)?,
+                    page_generation,
+                    deadline: deadline()?,
+                    expires_at,
+                }))
+            }
+            "site_session.attach.finish" if exact(&["transferId", "bytes", "sha256"]) => {
+                let sha256 = text("sha256")?;
+                if sha256.len() != 64
+                    || !sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+                {
+                    return Err(REFUSED);
+                }
+                let bytes = integer("bytes")?;
+                if bytes == 0 {
+                    return Err(REFUSED);
+                }
+                Ok(Self::Transfer(TransferRequest::Finish {
+                    transfer_id: identifier("transferId")?,
+                    bytes,
+                    sha256,
+                }))
+            }
+            "site_session.state.part" if exact(&["transferId", "offset", "data"]) => {
+                let encoded = text("data")?;
+                if encoded.is_empty() || encoded.len() > super::bytes::CHUNK_BYTES.div_ceil(3) * 4 {
+                    return Err(REFUSED);
+                }
+                let data = STANDARD.decode(&encoded).map_err(|_| REFUSED)?;
+                if data.len() > super::bytes::CHUNK_BYTES || STANDARD.encode(&data) != encoded {
+                    return Err(REFUSED);
+                }
+                Ok(Self::Transfer(TransferRequest::Part {
+                    transfer_id: identifier("transferId")?,
+                    offset: integer("offset")?,
+                    data,
+                }))
+            }
+            "site_session.state.read" if exact(&["transferId", "offset"]) => {
+                Ok(Self::Transfer(TransferRequest::Read {
+                    transfer_id: identifier("transferId")?,
+                    offset: integer("offset")?,
+                }))
+            }
+            "site_session.state.close" if exact(&["transferId"]) => {
+                Ok(Self::Transfer(TransferRequest::Close {
+                    transfer_id: identifier("transferId")?,
+                }))
+            }
+            "site_session.export"
+                if exact(&["sites", "transfer", "expectedUseId", "deadlineAt"])
+                    && fields["transfer"] == true =>
+            {
+                Ok(Self::Transfer(TransferRequest::Export {
+                    site: one_site()?,
+                    expected_use: expected_use()?,
+                    deadline: deadline()?,
+                }))
+            }
+            "site_session.detach" if exact(&["sites", "reason", "expectedUseId"]) => {
+                let reason = text("reason")?;
+                if !["revoked", "ended"].contains(&reason.as_str()) {
+                    return Err(REFUSED);
+                }
+                Ok(Self::Transfer(TransferRequest::Detach {
+                    site: one_site()?,
+                    expected_use: expected_use()?,
+                    revoked: reason == "revoked",
+                }))
+            }
             "site_sessions.offer" if exact(&["sites"]) => {
                 let offers: Vec<Offer> =
                     serde_json::from_value(fields["sites"].clone()).map_err(|_| REFUSED)?;
@@ -252,5 +431,59 @@ mod tests {
                 fields["useId"] == "11111111-1111-4111-8111-111111111111"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+    use serde_json::json;
+    const ID: &str = "11111111-1111-4111-8111-111111111111";
+    #[test]
+    fn bounded_transfer_frames_have_exact_authority_and_byte_shapes() {
+        let begin = json!({"requestId":ID,"useId":ID,"site":"https://example.com","mode":"act","pageGeneration":"page","deadlineAt":"2026-10-01T00:00:00Z"});
+        assert!(Request::read("site_session.attach.begin", begin.clone()).is_ok());
+        for (key, value) in [
+            ("bytes", json!(1)),
+            ("sha256", json!("a".repeat(64))),
+            ("pageGeneration", json!("")),
+            ("deadlineAt", json!("invalid")),
+            ("useId", Value::Null),
+        ] {
+            let mut invalid = begin.clone();
+            invalid[key] = value;
+            assert!(Request::read("site_session.attach.begin", invalid).is_err());
+        }
+        let data = vec![b'x'; super::super::bytes::CHUNK_BYTES];
+        assert!(Request::read(
+            "site_session.state.part",
+            json!({"transferId":ID,"offset":0,"data":STANDARD.encode(&data)})
+        )
+        .is_ok());
+        for encoded in [
+            STANDARD.encode(vec![b'x'; data.len() + 1]),
+            "eA".into(),
+            "eB==".into(),
+            "eA==\n".into(),
+            "".into(),
+        ] {
+            assert!(Request::read(
+                "site_session.state.part",
+                json!({"transferId":ID,"offset":0,"data":encoded})
+            )
+            .is_err());
+        }
+        assert!(Request::read(
+            "site_session.attach.finish",
+            json!({"transferId":ID,"bytes":1,"sha256":"a".repeat(64)})
+        )
+        .is_ok());
+        assert!(Request::read(
+            "site_session.attach.finish",
+            json!({"transferId":ID,"bytes":0,"sha256":"a".repeat(64)})
+        )
+        .is_err());
+        assert!(Request::read("site_session.export",json!({"sites":["https://example.com"],"transfer":true,"expectedUseId":null,"deadlineAt":"2026-10-01T00:00:00Z"})).is_ok());
+        assert!(Request::read("site_session.export",json!({"sites":["https://example.com"],"transfer":true,"deadlineAt":"2026-10-01T00:00:00Z"})).is_err());
     }
 }

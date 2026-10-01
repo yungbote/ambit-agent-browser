@@ -1,8 +1,9 @@
 //! Temporary custody bytes, streamed without a whole-frame allocation. These
 //! bytes are never a saved browser profile or a second durable custody store.
 
+use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::PathBuf;
 
 /// One work unit fits below the existing 2 MiB control budget even after
@@ -42,6 +43,32 @@ impl Bytes {
     pub(crate) fn reader(&mut self) -> std::io::Result<BufReader<&mut File>> {
         self.file.seek(SeekFrom::Start(0))?;
         Ok(BufReader::new(&mut self.file))
+    }
+
+    /// JSON escaping emits tiny fragments. Buffer them at this shared owner
+    /// so a valid Unicode/control-character row does not cause millions of
+    /// seeks/writes. The buffer is one bounded work unit, never a site limit.
+    pub(crate) fn write_json<T: serde::Serialize + ?Sized>(
+        &mut self,
+        value: &T,
+    ) -> Result<(), serde_json::Error> {
+        let mut writer = BufWriter::new(self);
+        serde_json::to_writer(&mut writer, value)?;
+        writer.flush().map_err(serde_json::Error::io)
+    }
+
+    pub(crate) fn digest(&mut self) -> std::io::Result<String> {
+        let mut hash = Sha256::new();
+        let mut reader = self.reader()?;
+        let mut part = vec![0; CHUNK_BYTES];
+        loop {
+            let count = reader.read(&mut part)?;
+            if count == 0 {
+                break;
+            }
+            hash.update(&part[..count]);
+        }
+        Ok(hex::encode(hash.finalize()))
     }
 
     pub(crate) fn length(&self) -> u64 {
@@ -89,6 +116,25 @@ impl Drop for Bytes {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn buffered_json_preserves_full_unicode_escapes_and_exact_digest() {
+        let document = serde_json::json!({"rows":["雪😀\\\"\n\t\0".repeat(100_000),"𝄞é\r\\雪\"".repeat(100_000)]});
+        let expected = serde_json::to_vec(&document).unwrap();
+        let mut bytes = Bytes::new().unwrap();
+        let started = std::time::Instant::now();
+        bytes.write_json(&document).unwrap();
+        assert_eq!(bytes.length(), expected.len() as u64);
+        assert_eq!(
+            bytes.digest().unwrap(),
+            hex::encode(Sha256::digest(&expected))
+        );
+        assert_eq!(bytes.chunk(0, expected.len()).unwrap(), expected);
+        eprintln!(
+            "buffered_json_receipt={}",
+            serde_json::json!({"bytes":expected.len(),"elapsedMs":started.elapsed().as_millis()})
+        );
+    }
 
     #[test]
     fn temporary_bytes_keep_exact_offsets_across_readback() {

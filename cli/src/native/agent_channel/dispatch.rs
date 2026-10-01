@@ -340,6 +340,7 @@ impl Browser for DaemonBrowser {
         &self,
         channel: ChannelId,
         request: crate::native::site_sessions::protocol::Request,
+        ledger: Arc<super::ledger::Ledger>,
     ) -> Result<Value, &'static str> {
         // Attach must never wait behind the navigation it is releasing.
         // Other requests can refresh a new native connection without taking
@@ -366,7 +367,10 @@ impl Browser for DaemonBrowser {
                 }
             }
         }
-        let response = self.custody.request(channel, request).await?;
+        let response = self
+            .custody
+            .request_current(channel, request, ledger)
+            .await?;
         // The first offer may arrive before the browser was launched.
         if let Ok(state) = self.state.try_lock() {
             if let Some(browser) = &state.browser {
@@ -498,6 +502,10 @@ impl Browser for DaemonBrowser {
         }
     }
 
+    async fn channel_closed(&self, channel: ChannelId) {
+        self.custody.channel_closed(channel).await;
+    }
+
     async fn end(&self, channel: ChannelId) {
         self.programs.end(channel).await;
         self.custody.end(channel).await;
@@ -599,7 +607,7 @@ mod tests {
         };
         let channel = ChannelId::parse("11111111-1111-4111-8111-111111111111").unwrap();
         let later = ChannelId::parse("22222222-2222-4222-8222-222222222222").unwrap();
-        let ledger = Ledger::default();
+        let ledger = Arc::new(Ledger::default());
         assert!(ledger.open(channel));
         ledger.register(channel, owner).unwrap();
         let receipt = Receipt {
@@ -624,6 +632,7 @@ mod tests {
             .site_request(
                 later,
                 Request::read("site_sessions.offer", json!({"sites":[]})).unwrap(),
+                ledger.clone(),
             )
             .await
             .unwrap();

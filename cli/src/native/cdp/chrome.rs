@@ -16,7 +16,50 @@ use super::system_theme::SystemTheme;
 use crate::ca_bundle::CaBundle;
 use crate::native::theme::Theme;
 
+/// One disposition on the existing retained profile identity. Every native
+/// connection and relaunch clone sees an unproved cleanup before reusing it.
+#[derive(Default)]
+pub(crate) struct SiteProfileDisposition {
+    pub(crate) documents: Arc<crate::native::site_sessions::documents::Documents>,
+    uncleared: std::sync::Mutex<std::collections::HashSet<String>>,
+}
+impl SiteProfileDisposition {
+    pub(crate) fn mark_uncleared(&self, site: &str) {
+        self.uncleared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(site.into());
+    }
+    pub(crate) fn prove_clear(&self, site: &str) {
+        self.uncleared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(site);
+    }
+    pub(crate) fn uncleared_sites(&self) -> Vec<String> {
+        self.uncleared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
+    pub(crate) fn require_clear(&self) -> Result<(), &'static str> {
+        if self
+            .uncleared
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .is_empty()
+        {
+            Ok(())
+        } else {
+            Err("The browser profile has an unsettled site cleanup.")
+        }
+    }
+}
+
 pub struct ChromeProcess {
+    site_profile: Arc<SiteProfileDisposition>,
     child: Child,
     /// Absent when Chrome runs without any remote-debugging switch: such a
     /// browser has no automation channel at all.
@@ -86,8 +129,16 @@ impl PreparedNssHome {
 /// It has no caller-selected path or serialized credential representation.
 #[derive(Clone)]
 pub(crate) struct RetainedChromeProfile {
+    disposition: Arc<SiteProfileDisposition>,
     directory: Arc<TemporaryBrowserDirectory>,
     nss_home: Option<PreparedNssHome>,
+}
+
+#[cfg(test)]
+impl RetainedChromeProfile {
+    pub(crate) fn path(&self) -> &Path {
+        &self.directory.path
+    }
 }
 
 /// Shared ownership of one private display, so a browser relaunched into it
@@ -101,6 +152,9 @@ pub(crate) struct RetainedDisplay {
 }
 
 impl ChromeProcess {
+    pub(crate) fn site_profile(&self) -> Arc<SiteProfileDisposition> {
+        self.site_profile.clone()
+    }
     pub(crate) async fn apply_window_theme(&self, theme: Theme) -> &'static str {
         if matches!(self.window_theme, WindowTheme::Pinned) {
             return "pinned";
@@ -125,6 +179,7 @@ impl ChromeProcess {
 
     pub(crate) fn retained_profile(&self) -> Option<RetainedChromeProfile> {
         Some(RetainedChromeProfile {
+            disposition: self.site_profile.clone(),
             directory: self.temp_user_data_dir.clone()?,
             nss_home: self.temp_nss_home.clone(),
         })
@@ -140,6 +195,7 @@ impl ChromeProcess {
     /// session. Callers choose whether DevTools is open, and stamp the
     /// session's current theme, which may have changed since this launch.
     pub(crate) fn relaunch_options(&self) -> Result<LaunchOptions, String> {
+        self.site_profile.require_clear().map_err(str::to_owned)?;
         let executable = self
             .executable
             .to_str()
@@ -148,6 +204,7 @@ impl ChromeProcess {
             executable_path: Some(executable.to_string()),
             prepared_nss_home: self.temp_nss_home.clone(),
             retained_profile: self.retained_profile(),
+            site_profile: Some(self.site_profile.clone()),
             #[cfg(target_os = "linux")]
             retained_display: self.xvfb.clone(),
             restore_last_session: true,
@@ -552,6 +609,7 @@ pub struct LaunchOptions {
     pub(crate) ca_cert_digest: Option<[u8; 32]>,
     pub(crate) prepared_nss_home: Option<PreparedNssHome>,
     pub(crate) retained_profile: Option<RetainedChromeProfile>,
+    pub(crate) site_profile: Option<Arc<SiteProfileDisposition>>,
     pub color_scheme: Option<String>,
     /// The session theme at this launch, which draws a headed window's own UI
     /// (see `crate::native::theme`). Session state, not launch configuration:
@@ -595,6 +653,17 @@ pub struct LaunchOptions {
 }
 
 impl LaunchOptions {
+    fn require_site_clear(&self) -> Result<(), String> {
+        for disposition in self.site_profile.iter().chain(
+            self.retained_profile
+                .iter()
+                .map(|profile| &profile.disposition),
+        ) {
+            disposition.require_clear().map_err(str::to_owned)?;
+        }
+        Ok(())
+    }
+
     /// Whether Chrome will actually run headless after applying launch rules.
     ///
     /// Extensions force headed mode because Chrome does not inject their
@@ -640,6 +709,7 @@ impl Default for LaunchOptions {
             ca_cert_digest: None,
             prepared_nss_home: None,
             retained_profile: None,
+            site_profile: None,
             color_scheme: None,
             theme: None,
             download_path: None,
@@ -776,6 +846,7 @@ fn custom_window_theme(options: &LaunchOptions) -> bool {
 }
 
 fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
+    options.require_site_clear()?;
     validate_sandbox_options(options, Some("chrome"), false)?;
     // Without DevTools nothing can observe or drive the browser but its own
     // window, so only an owned window reopening its own profile qualifies.
@@ -1187,6 +1258,7 @@ fn launch_chrome_blocking(
         return Err("Chrome launch canceled".to_string());
     }
     // Reject deterministic policy conflicts before touching profiles or retrying.
+    options.require_site_clear()?;
     validate_sandbox_options(options, Some("chrome"), false)?;
     let chrome_path = match &options.executable_path {
         Some(p) => PathBuf::from(p),
@@ -1435,6 +1507,16 @@ fn try_launch_chrome(
     #[cfg(unix)]
     let pgid = Some(child.id() as i32);
     let mut process = ChromeProcess {
+        site_profile: options
+            .site_profile
+            .clone()
+            .or_else(|| {
+                options
+                    .retained_profile
+                    .as_ref()
+                    .map(|profile| profile.disposition.clone())
+            })
+            .unwrap_or_default(),
         child,
         devtools_url: None,
         launch: Box::new(options.clone()),
@@ -1449,6 +1531,20 @@ fn try_launch_chrome(
         #[cfg(target_os = "linux")]
         display_process: None,
     };
+    if !options.remote_debugging
+        || options.profile.is_some()
+        || options
+            .args
+            .iter()
+            .any(|arg| arg.starts_with("--user-data-dir"))
+    {
+        process.site_profile.documents.unobserved();
+    } else if options.retained_profile.is_none()
+        && options.site_profile.is_none()
+        && process.temp_user_data_dir.is_some()
+    {
+        process.site_profile.documents.fresh();
+    }
     let stderr = process
         .child
         .stderr
@@ -2428,6 +2524,38 @@ mod tests {
         Child::spawn(&cmd, &["/C".into(), "exit 0".into()], false).unwrap()
     }
 
+    #[test]
+    fn retained_profile_clones_and_launch_options_share_unsettled_cleanup() {
+        let profile = retained_profile();
+        let clone = profile.clone();
+        let path = profile.directory.path.clone();
+        let options = LaunchOptions {
+            retained_profile: Some(clone.clone()),
+            ..LaunchOptions::default()
+        };
+        assert!(build_chrome_args(&options).is_ok());
+        profile.disposition.mark_uncleared("https://example.com");
+        profile.disposition.mark_uncleared("https://second.example");
+        assert!(clone.disposition.require_clear().is_err());
+        assert!(build_chrome_args(&options).is_err());
+        assert!(build_chrome_args(&options.clone()).is_err());
+        drop(profile);
+        assert!(path.exists(), "unsettled profile is preserved for cleanup");
+        clone.disposition.prove_clear("https://example.com");
+        assert!(
+            build_chrome_args(&options).is_err(),
+            "one site's proof cannot clear another failure"
+        );
+        clone.disposition.prove_clear("https://second.example");
+        assert!(build_chrome_args(&options).is_ok());
+        drop(options);
+        drop(clone);
+        assert!(
+            !path.exists(),
+            "only existing last-owner Drop retires the ephemeral directory"
+        );
+    }
+
     fn retained_profile() -> RetainedChromeProfile {
         let path = std::env::temp_dir().join(format!(
             "agent-browser-retained-test-{}",
@@ -2435,6 +2563,7 @@ mod tests {
         ));
         std::fs::create_dir(&path).unwrap();
         RetainedChromeProfile {
+            disposition: Arc::default(),
             directory: Arc::new(TemporaryBrowserDirectory { path }),
             nss_home: None,
         }
@@ -2442,6 +2571,7 @@ mod tests {
 
     fn test_process(child: Child, launch: LaunchOptions) -> ChromeProcess {
         ChromeProcess {
+            site_profile: Arc::default(),
             child,
             devtools_url: None,
             launch: Box::new(launch),
@@ -3672,6 +3802,7 @@ mod tests {
             // logic by creating a small helper process.
             let child = spawn_noop_child();
             let _process = ChromeProcess {
+                site_profile: Arc::default(),
                 child,
                 devtools_url: None,
                 launch: Box::default(),
@@ -3700,6 +3831,7 @@ mod tests {
         ));
         std::fs::create_dir(&dir).unwrap();
         let process = ChromeProcess {
+            site_profile: Arc::default(),
             child: spawn_noop_child(),
             devtools_url: None,
             launch: Box::default(),

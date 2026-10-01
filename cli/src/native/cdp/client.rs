@@ -47,7 +47,12 @@ impl PendingResponse {
 }
 
 type PendingMap = Arc<Mutex<HashMap<u64, PendingResponse>>>;
-type PageGenerations = Arc<std::sync::Mutex<HashMap<String, String>>>;
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum GenerationKey {
+    Page(String),
+    Frame(String, String),
+}
+type PageGenerations = Arc<std::sync::Mutex<HashMap<GenerationKey, String>>>;
 
 /// A pointer realm armed without a command: the session it was armed in and
 /// where its first trusted pointer event's report goes.
@@ -143,7 +148,7 @@ fn page_generation(pages: &PageGenerations, session: &str) -> String {
     pages
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .entry(session.into())
+        .entry(GenerationKey::Page(session.into()))
         .or_insert_with(|| uuid::Uuid::new_v4().to_string())
         .clone()
 }
@@ -153,7 +158,7 @@ fn reset_page(pages: &PageGenerations, sender: &broadcast::Sender<CdpEvent>, ses
     pages
         .lock()
         .unwrap_or_else(|error| error.into_inner())
-        .insert(session.into(), generation.clone());
+        .insert(GenerationKey::Page(session.into()), generation.clone());
     let _ = sender.send(activity::reset(session, &generation));
 }
 
@@ -244,6 +249,7 @@ pub struct RawCdpMessage {
 }
 
 pub struct CdpClient {
+    site_profile: Arc<std::sync::RwLock<Arc<super::chrome::SiteProfileDisposition>>>,
     debugger_endpoint: Option<url::Url>,
     site_context: std::sync::RwLock<crate::native::site_sessions::Context>,
     site_custody:
@@ -377,6 +383,22 @@ impl Drop for PendingGuard {
 }
 
 impl CdpClient {
+    pub(crate) fn bind_site_profile(
+        &self,
+        disposition: Arc<super::chrome::SiteProfileDisposition>,
+    ) {
+        *self
+            .site_profile
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = disposition;
+    }
+    pub(crate) fn site_profile(&self) -> Arc<super::chrome::SiteProfileDisposition> {
+        self.site_profile
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
     /// End a temporary attachment without closing its browser. Its owner first
     /// settles request tasks; aborting the read/keepalive loops then releases
     /// the connection when its final handle is dropped.
@@ -452,6 +474,10 @@ impl CdpClient {
         let targets_clone = target_sessions.clone();
         let frame_pages: FramePages = Arc::default();
         let frames_clone = frame_pages.clone();
+        let site_profile = Arc::new(std::sync::RwLock::new(Arc::<
+            super::chrome::SiteProfileDisposition,
+        >::default()));
+        let sites_reader = site_profile.clone();
 
         let page_generations: PageGenerations = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let pages_clone = page_generations.clone();
@@ -701,6 +727,25 @@ impl CdpClient {
                         parsed.params.as_ref().unwrap_or(&Value::Null),
                         parsed.session_id.as_deref(),
                     );
+                    let page = parsed.session_id.as_deref().map(|session| {
+                        frame_page(&frames_clone, session).unwrap_or_else(|| session.to_owned())
+                    });
+                    let target = page.as_ref().and_then(|page| {
+                        targets_clone
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .get(page)
+                            .cloned()
+                    });
+                    sites_reader
+                        .read()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .documents
+                        .observe(
+                            method,
+                            parsed.params.as_ref().unwrap_or(&Value::Null),
+                            target.as_deref(),
+                        );
                     // Retain download truth before broadcasting it to consumers.
                     downloads_reader
                         .observe(method, parsed.params.as_ref().unwrap_or(&Value::Null));
@@ -711,6 +756,17 @@ impl CdpClient {
                         session_id: parsed.session_id.clone(),
                     };
                     if let Some(session) = event.session_id.as_deref() {
+                        if method == "Page.frameNavigated" {
+                            if let Some(frame) = event.params["frame"]["id"].as_str() {
+                                pages_clone
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .insert(
+                                        GenerationKey::Frame(session.into(), frame.into()),
+                                        uuid::Uuid::new_v4().to_string(),
+                                    );
+                            }
+                        }
                         if method == "Page.frameNavigated"
                             && event.params["frame"]["parentId"]
                                 .as_str()
@@ -728,7 +784,11 @@ impl CdpClient {
                             pages_clone
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner())
-                                .remove(session);
+                                .retain(|key, _| match key {
+                                    GenerationKey::Page(page) | GenerationKey::Frame(page, _) => {
+                                        page != session
+                                    }
+                                });
                         }
                     }
                     let routed = event.session_id.as_deref().is_some_and(|sid| {
@@ -781,6 +841,7 @@ impl CdpClient {
         });
 
         Ok(Self {
+            site_profile,
             debugger_endpoint: url::Url::parse(&normalized_url).ok(),
             site_context: std::sync::RwLock::default(),
             site_custody: std::sync::RwLock::default(),
@@ -1054,6 +1115,19 @@ impl CdpClient {
         page_generation(&self.page_generations, session)
     }
 
+    pub(crate) fn document_generation(&self, session: &str, frame: Option<&str>) -> String {
+        match frame {
+            None => self.page_generation(session),
+            Some(frame) => self
+                .page_generations
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .entry(GenerationKey::Frame(session.into(), frame.into()))
+                .or_insert_with(|| uuid::Uuid::new_v4().to_string())
+                .clone(),
+        }
+    }
+
     /// The page an out-of-process frame's session shows in, or the session
     /// itself when it is no frame.
     pub(crate) fn page_of(&self, session: &str) -> String {
@@ -1255,7 +1329,10 @@ impl CdpClient {
             .lock()
             .unwrap()
             .keys()
-            .cloned()
+            .filter_map(|key| match key {
+                GenerationKey::Page(session) => Some(session.clone()),
+                GenerationKey::Frame(_, _) => None,
+            })
             .collect();
         for session in sessions {
             self.rotate_page_generation(&session);
@@ -1302,6 +1379,7 @@ impl CdpClient {
     /// Publish this connection's acknowledged input as `owner`'s, for
     /// targets the owner is attached to. Set once, before any input.
     pub(crate) fn publish_activity_as(&self, owner: &CdpClient) {
+        self.bind_site_profile(owner.site_profile());
         *self
             .site_context
             .write()
@@ -1368,14 +1446,20 @@ impl CdpClient {
         Some(json!({"urlPattern":format!("*://*:{port}/*"),"requestStage":"Request"}))
     }
 
-    pub(crate) async fn site_request_ready(self: &Arc<Self>, session: String, params: Value) {
+    pub(crate) async fn site_request_ready(
+        self: &Arc<Self>,
+        session: String,
+        params: Value,
+    ) -> bool {
         let custody = self
             .site_custody
             .read()
             .unwrap_or_else(|error| error.into_inner())
             .upgrade();
         if let Some(custody) = custody {
-            Box::pin(custody.paused(self, session, params)).await;
+            Box::pin(custody.paused(self, session, params)).await
+        } else {
+            true
         }
     }
 

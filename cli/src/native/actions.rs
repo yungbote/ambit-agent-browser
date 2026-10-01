@@ -1192,9 +1192,10 @@ impl DaemonState {
                             origin_headers.clone(),
                         );
                         requests.spawn(async move {
-                            client
-                                .site_request_ready(paused.session_id.clone(), params)
-                                .await;
+                            if !client.site_request_ready(paused.session_id.clone(),params).await {
+                                let _=client.send_command("Fetch.failRequest",Some(json!({"requestId":paused.request_id,"errorReason":"Aborted"})),Some(&paused.session_id)).await;
+                                return;
+                            }
                             let df = domain_filter.read().await;
                             let rt = routes.read().await;
                             let oh = origin_headers.read().await;
@@ -5025,6 +5026,7 @@ fn launch_options_from_env() -> LaunchOptions {
         ca_cert_digest: None,
         prepared_nss_home: None,
         retained_profile: None,
+        site_profile: None,
         color_scheme: env::var("AGENT_BROWSER_COLOR_SCHEME").ok(),
         theme: None,
         download_path: env::var("AGENT_BROWSER_DOWNLOAD_PATH").ok(),
@@ -5507,6 +5509,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
         ca_cert_digest: None,
         prepared_nss_home: None,
         retained_profile: None,
+        site_profile: None,
         color_scheme: cmd
             .get("colorScheme")
             .and_then(|v| v.as_str())

@@ -1,0 +1,654 @@
+//! Retained tab custody. An origin belongs to every tab whose current or
+//! recoverable frames have visited it, until that tab's history is retired.
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Mutex;
+
+use serde_json::{json, Value};
+
+use super::{state, storage};
+use crate::native::cdp::client::CdpClient;
+
+#[derive(Default)]
+struct Tab {
+    origins: HashSet<String>,
+    known: bool,
+}
+
+#[derive(Default)]
+pub(crate) struct Documents {
+    tabs: Mutex<HashMap<String, Tab>>,
+    frames: Mutex<HashMap<String, String>>,
+    keys: Mutex<HashSet<String>>,
+    pending_keys: Mutex<HashSet<(String, String, String)>>,
+    keys_changed: tokio::sync::Notify,
+    inventory: std::sync::atomic::AtomicBool,
+    non_documents: Mutex<HashSet<String>>,
+}
+
+fn storage_origin(key: &str) -> Option<String> {
+    let prefix = key.split('^').next()?;
+    let value = origin(prefix)?;
+    (prefix == format!("{value}/")).then_some(value)
+}
+
+fn origin(value: &str) -> Option<String> {
+    let url = url::Url::parse(value.strip_prefix("blob:").unwrap_or(value)).ok()?;
+    matches!(url.scheme(), "http" | "https").then(|| url.origin().ascii_serialization())
+}
+
+fn frame_origins(tree: &Value, origins: &mut HashSet<String>) {
+    if let Some(value) = frame_origin(&tree["frame"]) {
+        origins.insert(value);
+    }
+    if let Some(children) = tree["childFrames"].as_array() {
+        for child in children {
+            frame_origins(child, origins);
+        }
+    }
+}
+
+fn frame_origin(frame: &Value) -> Option<String> {
+    frame["securityOrigin"]
+        .as_str()
+        .and_then(origin)
+        .or_else(|| frame["url"].as_str().and_then(origin))
+}
+
+fn frame_ids(tree: &Value, ids: &mut Vec<String>) {
+    if let Some(id) = tree["frame"]["id"].as_str() {
+        ids.push(id.into());
+    }
+    if let Some(children) = tree["childFrames"].as_array() {
+        for child in children {
+            frame_ids(child, ids);
+        }
+    }
+}
+
+fn same_frame(tree: &Value, id: &str, loader: &str, expected: &str) -> bool {
+    (tree["frame"]["id"] == id
+        && tree["frame"]["loaderId"].as_str().unwrap_or("") == loader
+        && frame_origin(&tree["frame"]).as_deref() == Some(expected))
+        || tree["childFrames"].as_array().is_some_and(|children| {
+            children
+                .iter()
+                .any(|child| same_frame(child, id, loader, expected))
+        })
+}
+
+impl Documents {
+    pub(crate) fn fresh(&self) {
+        self.inventory
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+    pub(crate) fn unobserved(&self) {
+        self.inventory
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+    pub(crate) fn is_document(&self, target: &str) -> bool {
+        !self
+            .non_documents
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .contains(target)
+    }
+    pub(crate) fn keys(&self, site: &str) -> Result<Vec<String>, &'static str> {
+        let boundary = state::site_url(site)?;
+        Ok(self
+            .keys
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .filter(|key| {
+                storage_origin(key).is_some_and(|origin| state::origin_in_site(&origin, &boundary))
+            })
+            .cloned()
+            .collect())
+    }
+    pub(crate) async fn settle_keys(&self, site: &str) -> Result<(), &'static str> {
+        if !self.inventory.load(std::sync::atomic::Ordering::Acquire) {
+            return Err(storage::UNCLEARED);
+        }
+        let boundary = state::site_url(site)?;
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            loop {
+                let changed = self.keys_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                if !self
+                    .pending_keys
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .iter()
+                    .any(|(_, _, origin)| state::origin_in_site(origin, &boundary))
+                {
+                    return Ok(());
+                }
+                changed.await;
+            }
+        })
+        .await
+        .map_err(|_| storage::UNCLEARED)?
+    }
+    pub(crate) async fn admit_mutation(
+        &self,
+        client: &CdpClient,
+        site: &str,
+    ) -> Result<(), &'static str> {
+        self.sessions(client, site, true).await?;
+        self.settle_keys(site).await
+    }
+
+    pub(crate) async fn retain_key(
+        &self,
+        client: &CdpClient,
+        session: &str,
+        frame: &Value,
+    ) -> Result<(), &'static str> {
+        let Some(origin) = frame_origin(frame) else {
+            return Ok(());
+        };
+        let id = frame["id"].as_str().ok_or(storage::UNCLEARED)?;
+        let loader = frame["loaderId"].as_str().unwrap_or("").to_owned();
+        let before = client
+            .send_command_no_params("Page.getFrameTree", Some(session))
+            .await
+            .map_err(|_| storage::UNCLEARED)?;
+        if !same_frame(&before["frameTree"], id, &loader, &origin) {
+            return Err(storage::UNCLEARED);
+        }
+        let key = client
+            .send_command(
+                "Storage.getStorageKeyForFrame",
+                Some(json!({"frameId":id})),
+                Some(session),
+            )
+            .await
+            .map_err(|_| storage::UNCLEARED)?;
+        let key = key["storageKey"].as_str().ok_or(storage::UNCLEARED)?;
+        if storage_origin(key).as_deref() != Some(&origin) {
+            return Err(storage::UNCLEARED);
+        }
+        let after = client
+            .send_command_no_params("Page.getFrameTree", Some(session))
+            .await
+            .map_err(|_| storage::UNCLEARED)?;
+        if !same_frame(&after["frameTree"], id, &loader, &origin) {
+            return Err(storage::UNCLEARED);
+        }
+        self.keys
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .insert(key.into());
+        self.pending_keys
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove(&(id.into(), loader, origin));
+        self.keys_changed.notify_waiters();
+        Ok(())
+    }
+    /// Runs on the CDP reader before broadcast, so event lag cannot silently
+    /// forget the origin of a frame that has since entered the back cache.
+    pub(crate) fn observe(&self, method: &str, params: &Value, target: Option<&str>) {
+        let mut frames = self
+            .frames
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        let mut tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        if method == "Target.attachedToTarget" {
+            if let (Some(id), Some(kind)) = (
+                params["targetInfo"]["targetId"].as_str(),
+                params["targetInfo"]["type"].as_str(),
+            ) {
+                if !matches!(kind, "page" | "iframe") {
+                    self.non_documents
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert(id.into());
+                }
+            }
+        }
+        if method == "Target.targetDestroyed" {
+            if let Some(target) = params["targetId"].as_str() {
+                self.non_documents
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .remove(target);
+                // An OOP target disappears when its frame enters a retained
+                // document. Its origin remains with that document's tab.
+                if frames.get(target).is_none_or(|owner| owner == target) {
+                    tabs.remove(target);
+                    frames.retain(|_, owner| owner != target);
+                }
+            }
+        } else if method == "Page.frameAttached" {
+            if let (Some(frame), Some(target)) = (params["frameId"].as_str(), target) {
+                let owner = frames.get(target).cloned().unwrap_or_else(|| target.into());
+                frames.insert(frame.into(), owner.clone());
+                if frame != owner {
+                    if let Some(previous) = tabs.remove(frame) {
+                        tabs.entry(owner)
+                            .or_default()
+                            .origins
+                            .extend(previous.origins);
+                    }
+                }
+            }
+        } else if method == "Target.attachedToTarget"
+            && params["waitingForDebugger"] == true
+            && params["targetInfo"]["url"] == "about:blank"
+        {
+            if let Some(target) = params["targetInfo"]["targetId"].as_str() {
+                tabs.entry(target.into()).or_default().known = true;
+            }
+        } else if method == "Page.frameNavigated" {
+            if let Some(target) = target {
+                let frame = params["frame"]["id"].as_str().unwrap_or(target);
+                let owner = frames
+                    .get(frame)
+                    .or_else(|| frames.get(target))
+                    .cloned()
+                    .unwrap_or_else(|| target.into());
+                frames.insert(frame.into(), owner.clone());
+                if let Some(value) = frame_origin(&params["frame"]) {
+                    self.pending_keys
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert((
+                            frame.into(),
+                            params["frame"]["loaderId"].as_str().unwrap_or("").into(),
+                            value.clone(),
+                        ));
+                    tabs.entry(owner).or_default().origins.insert(value);
+                }
+            }
+        } else if method.starts_with("DOMStorage.") {
+            if let Some(key) = params["storageId"]["storageKey"].as_str() {
+                if let Some(value) = storage_origin(key) {
+                    if params["storageId"]["securityOrigin"]
+                        .as_str()
+                        .is_none_or(|claimed| claimed == value)
+                    {
+                        self.keys
+                            .lock()
+                            .unwrap_or_else(|error| error.into_inner())
+                            .insert(key.into());
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn seed(&self, client: &CdpClient, session: &str) -> Result<(), &'static str> {
+        self.seed_current(client, session, false).await
+    }
+    pub(crate) async fn seed_fresh(
+        &self,
+        client: &CdpClient,
+        session: &str,
+    ) -> Result<(), &'static str> {
+        self.seed_current(client, session, true).await
+    }
+    async fn seed_current(
+        &self,
+        client: &CdpClient,
+        session: &str,
+        owned: bool,
+    ) -> Result<(), &'static str> {
+        let page = client.page_of(session);
+        let Some(target) = client.target_for_session(&page) else {
+            // Preparation may precede the attachment event. It still installs
+            // Fetch; an unobserved target gains no history proof from this.
+            return Ok(());
+        };
+        let target = self
+            .frames
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&target)
+            .cloned()
+            .unwrap_or(target);
+        let page = client.session_for_target(&target).unwrap_or(page);
+        let tree = client
+            .send_command_no_params("Page.getFrameTree", Some(session))
+            .await
+            .map_err(|_| storage::UNCLEARED)?;
+        let history = client
+            .send_command_no_params("Page.getNavigationHistory", Some(&page))
+            .await
+            .map_err(|_| storage::UNCLEARED)?;
+        let entries = history["entries"].as_array().ok_or(storage::UNCLEARED)?;
+        let fresh = entries.len() == 1
+            && entries[0]["url"] == "about:blank"
+            && tree["frameTree"]["frame"]["url"] == "about:blank";
+        let mut ids = Vec::new();
+        frame_ids(&tree["frameTree"], &mut ids);
+        let mut nodes = vec![&tree["frameTree"]];
+        while let Some(node) = nodes.pop() {
+            if let Some(children) = node["childFrames"].as_array() {
+                nodes.extend(children);
+            }
+            if frame_origin(&node["frame"]).is_some() {
+                let frame = node["frame"]["id"].as_str().ok_or(storage::UNCLEARED)?;
+                let own_session = client
+                    .session_for_target(frame)
+                    .unwrap_or_else(|| session.to_owned());
+                self.retain_key(client, &own_session, &node["frame"])
+                    .await?;
+            }
+        }
+        let mut frames = self
+            .frames
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        frames.extend(ids.into_iter().map(|id| (id, target.clone())));
+        let mut tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        let tab = tabs.entry(target).or_default();
+        // Only an initially blank target establishes complete history. A
+        // current frame tree cannot attest old embedded/cached documents.
+        tab.known |= owned && fresh;
+        frame_origins(&tree["frameTree"], &mut tab.origins);
+        for entry in entries {
+            if let Some(value) = entry["url"].as_str().and_then(origin) {
+                tab.origins.insert(value);
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn origins(&self, site: &str) -> Result<Vec<String>, &'static str> {
+        let boundary = state::site_url(site)?;
+        let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+        let mut origins = tabs
+            .values()
+            .flat_map(|tab| tab.origins.iter())
+            .filter(|origin| state::origin_in_site(origin, &boundary))
+            .cloned()
+            .collect::<HashSet<_>>();
+        origins.extend(
+            self.keys(site)?
+                .iter()
+                .filter_map(|key| storage_origin(key)),
+        );
+        Ok(origins.into_iter().collect())
+    }
+
+    async fn sessions(
+        &self,
+        client: &CdpClient,
+        site: &str,
+        destructive: bool,
+    ) -> Result<Vec<String>, &'static str> {
+        let boundary = state::site_url(site)?;
+        let targets = client
+            .send_command_no_params("Target.getTargets", None)
+            .await
+            .map_err(|_| storage::UNCLEARED)?;
+        let contexts = client
+            .send_command_no_params("Target.getBrowserContexts", None)
+            .await
+            .map_err(|_| storage::UNCLEARED)?;
+        let isolated = contexts["browserContextIds"]
+            .as_array()
+            .ok_or(storage::UNCLEARED)?;
+        let mut sessions = Vec::new();
+        for target in targets["targetInfos"]
+            .as_array()
+            .ok_or(storage::UNCLEARED)?
+        {
+            let id = target["targetId"].as_str().ok_or(storage::UNCLEARED)?;
+            if target["type"] != "page"
+                || client.site_context().private_target(id)
+                || isolated
+                    .iter()
+                    .any(|context| context == &target["browserContextId"])
+            {
+                continue;
+            }
+            let session = client.session_for_target(id).ok_or(storage::UNCLEARED)?;
+            // Admission can own a Fetch pause between documents. Renderer
+            // reads cannot answer then; preparation already seeded the tab
+            // before navigation and the native reader retains its footprint.
+            let tracked = self
+                .tabs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .contains_key(id);
+            if !tracked {
+                self.seed(client, &session).await?;
+            }
+            let tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
+            let tab = tabs.get(id).ok_or(storage::UNCLEARED)?;
+            if destructive && !tab.known {
+                return Err(storage::UNCLEARED);
+            }
+            if tab
+                .origins
+                .iter()
+                .any(|origin| state::origin_in_site(origin, &boundary))
+            {
+                sessions.push(session);
+            }
+        }
+        Ok(sessions)
+    }
+
+    /// Freeze before cookie enumeration or origin mutation. The physical
+    /// effect owner awaits resume too, including an abandoned request waiter.
+    pub(crate) async fn freeze(
+        &self,
+        client: &CdpClient,
+        site: &str,
+    ) -> Result<Vec<String>, &'static str> {
+        let sessions = self.sessions(client, site, false).await?;
+        let mut frozen = Vec::new();
+        for session in sessions {
+            if client
+                .send_command(
+                    "Page.setWebLifecycleState",
+                    Some(json!({"state":"frozen"})),
+                    Some(&session),
+                )
+                .await
+                .is_err()
+            {
+                self.resume(client, &frozen).await?;
+                return Err(storage::UNCLEARED);
+            }
+            frozen.push(session);
+        }
+        Ok(frozen)
+    }
+
+    pub(crate) async fn resume(
+        &self,
+        client: &CdpClient,
+        sessions: &[String],
+    ) -> Result<(), &'static str> {
+        for session in sessions {
+            client
+                .send_command(
+                    "Page.setWebLifecycleState",
+                    Some(json!({"state":"active"})),
+                    Some(session),
+                )
+                .await
+                .map_err(|_| storage::UNCLEARED)?;
+        }
+        Ok(())
+    }
+
+    /// The user approved losing history only on affected retained tabs. Blank
+    /// commits before reset; storage clears afterward, including pagehide writes.
+    pub(crate) async fn retire(
+        &self,
+        client: &CdpClient,
+        site: &str,
+    ) -> Result<Vec<String>, &'static str> {
+        let sessions = self.sessions(client, site, true).await?;
+        self.settle_keys(site).await?;
+        let origins = self.origins(site)?;
+        for session in sessions {
+            let mut events = client.subscribe();
+            let reply = client
+                .send_command(
+                    "Page.navigate",
+                    Some(json!({"url":"about:blank"})),
+                    Some(&session),
+                )
+                .await
+                .map_err(|_| storage::UNCLEARED)?;
+            if reply.get("errorText").is_some() {
+                return Err(storage::UNCLEARED);
+            }
+            let mut tree = client
+                .send_command_no_params("Page.getFrameTree", Some(&session))
+                .await
+                .map_err(|_| storage::UNCLEARED)?;
+            if tree["frameTree"]["frame"]["url"] != "about:blank" {
+                let loader = reply["loaderId"].as_str().ok_or(storage::UNCLEARED)?;
+                tokio::time::timeout(std::time::Duration::from_secs(8), async {
+                    loop { tokio::select! {
+                        event=events.recv()=>{let event=event.map_err(|_|storage::UNCLEARED)?; if event.session_id.as_deref()==Some(&session) && event.method=="Page.frameNavigated" && event.params["frame"]["parentId"].as_str().is_none_or(str::is_empty) && event.params["frame"]["loaderId"]==loader && event.params["frame"]["url"]=="about:blank" {return Ok::<_,&'static str>(());}},
+                        _=client.closed()=>return Err(storage::UNCLEARED),
+                    }}
+                }).await.map_err(|_|storage::UNCLEARED)??;
+                tree = client
+                    .send_command_no_params("Page.getFrameTree", Some(&session))
+                    .await
+                    .map_err(|_| storage::UNCLEARED)?;
+                if tree["frameTree"]["frame"]["url"] != "about:blank" {
+                    return Err(storage::UNCLEARED);
+                }
+            }
+            client
+                .send_command_no_params("Page.resetNavigationHistory", Some(&session))
+                .await
+                .map_err(|_| storage::UNCLEARED)?;
+            let history = client
+                .send_command_no_params("Page.getNavigationHistory", Some(&session))
+                .await
+                .map_err(|_| storage::UNCLEARED)?;
+            let entries = history["entries"].as_array().ok_or(storage::UNCLEARED)?;
+            if entries.len() != 1 || entries[0]["url"] != "about:blank" {
+                return Err(storage::UNCLEARED);
+            }
+            let target = client
+                .target_for_session(&session)
+                .ok_or(storage::UNCLEARED)?;
+            self.tabs
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .insert(
+                    target.clone(),
+                    Tab {
+                        known: true,
+                        ..Default::default()
+                    },
+                );
+            self.frames
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .retain(|_, owner| owner != &target);
+            self.resume(client, std::slice::from_ref(&session)).await?;
+        }
+        Ok(origins)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retained_origins_belong_to_target_until_its_history_is_retired() {
+        let owner = Documents::default();
+        owner.observe(
+            "Page.frameNavigated",
+            &json!({"frame":{"url":"https://private.example/account"}}),
+            Some("affected"),
+        );
+        owner.observe(
+            "Page.frameNavigated",
+            &json!({"frame":{"url":"https://other.example/frame","parentId":"page"}}),
+            Some("affected"),
+        );
+        owner.observe(
+            "Page.frameNavigated",
+            &json!({"frame":{"url":"https://other.example/next"}}),
+            Some("affected"),
+        );
+        owner.observe(
+            "Page.frameNavigated",
+            &json!({"frame":{"url":"https://other.example/only"}}),
+            Some("unrelated"),
+        );
+        assert_eq!(
+            owner.origins("https://private.example").unwrap(),
+            vec!["https://private.example"]
+        );
+        assert!(!owner.tabs.lock().unwrap()["affected"].known);
+        owner.observe(
+            "Target.targetDestroyed",
+            &json!({"targetId":"affected"}),
+            None,
+        );
+        assert!(owner.origins("https://private.example").unwrap().is_empty());
+        assert_eq!(owner.tabs.lock().unwrap()["unrelated"].origins.len(), 1);
+    }
+
+    #[test]
+    fn only_a_new_paused_blank_target_establishes_complete_history() {
+        let owner = Documents::default();
+        for (id, paused, url, known) in [
+            ("new", true, "about:blank", true),
+            ("adopted", false, "about:blank", false),
+            ("loaded", true, "https://example.com", false),
+        ] {
+            owner.observe(
+                "Target.attachedToTarget",
+                &json!({"waitingForDebugger":paused,"targetInfo":{"targetId":id,"url":url}}),
+                None,
+            );
+            assert_eq!(
+                owner
+                    .tabs
+                    .lock()
+                    .unwrap()
+                    .get(id)
+                    .is_some_and(|tab| tab.known),
+                known
+            );
+        }
+    }
+
+    #[test]
+    fn cached_oop_frame_origin_stays_with_its_parent_after_frame_target_destroyed() {
+        let owner = Documents::default();
+        owner.observe(
+            "Page.frameAttached",
+            &json!({"frameId":"inner","parentFrameId":"outer"}),
+            Some("parent-tab"),
+        );
+        owner.observe(
+            "Page.frameNavigated",
+            &json!({"frame":{"id":"inner","url":"https://private.example/frame"}}),
+            Some("inner"),
+        );
+        owner.observe("Target.targetDestroyed", &json!({"targetId":"inner"}), None);
+        let tabs = owner.tabs.lock().unwrap();
+        assert!(tabs["parent-tab"]
+            .origins
+            .contains("https://private.example"));
+        assert!(!tabs.contains_key("inner"));
+        drop(tabs);
+        owner.observe(
+            "Target.targetDestroyed",
+            &json!({"targetId":"parent-tab"}),
+            None,
+        );
+        assert!(owner.origins("https://private.example").unwrap().is_empty());
+        assert!(owner.frames.lock().unwrap().is_empty());
+    }
+}

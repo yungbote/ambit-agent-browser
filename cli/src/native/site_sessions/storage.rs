@@ -12,6 +12,8 @@ use super::bytes::Bytes;
 use super::state::{self, Cookie, SiteState};
 use crate::native::cdp::client::CdpClient;
 
+pub(crate) const UNCLEARED: &str = "The browser site cleanup is unsettled.";
+
 const FAILED: &str = "The browser could not complete site state custody.";
 const SCRIPT: &str = include_str!("storage.js");
 
@@ -53,12 +55,26 @@ fn cookie_to_chrome(cookie: &Cookie) -> Value {
     value
 }
 
+#[cfg(test)]
 pub(crate) async fn import(client: &Arc<CdpClient>, state: &SiteState) -> Result<(), &'static str> {
+    import_current(client, state, None).await
+}
+
+/// The owner awaits this to completion on cancellation: the private document
+/// closes first, then partial state clears, with no applying command left alive.
+pub(crate) async fn import_current(
+    client: &Arc<CdpClient>,
+    state: &SiteState,
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<(), &'static str> {
     let values = client.site_context();
     state.register(&values.values);
     let applying = async {
         for origin in &state.origins {
-            synthetic(client, &origin.origin, "import", origin).await?;
+            synthetic(client, &origin.origin, "import", origin, cancel.clone()).await?;
+        }
+        if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+            return Err(FAILED);
         }
         command(
             client,
@@ -67,12 +83,19 @@ pub(crate) async fn import(client: &Arc<CdpClient>, state: &SiteState) -> Result
             None,
         )
         .await?;
+        if cancel.as_ref().is_some_and(|cancel| *cancel.borrow()) {
+            return Err(FAILED);
+        }
         Ok(())
     }
     .await;
     if applying.is_err() {
-        // An incomplete attach is signed out, never a partial grant release.
-        let _ = clear(client, state).await;
+        // A refused close cannot prove the importer stopped. Keep the profile
+        // and pause unsettled instead of clearing beneath a live transaction.
+        if applying == Err(UNCLEARED) || clear(client, state).await.is_err() {
+            client.site_profile().mark_uncleared(&state.site);
+            return Err(UNCLEARED);
+        }
     }
     applying
 }
@@ -108,6 +131,15 @@ pub(crate) async fn capture(
     site: &str,
     origins: &[String],
 ) -> Result<SiteState, &'static str> {
+    capture_current(client, site, origins, None).await
+}
+
+pub(crate) async fn capture_current(
+    client: &Arc<CdpClient>,
+    site: &str,
+    origins: &[String],
+    cancel: Option<tokio::sync::watch::Receiver<bool>>,
+) -> Result<SiteState, &'static str> {
     let boundary = state::site_url(site)?;
     let cookies = cookies(client, site).await?;
     let mut stored = Vec::new();
@@ -121,6 +153,7 @@ pub(crate) async fn capture(
             origin,
             "export",
             &json!({"chunkCharacters":super::bytes::CHUNK_BYTES / 4}),
+            cancel.clone(),
         )
         .await?;
         for omission in result["omitted"].as_array().ok_or(FAILED)? {
@@ -222,6 +255,16 @@ pub(crate) async fn clear_site(
         .await
         .map_err(|_| "The browser could not clear the site's origin storage.")?;
     }
+    for key in client.site_profile().documents.keys(site)? {
+        command(
+            client,
+            "Storage.clearDataForStorageKey",
+            json!({"storageKey":key,"storageTypes":"all"}),
+            Some(&session),
+        )
+        .await
+        .map_err(|_| UNCLEARED)?;
+    }
     Ok(())
 }
 
@@ -230,6 +273,7 @@ async fn synthetic<T: serde::Serialize + Sync>(
     origin: &str,
     mode: &str,
     input: &T,
+    mut cancel: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<Value, &'static str> {
     let target = command(
         client,
@@ -240,8 +284,9 @@ async fn synthetic<T: serde::Serialize + Sync>(
     .await?;
     let target = target["targetId"].as_str().ok_or(FAILED)?.to_owned();
     let mut held = SyntheticTarget::new(client.clone(), target.clone());
-    let outcome = async {
-        let session = tokio::time::timeout(Duration::from_secs(8), async {
+    let outcome = {
+        let applying = async {
+            let session = tokio::time::timeout(Duration::from_secs(8), async {
         let attached = command(client, "Target.attachToTarget", json!({"targetId":target,"flatten":true}), None).await?;
         let session = attached["sessionId"].as_str().ok_or(FAILED)?;
         let mut events = client.subscribe_session(session);
@@ -271,44 +316,105 @@ async fn synthetic<T: serde::Serialize + Sync>(
         command(client, "Fetch.disable", json!({}), Some(session)).await?;
         Ok::<_, &'static str>(session.to_owned())
         }).await.map_err(|_| FAILED)??;
-        let expression = if mode == "export" {
-            format!("({SCRIPT})(\"export\",{})", serde_json::to_string(input).map_err(|_| FAILED)?)
-        } else { "({decoder:new TextDecoder('utf-8',{fatal:true}),parts:[]})".into() };
-        let result = tokio::time::timeout(Duration::from_secs(8), command(client, "Runtime.evaluate", json!({"expression":expression,"awaitPromise":true,"returnByValue":false}), Some(&session))).await.map_err(|_| FAILED)??;
-        client.unsubscribe_session(&session);
-        if result.get("exceptionDetails").is_some() { return Err(FAILED); }
-        let iterator = result["result"]["objectId"].as_str().ok_or(FAILED)?;
-        let mut bytes = Bytes::new().map_err(|_| FAILED)?;
-        if mode == "import" {
-            serde_json::to_writer(&mut bytes,input).map_err(|_| FAILED)?;
-            let mut offset = 0;
-            while offset < bytes.length() {
-                let chunk = bytes.chunk(offset, super::bytes::CHUNK_BYTES).map_err(|_| FAILED)?;
-                let appended = tokio::time::timeout(Duration::from_secs(8), command(client,"Runtime.callFunctionOn",json!({
+            client
+                .site_profile()
+                .documents
+                .seed(client, &session)
+                .await?;
+            let expression = if mode == "export" {
+                format!(
+                    "({SCRIPT})(\"export\",{})",
+                    serde_json::to_string(input).map_err(|_| FAILED)?
+                )
+            } else {
+                "({decoder:new TextDecoder('utf-8',{fatal:true}),parts:[]})".into()
+            };
+            let result = tokio::time::timeout(
+                Duration::from_secs(8),
+                command(
+                    client,
+                    "Runtime.evaluate",
+                    json!({"expression":expression,"awaitPromise":true,"returnByValue":false}),
+                    Some(&session),
+                ),
+            )
+            .await
+            .map_err(|_| FAILED)??;
+            client.unsubscribe_session(&session);
+            if result.get("exceptionDetails").is_some() {
+                return Err(FAILED);
+            }
+            let iterator = result["result"]["objectId"].as_str().ok_or(FAILED)?;
+            #[cfg(test)]
+            eprintln!("private_document_stage=iterator-ready mode={mode}");
+            let mut bytes = Bytes::new().map_err(|_| FAILED)?;
+            if mode == "import" {
+                bytes.write_json(input).map_err(|_| FAILED)?;
+                let mut offset = 0;
+                while offset < bytes.length() {
+                    let chunk = bytes
+                        .chunk(offset, super::bytes::CHUNK_BYTES)
+                        .map_err(|_| FAILED)?;
+                    let appended = tokio::time::timeout(Duration::from_secs(8), command(client,"Runtime.callFunctionOn",json!({
                     "objectId":iterator,"functionDeclaration":"function(data){const bytes=Uint8Array.from(atob(data),character=>character.charCodeAt(0));this.parts.push(this.decoder.decode(bytes,{stream:true}));return bytes.length}",
                     "arguments":[{"value":STANDARD.encode(&chunk)}],"returnByValue":true}),Some(&session))).await.map_err(|_| FAILED)??;
-                if appended.get("exceptionDetails").is_some() || appended["result"]["value"] != chunk.len() { return Err(FAILED); }
-                offset += chunk.len() as u64;
-            }
-            let applying = format!("async function(){{this.parts.push(this.decoder.decode());this.decoder=null;const input=JSON.parse(this.parts.join(''));this.parts=null;return await ({SCRIPT})(\"import\",input)}}");
-            let applied = tokio::time::timeout(Duration::from_secs(8),command(client,"Runtime.callFunctionOn",json!({
+                    if appended.get("exceptionDetails").is_some()
+                        || appended["result"]["value"] != chunk.len()
+                    {
+                        return Err(FAILED);
+                    }
+                    offset += chunk.len() as u64;
+                }
+                #[cfg(test)]
+                eprintln!(
+                    "private_document_stage=input-ready bytes={}",
+                    bytes.length()
+                );
+                let applying = format!("async function(){{this.parts.push(this.decoder.decode());this.decoder=null;const input=JSON.parse(this.parts.join(''));this.parts=null;return await ({SCRIPT})(\"import\",input)}}");
+                let applied = tokio::time::timeout(Duration::from_secs(8),command(client,"Runtime.callFunctionOn",json!({
                 "objectId":iterator,"functionDeclaration":applying,"awaitPromise":true,"returnByValue":true}),Some(&session))).await.map_err(|_| FAILED)??;
-            if applied.get("exceptionDetails").is_some() { return Err(FAILED); }
-            return applied["result"].get("value").cloned().ok_or(FAILED);
-        }
-        loop {
-            let next = tokio::time::timeout(Duration::from_secs(8), command(client, "Runtime.callFunctionOn",
+                if applied.get("exceptionDetails").is_some() {
+                    return Err(FAILED);
+                }
+                return applied["result"].get("value").cloned().ok_or(FAILED);
+            }
+            loop {
+                let next = tokio::time::timeout(Duration::from_secs(8), command(client, "Runtime.callFunctionOn",
                 json!({"objectId":iterator,"functionDeclaration":"async function(){return await this.next()}","awaitPromise":true,"returnByValue":true}), Some(&session)))
                 .await.map_err(|_| FAILED)??;
-            if next.get("exceptionDetails").is_some() { return Err(FAILED); }
-            let next = &next["result"]["value"];
-            if next["done"] == true { break; }
-            let chunk = next["value"].as_str().ok_or(FAILED)?;
-            if chunk.len() > super::bytes::CHUNK_BYTES { return Err(FAILED); }
-            bytes.write_all(chunk.as_bytes()).map_err(|_| FAILED)?;
-        }
-        serde_json::from_reader(bytes.reader().map_err(|_| FAILED)?).map_err(|_| FAILED)
-    }.await;
+                if next.get("exceptionDetails").is_some() {
+                    return Err(FAILED);
+                }
+                let next = &next["result"]["value"];
+                if next["done"] == true {
+                    break;
+                }
+                let chunk = next["value"].as_str().ok_or(FAILED)?;
+                if chunk.len() > super::bytes::CHUNK_BYTES {
+                    return Err(FAILED);
+                }
+                bytes.write_all(chunk.as_bytes()).map_err(|_| FAILED)?;
+            }
+            serde_json::from_reader(bytes.reader().map_err(|_| FAILED)?).map_err(|_| FAILED)
+        };
+        tokio::pin!(applying);
+        let outcome = tokio::select! {
+            biased;
+            _ = async { match &mut cancel {
+                Some(cancel) => { while !*cancel.borrow_and_update() { if cancel.changed().await.is_err() { break; } } },
+                None => std::future::pending::<()>().await,
+            } } => Err(FAILED),
+            result = &mut applying => result,
+        };
+        // Drop the applying future before close. Chrome's target closure settles
+        // its script/transactions; only then can the caller clear partial writes.
+        outcome
+    };
+    #[cfg(test)]
+    eprintln!(
+        "private_document_outcome={}",
+        json!({"mode":mode,"complete":outcome.is_ok()})
+    );
     held.close().await?;
     outcome
 }
@@ -330,14 +436,8 @@ impl SyntheticTarget {
     }
 
     async fn close(&mut self) -> Result<(), &'static str> {
-        let target = self.target.as_ref().ok_or(FAILED)?;
-        command(
-            &self.client,
-            "Target.closeTarget",
-            json!({"targetId":target}),
-            None,
-        )
-        .await?;
+        let target = self.target.as_ref().ok_or(UNCLEARED)?;
+        close_target(&self.client, target).await?;
         self.client.site_context().release_target(target);
         self.target = None;
         Ok(())
@@ -349,18 +449,67 @@ impl Drop for SyntheticTarget {
         if let Some(target) = self.target.take() {
             let client = self.client.clone();
             tokio::spawn(async move {
-                if command(
-                    &client,
-                    "Target.closeTarget",
-                    json!({"targetId":target}),
-                    None,
-                )
-                .await
-                .is_ok()
-                {
+                if close_target(&client, &target).await.is_ok() {
                     client.site_context().release_target(&target);
                 }
             });
         }
     }
+}
+
+/// A close reply is not a retirement receipt. Confirm absence through the
+/// same browser before allowing a partial import to clear or a pause to resume.
+async fn close_target(client: &CdpClient, target: &str) -> Result<(), &'static str> {
+    let mut events = client.subscribe();
+    let closed = command(
+        client,
+        "Target.closeTarget",
+        json!({"targetId":target}),
+        None,
+    )
+    .await;
+    if closed.as_ref().is_ok_and(|reply| reply["success"] == false) {
+        return Err(UNCLEARED);
+    }
+    let absent = |targets: &Value| -> Result<bool, &'static str> {
+        Ok(!targets["targetInfos"]
+            .as_array()
+            .ok_or(UNCLEARED)?
+            .iter()
+            .any(|entry| entry["targetId"] == target))
+    };
+    let targets = command(client, "Target.getTargets", json!({}), None)
+        .await
+        .map_err(|_| UNCLEARED)?;
+    #[cfg(test)]
+    eprintln!(
+        "private_close_receipt={}",
+        json!({"replySuccess":closed.as_ref().ok().map(|reply|reply["success"].clone()),"targetAbsent":absent(&targets)?})
+    );
+    if !absent(&targets)? {
+        tokio::time::timeout(Duration::from_secs(8),async {
+            loop {tokio::select! {
+                event=events.recv()=>{let event=event.map_err(|_|UNCLEARED)?;if event.method=="Target.targetDestroyed" && event.params["targetId"]==target {return Ok::<_,&'static str>(());}},
+                _=client.closed()=>return Err(UNCLEARED),
+            }}
+        }).await.map_err(|_|UNCLEARED)??;
+        let targets = command(client, "Target.getTargets", json!({}), None)
+            .await
+            .map_err(|_| UNCLEARED)?;
+        if !absent(&targets)? {
+            return Err(UNCLEARED);
+        }
+    }
+    Ok(())
+}
+
+pub(crate) async fn settle_private_targets(
+    client: &CdpClient,
+    context: &super::Context,
+) -> Result<(), &'static str> {
+    for target in context.owned_targets() {
+        close_target(client, &target).await?;
+        context.release_target(&target);
+    }
+    Ok(())
 }

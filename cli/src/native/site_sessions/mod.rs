@@ -2,6 +2,7 @@
 
 pub(crate) mod bytes;
 pub(crate) mod custody;
+pub(crate) mod documents;
 pub(crate) mod protocol;
 pub(crate) mod redaction;
 pub(crate) mod state;
@@ -20,6 +21,14 @@ pub(crate) struct Context {
 }
 
 impl Context {
+    pub(crate) fn owned_targets(&self) -> Vec<String> {
+        self.targets
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .cloned()
+            .collect()
+    }
     pub(crate) fn private_target(&self, target: &str) -> bool {
         self.targets
             .read()

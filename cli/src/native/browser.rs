@@ -793,6 +793,9 @@ impl BrowserManager {
             initialize_lightpanda_manager(ws_url, process).await?
         } else {
             let client = Arc::new(CdpClient::connect(&ws_url).await?);
+            if let BrowserProcess::Chrome(chrome) = &process {
+                client.bind_site_profile(chrome.site_profile());
+            }
             let mut manager = Self {
                 client,
                 browser_process: Some(process),
@@ -814,6 +817,15 @@ impl BrowserManager {
                 documents: Default::default(),
             };
             manager.discover_and_attach_targets().await?;
+            for page in &manager.pages {
+                manager
+                    .client
+                    .site_profile()
+                    .documents
+                    .seed_fresh(&manager.client, &page.session_id)
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
             manager
         };
 

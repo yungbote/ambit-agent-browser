@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures_util::{stream::FuturesUnordered, FutureExt, StreamExt};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
@@ -177,6 +178,7 @@ pub(crate) trait Browser: Sync {
         &self,
         _channel: ChannelId,
         _request: SiteRequest,
+        _ledger: Arc<Ledger>,
     ) -> impl Future<Output = Result<Value, &'static str>> + Send {
         async { Err("This browser does not serve site custody.") }
     }
@@ -202,6 +204,12 @@ pub(crate) trait Browser: Sync {
         frame: &FrameContext<'_>,
         asks: &Asks<'_>,
     ) -> impl Future<Output = Finish> + Send;
+
+    /// Immediate authority fence when the connection ends. Ordinary input
+    /// settlement remains in end after its currently executing step finishes.
+    fn channel_closed(&self, _channel: ChannelId) -> impl Future<Output = ()> + Send {
+        async {}
+    }
 
     /// `channel` ended and starts nothing more: the input its steps left
     /// held is released, unless another channel's step acted since.
@@ -296,7 +304,7 @@ impl ArtifactDigest {
 
 /// The daemon's agent channels: what outlives any one connection.
 pub(crate) struct Endpoint {
-    ledger: Ledger,
+    ledger: Arc<Ledger>,
     identity: Identity,
     artifact: ArtifactDigest,
 }
@@ -304,7 +312,7 @@ pub(crate) struct Endpoint {
 impl Endpoint {
     pub(crate) fn new(identity: Identity) -> Self {
         Self {
-            ledger: Ledger::default(),
+            ledger: Arc::new(Ledger::default()),
             identity,
             artifact: ArtifactDigest::of_executable(),
         }
@@ -359,14 +367,15 @@ impl Endpoint {
                     received=inbox.next(&self.ledger)=>break received,
                     event=async { events.as_mut().unwrap().recv().await }, if events.is_some()=>{
                         if let Ok((channel,event))=event {
-                            if session.as_ref().is_some_and(|session|session.channel==channel) {
-                                if write_line(writer,&event).await.is_err() { inbox.close(&self.ledger); }
-                            }
+                            if session.as_ref().is_some_and(|session|session.channel==channel) && write_line(writer,&event).await.is_err() {inbox.close(&self.ledger);}
                         }
                     }
                 }
             };
             let Some(received) = received else {
+                if let Some(session) = &session {
+                    browser.channel_closed(session.channel).await;
+                }
                 break;
             };
             idle.mark();
@@ -374,15 +383,25 @@ impl Endpoint {
             let outcome = {
                 let work = self.process(browser, session.as_ref(), received);
                 tokio::pin!(work);
+                let mut completed = None;
+                let mut independent = FuturesUnordered::new();
                 loop {
+                    if independent.is_empty() {
+                        if let Some(output) = completed.take() {
+                            break output;
+                        }
+                    }
                     tokio::select! {
                         biased;
-                        output=&mut work=>break output,
+                        output=&mut work, if completed.is_none()=> { completed=Some(output); }
+                        output=independent.next(), if !independent.is_empty()=> {
+                            if let Some(Some((reply,_)))=output {
+                                if write_line(writer,&reply).await.is_err() { inbox.close(&self.ledger); }
+                            }
+                        }
                         event=async { events.as_mut().unwrap().recv().await }, if events.is_some()=>{
                             if let Ok((channel,event))=event {
-                                if session.as_ref().is_some_and(|session|session.channel==channel) {
-                                    if write_line(writer,&event).await.is_err() { inbox.close(&self.ledger); }
-                                }
+                                if session.as_ref().is_some_and(|session|session.channel==channel) && write_line(writer,&event).await.is_err() {inbox.close(&self.ledger);}
                             }
                         }
                         line=inbox.read_line(), if !inbox.closed=>{
@@ -393,14 +412,17 @@ impl Endpoint {
                                     Ok((_,Frame::Files(_,_)))=>true,
                                     Ok((_,Frame::Program(_,request)))=>request.independent(),
                                     _=>false,
-                                }) {
+                                }) && independent.len()<MAX_IN_FLIGHT {
                                     let received=inbox.frames.pop_back().unwrap();
                                     inbox.queued_bytes=inbox.queued_bytes.saturating_sub(received.bytes);
-                                    if let Some((reply,_))=self.process(browser,session.as_ref(),received).await {
-                                        if write_line(writer,&reply).await.is_err() { inbox.close(&self.ledger); }
-                                    }
+                                    independent.push(self.process(browser,session.as_ref(),received).boxed());
                                 }
                             } else { inbox.close(&self.ledger); }
+                        }
+                    }
+                    if inbox.closed {
+                        if let Some(session) = &session {
+                            browser.channel_closed(session.channel).await;
                         }
                     }
                 }
@@ -492,11 +514,14 @@ impl Endpoint {
                 (self.op_status(session, id, query).await, None)
             }
             (Frame::Site(request), Some(session)) => {
-                let result = if session.binding.browser_host {
-                    browser.site_request(session.channel, request).await
-                } else {
-                    Err("Site custody requires this daemon's immutable browser-host role.")
-                };
+                let result =
+                    if session.binding.browser_host && self.ledger.may_continue(session.channel) {
+                        browser
+                            .site_request(session.channel, request, self.ledger.clone())
+                            .await
+                    } else {
+                        Err("Site custody requires this daemon's immutable browser-host role.")
+                    };
                 let reply = match result {
                     Ok(data) => json!({"id":id,"success":true,"data":data}),
                     Err(error) => refusal(id, "browser_site_custody_refused", error, false),
@@ -635,6 +660,7 @@ impl Endpoint {
                 "maxInFlight": MAX_IN_FLIGHT, "maxRequestBytes": MAX_REQUEST_BYTES,
                 "maxReplyBytes": MAX_REPLY_BYTES, "ledgerEntries": ledger::ENTRIES,
                 "maxCustodyBytes":site_protocol::MAX_FRAME_BYTES,
+                "maxCustodyChunkBytes":crate::native::site_sessions::bytes::CHUNK_BYTES,
                 "ledgerBytes": ledger::BYTES, "candidates": CANDIDATES,
                 "resolve": frame::MAX_RESOLVE,
             },
@@ -962,7 +988,7 @@ impl<R: AsyncRead + Unpin> Inbox<'_, R> {
                     self.close(ledger);
                     return;
                 }
-                let limit = if site_protocol::is_kind(kind) {
+                let limit = if matches!(kind, "site_session.attach" | "site_session.export") {
                     site_protocol::MAX_FRAME_BYTES
                 } else {
                     MAX_REQUEST_BYTES

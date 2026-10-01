@@ -16,11 +16,17 @@ use super::{
 use crate::native::agent_channel::frame::ChannelId;
 use crate::native::cdp::client::CdpClient;
 
+#[path = "transfer.rs"]
+mod transfer;
+
 const REFUSED: &str = "The browser site custody request is no longer authorized for this channel.";
 const DEADLINE: Duration = Duration::from_secs(2);
 
 struct Pause {
-    ready: tokio::sync::oneshot::Sender<()>,
+    ready: tokio::sync::oneshot::Sender<bool>,
+    session: String,
+    generation: String,
+    frame: Option<String>,
 }
 struct Pending {
     channel: ChannelId,
@@ -29,22 +35,46 @@ struct Pending {
     expires: Instant,
     offer_generation: u64,
     pauses: Vec<Pause>,
+    admitted: bool,
+    expected_use: Option<String>,
 }
 struct Held {
     use_id: String,
     mode: Mode,
     expires_at: Option<chrono::DateTime<chrono::Utc>>,
+    origins: HashSet<String>,
 }
+struct ExpectedHeld {
+    channel: Option<ChannelId>,
+    use_id: Option<String>,
+    expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+impl ExpectedHeld {
+    fn matches(&self, state: &State, site: &str) -> bool {
+        self.channel
+            .is_none_or(|channel| state.channel == Some(channel))
+            && state.held.get(site).map(|held| held.use_id.clone()) == self.use_id
+            && self.expires_at.is_none_or(|expiry| {
+                state
+                    .held
+                    .get(site)
+                    .is_some_and(|held| held.expires_at == Some(expiry))
+                    && expiry <= chrono::Utc::now()
+            })
+    }
+}
+
 #[derive(Default)]
 struct State {
     channel: Option<ChannelId>,
+    ledger: Option<Arc<crate::native::agent_channel::ledger::Ledger>>,
     offers: HashMap<String, Offer>,
     pending: HashMap<String, Pending>,
     resolved: HashSet<String>,
     held: HashMap<String, Held>,
+    transfers: HashMap<String, transfer::Transfer>,
     activated: bool,
     offer_generation: u64,
-    origins: HashSet<String>,
     prepared: HashSet<String>,
     client: Option<Arc<CdpClient>>,
     task: Option<tokio::task::JoinHandle<()>>,
@@ -52,8 +82,26 @@ struct State {
 
 pub(crate) struct Custody {
     state: Mutex<State>,
+    effects: Mutex<()>,
+    effect_site: std::sync::RwLock<Option<String>>,
+    effect_changed: tokio::sync::Notify,
     context: Context,
     events: broadcast::Sender<(ChannelId, Value)>,
+}
+
+struct Effect<'a> {
+    owner: &'a Custody,
+    _lock: tokio::sync::MutexGuard<'a, ()>,
+}
+impl Drop for Effect<'_> {
+    fn drop(&mut self) {
+        *self
+            .owner
+            .effect_site
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = None;
+        self.owner.effect_changed.notify_waiters();
+    }
 }
 
 impl Custody {
@@ -70,6 +118,9 @@ impl Custody {
         let (events, _) = broadcast::channel(64);
         Arc::new(Self {
             state: Mutex::new(State::default()),
+            effects: Mutex::new(()),
+            effect_site: std::sync::RwLock::default(),
+            effect_changed: tokio::sync::Notify::new(),
             context: Context::default(),
             events,
         })
@@ -77,6 +128,17 @@ impl Custody {
 
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<(ChannelId, Value)> {
         self.events.subscribe()
+    }
+    async fn effect(&self, site: &str) -> Effect<'_> {
+        let lock = self.effects.lock().await;
+        *self
+            .effect_site
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = Some(site.into());
+        Effect {
+            owner: self,
+            _lock: lock,
+        }
     }
     pub(crate) fn scrub(&self, value: &mut Value) {
         self.context.values.scrub_protocol(value);
@@ -92,6 +154,38 @@ impl Custody {
         );
     }
 
+    fn site_origins(&self, state: &State, site: &str) -> Result<Vec<String>, &'static str> {
+        let mut origins = state
+            .client
+            .as_ref()
+            .map(|client| client.site_profile().documents.origins(site))
+            .transpose()?
+            .unwrap_or_default()
+            .into_iter()
+            .collect::<HashSet<_>>();
+        if let Some(held) = state.held.get(site) {
+            origins.extend(held.origins.iter().cloned());
+        }
+        Ok(origins.into_iter().collect())
+    }
+
+    async fn clear_documents(
+        &self,
+        client: &CdpClient,
+        site: &str,
+        origins: &[String],
+    ) -> Result<(), &'static str> {
+        let mut known = client
+            .site_profile()
+            .documents
+            .retire(client, site)
+            .await?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        known.extend(origins.iter().cloned());
+        storage::clear_site(client, site, &known.into_iter().collect::<Vec<_>>()).await
+    }
+
     /// Runs after the canonical launch and before its first command. Mandatory
     /// file policy does not depend on an optional identity offer. A new native
     /// connection gets the same value registry, but fresh page gates.
@@ -100,14 +194,12 @@ impl Custody {
         client: Arc<CdpClient>,
         sessions: Vec<String>,
     ) -> Result<(), &'static str> {
+        self.recover_cleanup(&client).await?;
         if crate::native::workspace_role::current().is_ok_and(|role| role.is_browser_host()) {
             self.context.files.guard();
         }
         {
             let mut state = self.state.lock().await;
-            if state.channel.is_none() && !self.context.files.guarded() {
-                return Ok(());
-            }
             if !state
                 .client
                 .as_ref()
@@ -126,32 +218,34 @@ impl Custody {
                 state.task = Some(tokio::spawn(async move {
                     loop {
                         let event = tokio::select! {
-                            event=events.recv()=>match event { Ok(event)=>event, Err(_)=>break },
+                            event=events.recv()=>match event { Ok(event)=>event, Err(broadcast::error::RecvError::Lagged(_))=>{connection.site_profile().documents.unobserved();break;},Err(_)=>break },
                             _=connection.closed()=>break,
                         };
                         let Some(owner) = owner.upgrade() else {
                             break;
                         };
                         if event.method == "Page.frameNavigated" {
-                            if let Some(url) =
-                                event.params.pointer("/frame/url").and_then(Value::as_str)
-                            {
-                                if let Ok(url) = Url::parse(url) {
-                                    if matches!(url.scheme(), "http" | "https") {
-                                        owner
-                                            .state
-                                            .lock()
-                                            .await
-                                            .origins
-                                            .insert(url.origin().ascii_serialization());
-                                    }
-                                }
+                            if let Some(session) = event.session_id.as_deref() {
+                                let _ = connection
+                                    .site_profile()
+                                    .documents
+                                    .retain_key(&connection, session, &event.params["frame"])
+                                    .await;
                             }
+                        }
+                        owner.retire_stale().await;
+                    }
+                    if let Some(owner) = owner.upgrade() {
+                        let channel = owner.state.lock().await.channel;
+                        if let Some(channel) = channel {
+                            owner.channel_closed(channel).await;
+                            owner.end(channel).await;
                         }
                     }
                 }));
             }
         }
+        self.retire_stale().await;
         // Page-created targets must wait for the same native preparation as
         // daemon-created tabs, before their first document can escape.
         client
@@ -177,6 +271,29 @@ impl Custody {
             .is_some_and(|target| client.site_context().private_target(&target))
         {
             return Ok(());
+        }
+        let document = client
+            .target_for_session(session)
+            .is_none_or(|target| client.site_profile().documents.is_document(&target));
+        if document && client.target_for_session(session).is_some() {
+            // A page manager already enables these events for its tabs. OOP
+            // targets can be resumed without network controls, so custody
+            // establishes the same subscription before their first document.
+            client
+                .send_command_no_params("Page.enable", Some(session))
+                .await
+                .map_err(|_| REFUSED)?;
+            client
+                .send_command_no_params("DOMStorage.enable", Some(session))
+                .await
+                .map_err(|_| REFUSED)?;
+        }
+        if document {
+            client
+                .site_profile()
+                .documents
+                .seed(client, session)
+                .await?;
         }
         {
             let state = self.state.lock().await;
@@ -213,15 +330,49 @@ impl Custody {
         client: &Arc<CdpClient>,
         session: String,
         params: Value,
-    ) {
+    ) -> bool {
         let Some(_) = params["requestId"].as_str() else {
-            return;
+            return true;
         };
         let url = params
             .pointer("/request/url")
             .and_then(Value::as_str)
             .and_then(|url| Url::parse(url).ok());
+        // New same-site documents wait too; freezing the enumerated targets
+        // alone cannot fence a popup created while an effect is in progress.
+        if !client
+            .target_for_session(&session)
+            .is_some_and(|target| client.site_context().private_target(&target))
+        {
+            loop {
+                let changed = self.effect_changed.notified();
+                tokio::pin!(changed);
+                changed.as_mut().enable();
+                let blocked = self
+                    .effect_site
+                    .read()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .as_ref()
+                    .is_some_and(|site| {
+                        url.as_ref().is_some_and(|url| {
+                            state::site_url(site).is_ok_and(|site| {
+                                url.scheme() == site.scheme()
+                                    && url
+                                        .host_str()
+                                        .is_some_and(|host| state::host_in_site(host, &site))
+                            })
+                        })
+                    });
+                if !blocked {
+                    break;
+                }
+                tokio::select! {_=changed=>{},_=client.closed()=>return false}
+            }
+        }
         let mut state = self.state.lock().await;
+        if client.site_profile().require_clear().is_err() {
+            return false;
+        }
         let site = url.as_ref().and_then(|url| {
             state
                 .offers
@@ -237,7 +388,7 @@ impl Custody {
                 .cloned()
         });
         let Some(site) = site.filter(|site| !state.resolved.contains(site)) else {
-            return;
+            return true;
         };
         if protocol::expiry(state.offers[&site].expires_at.as_deref())
             .ok()
@@ -245,26 +396,32 @@ impl Custody {
             .is_some_and(|at| at <= chrono::Utc::now())
         {
             drop(state);
-            let _ = self.detach(&site).await;
-            return;
+            return self.detach(&site).await.is_ok();
         }
         let (ready, waiting) = tokio::sync::oneshot::channel();
+        let frame = params["frameId"].as_str().map(ToString::to_string);
+        let generation = client.document_generation(&session, frame.as_deref());
         if let Some((_, pending)) = state
             .pending
             .iter_mut()
             .find(|(_, pending)| pending.site == site)
         {
-            pending.pauses.push(Pause { ready });
+            pending.pauses.push(Pause {
+                ready,
+                session: session.clone(),
+                generation: generation.clone(),
+                frame: frame.clone(),
+            });
             drop(state);
-            let _ = waiting.await;
-            return;
+            return waiting.await.unwrap_or(false);
         }
         let Some(channel) = state.channel else {
-            return;
+            return true;
         };
         let request_id = uuid::Uuid::new_v4().to_string();
         let mode = state.offers[&site].mode;
         let offer_generation = state.offer_generation;
+        let expected_use = state.held.get(&site).map(|held| held.use_id.clone());
         state.pending.insert(
             request_id.clone(),
             Pending {
@@ -273,48 +430,122 @@ impl Custody {
                 mode,
                 expires: Instant::now() + DEADLINE,
                 offer_generation,
-                pauses: vec![Pause { ready }],
+                pauses: vec![Pause {
+                    ready,
+                    session: session.clone(),
+                    generation: generation.clone(),
+                    frame,
+                }],
+                admitted: false,
+                expected_use,
             },
         );
         drop(state);
-        let _=self.events.send((channel,json!({"type":"site_session.need","requestId":request_id,"site":site,"pageGeneration":client.page_generation(&session)})));
+        let _=self.events.send((channel,json!({"type":"site_session.need","requestId":request_id,"site":site,"pageGeneration":generation})));
         let owner = Arc::downgrade(self);
         tokio::spawn(async move {
             tokio::time::sleep(DEADLINE).await;
             if let Some(owner) = owner.upgrade() {
-                owner.release(&request_id).await;
+                let due = owner
+                    .state
+                    .lock()
+                    .await
+                    .pending
+                    .get(&request_id)
+                    .is_some_and(|pending| !pending.admitted && pending.expires <= Instant::now());
+                if due {
+                    let _ = owner.release(&request_id).await;
+                }
             }
         });
-        let _ = waiting.await;
+        waiting.await.unwrap_or(false)
     }
 
-    async fn release(&self, request_id: &str) {
-        let (pending, client, had_state, origins) = {
-            let mut state = self.state.lock().await;
-            let Some(pending) = state.pending.remove(request_id) else {
-                return;
-            };
-            state.resolved.insert(pending.site.clone());
-            let had_state = state.held.remove(&pending.site).is_some();
-            let boundary = state::site_url(&pending.site).expect("an admitted pending site");
-            let origins = state
-                .origins
-                .iter()
-                .filter(|origin| state::origin_in_site(origin, &boundary))
-                .cloned()
-                .collect::<Vec<_>>();
-            (pending, state.client.clone(), had_state, origins)
+    async fn release(self: &Arc<Self>, request_id: &str) -> Result<(), &'static str> {
+        let owner = self.clone();
+        let request_id = request_id.to_owned();
+        tokio::spawn(async move { owner.release_pending(&request_id).await })
+            .await
+            .map_err(|_| storage::UNCLEARED)?
+    }
+    async fn release_pending(&self, request_id: &str) -> Result<(), &'static str> {
+        let pending_site = self
+            .state
+            .lock()
+            .await
+            .pending
+            .get(request_id)
+            .map(|pending| pending.site.clone());
+        let Some(pending_site) = pending_site else {
+            return Ok(());
         };
-        if let Some(client) = client {
-            if had_state {
-                // A refused revalidation must really continue signed out,
-                // including cookies retained across a native relaunch.
-                let _ = storage::clear_site(&client, &pending.site, &origins).await;
+        let _effect = self.effect(&pending_site).await;
+        let (client, site, had_state, origins) = {
+            let state = self.state.lock().await;
+            let Some(pending) = state.pending.get(request_id) else {
+                return Ok(());
+            };
+            let client = state.client.clone().ok_or(REFUSED)?;
+            client.site_profile().require_clear()?;
+            if state
+                .held
+                .get(&pending.site)
+                .map(|held| held.use_id.clone())
+                != pending.expected_use
+            {
+                drop(state);
+                let pending = self.state.lock().await.pending.remove(request_id);
+                if let Some(pending) = pending {
+                    for pause in pending.pauses {
+                        let _ = pause.ready.send(false);
+                    }
+                }
+                return Err(REFUSED);
             }
-            for pause in pending.pauses {
-                let _ = pause.ready.send(());
-            }
+            (
+                client,
+                pending.site.clone(),
+                state.held.contains_key(&pending.site),
+                self.site_origins(&state, &pending.site)?,
+            )
+        };
+        if had_state
+            && self
+                .clear_documents(&client, &site, &origins)
+                .await
+                .is_err()
+        {
+            client.site_profile().mark_uncleared(&site);
+            return Err(storage::UNCLEARED);
         }
+        let mut state = self.state.lock().await;
+        let Some(pending) = state.pending.remove(request_id) else {
+            return Ok(());
+        };
+        if had_state {
+            state.held.remove(&site);
+        }
+        state.resolved.insert(site);
+        drop(state);
+        for pause in pending.pauses {
+            let _ = pause.ready.send(!had_state);
+        }
+        Ok(())
+    }
+
+    /// Share the endpoint's current authority rather than copying a live flag.
+    /// An EOF/fence is visible even while an owned custody job is finishing.
+    pub(crate) async fn request_current(
+        self: &Arc<Self>,
+        channel: ChannelId,
+        request: Request,
+        ledger: Arc<crate::native::agent_channel::ledger::Ledger>,
+    ) -> Result<Value, &'static str> {
+        if !ledger.may_continue(channel) {
+            return Err(REFUSED);
+        }
+        self.state.lock().await.ledger = Some(ledger);
+        self.request(channel, request).await
     }
 
     pub(crate) async fn request(
@@ -322,17 +553,28 @@ impl Custody {
         channel: ChannelId,
         request: Request,
     ) -> Result<Value, &'static str> {
+        if matches!(&request, Request::Offer(_)) {
+            let client = { self.state.lock().await.client.clone() };
+            if let Some(client) = client {
+                self.recover_cleanup(&client).await?;
+            }
+        }
+        if let Request::Transfer(request) = request {
+            return self.transfer(channel, request).await;
+        }
         if let Request::Offer(offers) = request {
-            {
+            let generation = {
                 let mut state = self.state.lock().await;
                 state.offer_generation = state.offer_generation.checked_add(1).ok_or(REFUSED)?;
-            }
+                state.offer_generation
+            };
+            self.retire_stale().await;
             let pending = {
                 let state = self.state.lock().await;
                 state.pending.keys().cloned().collect::<Vec<_>>()
             };
             for request in pending {
-                self.release(&request).await;
+                let _ = self.release(&request).await;
             }
             let discard = {
                 let state = self.state.lock().await;
@@ -350,13 +592,30 @@ impl Custody {
                                     .is_none_or(|at| at > chrono::Utc::now())
                         })
                     })
-                    .map(|(site, _)| site.clone())
+                    .map(|(site, held)| (site.clone(), held.use_id.clone()))
                     .collect::<Vec<_>>()
             };
-            for site in discard {
-                self.detach(&site).await?;
+            for (site, use_id) in discard {
+                self.detach_expected(
+                    &site,
+                    Some(ExpectedHeld {
+                        channel: None,
+                        use_id: Some(use_id),
+                        expires_at: None,
+                    }),
+                )
+                .await?;
             }
+            let _effect = self.effects.lock().await;
             let mut state = self.state.lock().await;
+            if state.offer_generation != generation
+                || state
+                    .ledger
+                    .as_ref()
+                    .is_some_and(|ledger| !ledger.may_continue(channel))
+            {
+                return Err(REFUSED);
+            }
             state.channel = Some(channel);
             state.activated = true;
             state.offers = offers
@@ -412,78 +671,65 @@ impl Custody {
                 expires_at,
                 state: attached,
             } => {
-                let (pending, client) = {
-                    let mut state = self.state.lock().await;
+                // Inline v3 is only a wire adapter: use the same current
+                // admission/import/cancellation owner, retaining its old two
+                // second whole-operation deadline and 8 MiB reader budget.
+                let (page_generation, deadline) = {
+                    let state = self.state.lock().await;
                     let pending = state.pending.get(&request_id).ok_or(REFUSED)?;
-                    if pending.channel != channel
-                        || pending.site != site
-                        || pending.mode != mode
-                        || pending.expires <= Instant::now()
-                    {
-                        return Err(REFUSED);
-                    }
-                    let deadline = protocol::expiry(expires_at.as_deref())?;
-                    let offered = protocol::expiry(
-                        state
-                            .offers
-                            .get(&site)
-                            .ok_or(REFUSED)?
-                            .expires_at
-                            .as_deref(),
-                    )?;
-                    if deadline.is_some_and(|at| at <= chrono::Utc::now())
-                        || offered.is_some_and(|limit| deadline.is_none_or(|at| at > limit))
-                    {
-                        return Err(REFUSED);
-                    }
-                    let client = state.client.clone().ok_or(REFUSED)?;
-                    (state.pending.remove(&request_id).ok_or(REFUSED)?, client)
+                    let remaining = pending.expires.saturating_duration_since(Instant::now());
+                    (
+                        pending.pauses.first().ok_or(REFUSED)?.generation.clone(),
+                        chrono::Utc::now()
+                            + chrono::Duration::from_std(remaining).map_err(|_| REFUSED)?,
+                    )
                 };
-                let expiry = tokio::time::Instant::from_std(pending.expires);
-                let imported = tokio::time::timeout_at(expiry, storage::import(&client, &attached))
-                    .await
-                    .map_err(|_| REFUSED)
-                    .and_then(|result| result);
-                if imported.is_err() {
-                    let _ = storage::clear(&client, &attached).await;
+                let begun = self
+                    .transfer(
+                        channel,
+                        protocol::TransferRequest::Begin {
+                            request_id,
+                            use_id,
+                            site,
+                            mode,
+                            page_generation,
+                            deadline: protocol::expiry(expires_at.as_deref())?
+                                .map_or(deadline, |at| deadline.min(at)),
+                            expires_at: protocol::expiry(expires_at.as_deref())?,
+                        },
+                    )
+                    .await?;
+                let transfer_id = begun["transferId"].as_str().ok_or(REFUSED)?.to_owned();
+                let mut body = super::bytes::Bytes::new().map_err(|_| REFUSED)?;
+                body.write_json(&attached).map_err(|_| REFUSED)?;
+                let bytes = body.length();
+                let sha256 = body.digest().map_err(|_| REFUSED)?;
+                let mut offset = 0;
+                while offset < bytes {
+                    let data = body
+                        .chunk(offset, super::bytes::CHUNK_BYTES)
+                        .map_err(|_| REFUSED)?;
+                    let count = data.len();
+                    self.transfer(
+                        channel,
+                        protocol::TransferRequest::Part {
+                            transfer_id: transfer_id.clone(),
+                            offset,
+                            data,
+                        },
+                    )
+                    .await?;
+                    offset += count as u64;
                 }
-                {
-                    let mut state = self.state.lock().await;
-                    // Offer replacement or channel close wins over late import.
-                    if state.channel != Some(channel)
-                        || state.offers.get(&site).map(|offer| offer.mode) != Some(mode)
-                        || state.offer_generation != pending.offer_generation
-                    {
-                        drop(state);
-                        let _ = storage::clear(&client, &attached).await;
-                        for pause in pending.pauses {
-                            let _ = pause.ready.send(());
-                        }
-                        return Err(REFUSED);
-                    }
-                    state.resolved.insert(site.clone());
-                    if imported.is_ok() {
-                        state
-                            .origins
-                            .extend(attached.origins.iter().map(|origin| origin.origin.clone()));
-                        state.held.insert(
-                            site.clone(),
-                            Held {
-                                use_id: use_id.clone(),
-                                mode,
-                                expires_at: protocol::expiry(expires_at.as_deref())?,
-                            },
-                        );
-                    }
-                }
-                for pause in pending.pauses {
-                    let _ = pause.ready.send(());
-                }
-                imported?;
-                if let Some(deadline) = protocol::expiry(expires_at.as_deref())? {
-                    self.schedule_expiry(site.clone(), use_id, deadline);
-                }
-                Ok(json!({"site":site,"attached":true}))
+                self.transfer(
+                    channel,
+                    protocol::TransferRequest::Finish {
+                        transfer_id,
+                        bytes,
+                        sha256,
+                    },
+                )
+                .await
             }
             Request::Refuse { request_id, site } => {
                 let state = self.state.lock().await;
@@ -492,23 +738,42 @@ impl Custody {
                     return Err(REFUSED);
                 }
                 drop(state);
-                self.release(&request_id).await;
+                self.release(&request_id).await?;
                 Ok(json!({"site":site,"attached":false}))
             }
             Request::Export(site) => {
-                let (client, origins) = {
-                    let state = self.state.lock().await;
-                    let boundary = state::site_url(&site)?;
-                    let origins = state
-                        .origins
-                        .iter()
-                        .filter(|origin| state::origin_in_site(origin, &boundary))
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    (state.client.clone().ok_or(REFUSED)?, origins)
-                };
-                let captured = storage::capture(&client, &site, &origins).await?;
-                Ok(json!({"states":[captured]}))
+                let owner = self.clone();
+                tokio::spawn(async move {
+                    let _effect = owner.effect(&site).await;
+                    let client = owner.state.lock().await.client.clone().ok_or(REFUSED)?;
+                    client.site_profile().require_clear()?;
+                    let frozen = client
+                        .site_profile()
+                        .documents
+                        .freeze(&client, &site)
+                        .await?;
+                    let origins = owner.site_origins(&*owner.state.lock().await, &site)?;
+                    let captured = storage::capture(&client, &site, &origins).await;
+                    if client
+                        .site_profile()
+                        .documents
+                        .resume(&client, &frozen)
+                        .await
+                        .is_err()
+                    {
+                        client.site_profile().mark_uncleared(&site);
+                        return Err(storage::UNCLEARED);
+                    }
+                    let captured = captured?;
+                    let mut legacy = super::bytes::Bytes::new().map_err(|_| REFUSED)?;
+                    legacy.write_json(&captured).map_err(|_| REFUSED)?;
+                    if legacy.length() > state::MAX_BYTES as u64 {
+                        return Err(REFUSED);
+                    }
+                    Ok(json!({"states":[captured]}))
+                })
+                .await
+                .map_err(|_| storage::UNCLEARED)?
             }
             Request::Detach { sites, revoked } => {
                 let mut cleared = Vec::new();
@@ -518,106 +783,146 @@ impl Custody {
                 }
                 Ok(json!({"sites":cleared,"reason":if revoked{"revoked"}else{"ended"}}))
             }
+            Request::Transfer(_) => unreachable!(),
             Request::Offer(_) => unreachable!(),
         }
     }
 
-    async fn detach(&self, site: &str) -> Result<(), &'static str> {
-        let (requests, client, origins) = {
-            let mut state = self.state.lock().await;
-            state.offers.remove(site);
-            state.resolved.insert(site.into());
-            let requests = state
-                .pending
+    async fn detach(self: &Arc<Self>, site: &str) -> Result<(), &'static str> {
+        self.detach_expected(site, None).await
+    }
+    async fn detach_expected(
+        self: &Arc<Self>,
+        site: &str,
+        expected: Option<ExpectedHeld>,
+    ) -> Result<(), &'static str> {
+        let owner = self.clone();
+        let site = site.to_owned();
+        tokio::spawn(async move { owner.detach_current(&site, expected).await })
+            .await
+            .map_err(|_| storage::UNCLEARED)?
+    }
+    async fn detach_current(
+        self: &Arc<Self>,
+        site: &str,
+        expected: Option<ExpectedHeld>,
+    ) -> Result<(), &'static str> {
+        let transfers = {
+            let state = self.state.lock().await;
+            if expected
+                .as_ref()
+                .is_some_and(|expected| !expected.matches(&state, site))
+            {
+                return Err(REFUSED);
+            }
+            state
+                .transfers
                 .iter()
-                .filter(|(_, pending)| pending.site == site)
-                .map(|(id, _)| id.clone())
-                .collect::<Vec<_>>();
-            state.held.remove(site);
-            let boundary = state::site_url(site)?;
-            let origins = state
-                .origins
-                .iter()
-                .filter(|origin| state::origin_in_site(origin, &boundary))
-                .cloned()
-                .collect::<Vec<_>>();
-            (requests, state.client.clone(), origins)
+                .filter(|(_, transfer)| transfer.site == site)
+                .map(|(id, transfer)| {
+                    transfer.cancel();
+                    id.clone()
+                })
+                .collect::<Vec<_>>()
         };
-        for request in requests {
-            self.release(&request).await;
+        for id in transfers {
+            self.retire_transfer(&id).await?;
         }
-        if let Some(client) = client {
-            storage::clear_site(&client, site, &origins).await?;
-            let targets = client
-                .send_command("Target.getTargets", Some(json!({})), None)
-                .await
-                .map_err(|_| REFUSED)?;
-            for target in targets["targetInfos"].as_array().ok_or(REFUSED)? {
-                let matches = target["url"]
-                    .as_str()
-                    .and_then(|url| Url::parse(url).ok())
-                    .is_some_and(|url| {
-                        state::site_url(site).is_ok_and(|boundary| {
-                            url.scheme() == boundary.scheme()
-                                && url
-                                    .host_str()
-                                    .is_some_and(|host| state::host_in_site(host, &boundary))
-                        })
-                    });
-                if matches {
-                    if let Some(session) = target["targetId"]
-                        .as_str()
-                        .and_then(|target| client.session_for_target(target))
-                    {
-                        client
-                            .send_command(
-                                "Page.reload",
-                                Some(json!({"ignoreCache":true})),
-                                Some(&session),
-                            )
-                            .await
-                            .map_err(|_| REFUSED)?;
-                    }
-                }
+        let _effect = self.effect(site).await;
+        let (client, origins) = {
+            let state = self.state.lock().await;
+            if expected
+                .as_ref()
+                .is_some_and(|expected| !expected.matches(&state, site))
+            {
+                return Err(REFUSED);
+            }
+            let client = state.client.clone();
+            if let Some(client) = &client {
+                client.site_profile().require_clear()?;
+            }
+            (client, self.site_origins(&state, site)?)
+        };
+        if let Some(client) = &client {
+            if self.clear_documents(client, site, &origins).await.is_err() {
+                client.site_profile().mark_uncleared(site);
+                return Err(storage::UNCLEARED);
+            }
+        }
+        let mut state = self.state.lock().await;
+        state.offers.remove(site);
+        state.held.remove(site);
+        state.resolved.insert(site.into());
+        let requests = state
+            .pending
+            .iter()
+            .filter(|(_, pending)| pending.site == site)
+            .map(|(id, _)| id.clone())
+            .collect::<Vec<_>>();
+        let pending = requests
+            .into_iter()
+            .filter_map(|id| state.pending.remove(&id))
+            .collect::<Vec<_>>();
+        drop(state);
+        for pending in pending {
+            for pause in pending.pauses {
+                let _ = pause.ready.send(false);
             }
         }
         Ok(())
     }
 
-    pub(crate) async fn end(&self, channel: ChannelId) {
-        if self.state.lock().await.channel != Some(channel) {
-            return;
-        }
+    pub(crate) async fn end(self: &Arc<Self>, channel: ChannelId) {
+        self.channel_closed(channel).await;
+        self.retire_stale().await;
         let pending = {
             let state = self.state.lock().await;
-            state.pending.keys().cloned().collect::<Vec<_>>()
+            state
+                .pending
+                .iter()
+                .filter(|(_, pending)| pending.channel == channel)
+                .map(|(id, _)| id.clone())
+                .collect::<Vec<_>>()
         };
         for request in pending {
-            self.release(&request).await;
+            let _ = self.release(&request).await;
         }
         let mut state = self.state.lock().await;
-        state.channel = None;
-        state.offers.clear();
-        state.resolved.clear();
+        if state.channel.is_none() {
+            state.offers.clear();
+            state.resolved.clear();
+        }
     }
 
     pub(crate) async fn admits_channel(&self, channel: ChannelId) -> bool {
         let state = self.state.lock().await;
-        !state.activated || state.channel == Some(channel)
+        state
+            .client
+            .as_ref()
+            .is_none_or(|client| client.site_profile().require_clear().is_ok())
+            && (!state.activated || state.channel == Some(channel))
     }
 
-    async fn expire_due(&self) -> Result<(), &'static str> {
+    async fn expire_due(self: &Arc<Self>) -> Result<(), &'static str> {
         let due = {
             let state = self.state.lock().await;
             state
                 .held
                 .iter()
                 .filter(|(_, held)| held.expires_at.is_some_and(|at| at <= chrono::Utc::now()))
-                .map(|(site, _)| site.clone())
+                .map(|(site, held)| (site.clone(), held.use_id.clone(), held.expires_at.unwrap()))
                 .collect::<Vec<_>>()
         };
-        for site in due {
-            self.detach(&site).await?;
+        for (site, use_id, expiry) in due {
+            self.detach_expected(
+                &site,
+                Some(ExpectedHeld {
+                    channel: None,
+                    use_id: Some(use_id),
+                    expires_at: Some(expiry),
+                }),
+            )
+            .await?;
         }
         Ok(())
     }
@@ -646,7 +951,16 @@ impl Custody {
                 })
             };
             if due {
-                let _ = owner.detach(&site).await;
+                let _ = owner
+                    .detach_expected(
+                        &site,
+                        Some(ExpectedHeld {
+                            channel: None,
+                            use_id: Some(use_id),
+                            expires_at: Some(deadline),
+                        }),
+                    )
+                    .await;
             }
         });
     }
