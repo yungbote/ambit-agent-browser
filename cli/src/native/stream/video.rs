@@ -42,7 +42,7 @@ use super::StreamMedia;
 use crate::native::display::DisplayClient;
 use crate::native::video::{Declared, VideoCodec, VideoError};
 use parts::Parts;
-use policy::LinkRate;
+pub(super) use policy::LinkRate;
 #[cfg(test)]
 pub(super) use policy::Quality;
 #[cfg(all(test, target_os = "linux"))]
@@ -503,7 +503,7 @@ impl VideoTrack {
             }
             let mut parts = Parts::new(unit, codec, epoch.stream_id.clone(), epoch.seq);
             if let Some(rate) = self.link_rate {
-                parts.set_rate(rate, Instant::now());
+                parts.set_rate(rate);
             }
             self.parts = Some(parts);
             self.update_ready();
@@ -571,12 +571,13 @@ impl VideoTrack {
     }
 
     pub(super) async fn part_ready(&self) {
-        match self.parts.as_ref().and_then(Parts::deadline) {
-            Some(deadline) => {
-                tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await
-            }
-            None => std::future::pending().await,
+        if !self.parts.as_ref().is_some_and(Parts::ready) {
+            std::future::pending::<()>().await;
         }
+    }
+
+    pub(super) fn link_rate(&self) -> Option<LinkRate> {
+        self.link_rate
     }
 
     pub(super) fn part(&mut self) -> Option<Message> {
@@ -616,7 +617,7 @@ impl VideoTrack {
                 self.link_rate = Some(rate);
                 self.flow.set_link_rate(Some(rate));
                 if let Some(parts) = self.parts.as_mut() {
-                    parts.set_rate(rate, Instant::now());
+                    parts.set_rate(rate);
                 }
                 if let Some(subscription) = &self.subscription {
                     subscription.set_link_rate(rate);

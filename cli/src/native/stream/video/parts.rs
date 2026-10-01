@@ -3,7 +3,7 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use super::{LinkRate, Unit};
 use crate::native::stream::wire;
@@ -28,7 +28,6 @@ pub(super) struct Parts {
     canonical_bytes: usize,
     socket_bytes: usize,
     rate: Option<LinkRate>,
-    next_at: Instant,
     first_at: Option<Instant>,
 }
 
@@ -47,7 +46,6 @@ impl Parts {
             canonical_bytes: 0,
             socket_bytes: 0,
             rate: None,
-            next_at: Instant::now(),
             first_at: None,
         }
     }
@@ -75,30 +73,25 @@ impl Parts {
         }
     }
 
-    pub(super) fn set_rate(&mut self, rate: LinkRate, now: Instant) {
-        if let Some(old) = self.rate {
-            let debt = self.next_at.saturating_duration_since(now).as_secs_f64()
-                * f64::from(old.bits_per_second)
-                / 8.0;
-            self.next_at =
-                now + Duration::from_secs_f64(debt * 8.0 / f64::from(rate.bits_per_second));
-        }
+    pub(super) fn set_rate(&mut self, rate: LinkRate) {
         self.rate = Some(rate);
     }
 
-    pub(super) fn deadline(&self) -> Option<Instant> {
+    pub(super) fn ready(&self) -> bool {
         let (_, window) = self.limits();
         if self.complete() || self.reserved.is_some() || window == 0 {
-            return None;
+            return false;
         }
-        let minimum =
-            wire::video_part_minimum(&self.unit, self.codec, &self.stream, self.seq, self.sent)?;
+        let Some(minimum) =
+            wire::video_part_minimum(&self.unit, self.codec, &self.stream, self.seq, self.sent)
+        else {
+            return false;
+        };
         let minimum = minimum + FrameHeader::default().len(minimum as u64);
-        (self.bytes == 0
+        self.bytes == 0
             || window
                 .checked_sub(self.bytes)
-                .is_some_and(|room| room >= minimum))
-        .then_some(self.next_at)
+                .is_some_and(|room| room >= minimum)
     }
 
     pub(super) fn first_at(&self) -> Option<Instant> {
@@ -161,10 +154,6 @@ impl Parts {
         self.canonical_bytes += message.len();
         self.socket_bytes += bytes;
         self.first_at.get_or_insert(now);
-        if let Some(rate) = self.rate {
-            self.next_at = now.max(self.next_at)
-                + Duration::from_secs_f64(bytes as f64 * 8.0 / f64::from(rate.bits_per_second));
-        }
         Some(message)
     }
 
@@ -337,60 +326,44 @@ mod tests {
     }
 
     #[test]
-    fn tiny_rate_pays_actual_minimum_envelopes_and_rate_drop_preserves_debt() {
+    fn tiny_rate_reserves_actual_minimum_envelopes_and_rate_drop_preserves_credit() {
         let mut picture = parts();
         let now = Instant::now();
         let slow = LinkRate {
             bits_per_second: 1000,
             burst_bytes: 1,
         };
-        picture.set_rate(slow, now);
+        picture.set_rate(slow);
         assert_eq!(picture.limits(), (3, 1));
         let stream = picture.stream.clone();
         for _ in 0..2 {
-            let at = picture.deadline().unwrap();
-            let part = picture.prepare(3, 1, at).unwrap();
+            assert!(picture.ready());
+            let part = picture.prepare(3, 1, now).unwrap();
             let (end, cost) = picture.sent().unwrap();
             assert!(cost > 1, "only actual minimum envelope overrun");
             let header_end = 4 + u32::from_be_bytes(part[..4].try_into().unwrap()) as usize;
             assert_eq!(part.len() - header_end, 1);
-            assert!(
-                picture.deadline().is_none(),
-                "receipt must drain full overrun"
-            );
+            assert!(!picture.ready(), "receipt must drain full overrun");
             assert!(picture.receive(&stream, 1, end));
-            assert_eq!(
-                picture.deadline().unwrap(),
-                at + Duration::from_secs_f64(cost as f64 / 125.0)
-            );
+            assert!(picture.ready());
         }
-        let at = picture.deadline().unwrap();
-        picture.set_rate(
-            LinkRate {
-                bits_per_second: 500_000,
-                burst_bytes: 65_536,
-            },
-            at,
-        );
+        let at = Instant::now();
+        picture.set_rate(LinkRate {
+            bits_per_second: 500_000,
+            burst_bytes: 65_536,
+        });
         let (quantum, window) = picture.limits();
         assert_eq!((quantum, window), (1562, 3124));
         picture.prepare(quantum, window, at).unwrap();
         let (end, cost) = picture.sent().unwrap();
         picture.receive(&stream, 1, end);
-        let half = at + Duration::from_secs_f64(cost as f64 / 125_000.0);
-        picture.set_rate(
-            LinkRate {
-                bits_per_second: 250_000,
-                burst_bytes: 65_536,
-            },
-            half,
-        );
-        let remaining = picture
-            .deadline()
-            .unwrap()
-            .duration_since(half)
-            .as_secs_f64();
-        assert!((remaining - cost as f64 / 62_500.0).abs() < 1e-7);
+        picture.set_rate(LinkRate {
+            bits_per_second: 250_000,
+            burst_bytes: 65_536,
+        });
+        assert_eq!(picture.in_flight(), 0);
+        assert!(picture.ready());
+        assert!(cost > 0);
     }
 
     /// Framing fixture only. The archive's outer u32 message length preserves
@@ -421,22 +394,17 @@ mod tests {
         });
         let stream = "00000000-0000-4000-8000-000000000001";
         let mut picture = Parts::new(source, VideoCodec::Av1Full, stream.into(), 1);
-        picture.set_rate(
-            LinkRate {
-                bits_per_second: 500_000,
-                burst_bytes: 65_536,
-            },
-            Instant::now(),
-        );
+        picture.set_rate(LinkRate {
+            bits_per_second: 500_000,
+            burst_bytes: 65_536,
+        });
         let path = std::env::var("AMBIT_NATIVE_PARTS_OUT").unwrap();
         let mut archive = std::io::BufWriter::new(std::fs::File::create(path).unwrap());
         let mut fragments = 0;
         let mut first_header = None;
         while !picture.complete() {
             let (quantum, window) = picture.limits();
-            let part = picture
-                .prepare(quantum, window, picture.deadline().unwrap())
-                .unwrap();
+            let part = picture.prepare(quantum, window, Instant::now()).unwrap();
             if first_header.is_none() {
                 let end = 4 + u32::from_be_bytes(part[..4].try_into().unwrap()) as usize;
                 first_header =

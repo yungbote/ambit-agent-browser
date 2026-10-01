@@ -1,17 +1,16 @@
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::stream::SplitStream;
+use futures_util::StreamExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, watch, Mutex, Notify, RwLock};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
 
 use crate::native::audio::{AudioCodec, AudioError, AudioSource};
 use crate::native::browser_control::{custody_active, BrowserControl};
@@ -30,6 +29,9 @@ use super::BrowserNote;
 use super::{
     is_allowed_origin, timestamp_ms, Audience, FrameNeeds, IdleActivity, StreamFrame, StreamMedia,
 };
+
+mod writer;
+use writer::{Socket, Writer, Written};
 
 /// Highest per-client frame rate a client may request via the `config` message.
 const MAX_CONFIGURABLE_FPS: u32 = 120;
@@ -661,7 +663,16 @@ async fn handle_ws_client(
             Ok(resp)
         };
 
-    let ws_stream = match tokio_tungstenite::accept_hdr_async(stream, callback).await {
+    let written = Arc::new(AtomicU64::new(0));
+    let ws_stream = match tokio_tungstenite::accept_hdr_async(
+        Written {
+            inner: stream,
+            bytes: written.clone(),
+        },
+        callback,
+    )
+    .await
+    {
         Ok(ws) => ws,
         Err(_) => return,
     };
@@ -678,7 +689,8 @@ async fn handle_ws_client(
     // The viewer's place in the roster, left on every path out.
     let mut seat = media.seat(initial_config.frame_needs());
 
-    let (mut ws_tx, ws_rx) = ws_stream.split();
+    let (ws_tx, ws_rx) = ws_stream.split();
+    let mut ws_tx = Writer::new(ws_tx, written);
 
     // Watch channels, not atomics, so a mid-stream change wakes the writer's
     // select! below instead of leaving it asleep on a stale deadline.
@@ -807,6 +819,11 @@ async fn handle_ws_client(
     let mut framed = true;
 
     loop {
+        let now = std::time::Instant::now();
+        ws_tx.settle(now);
+        ws_tx
+            .debt
+            .set_rate(video.as_ref().and_then(VideoTrack::link_rate), now);
         // The viewer is served video while its track holds a subscription,
         // frames otherwise. Frames resume whole: nothing sent before the video
         // is a base, and nothing in flight is awaited.
@@ -977,7 +994,11 @@ async fn handle_ws_client(
                 in_flight.acknowledge(acked, Instant::now(), true);
                 byte_blocked = false;
             }
-            _ = next_video_part(&video) => {
+            _ = next_video_part(&video, &ws_tx) => {
+                // The reader may have serialized an automatic control frame
+                // while readiness waited. Reconcile and recheck before admission.
+                ws_tx.settle(std::time::Instant::now());
+                if std::time::Instant::now() < ws_tx.debt.next_at { continue; }
                 let Some(track) = video.as_mut() else { continue };
                 // Return through this priority loop after each bounded part:
                 // source/config, audio, records and feedback can all progress.
@@ -1036,10 +1057,7 @@ async fn handle_ws_client(
 }
 
 /// Writes a track's records in order; false when the connection is gone.
-async fn send_records(
-    writer: &mut SplitSink<WebSocketStream<TcpStream>, Message>,
-    records: Vec<Value>,
-) -> bool {
+async fn send_records(writer: &mut Writer, records: Vec<Value>) -> bool {
     for record in records {
         if writer
             .send(Message::Text(record.to_string()))
@@ -1060,9 +1078,12 @@ async fn next_video(track: &Option<VideoTrack>) -> Delivery {
     }
 }
 
-async fn next_video_part(track: &Option<VideoTrack>) {
+async fn next_video_part(track: &Option<VideoTrack>, writer: &Writer) {
     match track {
-        Some(track) => track.part_ready().await,
+        Some(track) => {
+            track.part_ready().await;
+            tokio::time::sleep_until(tokio::time::Instant::from_std(writer.debt.next_at)).await;
+        }
         None => std::future::pending().await,
     }
 }
@@ -1094,7 +1115,7 @@ async fn next_audio(
 /// must not be reordered.
 #[allow(clippy::too_many_arguments)]
 async fn reader_loop(
-    mut ws_rx: SplitStream<WebSocketStream<TcpStream>>,
+    mut ws_rx: SplitStream<Socket>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     cdp_session_id: Arc<RwLock<Option<String>>>,
     config: watch::Sender<ClientConfig>,
