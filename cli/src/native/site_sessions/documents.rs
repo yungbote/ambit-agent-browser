@@ -792,7 +792,7 @@ impl Documents {
                 .send_command(
                     "Page.navigate",
                     Some(json!({"url":"about:blank"})),
-                    Some(&session),
+                    Some(session),
                 )
                 .await
                 .map_err(|_| storage::UNCLEARED)?;
@@ -800,7 +800,7 @@ impl Documents {
                 return Err(storage::UNCLEARED);
             }
             let mut tree = client
-                .send_command_no_params("Page.getFrameTree", Some(&session))
+                .send_command_no_params("Page.getFrameTree", Some(session))
                 .await
                 .map_err(|_| storage::UNCLEARED)?;
             if tree["frameTree"]["frame"]["url"] != "about:blank" {
@@ -812,7 +812,7 @@ impl Documents {
                     }}
                 }).await.map_err(|_|storage::UNCLEARED)??;
                 tree = client
-                    .send_command_no_params("Page.getFrameTree", Some(&session))
+                    .send_command_no_params("Page.getFrameTree", Some(session))
                     .await
                     .map_err(|_| storage::UNCLEARED)?;
                 if tree["frameTree"]["frame"]["url"] != "about:blank" {
@@ -820,11 +820,11 @@ impl Documents {
                 }
             }
             client
-                .send_command_no_params("Page.resetNavigationHistory", Some(&session))
+                .send_command_no_params("Page.resetNavigationHistory", Some(session))
                 .await
                 .map_err(|_| storage::UNCLEARED)?;
             let history = client
-                .send_command_no_params("Page.getNavigationHistory", Some(&session))
+                .send_command_no_params("Page.getNavigationHistory", Some(session))
                 .await
                 .map_err(|_| storage::UNCLEARED)?;
             let entries = history["entries"].as_array().ok_or(storage::UNCLEARED)?;
@@ -832,7 +832,7 @@ impl Documents {
                 return Err(storage::UNCLEARED);
             }
             let target = client
-                .target_for_session(&session)
+                .target_for_session(session)
                 .ok_or(storage::UNCLEARED)?;
             self.tabs
                 .lock()
@@ -1089,14 +1089,12 @@ mod tests {
                 let attached = |session: &str, target: &str| json!({"method":"Target.attachedToTarget","params":{"sessionId":session,"waitingForDebugger":false,"targetInfo":{"targetId":target,"type":"shared_worker","url":"https://other.example/script.js"}}});
                 socket
                     .send(Message::Text(
-                        attached("old-session", "selected-target")
-                            .to_string()
-                            .into(),
+                        attached("old-session", "selected-target").to_string(),
                     ))
                     .await
                     .unwrap();
                 if case == "same-target-reattached" {
-                    socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"old-session","targetId":"selected-target"}}).to_string().into())).await.unwrap();
+                    socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"old-session","targetId":"selected-target"}}).to_string())).await.unwrap();
                 }
                 let mut stopped = false;
                 while let Some(Ok(message)) = socket.next().await {
@@ -1119,9 +1117,7 @@ mod tests {
                             assert_eq!(request["params"]["targetId"], "selected-target");
                             socket
                                 .send(Message::Text(
-                                    attached("current-session", "selected-target")
-                                        .to_string()
-                                        .into(),
+                                    attached("current-session", "selected-target").to_string(),
                                 ))
                                 .await
                                 .unwrap();
@@ -1129,12 +1125,10 @@ mod tests {
                         }
                         "Storage.getStorageKey" => {
                             if case == "changed-target" {
-                                socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"old-session","targetId":"selected-target"}}).to_string().into())).await.unwrap();
+                                socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"old-session","targetId":"selected-target"}}).to_string())).await.unwrap();
                                 socket
                                     .send(Message::Text(
-                                        attached("old-session", "unrelated-target")
-                                            .to_string()
-                                            .into(),
+                                        attached("old-session", "unrelated-target").to_string(),
                                     ))
                                     .await
                                     .unwrap();
@@ -1144,22 +1138,20 @@ mod tests {
                         "Target.closeTarget" => {
                             assert_eq!(case, "same-target-reattached");
                             assert_eq!(request["params"]["targetId"], "selected-target");
-                            socket.send(Message::Text(json!({"method":"Inspector.targetCrashed","sessionId":"current-session","params":{}}).to_string().into())).await.unwrap();
+                            socket.send(Message::Text(json!({"method":"Inspector.targetCrashed","sessionId":"current-session","params":{}}).to_string())).await.unwrap();
                             stopped = true;
                             json!({"success":true})
                         }
                         "Target.detachFromTarget" => {
                             assert_eq!(request["params"]["sessionId"], "current-session");
-                            socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"current-session","targetId":"selected-target"}}).to_string().into())).await.unwrap();
+                            socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"current-session","targetId":"selected-target"}}).to_string())).await.unwrap();
                             json!({})
                         }
                         _ => panic!("unexpected worker command {method}"),
                     };
                     socket
                         .send(Message::Text(
-                            json!({"id":request["id"],"result":result})
-                                .to_string()
-                                .into(),
+                            json!({"id":request["id"],"result":result}).to_string(),
                         ))
                         .await
                         .unwrap();
