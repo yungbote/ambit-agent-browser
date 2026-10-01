@@ -1,5 +1,5 @@
 //! Maintained desktop services for one SystemTheme-owned private display.
-//! The session theme is authoritative; the keyfile is only its GSettings projection.
+//! The session theme is authoritative; maintained dconf owns GSettings writes.
 
 use std::fs;
 use std::os::unix::ffi::OsStrExt;
@@ -15,13 +15,14 @@ use crate::native::theme::Theme;
 const FRONTEND: &str = "/usr/libexec/xdg-desktop-portal";
 const BACKEND: &str = "/usr/libexec/xdg-desktop-portal-gtk";
 const OBSERVER: &str = "/usr/bin/dbus-send";
+const SETTER: &str = "/usr/bin/gsettings";
+const WRITER: &str = "/usr/libexec/dconf-service";
 const READINESS: Duration = Duration::from_secs(5);
 
 pub(super) struct DesktopPortal {
     children: Vec<Child>,
     address: String,
     configuration: PathBuf,
-    settings: PathBuf,
     directory: PathBuf,
     display: String,
     authority: PathBuf,
@@ -42,7 +43,7 @@ impl DesktopPortal {
         let directory = directory.join("desktop");
         for child in [
             "",
-            "config/glib-2.0/settings",
+            "config",
             "config/xdg-desktop-portal",
             "data",
             "cache",
@@ -58,7 +59,6 @@ impl DesktopPortal {
             children: Vec::new(),
             address: bus_address(&directory.join("bus")),
             configuration: directory.join("bus.conf"),
-            settings: directory.join("config/glib-2.0/settings/keyfile"),
             directory,
             display: display.into(),
             authority: authority.into(),
@@ -66,7 +66,7 @@ impl DesktopPortal {
         write_private_configuration(&owner.configuration, &bus_configuration(&owner.address))?;
         write_private_configuration(&owner.directory.join("config/xdg-desktop-portal/portals.conf"),
             "[preferred]\ndefault=none\norg.freedesktop.impl.portal.Settings=gtk\norg.freedesktop.impl.portal.FileChooser=gtk\n")?;
-        owner.project(theme)?;
+        write_private_configuration(&owner.directory.join("dconf-profile"), "user-db:user\n")?;
         let deadline = Instant::now() + READINESS;
         let configuration = owner
             .configuration
@@ -82,6 +82,13 @@ impl DesktopPortal {
             owner.name_owned("org.freedesktop.DBus", deadline, canceled)
         }) {
             return Err("Private desktop bus did not become ready".into());
+        }
+        owner.spawn(WRITER, &[], canceled)?;
+        if !owner.await_condition(deadline, canceled, |owner, deadline| {
+            owner.name_owned("ca.desrt.dconf", deadline, canceled)
+        }) || !owner.project(theme, deadline, canceled)
+        {
+            return Err("Private GSettings writer did not become ready".into());
         }
         owner.spawn(BACKEND, &[], canceled)?;
         if !owner.await_condition(deadline, canceled, |owner, deadline| {
@@ -117,7 +124,8 @@ impl DesktopPortal {
             .env("XDG_DATA_HOME", self.directory.join("data"))
             .env("XDG_CACHE_HOME", self.directory.join("cache"))
             .env("XDG_RUNTIME_DIR", self.directory.join("runtime"))
-            .env("GSETTINGS_BACKEND", "keyfile")
+            .env("GSETTINGS_BACKEND", "dconf")
+            .env("DCONF_PROFILE", self.directory.join("dconf-profile"))
             .env_remove("WAYLAND_DISPLAY")
             .env_remove("WAYLAND_SOCKET");
         command
@@ -215,15 +223,38 @@ impl DesktopPortal {
         .is_some_and(|bytes| appearance_acknowledged(&bytes, theme))
     }
 
-    fn project(&self, theme: Theme) -> Result<(), String> {
-        write_private_configuration(&self.settings, &appearance_configuration(theme))
+    fn project(&self, theme: Theme, deadline: Instant, canceled: &AtomicBool) -> bool {
+        self.project_with_program(SETTER, theme, deadline, canceled)
+    }
+
+    fn project_with_program(
+        &self,
+        setter: &str,
+        theme: Theme,
+        deadline: Instant,
+        canceled: &AtomicBool,
+    ) -> bool {
+        let mut command = self.command(setter);
+        // The maintained CLI changes only this key and flushes its GSettings
+        // write before exit; dconf serializes it with the chooser's own keys.
+        command.args([
+            "set",
+            "org.gnome.desktop.interface",
+            "color-scheme",
+            appearance_value(theme),
+        ]);
+        read_owned_output(command, deadline, canceled).is_some()
     }
 
     pub(super) fn apply(&mut self, theme: Theme, canceled: &AtomicBool) -> bool {
-        if canceled.load(Ordering::Relaxed) || !self.running() || self.project(theme).is_err() {
+        let deadline = Instant::now() + READINESS;
+        if canceled.load(Ordering::Relaxed)
+            || !self.running()
+            || !self.project(theme, deadline, canceled)
+        {
             return false;
         }
-        self.await_condition(Instant::now() + READINESS, canceled, |owner, deadline| {
+        self.await_condition(deadline, canceled, |owner, deadline| {
             owner.theme_acknowledged(theme, deadline, canceled)
         })
     }
@@ -261,14 +292,11 @@ fn bus_configuration(address: &str) -> String {
     format!("<busconfig>\n<type>session</type>\n<listen>{address}</listen>\n<auth>EXTERNAL</auth>\n<policy context=\"default\">\n<deny user=\"*\"/>\n<allow user=\"{}\"/>\n<allow own=\"*\"/>\n<allow send_destination=\"*\"/>\n<allow receive_sender=\"*\"/>\n</policy>\n</busconfig>\n", unsafe { libc::geteuid() })
 }
 
-fn appearance_configuration(theme: Theme) -> String {
-    format!(
-        "[org/gnome/desktop/interface]\ncolor-scheme='{}'\n",
-        match theme {
-            Theme::Dark => "prefer-dark",
-            Theme::Light => "prefer-light",
-        }
-    )
+fn appearance_value(theme: Theme) -> &'static str {
+    match theme {
+        Theme::Dark => "prefer-dark",
+        Theme::Light => "prefer-light",
+    }
 }
 
 fn tokens(bytes: &[u8]) -> Option<Vec<&str>> {
@@ -300,14 +328,8 @@ mod tests {
 
     #[test]
     fn the_same_session_enum_projects_to_standard_settings_values() {
-        assert_eq!(
-            appearance_configuration(Theme::Dark),
-            "[org/gnome/desktop/interface]\ncolor-scheme='prefer-dark'\n"
-        );
-        assert_eq!(
-            appearance_configuration(Theme::Light),
-            "[org/gnome/desktop/interface]\ncolor-scheme='prefer-light'\n"
-        );
+        assert_eq!(appearance_value(Theme::Dark), "prefer-dark");
+        assert_eq!(appearance_value(Theme::Light), "prefer-light");
         assert!(appearance_acknowledged(
             b" variant variant uint32 1\n",
             Theme::Dark
@@ -358,6 +380,78 @@ mod tests {
     }
 
     #[test]
+    fn maintained_setter_changes_only_the_theme_key_with_private_environment_and_bounded_failure() {
+        let root = tempfile::tempdir().unwrap();
+        let directory = root.path().join("desktop");
+        fs::create_dir_all(directory.join("config/dconf")).unwrap();
+        let database = directory.join("config/dconf/user");
+        fs::write(&database, "chooser preferences must remain").unwrap();
+        let record = root.path().join("setter-call.json");
+        let setter = root.path().join("gsettings");
+        let owner = DesktopPortal {
+            children: Vec::new(),
+            address: bus_address(&directory.join("bus")),
+            configuration: directory.join("bus.conf"),
+            directory: directory.clone(),
+            display: ":994".into(),
+            authority: root.path().join("authority"),
+        };
+        for theme in Theme::ALL {
+            fs::write(&setter, format!("#!/usr/bin/python3\nimport json,os,sys\nfrom pathlib import Path\nPath({record:?}).write_text(json.dumps(dict(args=sys.argv[1:],config=os.environ['XDG_CONFIG_HOME'],backend=os.environ['GSETTINGS_BACKEND'],profile=os.environ['DCONF_PROFILE'])))\n")).unwrap();
+            fs::set_permissions(&setter, fs::Permissions::from_mode(0o700)).unwrap();
+            assert!(owner.project_with_program(
+                setter.to_str().unwrap(),
+                theme,
+                Instant::now() + Duration::from_secs(2),
+                &AtomicBool::new(false)
+            ));
+            let observed: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&record).unwrap()).unwrap();
+            assert_eq!(
+                observed["args"],
+                serde_json::json!([
+                    "set",
+                    "org.gnome.desktop.interface",
+                    "color-scheme",
+                    appearance_value(theme)
+                ])
+            );
+            assert_eq!(
+                observed["config"],
+                directory.join("config").to_str().unwrap()
+            );
+            assert_eq!(observed["backend"], "dconf");
+            assert_eq!(
+                observed["profile"],
+                directory.join("dconf-profile").to_str().unwrap()
+            );
+            assert_eq!(
+                fs::read_to_string(&database).unwrap(),
+                "chooser preferences must remain"
+            );
+        }
+        fs::remove_file(&record).unwrap();
+        assert!(!owner.project_with_program(
+            setter.to_str().unwrap(),
+            Theme::Dark,
+            Instant::now() + Duration::from_secs(2),
+            &AtomicBool::new(true)
+        ));
+        assert!(!record.exists());
+        fs::write(&setter, "#!/usr/bin/python3\nimport sys\nsys.exit(1)\n").unwrap();
+        assert!(!owner.project_with_program(
+            setter.to_str().unwrap(),
+            Theme::Dark,
+            Instant::now() + Duration::from_secs(2),
+            &AtomicBool::new(false)
+        ));
+        assert_eq!(
+            fs::read_to_string(database).unwrap(),
+            "chooser preferences must remain"
+        );
+    }
+
+    #[test]
     fn dropping_the_owner_reaps_its_children_and_removes_only_its_directory() {
         let root = tempfile::tempdir().unwrap();
         let directory = root.path().join("desktop");
@@ -376,14 +470,14 @@ mod tests {
             children: vec![child],
             address: bus_address(&directory.join("bus")),
             configuration: directory.join("bus.conf"),
-            settings: directory.join("keyfile"),
             directory: directory.clone(),
             display: ":994".into(),
             authority: root.path().join("authority"),
         };
-        owner.project(Theme::Dark).unwrap();
+        let configuration = directory.join("bus.conf");
+        write_private_configuration(&configuration, &bus_configuration(&owner.address)).unwrap();
         assert_eq!(
-            fs::metadata(&owner.settings).unwrap().permissions().mode() & 0o777,
+            fs::metadata(&configuration).unwrap().permissions().mode() & 0o777,
             0o600
         );
         let mut chrome = Command::new("unexecuted-chrome");
