@@ -392,6 +392,14 @@ impl RetainedDisplay {
                     .is_some_and(|owner| owner.apply(theme, canceled))
             })
     }
+
+    fn apply_system_theme_environment(&self, command: &mut Command) {
+        if let Ok(settings) = self.server.system_theme.lock() {
+            if let Some(settings) = settings.as_ref() {
+                settings.apply_chrome_environment(command);
+            }
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1451,6 +1459,7 @@ fn try_launch_chrome(
     if let Some(ref x) = xvfb {
         cmd.env("DISPLAY", &x.server.display);
         cmd.env("XAUTHORITY", &x.server.auth_file);
+        x.apply_system_theme_environment(&mut cmd);
         // The private display is X11. Inheriting a workstation's Wayland
         // selection can open Chrome on another surface than the one we own.
         // Scope this choice to Chrome; never alter the host desktop session.
