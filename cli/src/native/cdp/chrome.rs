@@ -906,7 +906,6 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         "--disable-hang-monitor".to_string(),
         "--disable-popup-blocking".to_string(),
         "--disable-prompt-on-repost".to_string(),
-        "--disable-sync".to_string(),
         "--disable-features=Translate".to_string(),
         format!("--enable-features={}", enable_features.join(",")),
         "--metrics-recording-only".to_string(),
@@ -2618,6 +2617,10 @@ mod tests {
         };
         let managed = build_chrome_args(&automation).unwrap().args;
         assert_eq!(managed[0], "--remote-debugging-port=0");
+        assert!(
+            !managed.iter().any(|arg| arg == "--disable-sync"),
+            "owned launch defaults must not disable Chrome Sync"
+        );
         let sign_in = automation.clone().without_automation().unwrap();
         assert!(!sign_in.remote_debugging);
         let args = build_chrome_args(&sign_in).unwrap().args;
