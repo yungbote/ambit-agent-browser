@@ -1286,3 +1286,450 @@ async fn e2e_site_state_transfer_backend_native_consumer() {
     assert!(custody.state.lock().await.transfers.is_empty());
     eprintln!("backend_native_transfer_receipt={receipt}");
 }
+
+/// A surviving worker can repopulate cleared storage after every A document
+/// has retired. B worker execution, registrations and history are independent.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_site_state_revocation_retires_workers_and_preserves_other_site() {
+    Box::pin(worker_retirement_case(None)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_site_state_worker_close_override_holds_without_erasure() {
+    Box::pin(worker_retirement_case(Some("noop"))).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_site_state_worker_close_throw_holds_without_erasure() {
+    Box::pin(worker_retirement_case(Some("throw"))).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_site_state_worker_close_refusal_preserves_user_disabled_scripts() {
+    Box::pin(worker_retirement_case(Some("predisabled"))).await;
+}
+
+async fn worker_retirement_case(fault: Option<&str>) {
+    const PUT: &str = r#"self.put=value=>new Promise((resolve,reject)=>{const opening=indexedDB.open('worker-custody',1);opening.onupgradeneeded=()=>opening.result.createObjectStore('values');opening.onerror=()=>reject(opening.error);opening.onsuccess=()=>{const db=opening.result;const tx=db.transaction('values','readwrite');tx.objectStore('values').put(value,'credential');tx.oncomplete=()=>{db.close();resolve(value)};tx.onerror=()=>{db.close();reject(tx.error)}}});"#;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let origin = format!("http://127.0.0.1:{port}");
+    let other = format!("http://localhost:{port}");
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0; 4096];
+                let count = socket.read(&mut request).await.unwrap_or(0);
+                let request = String::from_utf8_lossy(&request[..count]);
+                let (mime, body) = if request.starts_with("GET /shared.js ") {
+                    ("application/javascript", format!("{PUT}onconnect=e=>{{const port=e.ports[0];port.onmessage=async e=>port.postMessage(await put(e.data));port.start()}};"))
+                } else if request.starts_with("GET /dedicated-parent.js ") {
+                    ("application/javascript", format!("{PUT}self.child=new Worker('/dedicated.js');onmessage=async e=>{{const value=await new Promise(resolve=>{{child.onmessage=e=>resolve(e.data);child.postMessage(e.data)}});postMessage(await put(value))}};"))
+                } else if request.starts_with("GET /dedicated.js ") {
+                    (
+                        "application/javascript",
+                        format!("{PUT}onmessage=async e=>postMessage(await put(e.data));"),
+                    )
+                } else if request.starts_with("GET /service.js ") {
+                    ("application/javascript", "self.addEventListener('install',e=>e.waitUntil(self.skipWaiting()));self.addEventListener('activate',e=>e.waitUntil(clients.claim()));".into())
+                } else {
+                    (
+                        "text/html",
+                        "<!doctype html><title>Worker custody</title>".into(),
+                    )
+                };
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type:{mime}\r\nContent-Length:{}\r\nConnection:close\r\n\r\n{body}", body.len());
+                let _ = socket.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    let mut daemon = crate::native::actions::DaemonState::new();
+    let launched = Box::pin(crate::native::actions::execute_command(
+        &json!({"action":"launch","headless":true,"executablePath":std::env::var("AMBIT_TEST_CHROME_EXECUTABLE").unwrap_or("/usr/bin/google-chrome".into())}),
+        &mut daemon,
+    )).await;
+    assert_eq!(launched["success"], true);
+    let browser = daemon.browser.as_mut().unwrap();
+    let client = browser.client.clone();
+    let owner = Custody::new();
+    owner
+        .browser_ready(
+            client.clone(),
+            vec![browser.active_session_id().unwrap().into()],
+        )
+        .await
+        .unwrap();
+    let resume_workers = |client: &Arc<CdpClient>| {
+        let mut events = client.subscribe();
+        let resuming = client.clone();
+        tokio::spawn(async move {
+            while let Ok(event) = events.recv().await {
+                if event.method == "Target.attachedToTarget"
+                    && event.params["waitingForDebugger"] == true
+                    && matches!(
+                        event.params["targetInfo"]["type"].as_str(),
+                        Some("shared_worker" | "service_worker" | "worker")
+                    )
+                {
+                    let session = event.params["sessionId"].as_str().unwrap();
+                    eprintln!(
+                        "fixture_worker_attached={}",
+                        event.params["targetInfo"]["type"]
+                    );
+                    resuming
+                        .send_command_no_wait("Target.setAutoAttach", Some(json!({"autoAttach":true,"waitForDebuggerOnStart":true,"flatten":true})), Some(session))
+                        .await
+                        .unwrap();
+                    resuming
+                        .send_command_no_wait(
+                            "Runtime.runIfWaitingForDebugger",
+                            None,
+                            Some(session),
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        })
+    };
+    let resume = resume_workers(&client);
+    let create = r#"(async()=>{await navigator.serviceWorker.register('/service.js');await navigator.serviceWorker.ready;const value=location.hostname==='localhost'?'nosecret-B-worker':'nosecret-A-worker';window.dedicated=new Worker('/dedicated-parent.js');await new Promise(resolve=>{dedicated.onmessage=e=>resolve(e.data);dedicated.postMessage(value)});window.worker=new SharedWorker('/shared.js',{name:'custody',extendedLifetime:true});worker.port.start();return await new Promise(resolve=>{worker.port.onmessage=e=>resolve(e.data);worker.port.postMessage(value)})})()"#;
+    // Exercise the exact successful createTarget owner too; merely attaching
+    // an adopted paused blank page must not invent script-state provenance.
+    browser.tab_new(None, None).await.unwrap();
+    browser
+        .navigate(&format!("{origin}/writer"), WaitUntil::Load)
+        .await
+        .unwrap();
+    let a_page = browser.active_session_id().unwrap().to_owned();
+    let made = client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({"expression":create,"awaitPromise":true,"returnByValue":true})),
+            Some(&a_page),
+        )
+        .await
+        .unwrap();
+    assert_eq!(made["result"]["value"], "nosecret-A-worker", "{made}");
+    client
+        .site_profile()
+        .documents
+        .settle_keys("http://127.0.0.1")
+        .await
+        .unwrap();
+    browser.tab_new(None, None).await.unwrap();
+    browser
+        .navigate(&format!("{other}/writer"), WaitUntil::Load)
+        .await
+        .unwrap();
+    let b_page = browser.active_session_id().unwrap().to_owned();
+    let made = client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({"expression":create,"awaitPromise":true,"returnByValue":true})),
+            Some(&b_page),
+        )
+        .await
+        .unwrap();
+    assert_eq!(made["result"]["value"], "nosecret-B-worker", "{made}");
+    let b_own = client.send_command("Runtime.evaluate", Some(json!({"expression":"localStorage.setItem('B-own','nosecret-B-own');document.cookie='B_own=nosecret-B-cookie;path=/;max-age=600';true","returnByValue":true})), Some(&b_page)).await.unwrap();
+    assert_eq!(b_own["result"]["value"], true);
+    let targets = client
+        .send_command_no_params("Target.getTargets", None)
+        .await
+        .unwrap();
+    let worker = |kind: &str, url: &str| {
+        targets["targetInfos"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|target| target["type"] == kind && target["url"] == url)
+            .unwrap()["targetId"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let a_worker = worker("shared_worker", &format!("{origin}/shared.js"));
+    let b_worker = worker("shared_worker", &format!("{other}/shared.js"));
+    let a_child = worker("worker", &format!("{origin}/dedicated.js"));
+    let b_child = worker("worker", &format!("{other}/dedicated.js"));
+    let a_session = client.session_for_target(&a_worker).unwrap();
+    let b_session = client.session_for_target(&b_worker).unwrap();
+    let a_child_session = client.session_for_target(&a_child).unwrap();
+    let b_child_session = client.session_for_target(&b_child).unwrap();
+    let a_key = client
+        .send_command_no_params("Storage.getStorageKey", Some(&a_session))
+        .await
+        .unwrap();
+    assert_eq!(a_key["storageKey"], format!("{origin}/"));
+    let child_close = client
+        .send_command(
+            "Target.closeTarget",
+            Some(json!({"targetId":a_child})),
+            None,
+        )
+        .await;
+    assert!(
+        child_close.is_err(),
+        "Chrome cannot directly close a dedicated worker: {child_close:?}"
+    );
+    eprintln!("dedicated_worker_direct_close_supported=false");
+    let b_history = client
+        .send_command_no_params("Page.getNavigationHistory", Some(&b_page))
+        .await
+        .unwrap();
+    let a_history = client
+        .send_command_no_params("Page.getNavigationHistory", Some(&a_page))
+        .await
+        .unwrap();
+    let a_parent = worker("worker", &format!("{origin}/dedicated-parent.js"));
+    if fault == Some("predisabled") {
+        let control = client.send_command("Runtime.evaluate",Some(json!({"expression":"window.nosecretScriptClicked=false;const button=document.createElement('button');button.style.cssText='position:fixed;left:0;top:0;width:100px;height:100px';button.onclick=()=>{window.nosecretScriptClicked=true};document.body.append(button);true","returnByValue":true})),Some(&a_page)).await.unwrap();
+        assert_eq!(control["result"]["value"], true);
+        for kind in ["mousePressed", "mouseReleased"] {
+            client
+                .send_command(
+                    "Input.dispatchMouseEvent",
+                    Some(json!({"type":kind,"x":20,"y":20,"button":"left","clickCount":1})),
+                    Some(&a_page),
+                )
+                .await
+                .unwrap();
+        }
+        let control = client.send_command("Runtime.evaluate",Some(json!({"expression":"const clicked=window.nosecretScriptClicked;window.nosecretScriptClicked=false;clicked","returnByValue":true})),Some(&a_page)).await.unwrap();
+        assert_eq!(
+            control["result"]["value"], true,
+            "the actual click probe works before scripts are disabled"
+        );
+        client
+            .send_command(
+                "Emulation.setScriptExecutionDisabled",
+                Some(json!({"value":true})),
+                Some(&a_page),
+            )
+            .await
+            .unwrap();
+    }
+    if let Some(fault) = fault {
+        let session = match client.session_for_target(&a_parent) {
+            Some(session) => session,
+            None => client
+                .send_command(
+                    "Target.attachToTarget",
+                    Some(json!({"targetId":a_parent,"flatten":true})),
+                    None,
+                )
+                .await
+                .unwrap()["sessionId"]
+                .as_str()
+                .unwrap()
+                .to_owned(),
+        };
+        let key = client
+            .send_command_no_params("Storage.getStorageKey", Some(&session))
+            .await
+            .unwrap();
+        assert_eq!(key, a_key);
+        let replacement = if fault == "throw" {
+            "()=>{throw new Error('nosecret close refused')}"
+        } else {
+            "()=>undefined"
+        };
+        let expression =
+            format!("globalThis.nosecretOriginalClose=self.close;self.close={replacement};true");
+        let changed = client
+            .send_command(
+                "Runtime.evaluate",
+                Some(json!({"expression":expression,"returnByValue":true})),
+                Some(&session),
+            )
+            .await
+            .unwrap();
+        assert_eq!(changed["result"]["value"], true);
+    }
+    let channel = ChannelId::parse("11111111-1111-4111-8111-111111111111").unwrap();
+    let detached = ask(
+        &owner,
+        channel,
+        "site_session.detach",
+        json!({"sites":["http://127.0.0.1"],"reason":"revoked"}),
+    )
+    .await;
+    if let Some(fault) = fault {
+        assert_eq!(detached, Err(storage::UNCLEARED));
+        assert!(client.site_profile().require_clear().is_err());
+        if fault == "predisabled" {
+            for kind in ["mousePressed", "mouseReleased"] {
+                client
+                    .send_command(
+                        "Input.dispatchMouseEvent",
+                        Some(json!({"type":kind,"x":20,"y":20,"button":"left","clickCount":1})),
+                        Some(&a_page),
+                    )
+                    .await
+                    .unwrap();
+            }
+            let clicked = client
+                .send_command(
+                    "Runtime.evaluate",
+                    Some(json!({"expression":"window.nosecretScriptClicked","returnByValue":true})),
+                    Some(&a_page),
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                clicked["result"]["value"], false,
+                "failed worker cleanup must preserve the user's disabled scripts"
+            );
+        }
+        let names = client
+            .send_command(
+                "IndexedDB.requestDatabaseNames",
+                Some(json!({"storageKey":a_key["storageKey"]})),
+                Some(&a_page),
+            )
+            .await
+            .unwrap();
+        assert_eq!(names["databaseNames"], json!(["worker-custody"]));
+        assert_eq!(
+            client
+                .send_command_no_params("Page.getNavigationHistory", Some(&a_page))
+                .await
+                .unwrap(),
+            a_history
+        );
+        assert_eq!(
+            client
+                .send_command_no_params("Page.getNavigationHistory", Some(&b_page))
+                .await
+                .unwrap(),
+            b_history
+        );
+        let b_alive = client.send_command("Runtime.evaluate",Some(json!({"expression":"put('nosecret-B-failure-after')","awaitPromise":true,"returnByValue":true})),Some(&b_child_session)).await.unwrap();
+        assert_eq!(b_alive["result"]["value"], "nosecret-B-failure-after");
+        let session = client
+            .session_for_target(&a_parent)
+            .expect("the refused A execution remains owned");
+        let key = client
+            .send_command_no_params("Storage.getStorageKey", Some(&session))
+            .await
+            .unwrap();
+        assert_eq!(key, a_key);
+        let restored = client.send_command("Runtime.evaluate",Some(json!({"expression":"self.close=globalThis.nosecretOriginalClose;true","returnByValue":true})),Some(&session)).await.unwrap();
+        assert_eq!(restored["result"]["value"], true);
+        owner.recover_cleanup(&client).await.unwrap();
+        assert!(client.site_profile().require_clear().is_ok());
+        let cleared = storage::capture(&client, "http://127.0.0.1", std::slice::from_ref(&origin))
+            .await
+            .unwrap();
+        assert!(cleared
+            .origins
+            .iter()
+            .all(|origin| origin.indexed_db.is_empty()));
+        assert_eq!(
+            client
+                .send_command_no_params("Page.getNavigationHistory", Some(&b_page))
+                .await
+                .unwrap(),
+            b_history
+        );
+        let b_data = client.send_command("Runtime.evaluate",Some(json!({"expression":"localStorage.getItem('B-own')==='nosecret-B-own'&&document.cookie.includes('B_own=nosecret-B-cookie')","returnByValue":true})),Some(&b_page)).await.unwrap();
+        assert_eq!(b_data["result"]["value"], true);
+        browser.close().await.unwrap();
+        resume.abort();
+        let _ = resume.await;
+        server.abort();
+        let _ = server.await;
+        eprintln!(
+            "worker_close_refusal_receipt={}",
+            json!({"fault":fault,"cleanupRefused":true,"AStoredRowsPreserved":true,"AHistoryExact":true,"BExecutionDataHistoryExact":true,"sameOwnerRecoveryProvedClear":true})
+        );
+        return;
+    }
+    detached.unwrap();
+    // An actual surviving execution rewrites bytes after native settlement;
+    // a closed worker must not acknowledge this write.
+    let repopulation = client.send_command("Runtime.evaluate", Some(json!({"expression":"put('nosecret-repopulated-A')","awaitPromise":true,"returnByValue":true})), Some(&a_session)).await;
+    let child_repopulation = client.send_command("Runtime.evaluate", Some(json!({"expression":"put('nosecret-repopulated-A-child')","awaitPromise":true,"returnByValue":true})), Some(&a_child_session)).await;
+    let a_state = storage::capture(&client, "http://127.0.0.1", std::slice::from_ref(&origin))
+        .await
+        .unwrap();
+    let b_write = client.send_command("Runtime.evaluate", Some(json!({"expression":"put('nosecret-B-after')","awaitPromise":true,"returnByValue":true})), Some(&b_session)).await.unwrap();
+    assert_eq!(b_write["result"]["value"], "nosecret-B-after");
+    let b_child_write = client.send_command("Runtime.evaluate", Some(json!({"expression":"put('nosecret-B-after')","awaitPromise":true,"returnByValue":true})), Some(&b_child_session)).await.unwrap();
+    assert_eq!(b_child_write["result"]["value"], "nosecret-B-after");
+    assert_eq!(
+        client
+            .send_command_no_params("Page.getNavigationHistory", Some(&b_page))
+            .await
+            .unwrap(),
+        b_history
+    );
+    let b_own = client.send_command("Runtime.evaluate", Some(json!({"expression":"(async()=>({data:localStorage.getItem('B-own')==='nosecret-B-own'&&document.cookie.includes('B_own=nosecret-B-cookie'),registrations:(await navigator.serviceWorker.getRegistrations()).map(r=>r.scope)}))()","awaitPromise":true,"returnByValue":true})), Some(&b_page)).await.unwrap();
+    assert_eq!(b_own["result"]["value"]["data"], true);
+    assert_eq!(
+        b_own["result"]["value"]["registrations"],
+        json!([format!("{other}/")])
+    );
+    let a_empty = a_state
+        .origins
+        .iter()
+        .all(|stored| stored.indexed_db.is_empty());
+    let retired_history = client
+        .send_command_no_params("Page.getNavigationHistory", Some(&a_page))
+        .await
+        .unwrap();
+    assert_eq!(retired_history["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(retired_history["entries"][0]["url"], "about:blank");
+    let relaunch = browser.relaunch_options().unwrap();
+    browser.close().await.unwrap();
+    resume.abort();
+    let _ = resume.await;
+    let mut reopened = crate::native::browser::BrowserManager::launch(relaunch, None)
+        .await
+        .unwrap();
+    let resume = resume_workers(&reopened.client);
+    reopened
+        .navigate(&format!("{other}/read"), WaitUntil::Load)
+        .await
+        .unwrap();
+    let b_persisted = reopened.client.send_command("Runtime.evaluate",Some(json!({"expression":"(async()=>({data:localStorage.getItem('B-own')==='nosecret-B-own'&&document.cookie.includes('B_own=nosecret-B-cookie'),registrations:(await navigator.serviceWorker.getRegistrations()).map(r=>r.scope),row:await new Promise((resolve,reject)=>{const opening=indexedDB.open('worker-custody');opening.onsuccess=()=>{const db=opening.result;const tx=db.transaction('values');const read=tx.objectStore('values').get('credential');read.onsuccess=()=>resolve(read.result);read.onerror=()=>reject(read.error);tx.oncomplete=()=>db.close()};opening.onerror=()=>reject(opening.error)})}))()","awaitPromise":true,"returnByValue":true})),Some(reopened.active_session_id().unwrap())).await.unwrap();
+    assert_eq!(b_persisted["result"]["value"]["data"], true);
+    assert_eq!(b_persisted["result"]["value"]["row"], "nosecret-B-after");
+    assert_eq!(
+        b_persisted["result"]["value"]["registrations"],
+        json!([format!("{other}/")])
+    );
+    reopened
+        .navigate(&format!("{origin}/read"), WaitUntil::Load)
+        .await
+        .unwrap();
+    let a_persisted = reopened.client.send_command("Runtime.evaluate",Some(json!({"expression":"(async()=>({registrations:(await navigator.serviceWorker.getRegistrations()).map(r=>r.scope),databases:(await indexedDB.databases()).map(db=>db.name)}))()","awaitPromise":true,"returnByValue":true})),Some(reopened.active_session_id().unwrap())).await.unwrap();
+    assert_eq!(a_persisted["result"]["value"]["registrations"], json!([]));
+    assert_eq!(a_persisted["result"]["value"]["databases"], json!([]));
+    reopened.close().await.unwrap();
+    resume.abort();
+    let _ = resume.await;
+    eprintln!(
+        "worker_retirement_receipt={}",
+        json!({"AExecutionRefused":repopulation.is_err(),"AChildExecutionRefused":child_repopulation.is_err(),"AStoredRowsAbsent":a_empty,"BWorkerStillWrites":true,"BChildWorkerStillWrites":true,"BRegistrationPreserved":true,"BDataAndHistoryExact":true,"AAffectedTabRetainedAndHistoryReset":true,"ARelaunchRegistrationAndIDBAbsent":true,"BRelaunchRegistrationDataAndWorkerWritePersisted":true})
+    );
+    server.abort();
+    let _ = server.await;
+    assert!(
+        repopulation.is_err(),
+        "the retired A worker still executes and repopulates storage: {repopulation:?}"
+    );
+    assert!(
+        a_empty,
+        "worker credentials survived after native settlement"
+    );
+    assert!(
+        child_repopulation.is_err(),
+        "the retired A child worker still executes: {child_repopulation:?}"
+    );
+}

@@ -13,13 +13,166 @@ use tokio_tungstenite::tungstenite::Message;
 use super::types::{CdpCommand, CdpEvent, CdpMessage};
 use crate::native::activity::{self, ActivityObservation, InputSource};
 
+/// Confirmed page emulation shared by the native and operation connections.
+/// Outstanding or unobserved changes are unknown, never an enabled default.
+#[derive(Default)]
+struct ScriptState {
+    disabled: Option<bool>,
+    issued: u64,
+    confirmed: u64,
+    pending: HashMap<u64, ScriptPending>,
+    sessions: HashMap<String, (u64, bool)>,
+}
+
+type ScriptPages = Arc<std::sync::Mutex<HashMap<String, Arc<std::sync::Mutex<ScriptState>>>>>;
+type ScriptStates = Arc<std::sync::RwLock<ScriptPages>>;
+
+struct ScriptPending {
+    session: String,
+    targets: Arc<std::sync::Mutex<HashMap<String, String>>>,
+}
+
+struct ScriptChange {
+    state: Arc<std::sync::Mutex<ScriptState>>,
+    targets: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    session: String,
+    target: String,
+    order: u64,
+    disabled: bool,
+    previous_actor: Option<bool>,
+    previous_page: Option<bool>,
+}
+
+impl ScriptChange {
+    fn complete(self, accepted: bool) {
+        let current = self
+            .targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&self.session)
+            == Some(&self.target);
+        let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        state.pending.remove(&self.order);
+        if accepted && current {
+            if state
+                .sessions
+                .get(&self.session)
+                .is_none_or(|(order, _)| *order < self.order)
+            {
+                state
+                    .sessions
+                    .insert(self.session, (self.order, self.disabled));
+            }
+            if self.order > state.confirmed {
+                state.confirmed = self.order;
+                // Blink's equal-value setter is a no-op on this attachment.
+                // It cannot prove another attachment's shared page override.
+                state.disabled = match self.previous_actor {
+                    Some(previous) if previous != self.disabled => Some(self.disabled),
+                    Some(_) => self.previous_page,
+                    None => None,
+                };
+            }
+        }
+    }
+}
+
+fn script_target(states: &ScriptStates, target: &str) -> Arc<std::sync::Mutex<ScriptState>> {
+    states
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(target.into())
+        .or_default()
+        .clone()
+}
+
+fn script_detached(states: &ScriptStates, session: &str, target: &str) {
+    let entry = script_target(states, target);
+    let mut state = entry.lock().unwrap_or_else(|e| e.into_inner());
+    // Blink disables this session's emulation during detach. A true override
+    // or an unsettled command can change the shared page state without a reply.
+    if state
+        .sessions
+        .remove(session)
+        .is_some_and(|(_, disabled)| disabled)
+        || state
+            .pending
+            .values()
+            .any(|pending| pending.session == session)
+    {
+        state.disabled = None;
+        state.confirmed = state.issued;
+    }
+}
+
+fn script_attached(states: &ScriptStates, session: &str, target: &str) {
+    let entry = script_target(states, target);
+    let mut state = entry.lock().unwrap_or_else(|e| e.into_inner());
+    let order = state.issued;
+    state
+        .sessions
+        .entry(session.into())
+        .or_insert((order, false));
+}
+
+fn script_seed_enabled(states: &ScriptStates, target: &str) {
+    let entry = script_target(states, target);
+    let mut state = entry.lock().unwrap_or_else(|e| e.into_inner());
+    if state.issued == 0 {
+        state.disabled = Some(false);
+    }
+}
+
+fn script_unobserved(
+    states: &ScriptStates,
+    targets: &Arc<std::sync::Mutex<HashMap<String, String>>>,
+    body: &str,
+) {
+    let Ok(command) = serde_json::from_str::<Value>(body) else {
+        return;
+    };
+    if !matches!(
+        command["method"].as_str(),
+        Some("Emulation.setScriptExecutionDisabled" | "Emulation.disable")
+    ) {
+        return;
+    }
+    let target = command["sessionId"].as_str().and_then(|session| {
+        targets
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(session)
+            .cloned()
+    });
+    let pages = states.read().unwrap_or_else(|e| e.into_inner()).clone();
+    let pages = pages.lock().unwrap_or_else(|e| e.into_inner());
+    for (_, entry) in pages
+        .iter()
+        .filter(|(id, _)| target.as_ref().is_none_or(|target| *id == target))
+    {
+        let mut state = entry.lock().unwrap_or_else(|e| e.into_inner());
+        state.issued += 1;
+        state.confirmed = state.issued;
+        state.disabled = None;
+        if let Some(session) = command["sessionId"].as_str().filter(|_| target.is_some()) {
+            state.sessions.remove(session);
+        } else {
+            state.sessions.clear();
+        }
+    }
+}
+
 struct PendingResponse {
+    created_target: bool,
     attached_target: Option<String>,
     detached_session: Option<String>,
     sender: oneshot::Sender<CdpMessage>,
     response: Option<CdpMessage>,
     activity: Option<ActivityObservation>,
     reset_page: Option<String>,
+    script_change: Option<ScriptChange>,
     _pointer_guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     native_pointer: Arc<std::sync::Mutex<Option<activity::NativePointer>>>,
 }
@@ -31,6 +184,9 @@ impl PendingResponse {
         pages: &PageGenerations,
         events: &broadcast::Sender<CdpEvent>,
     ) {
+        if let Some(change) = self.script_change {
+            change.complete(response.error.is_none());
+        }
         if response.error.is_none() {
             if let Some(session) = self.reset_page.as_deref() {
                 reset_page(pages, events, session);
@@ -273,6 +429,7 @@ pub struct CdpClient {
     raw_tx: broadcast::Sender<RawCdpMessage>,
     private_sessions: PrivateSessions,
     target_sessions: Arc<std::sync::Mutex<HashMap<String, String>>>,
+    script_states: ScriptStates,
     /// Out-of-process frame sessions and the session each hangs under.
     frame_pages: FramePages,
     native_pointer_enabled: Arc<AtomicBool>,
@@ -403,6 +560,14 @@ impl CdpClient {
     /// settles request tasks; aborting the read/keepalive loops then releases
     /// the connection when its final handle is dropped.
     pub(crate) fn disconnect(&self) {
+        for (session, target) in self
+            .target_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+        {
+            script_detached(&self.script_states, session, target);
+        }
         self._reader_handle.abort();
         self._keepalive_handle.abort();
     }
@@ -472,6 +637,8 @@ impl CdpClient {
         let private_sessions: PrivateSessions = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let target_sessions = Arc::new(std::sync::Mutex::new(HashMap::<String, String>::new()));
         let targets_clone = target_sessions.clone();
+        let script_states: ScriptStates = Arc::default();
+        let scripts_reader = script_states.clone();
         let frame_pages: FramePages = Arc::default();
         let frames_clone = frame_pages.clone();
         let site_profile = Arc::new(std::sync::RwLock::new(Arc::<
@@ -551,11 +718,23 @@ impl CdpClient {
                     let mut pending = pending_clone.lock().await;
                     if let Some(mut request) = pending.remove(&id) {
                         if parsed.error.is_none() {
+                            if request.created_target {
+                                if let Some(target) = parsed
+                                    .result
+                                    .as_ref()
+                                    .and_then(|result| result["targetId"].as_str())
+                                {
+                                    script_seed_enabled(&scripts_reader, target);
+                                }
+                            }
                             if let Some(session) = request.detached_session.as_ref() {
-                                targets_clone
+                                if let Some(target) = targets_clone
                                     .lock()
                                     .unwrap_or_else(|error| error.into_inner())
-                                    .remove(session);
+                                    .remove(session)
+                                {
+                                    script_detached(&scripts_reader, session, &target);
+                                }
                                 frames_clone
                                     .lock()
                                     .unwrap_or_else(|error| error.into_inner())
@@ -568,10 +747,20 @@ impl CdpClient {
                                     .as_ref()
                                     .and_then(|result| result["sessionId"].as_str()),
                             ) {
+                                if let Some(previous) = targets_clone
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .get(session)
+                                    .filter(|previous| *previous != target)
+                                    .cloned()
+                                {
+                                    script_detached(&scripts_reader, session, &previous);
+                                }
                                 targets_clone
                                     .lock()
                                     .unwrap_or_else(|error| error.into_inner())
                                     .insert(session.into(), target.clone());
+                                script_attached(&scripts_reader, session, target);
                             }
                         }
                         if parsed.error.is_none()
@@ -614,10 +803,20 @@ impl CdpClient {
                                 params["sessionId"].as_str(),
                                 params["targetInfo"]["targetId"].as_str(),
                             ) {
+                                if let Some(previous) = targets_clone
+                                    .lock()
+                                    .unwrap_or_else(|error| error.into_inner())
+                                    .get(session)
+                                    .filter(|previous| previous.as_str() != target)
+                                    .cloned()
+                                {
+                                    script_detached(&scripts_reader, session, &previous);
+                                }
                                 targets_clone
                                     .lock()
                                     .unwrap()
                                     .insert(session.into(), target.into());
+                                script_attached(&scripts_reader, session, target);
                                 // An out-of-process frame hangs under the
                                 // session it was attached through.
                                 if let (Some(parent), "iframe") = (
@@ -637,7 +836,9 @@ impl CdpClient {
                             .as_ref()
                             .and_then(|params| params["sessionId"].as_str())
                         {
-                            targets_clone.lock().unwrap().remove(session);
+                            if let Some(target) = targets_clone.lock().unwrap().remove(session) {
+                                script_detached(&scripts_reader, session, &target);
+                            }
                             frames_clone.lock().unwrap().remove(session);
                         }
                     } else if method == "Target.targetDestroyed" {
@@ -655,6 +856,9 @@ impl CdpClient {
                                 .map(|(session, _)| session.clone())
                                 .collect::<std::collections::HashSet<_>>();
                             targets.retain(|_, held| held.as_str() != target);
+                            for session in &removed {
+                                script_detached(&scripts_reader, session, target);
+                            }
                             frames_clone
                                 .lock()
                                 .unwrap_or_else(|error| error.into_inner())
@@ -815,6 +1019,13 @@ impl CdpClient {
             // instead of waiting for the 30-second timeout.
             downloads_reader.closed();
             files_reader.end();
+            for (session, target) in targets_clone
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+            {
+                script_detached(&scripts_reader, session, target);
+            }
             pending_clone.lock().await.clear();
 
             // Stop the keepalive task — the connection is gone.
@@ -855,6 +1066,7 @@ impl CdpClient {
             raw_tx,
             private_sessions,
             target_sessions,
+            script_states,
             frame_pages,
             native_pointer_enabled: Arc::new(AtomicBool::new(false)),
             native_pointer_lock: Arc::new(Mutex::new(())),
@@ -1058,11 +1270,16 @@ impl CdpClient {
         let (tx, rx) = oneshot::channel();
         let native_pointer = Arc::new(std::sync::Mutex::new(None));
 
+        // This lock fixes the command's order at the actual writer, rather
+        // than at id reservation or an asynchronously reordered response.
+        let mut ws_tx = self.ws_tx.lock().await;
+        let script_change = self.script_change(method, cmd.params.as_ref(), session_id);
         {
             let mut pending = self.pending.lock().await;
             pending.insert(
                 id,
                 PendingResponse {
+                    created_target: method == "Target.createTarget",
                     detached_session: (method == "Target.detachFromTarget")
                         .then(|| {
                             cmd.params
@@ -1083,6 +1300,7 @@ impl CdpClient {
                     response: None,
                     activity: observation,
                     reset_page,
+                    script_change,
                     _pointer_guard: pointer_guard,
                     native_pointer: native_pointer.clone(),
                 },
@@ -1097,7 +1315,6 @@ impl CdpClient {
         };
 
         {
-            let mut ws_tx = self.ws_tx.lock().await;
             ws_tx
                 .send(Message::Text(json))
                 .await
@@ -1146,6 +1363,87 @@ impl CdpClient {
             .unwrap()
             .iter()
             .find_map(|(session, observed)| (observed == target).then(|| session.clone()))
+    }
+
+    fn script_change(
+        &self,
+        method: &str,
+        params: Option<&Value>,
+        session: Option<&str>,
+    ) -> Option<ScriptChange> {
+        let disabled = match method {
+            "Emulation.setScriptExecutionDisabled" => params?["value"].as_bool()?,
+            "Emulation.disable" => false,
+            _ => return None,
+        };
+        let session = session?;
+        let target = self.target_for_session(session)?;
+        let entry = script_target(&self.script_states, &target);
+        let (order, previous_actor, previous_page) = {
+            let mut state = entry.lock().unwrap_or_else(|e| e.into_inner());
+            let previous_actor = state
+                .sessions
+                .get(session)
+                .and_then(|(confirmed, disabled)| {
+                    (!state
+                        .pending
+                        .iter()
+                        .any(|(order, pending)| pending.session == session && order > confirmed))
+                    .then_some(*disabled)
+                });
+            let previous_page = (!state.pending.keys().any(|order| *order > state.confirmed))
+                .then_some(state.disabled)
+                .flatten();
+            state.issued += 1;
+            let order = state.issued;
+            if state
+                .pending
+                .values()
+                .any(|pending| !Arc::ptr_eq(&pending.targets, &self.target_sessions))
+            {
+                // Separate sockets have no shared browser execution order.
+                // Overlapping overrides stay unknown until a later settled
+                // command; native writer order must not invent that fact.
+                state.confirmed = order;
+                state.disabled = None;
+            }
+            state.pending.insert(
+                order,
+                ScriptPending {
+                    session: session.into(),
+                    targets: self.target_sessions.clone(),
+                },
+            );
+            (order, previous_actor, previous_page)
+        };
+        Some(ScriptChange {
+            state: entry,
+            targets: self.target_sessions.clone(),
+            session: session.into(),
+            target,
+            order,
+            disabled,
+            previous_actor,
+            previous_page,
+        })
+    }
+
+    /// Only the fresh native process/new paused target owner establishes the
+    /// initial enabled baseline. Adoption/reconnect never invents it.
+    pub(crate) fn seed_script_enabled(&self, session: &str) {
+        if let Some(target) = self.target_for_session(session) {
+            script_seed_enabled(&self.script_states, &target);
+        }
+    }
+
+    pub(crate) fn script_execution_disabled(&self, session: &str) -> Option<bool> {
+        let target = self.target_for_session(session)?;
+        let entry = script_target(&self.script_states, &target);
+        let state = entry.lock().unwrap_or_else(|e| e.into_inner());
+        if state.pending.keys().any(|order| *order > state.confirmed) {
+            return None;
+        }
+        state.disabled
     }
 
     pub(crate) fn enable_window_pointer(&self) {
@@ -1381,6 +1679,14 @@ impl CdpClient {
     pub(crate) fn publish_activity_as(&self, owner: &CdpClient) {
         self.bind_site_profile(owner.site_profile());
         *self
+            .script_states
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = owner
+            .script_states
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        *self
             .site_context
             .write()
             .unwrap_or_else(|error| error.into_inner()) = owner.site_context();
@@ -1530,6 +1836,8 @@ impl CdpClient {
         InspectProxyHandle {
             ws_tx: self.ws_tx.clone(),
             raw_tx: self.raw_tx.clone(),
+            script_states: self.script_states.clone(),
+            targets: self.target_sessions.clone(),
         }
     }
 
@@ -1580,6 +1888,8 @@ impl CdpClient {
             .map_err(|e| format!("Failed to serialize CDP command: {}", e))?;
 
         let mut ws_tx = self.ws_tx.lock().await;
+        // A fire-and-forget override has no accepted state receipt.
+        let _ = self.script_change(method, cmd.params.as_ref(), session_id);
         ws_tx
             .send(Message::Text(json))
             .await
@@ -1590,6 +1900,7 @@ impl CdpClient {
     /// Used by the inspect proxy to forward DevTools frontend messages.
     pub async fn send_raw(&self, json: String) -> Result<(), String> {
         let mut ws_tx = self.ws_tx.lock().await;
+        script_unobserved(&self.script_states, &self.target_sessions, &json);
         ws_tx
             .send(Message::Text(json))
             .await
@@ -1620,11 +1931,14 @@ type WsTx = Arc<
 pub struct InspectProxyHandle {
     ws_tx: WsTx,
     raw_tx: broadcast::Sender<RawCdpMessage>,
+    script_states: ScriptStates,
+    targets: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl InspectProxyHandle {
     pub async fn send_raw(&self, json: String) -> Result<(), String> {
         let mut ws_tx = self.ws_tx.lock().await;
+        script_unobserved(&self.script_states, &self.targets, &json);
         ws_tx
             .send(Message::Text(json))
             .await
@@ -1643,6 +1957,354 @@ impl InspectProxyHandle {
 mod tests {
     use super::*;
     use tokio::net::TcpListener;
+
+    #[tokio::test]
+    async fn script_baseline_requires_exact_successful_created_target_not_a_paused_blank_attachment(
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let attached = |target: &str| json!({"method":"Target.attachedToTarget","params":{"sessionId":target,"waitingForDebugger":true,"targetInfo":{"targetId":target,"type":"page","url":"about:blank"}}});
+            for target in ["adopted", "other"] {
+                socket
+                    .send(Message::Text(attached(target).to_string()))
+                    .await
+                    .unwrap();
+            }
+            for index in 0..3 {
+                let Message::Text(body) = socket.next().await.unwrap().unwrap() else {
+                    panic!("a command");
+                };
+                let request: Value = serde_json::from_str(&body).unwrap();
+                let reply = match index {
+                    0 => {
+                        assert_eq!(request["method"], "Browser.getVersion");
+                        json!({"id":request["id"],"result":{}})
+                    }
+                    1 => {
+                        assert_eq!(request["method"], "Target.createTarget");
+                        socket
+                            .send(Message::Text(attached("created").to_string()))
+                            .await
+                            .unwrap();
+                        json!({"id":request["id"],"result":{"targetId":"created"}})
+                    }
+                    _ => {
+                        assert_eq!(request["method"], "Target.createTarget");
+                        socket
+                            .send(Message::Text(attached("refused").to_string()))
+                            .await
+                            .unwrap();
+                        json!({"id":request["id"],"error":{"code":-32000,"message":"refused"}})
+                    }
+                };
+                socket.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+            while let Some(Ok(_)) = socket.next().await {}
+        });
+        let client = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        client
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .unwrap();
+        assert_eq!(client.script_execution_disabled("adopted"), None);
+        assert_eq!(client.script_execution_disabled("other"), None);
+        client
+            .send_command(
+                "Target.createTarget",
+                Some(json!({"url":"about:blank"})),
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.script_execution_disabled("created"), Some(false));
+        assert_eq!(
+            client.script_execution_disabled("other"),
+            None,
+            "another attachment does not borrow the created target's proof"
+        );
+        assert!(client
+            .send_command(
+                "Target.createTarget",
+                Some(json!({"url":"about:blank"})),
+                None
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            client.script_execution_disabled("refused"),
+            None,
+            "a failed creation grants no baseline"
+        );
+        client.disconnect();
+        drop(client);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn script_state_tracks_writer_order_failed_replies_and_unknown_attachments() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(Message::Text(json!({"method":"Target.attachedToTarget","params":{"sessionId":"page","waitingForDebugger":false,"targetInfo":{"targetId":"A","type":"page","url":"https://private.example"}}}).to_string())).await.unwrap();
+            let mut reversed = Vec::new();
+            for index in 0..9 {
+                let Message::Text(body) = socket.next().await.unwrap().unwrap() else {
+                    panic!("a command");
+                };
+                let command: Value = serde_json::from_str(&body).unwrap();
+                if matches!(index, 3 | 4) {
+                    reversed.push(command);
+                    if index == 4 {
+                        for command in reversed.iter().rev() {
+                            socket
+                                .send(Message::Text(
+                                    json!({"id":command["id"],"result":{}}).to_string(),
+                                ))
+                                .await
+                                .unwrap();
+                        }
+                    }
+                    continue;
+                }
+                let reply = if index == 2 {
+                    json!({"id":command["id"],"error":{"code":-32000,"message":"refused"}})
+                } else {
+                    json!({"id":command["id"],"result":{}})
+                };
+                socket.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+            let Message::Text(body) = socket.next().await.unwrap().unwrap() else {
+                panic!("a barrier");
+            };
+            let command: Value = serde_json::from_str(&body).unwrap();
+            socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"page","targetId":"A"}}).to_string())).await.unwrap();
+            socket.send(Message::Text(json!({"method":"Target.attachedToTarget","params":{"sessionId":"page","waitingForDebugger":false,"targetInfo":{"targetId":"replacement","type":"page","url":"https://private.example"}}}).to_string())).await.unwrap();
+            socket
+                .send(Message::Text(
+                    json!({"id":command["id"],"result":{}}).to_string(),
+                ))
+                .await
+                .unwrap();
+            while let Some(Ok(_)) = socket.next().await {}
+        });
+        let client = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        client
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            client.script_execution_disabled("page"),
+            None,
+            "an adopted page has no enabled default"
+        );
+        client.seed_script_enabled("page");
+        assert_eq!(client.script_execution_disabled("page"), Some(false));
+        client
+            .send_command(
+                "Emulation.setScriptExecutionDisabled",
+                Some(json!({"value":true})),
+                Some("page"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(client.script_execution_disabled("page"), Some(true));
+        assert!(client
+            .send_command(
+                "Emulation.setScriptExecutionDisabled",
+                Some(json!({"value":false})),
+                Some("page")
+            )
+            .await
+            .is_err());
+        assert_eq!(
+            client.script_execution_disabled("page"),
+            Some(true),
+            "failure cannot advance confirmed state"
+        );
+        let early_id = client.reserve_command_id();
+        let later_id = client.reserve_command_id();
+        let mut first = client
+            .enqueue_reserved_command(
+                later_id,
+                "Emulation.setScriptExecutionDisabled",
+                Some(json!({"value":true})),
+                Some("page"),
+            )
+            .await
+            .unwrap();
+        let mut second = client
+            .enqueue_reserved_command(
+                early_id,
+                "Emulation.setScriptExecutionDisabled",
+                Some(json!({"value":false})),
+                Some("page"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client.script_execution_disabled("page"),
+            None,
+            "an outstanding later override is unknown"
+        );
+        second.acknowledgment().await.unwrap();
+        first.acknowledgment().await.unwrap();
+        assert_eq!(
+            client.script_execution_disabled("page"),
+            None,
+            "overlapping reordered mutations cannot invent the prior actor state"
+        );
+        client.inspect_handle().send_raw(json!({"id":-7,"method":"Emulation.setScriptExecutionDisabled","sessionId":"page","params":{"value":true}}).to_string()).await.unwrap();
+        assert_eq!(
+            client.script_execution_disabled("page"),
+            None,
+            "untracked DevTools changes have no accepted receipt"
+        );
+        client
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .unwrap();
+        client
+            .send_command(
+                "Emulation.setScriptExecutionDisabled",
+                Some(json!({"value":true})),
+                Some("page"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client.script_execution_disabled("page"),
+            None,
+            "an unobserved actor value is not repaired by an equal-value acknowledgement"
+        );
+        client
+            .send_command(
+                "Emulation.setScriptExecutionDisabled",
+                Some(json!({"value":false})),
+                Some("page"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            client.script_execution_disabled("page"),
+            Some(false),
+            "a confirmed actual transition reproves shared state"
+        );
+        client
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            client.script_execution_disabled("page"),
+            None,
+            "a replacement attachment inherits no prior state"
+        );
+        client.disconnect();
+        drop(client);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn script_state_is_shared_with_operation_connection_and_detach_invalidates_it() {
+        let owner_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let owner_address = owner_listener.local_addr().unwrap();
+        let owner_server = tokio::spawn(async move {
+            let (stream, _) = owner_listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for target in ["A", "B"] {
+                socket.send(Message::Text(json!({"method":"Target.attachedToTarget","params":{"sessionId":target,"waitingForDebugger":true,"targetInfo":{"targetId":target,"type":"page","url":"about:blank"}}}).to_string())).await.unwrap();
+            }
+            while let Some(Ok(Message::Text(body))) = socket.next().await {
+                let command: Value = serde_json::from_str(&body).unwrap();
+                socket
+                    .send(Message::Text(
+                        json!({"id":command["id"],"result":{}}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let owner = CdpClient::connect(&format!("ws://{owner_address}"))
+            .await
+            .unwrap();
+        owner
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .unwrap();
+        owner.seed_script_enabled("A");
+        owner.seed_script_enabled("B");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            socket.send(Message::Text(json!({"method":"Target.attachedToTarget","params":{"sessionId":"operation","waitingForDebugger":false,"targetInfo":{"targetId":"A","type":"page","url":"https://private.example"}}}).to_string())).await.unwrap();
+            while let Some(Ok(Message::Text(body))) = socket.next().await {
+                let command: Value = serde_json::from_str(&body).unwrap();
+                socket
+                    .send(Message::Text(
+                        json!({"id":command["id"],"result":{}}).to_string(),
+                    ))
+                    .await
+                    .unwrap();
+            }
+        });
+        let operation = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        operation.publish_activity_as(&owner);
+        operation
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .unwrap();
+        owner
+            .send_command(
+                "Emulation.setScriptExecutionDisabled",
+                Some(json!({"value":true})),
+                Some("A"),
+            )
+            .await
+            .unwrap();
+        operation
+            .send_command(
+                "Emulation.setScriptExecutionDisabled",
+                Some(json!({"value":false})),
+                Some("operation"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner.script_execution_disabled("A"), Some(true), "a new attachment's false-to-false no-op cannot overwrite the owner's shared true state");
+        operation
+            .send_command(
+                "Emulation.setScriptExecutionDisabled",
+                Some(json!({"value":true})),
+                Some("operation"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(owner.script_execution_disabled("A"), Some(true));
+        assert_eq!(owner.script_execution_disabled("B"), Some(false));
+        operation.disconnect();
+        assert_eq!(
+            owner.script_execution_disabled("A"),
+            None,
+            "Blink may reset a detached operation's override"
+        );
+        assert_eq!(owner.script_execution_disabled("B"), Some(false));
+        drop(operation);
+        server.await.unwrap();
+        owner.disconnect();
+        drop(owner);
+        owner_server.await.unwrap();
+    }
 
     #[tokio::test]
     async fn no_wait_resume_prepares_custody_before_writing_the_resume() {

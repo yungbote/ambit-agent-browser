@@ -175,10 +175,7 @@ impl Custody {
         site: &str,
         origins: &[String],
     ) -> Result<(), &'static str> {
-        let mut known = client
-            .site_profile()
-            .documents
-            .retire(client, site)
+        let mut known = Box::pin(client.site_profile().documents.retire(client, site))
             .await?
             .into_iter()
             .collect::<HashSet<_>>();

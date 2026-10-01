@@ -15,6 +15,15 @@ struct Tab {
     known: bool,
 }
 
+/// Current Chrome-owned execution and its actual namespace. This is scoped
+/// to one retirement effect; it is not a persisted worker or authority ledger.
+struct Worker {
+    target: String,
+    key: String,
+    origin: String,
+    dedicated: bool,
+}
+
 #[derive(Default)]
 pub(crate) struct Documents {
     tabs: Mutex<HashMap<String, Tab>>,
@@ -288,7 +297,9 @@ impl Documents {
         client: &CdpClient,
         session: &str,
     ) -> Result<(), &'static str> {
-        self.seed_current(client, session, true).await
+        self.seed_current(client, session, true).await?;
+        client.seed_script_enabled(session);
+        Ok(())
     }
     async fn seed_current(
         &self,
@@ -479,6 +490,261 @@ impl Documents {
         Ok(())
     }
 
+    async fn workers(&self, client: &CdpClient, site: &str) -> Result<Vec<Worker>, &'static str> {
+        let boundary = state::site_url(site)?;
+        let targets = client
+            .send_command_no_params("Target.getTargets", None)
+            .await
+            .map_err(|_| storage::UNCLEARED)?;
+        let contexts = client
+            .send_command_no_params("Target.getBrowserContexts", None)
+            .await
+            .map_err(|_| storage::UNCLEARED)?;
+        let isolated = contexts["browserContextIds"]
+            .as_array()
+            .ok_or(storage::UNCLEARED)?;
+        let mut workers = Vec::new();
+        for target in targets["targetInfos"]
+            .as_array()
+            .ok_or(storage::UNCLEARED)?
+        {
+            if !matches!(
+                target["type"].as_str(),
+                Some("worker" | "shared_worker" | "service_worker")
+            ) || isolated
+                .iter()
+                .any(|context| context == &target["browserContextId"])
+            {
+                continue;
+            }
+            let dedicated = target["type"] == "worker";
+            let target = target["targetId"].as_str().ok_or(storage::UNCLEARED)?;
+            let (session, borrowed) = self.worker_session(client, target).await?;
+            // Script URLs are not namespace authority: a worker may load a
+            // script from another origin. Keep Chrome's complete key verbatim.
+            let reply = client
+                .send_command_no_params("Storage.getStorageKey", Some(&session))
+                .await
+                .map_err(|error| {
+                    #[cfg(test)]
+                    eprintln!("worker_namespace_query_refused={error}");
+                    let _ = error;
+                    storage::UNCLEARED
+                })?;
+            let key = reply["storageKey"].as_str().ok_or(storage::UNCLEARED)?;
+            if let Some(origin) = storage_origin(key) {
+                if state::origin_in_site(&origin, &boundary) {
+                    workers.push(Worker {
+                        target: target.into(),
+                        key: key.into(),
+                        origin,
+                        dedicated,
+                    });
+                    continue;
+                }
+            } else if url::Url::parse(key.split('^').next().unwrap_or_default())
+                .map_or(true, |url| matches!(url.scheme(), "http" | "https"))
+            {
+                return Err(storage::UNCLEARED);
+            }
+            // A nested worker need not already have a native attachment.
+            // Unselected namespaces release only the metadata attachment
+            // borrowed above; their execution and original sessions stay.
+            if borrowed {
+                client
+                    .send_command(
+                        "Target.detachFromTarget",
+                        Some(json!({"sessionId":session})),
+                        None,
+                    )
+                    .await
+                    .map_err(|_| storage::UNCLEARED)?;
+            }
+        }
+        Ok(workers)
+    }
+
+    async fn worker_session(
+        &self,
+        client: &CdpClient,
+        target: &str,
+    ) -> Result<(String, bool), &'static str> {
+        if let Some(session) = client.session_for_target(target) {
+            return Ok((session, false));
+        }
+        let reply = client
+            .send_command(
+                "Target.attachToTarget",
+                Some(json!({"targetId":target,"flatten":true})),
+                None,
+            )
+            .await
+            .map_err(|_| storage::UNCLEARED)?;
+        Ok((
+            reply["sessionId"]
+                .as_str()
+                .ok_or(storage::UNCLEARED)?
+                .to_owned(),
+            true,
+        ))
+    }
+
+    async fn retire_worker(&self, client: &CdpClient, worker: &Worker) -> Result<(), &'static str> {
+        #[cfg(test)]
+        eprintln!("worker_stop_stage=inspect dedicated={}", worker.dedicated);
+        let mut events = client.subscribe();
+        let targets = client
+            .send_command_no_params("Target.getTargets", None)
+            .await
+            .map_err(|_| storage::UNCLEARED)?;
+        if !targets["targetInfos"]
+            .as_array()
+            .ok_or(storage::UNCLEARED)?
+            .iter()
+            .any(|target| target["targetId"] == worker.target)
+        {
+            return Ok(());
+        }
+        // Navigation can retire a worker's original parent attachment while
+        // execution remains. Rebind transport to the same target, then reprove
+        // Chrome's complete namespace; a session is not worker authority.
+        let (session, _) = self.worker_session(client, &worker.target).await?;
+        if client.target_for_session(&session).as_deref() != Some(&worker.target) {
+            return Err(storage::UNCLEARED);
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let current = client
+            .send_command_no_params("Storage.getStorageKey", Some(&session))
+            .await
+            .map_err(|error| {
+                #[cfg(test)]
+                eprintln!("worker_stop_namespace_query_refused={error}");
+                let _ = error;
+                storage::UNCLEARED
+            })?;
+        if current["storageKey"] != worker.key {
+            #[cfg(test)]
+            eprintln!("worker_stop_namespace_changed=true");
+            return Err(storage::UNCLEARED);
+        }
+        if client.target_for_session(&session).as_deref() != Some(&worker.target) {
+            return Err(storage::UNCLEARED);
+        }
+        // Dedicated execution can outlive its retired document in Chrome,
+        // which does not support closeTarget for it. Request the standard
+        // worker close only on the current namespace-bound session. A replaced
+        // or throwing close cannot settle without the browser's stop receipt.
+        if worker.dedicated {
+            let reply = client
+                .send_command(
+                    "Runtime.evaluate",
+                    // close() marks the scope; Chrome's normal task completion
+                    // performs shutdown. Inspector evaluation is not that task.
+                    Some(
+                        json!({"expression":"setTimeout(()=>self.close(),0)","returnByValue":true}),
+                    ),
+                    Some(&session),
+                )
+                .await
+                .map_err(|_| storage::UNCLEARED)?;
+            if reply.get("exceptionDetails").is_some() {
+                return Err(storage::UNCLEARED);
+            }
+        } else {
+            let reply = client
+                .send_command(
+                    "Target.closeTarget",
+                    Some(json!({"targetId":worker.target})),
+                    None,
+                )
+                .await
+                .map_err(|error| {
+                    #[cfg(test)]
+                    eprintln!("worker_stop_close_refused={error}");
+                    let _ = error;
+                    storage::UNCLEARED
+                })?;
+            if reply["success"] != true {
+                return Err(storage::UNCLEARED);
+            }
+        }
+        // Service workers stop asynchronously; a close acknowledgement alone
+        // is not retirement. Chrome reports the matching execution's demise.
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                tokio::select! {
+                    event=events.recv()=>{
+                        let event=event.map_err(|_|storage::UNCLEARED)?;
+                        #[cfg(test)]
+                        if event.session_id.as_deref()==Some(&session)
+                            || event.params["sessionId"]==session
+                            || event.params["targetId"]==worker.target
+                            || event.params["targetInfo"]["targetId"]==worker.target
+                        { eprintln!("worker_stop_browser_event={}", event.method); }
+                        if (event.method=="Inspector.targetCrashed" && event.session_id.as_deref()==Some(&session))
+                            || (event.method=="Target.targetDestroyed" && event.params["targetId"]==worker.target)
+                        {return Ok::<_,&'static str>(());}
+                    },
+                    _=client.closed()=>return Err(storage::UNCLEARED),
+                }
+            }
+        }).await.map_err(|_|storage::UNCLEARED)??;
+        // Retired DevTools hosts can remain as crashed inspection sessions.
+        // Release only this native attachment after its stopped receipt.
+        if client.target_for_session(&session).as_deref() == Some(&worker.target) {
+            let detached = client
+                .send_command(
+                    "Target.detachFromTarget",
+                    Some(json!({"sessionId":session})),
+                    None,
+                )
+                .await;
+            #[cfg(test)]
+            if let Err(error) = &detached {
+                eprintln!("worker_stopped_attachment_release_refused={error}");
+            }
+            // A stopped target may already have discarded the attachment
+            // before the native event cache observes it. Actual browser
+            // absence below settles teardown, never this transport reply.
+            let _ = detached;
+        }
+        // Stop notification can precede the manager's live-target removal.
+        // Wait on matching browser events and reread actual absence; do not
+        // make immediate visibility or a renderer return a timing requirement.
+        tokio::time::timeout_at(deadline, async {
+            loop {
+                let remaining = client
+                    .send_command_no_params("Target.getTargets", None)
+                    .await
+                    .map_err(|_| storage::UNCLEARED)?;
+                if !remaining["targetInfos"]
+                    .as_array()
+                    .ok_or(storage::UNCLEARED)?
+                    .iter()
+                    .any(|target| target["targetId"] == worker.target)
+                {
+                    return Ok::<_, &'static str>(());
+                }
+                loop {
+                    tokio::select! {
+                        event=events.recv()=> {
+                            let event=event.map_err(|_|storage::UNCLEARED)?;
+                            if event.params["targetId"]==worker.target
+                                || event.params["targetInfo"]["targetId"]==worker.target
+                                || event.params["sessionId"]==session
+                                || event.session_id.as_deref()==Some(&session)
+                            {break;}
+                        },
+                        _=client.closed()=>return Err(storage::UNCLEARED),
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| storage::UNCLEARED)??;
+        Ok(())
+    }
+
     /// The user approved losing history only on affected retained tabs. Blank
     /// commits before reset; storage clears afterward, including pagehide writes.
     pub(crate) async fn retire(
@@ -488,8 +754,39 @@ impl Documents {
     ) -> Result<Vec<String>, &'static str> {
         let sessions = self.sessions(client, site, true).await?;
         self.settle_keys(site).await?;
-        let origins = self.origins(site)?;
-        for session in sessions {
+        let scripts = sessions
+            .iter()
+            .map(|session| {
+                client
+                    .script_execution_disabled(session)
+                    .map(|disabled| (session.clone(), disabled))
+                    .ok_or(storage::UNCLEARED)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        #[cfg(test)]
+        eprintln!("worker_retirement_stage=initial_inventory");
+        // Resolve worker namespaces before any document/history mutation.
+        let mut workers = self.workers(client, site).await?;
+        let mut origins = self.origins(site)?;
+        let retiring = async {
+        // Quiesce creators without freezing worker task queues. Dedicated
+        // close must finish while its creator still owns an active document.
+        for (session, disabled) in &scripts {
+            // An equal-value setter is a no-op in that DevTools attachment.
+            // Reassert an already-enabled baseline before disabling, without
+            // ever enabling a creator the caller had kept disabled.
+            if !disabled {
+                client.send_command("Emulation.setScriptExecutionDisabled", Some(json!({"value":false})), Some(session)).await.map_err(|_|storage::UNCLEARED)?;
+            }
+            client.send_command("Emulation.setScriptExecutionDisabled", Some(json!({"value":true})), Some(session)).await.map_err(|_|storage::UNCLEARED)?;
+            if client.script_execution_disabled(session) != Some(true) { return Err(storage::UNCLEARED); }
+        }
+        for worker in workers.drain(..) {
+            self.retire_worker(client, &worker).await?;
+            self.keys.lock().unwrap_or_else(|error|error.into_inner()).insert(worker.key);
+            if !origins.contains(&worker.origin) {origins.push(worker.origin);}
+        }
+        for session in &sessions {
             let mut events = client.subscribe();
             let reply = client
                 .send_command(
@@ -510,7 +807,7 @@ impl Documents {
                 let loader = reply["loaderId"].as_str().ok_or(storage::UNCLEARED)?;
                 tokio::time::timeout(std::time::Duration::from_secs(8), async {
                     loop { tokio::select! {
-                        event=events.recv()=>{let event=event.map_err(|_|storage::UNCLEARED)?; if event.session_id.as_deref()==Some(&session) && event.method=="Page.frameNavigated" && event.params["frame"]["parentId"].as_str().is_none_or(str::is_empty) && event.params["frame"]["loaderId"]==loader && event.params["frame"]["url"]=="about:blank" {return Ok::<_,&'static str>(());}},
+                        event=events.recv()=>{let event=event.map_err(|_|storage::UNCLEARED)?; if event.session_id.as_deref()==Some(session.as_str()) && event.method=="Page.frameNavigated" && event.params["frame"]["parentId"].as_str().is_none_or(str::is_empty) && event.params["frame"]["loaderId"]==loader && event.params["frame"]["url"]=="about:blank" {return Ok::<_,&'static str>(());}},
                         _=client.closed()=>return Err(storage::UNCLEARED),
                     }}
                 }).await.map_err(|_|storage::UNCLEARED)??;
@@ -551,15 +848,140 @@ impl Documents {
                 .lock()
                 .unwrap_or_else(|error| error.into_inner())
                 .retain(|_, owner| owner != &target);
-            self.resume(client, std::slice::from_ref(&session)).await?;
+            self.resume(client, std::slice::from_ref(session)).await?;
         }
+        // Retire any execution born during teardown and prove a final empty
+        // selected set before erasing. Persistent churn remains unsettled.
+        #[cfg(test)]
+        eprintln!("worker_retirement_stage=execution_stop");
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            loop {
+                let workers = self.workers(client, site).await?;
+                if workers.is_empty() { return Ok::<_, &'static str>(()); }
+                for worker in workers {
+                    self.retire_worker(client, &worker).await?;
+                    self.keys
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .insert(worker.key);
+                    if !origins.contains(&worker.origin) {
+                        origins.push(worker.origin);
+                    }
+                }
+            }
+        }).await.map_err(|_|storage::UNCLEARED)??;
         Ok(origins)
+        }.await;
+        self.restore_scripts(client, &scripts).await.and(retiring)
+    }
+
+    async fn restore_scripts(
+        &self,
+        client: &CdpClient,
+        scripts: &[(String, bool)],
+    ) -> Result<(), &'static str> {
+        let mut restored = true;
+        for (session, disabled) in scripts {
+            // Restore every reachable creator even when an earlier target
+            // disappeared or refuses. The aggregate still fences erasure.
+            restored &= client
+                .send_command(
+                    "Emulation.setScriptExecutionDisabled",
+                    Some(json!({"value":disabled})),
+                    Some(session),
+                )
+                .await
+                .is_ok()
+                && client.script_execution_disabled(session) == Some(*disabled);
+        }
+        restored.then_some(()).ok_or(storage::UNCLEARED)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn creator_restore_attempts_every_affected_session_and_preserves_disabled_state() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for target in ["A-gone", "A-live", "B"] {
+                socket.send(Message::Text(json!({"method":"Target.attachedToTarget","params":{"sessionId":target,"waitingForDebugger":true,"targetInfo":{"targetId":target,"type":"page","url":"about:blank"}}}).to_string())).await.unwrap();
+            }
+            let Message::Text(body) = socket.next().await.unwrap().unwrap() else {
+                panic!("a barrier");
+            };
+            let request: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(request["method"], "Browser.getVersion");
+            socket
+                .send(Message::Text(
+                    json!({"id":request["id"],"result":{}}).to_string(),
+                ))
+                .await
+                .unwrap();
+            for (session, value, accepted) in [
+                ("B", true, true),
+                ("A-gone", false, false),
+                ("A-live", true, true),
+            ] {
+                let Message::Text(body) = socket.next().await.unwrap().unwrap() else {
+                    panic!("a restore");
+                };
+                let request: Value = serde_json::from_str(&body).unwrap();
+                assert_eq!(request["method"], "Emulation.setScriptExecutionDisabled");
+                assert_eq!(request["sessionId"], session);
+                assert_eq!(request["params"]["value"], value);
+                let reply = if accepted {
+                    json!({"id":request["id"],"result":{}})
+                } else {
+                    json!({"id":request["id"],"error":{"code":-32000,"message":"target gone"}})
+                };
+                socket.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+            while let Some(Ok(_)) = socket.next().await {}
+        });
+        let client = CdpClient::connect(&format!("ws://{address}"))
+            .await
+            .unwrap();
+        client
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .unwrap();
+        client
+            .send_command(
+                "Emulation.setScriptExecutionDisabled",
+                Some(json!({"value":true})),
+                Some("B"),
+            )
+            .await
+            .unwrap();
+        let result = Documents::default()
+            .restore_scripts(
+                &client,
+                &[("A-gone".into(), false), ("A-live".into(), true)],
+            )
+            .await;
+        assert_eq!(result, Err(storage::UNCLEARED));
+        assert_eq!(
+            client.script_execution_disabled("A-live"),
+            Some(true),
+            "later creators are restored despite the first failure"
+        );
+        assert_eq!(
+            client.script_execution_disabled("B"),
+            Some(true),
+            "unselected execution stays disabled as requested"
+        );
+        client.disconnect();
+        drop(client);
+        server.await.unwrap();
+    }
 
     #[test]
     fn retained_origins_belong_to_target_until_its_history_is_retired() {
@@ -650,5 +1072,130 @@ mod tests {
         );
         assert!(owner.origins("https://private.example").unwrap().is_empty());
         assert!(owner.frames.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn worker_retirement_reproves_namespace_and_current_target_after_reattachment() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        for case in ["changed-key", "changed-target", "same-target-reattached"] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let calls = std::sync::Arc::new(Mutex::new(Vec::new()));
+            let observed = calls.clone();
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let attached = |session: &str, target: &str| json!({"method":"Target.attachedToTarget","params":{"sessionId":session,"waitingForDebugger":false,"targetInfo":{"targetId":target,"type":"shared_worker","url":"https://other.example/script.js"}}});
+                socket
+                    .send(Message::Text(
+                        attached("old-session", "selected-target")
+                            .to_string()
+                            .into(),
+                    ))
+                    .await
+                    .unwrap();
+                if case == "same-target-reattached" {
+                    socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"old-session","targetId":"selected-target"}}).to_string().into())).await.unwrap();
+                }
+                let mut stopped = false;
+                while let Some(Ok(message)) = socket.next().await {
+                    let Message::Text(body) = message else {
+                        continue;
+                    };
+                    let request: Value = serde_json::from_str(&body).unwrap();
+                    let method = request["method"].as_str().unwrap();
+                    observed.lock().unwrap().push(method.to_owned());
+                    let result = match method {
+                        "Browser.getVersion" => json!({"product":"Chrome/154"}),
+                        "Target.getTargets" => {
+                            if stopped {
+                                json!({"targetInfos":[]})
+                            } else {
+                                json!({"targetInfos":[{"targetId":"selected-target","type":"shared_worker"},{"targetId":"unrelated-target","type":"shared_worker"}]})
+                            }
+                        }
+                        "Target.attachToTarget" => {
+                            assert_eq!(request["params"]["targetId"], "selected-target");
+                            socket
+                                .send(Message::Text(
+                                    attached("current-session", "selected-target")
+                                        .to_string()
+                                        .into(),
+                                ))
+                                .await
+                                .unwrap();
+                            json!({"sessionId":"current-session"})
+                        }
+                        "Storage.getStorageKey" => {
+                            if case == "changed-target" {
+                                socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"old-session","targetId":"selected-target"}}).to_string().into())).await.unwrap();
+                                socket
+                                    .send(Message::Text(
+                                        attached("old-session", "unrelated-target")
+                                            .to_string()
+                                            .into(),
+                                    ))
+                                    .await
+                                    .unwrap();
+                            }
+                            json!({"storageKey":if case=="changed-key" {"https://other.example/^0https://private.example"} else {"https://private.example/^0https://other.example"}})
+                        }
+                        "Target.closeTarget" => {
+                            assert_eq!(case, "same-target-reattached");
+                            assert_eq!(request["params"]["targetId"], "selected-target");
+                            socket.send(Message::Text(json!({"method":"Inspector.targetCrashed","sessionId":"current-session","params":{}}).to_string().into())).await.unwrap();
+                            stopped = true;
+                            json!({"success":true})
+                        }
+                        "Target.detachFromTarget" => {
+                            assert_eq!(request["params"]["sessionId"], "current-session");
+                            socket.send(Message::Text(json!({"method":"Target.detachedFromTarget","params":{"sessionId":"current-session","targetId":"selected-target"}}).to_string().into())).await.unwrap();
+                            json!({})
+                        }
+                        _ => panic!("unexpected worker command {method}"),
+                    };
+                    socket
+                        .send(Message::Text(
+                            json!({"id":request["id"],"result":result})
+                                .to_string()
+                                .into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            });
+            let client = CdpClient::connect(&format!("ws://{address}"))
+                .await
+                .unwrap();
+            client
+                .send_command_no_params("Browser.getVersion", None)
+                .await
+                .unwrap();
+            let worker = Worker {
+                target: "selected-target".into(),
+                key: "https://private.example/^0https://other.example".into(),
+                origin: "https://private.example".into(),
+                dedicated: false,
+            };
+            let result = Documents::default().retire_worker(&client, &worker).await;
+            assert_eq!(result.is_ok(), case == "same-target-reattached", "{case}");
+            client.disconnect();
+            drop(client);
+            server.await.unwrap();
+            let calls = calls.lock().unwrap();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|method| method.as_str() == "Target.closeTarget")
+                    .count(),
+                usize::from(case == "same-target-reattached"),
+                "{case}"
+            );
+            assert!(
+                !calls.iter().any(|method| method == "Runtime.evaluate"),
+                "the wire authority test requests no renderer execution"
+            );
+        }
     }
 }
