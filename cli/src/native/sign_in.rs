@@ -561,6 +561,221 @@ mod tests {
         );
     }
 
+    use crate::native::stream::{IdleActivity, StreamServer};
+    use crate::test_utils::EnvGuard;
+    use futures_util::StreamExt;
+
+    type Viewer = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    /// A daemon whose view streams to one viewer, in a socket directory of
+    /// its own (where the session log goes). The viewer's opening status is
+    /// read.
+    async fn viewed(guard: &EnvGuard<'_>, tag: &str) -> (DaemonState, Viewer, std::path::PathBuf) {
+        let directory = std::env::temp_dir().join(format!(
+            "agent-browser-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&directory).unwrap();
+        guard.set("AGENT_BROWSER_SOCKET_DIR", directory.to_str().unwrap());
+        let mut state = DaemonState::new();
+        state.session_id = tag.to_string();
+        let (server, slot) = StreamServer::start_without_client(
+            0,
+            tag.to_string(),
+            true,
+            Arc::new(IdleActivity::new()),
+        )
+        .await
+        .unwrap();
+        let port = server.port();
+        state.stream_server = Some(Arc::new(server));
+        state.stream_client = Some(slot);
+        let (mut viewer, _) = tokio_tungstenite::connect_async(format!("ws://127.0.0.1:{port}/"))
+            .await
+            .unwrap();
+        let opening = status(&mut viewer).await;
+        assert_eq!(opening["browser"], "closed", "{opening}");
+        (state, viewer, directory)
+    }
+
+    async fn status(viewer: &mut Viewer) -> Value {
+        loop {
+            let message = tokio::time::timeout(Duration::from_secs(5), viewer.next())
+                .await
+                .expect("a status record")
+                .expect("the stream ended")
+                .expect("a stream error");
+            if let tokio_tungstenite::tungstenite::Message::Text(text) = message {
+                let record: Value = serde_json::from_str(&text).unwrap();
+                if record["type"] == "status" {
+                    return record;
+                }
+            }
+        }
+    }
+
+    /// A browser whose process has already ended, as a sign-in window a
+    /// person closed.
+    fn ended_sign_in() -> SignInBrowser {
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        child.wait().unwrap();
+        SignInBrowser {
+            chrome: ChromeProcess::for_test(child, LaunchOptions::default()),
+        }
+    }
+
+    fn log(directory: &std::path::Path, tag: &str) -> String {
+        std::fs::read_to_string(directory.join(format!("{tag}.log"))).unwrap_or_default()
+    }
+
+    /// The launch a relaunch cannot start: an executable that is not there.
+    fn unlaunchable() -> Relaunch {
+        Relaunch {
+            options: LaunchOptions {
+                executable_path: Some("/nonexistent/agent-browser-test/chrome".into()),
+                ..LaunchOptions::default()
+            },
+            window: (800, 600),
+        }
+    }
+
+    /// A sign-in window closed before the hand-back leaves no browser; the
+    /// view says it exited, and the session log says so whatever the debug
+    /// setting.
+    #[tokio::test]
+    async fn a_sign_in_window_that_exits_closes_the_view_as_exited() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR"]);
+        let (mut state, mut viewer, directory) = viewed(&guard, "sign-in-exits").await;
+        state.sign_in = Some(ended_sign_in());
+        maintain(&mut state).await;
+        assert!(state.sign_in.is_none());
+        let closed = status(&mut viewer).await;
+        assert_eq!(closed["connected"], false, "{closed}");
+        assert_eq!(closed["browser"], "closed", "{closed}");
+        assert_eq!(closed["reason"], "exited", "{closed}");
+        assert!(log(&directory, "sign-in-exits").contains("browser closed: exited"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A hand-back tells every viewer at once that the browser restarts,
+    /// while the retired window is still the source; a hand-back with no
+    /// launch to repeat ends closed as a failed restart.
+    #[tokio::test]
+    async fn a_hand_back_says_restarting_then_restart_failed() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR"]);
+        let (mut state, mut viewer, directory) = viewed(&guard, "hand-back-fails").await;
+        let (retired, _control, _frames) = DisplayClient::test_channel();
+        state
+            .stream_server
+            .as_ref()
+            .unwrap()
+            .set_display(Some(retired))
+            .await;
+        state.sign_in = Some(ended_sign_in());
+        hand_back(&mut state).await;
+        let mut restarting = status(&mut viewer).await;
+        while restarting["browser"] == "running" {
+            // The retired window's capture loop reports its attach first.
+            restarting = status(&mut viewer).await;
+        }
+        assert_eq!(restarting["browser"], "restarting", "{restarting}");
+        assert_eq!(restarting["connected"], true, "{restarting}");
+        let mut failed = status(&mut viewer).await;
+        while failed["browser"] == "restarting" {
+            // Stopping the sign-in window may report the source again while
+            // the successor starts; only a change of state is owed.
+            failed = status(&mut viewer).await;
+        }
+        assert_eq!(failed["browser"], "closed", "{failed}");
+        assert_eq!(failed["reason"], "restart_failed", "{failed}");
+        assert_eq!(
+            failed["restartable"], false,
+            "no launch to repeat: {failed}"
+        );
+        assert!(!state.browser_restarting);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A relaunch that fails keeps its launch: the view is restartable, a
+    /// restart runs it again and refuses in the status record's words, and
+    /// an intended close ends what can be restarted.
+    #[tokio::test]
+    async fn a_failed_relaunch_is_restartable_and_restart_answers_in_the_record_s_words() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR"]);
+        let (mut state, mut viewer, directory) = viewed(&guard, "relaunch-fails").await;
+        state.launch_configuration = Some(Arc::new(json!({ "fixture": 1 })));
+        let deadline = Instant::now() + TRANSITION;
+        assert!(!relaunch_automation(&mut state, unlaunchable(), deadline).await);
+        let failed = status(&mut viewer).await;
+        assert_eq!(failed["reason"], "restart_failed", "{failed}");
+        assert_eq!(failed["restartable"], true, "{failed}");
+        assert!(log(&directory, "relaunch-fails").contains("automation relaunch failed"));
+
+        let request = ControlRequest::parse(&json!({
+            "action": crate::native::browser_control::ACTION,
+            "op": "restart",
+            "controllerId": "8c7d6f4e-2b1a-4c3d-9e8f-0a1b2c3d4e5f",
+        }))
+        .unwrap();
+        assert!(request.restarts());
+        let refused = restart(&mut state, &request)
+            .await
+            .err()
+            .expect("a refused restart");
+        assert_eq!(refused.error.code, "browser_control_unavailable");
+        assert_eq!(refused.reason, ClosedReason::RestartFailed);
+        let restarting = status(&mut viewer).await;
+        assert_eq!(
+            restarting["browser"], "closed",
+            "no source while it starts: {restarting}"
+        );
+        let again = status(&mut viewer).await;
+        assert_eq!(again["reason"], "restart_failed", "{again}");
+        assert_eq!(again["restartable"], true, "{again}");
+
+        let _ = close_current_browser(&mut state, ClosedReason::Closed).await;
+        assert!(!state.restartable());
+        let refused = restart(&mut state, &request)
+            .await
+            .err()
+            .expect("nothing to restart");
+        assert_eq!(refused.error.code, "browser_control_unavailable");
+        assert_eq!(refused.reason, ClosedReason::Closed);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// With a browser running, a restart answers as one that happened and
+    /// starts nothing: a repeated or late request changes nothing.
+    #[tokio::test]
+    async fn a_restart_with_a_browser_running_answers_restarted() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR"]);
+        let (mut state, _viewer, directory) = viewed(&guard, "restart-running").await;
+        let running = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        state.sign_in = Some(SignInBrowser {
+            chrome: ChromeProcess::for_test(running, LaunchOptions::default()),
+        });
+        let request = ControlRequest::parse(&json!({
+            "action": crate::native::browser_control::ACTION,
+            "op": "restart",
+            "controllerId": "8c7d6f4e-2b1a-4c3d-9e8f-0a1b2c3d4e5f",
+        }))
+        .unwrap();
+        let answer = restart(&mut state, &request).await.ok().expect("restarted");
+        assert_eq!(answer["status"], "restarted");
+        assert!(state.sign_in.is_some(), "nothing was relaunched");
+        let _ = close_current_browser(&mut state, ClosedReason::Closed).await;
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
     /// A cropping presenter's size-class layout leaves the framebuffer (the
     /// surface) larger than the window: both relaunches keep the window's
     /// size, not the framebuffer's.
