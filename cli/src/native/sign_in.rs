@@ -726,8 +726,7 @@ mod tests {
         assert!(request.restarts());
         let refused = restart(&mut state, &request)
             .await
-            .err()
-            .expect("a refused restart");
+            .expect_err("a refused restart");
         assert_eq!(refused.error.code, "browser_control_unavailable");
         assert_eq!(refused.reason, ClosedReason::RestartFailed);
         let restarting = status(&mut viewer).await;
@@ -743,8 +742,7 @@ mod tests {
         assert!(!state.restartable());
         let refused = restart(&mut state, &request)
             .await
-            .err()
-            .expect("nothing to restart");
+            .expect_err("nothing to restart");
         assert_eq!(refused.error.code, "browser_control_unavailable");
         assert_eq!(refused.reason, ClosedReason::Closed);
         let _ = std::fs::remove_dir_all(directory);

@@ -45,7 +45,10 @@ pub(super) fn disk_free_bytes(path: &Path) -> Option<u64> {
     if unsafe { libc::statvfs(c_path.as_ptr(), &mut stat) } != 0 {
         return None;
     }
-    Some(stat.f_bavail as u64 * stat.f_frsize)
+    // `f_bavail` is u64 on Linux but u32 on macOS; the cast is the portable form.
+    #[allow(clippy::unnecessary_cast)]
+    let available = stat.f_bavail as u64;
+    Some(available * stat.f_frsize)
 }
 
 #[cfg(windows)]
