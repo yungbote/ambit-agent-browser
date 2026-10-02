@@ -138,7 +138,7 @@ agent-browser screenshot --screenshot-format jpeg --screenshot-quality 80
 agent-browser pdf <path>              # Save as PDF
 agent-browser snapshot                # Accessibility tree with refs (best for AI)
 agent-browser eval <js>               # Run JavaScript (-b for base64, --stdin for piped input)
-agent-browser run-playwright <code>    # Async Playwright body in the existing browser (--stdin, --target, --timeout-ms)
+agent-browser run-playwright <code>    # Async Playwright body; starts the managed browser when fresh (--stdin, --target, --timeout-ms)
 agent-browser connect <port>          # Connect to browser via CDP
 agent-browser stream enable [--port <port>]  # Start runtime WebSocket streaming
 agent-browser webmcp list                     # List experimental page tools
@@ -2070,9 +2070,9 @@ Apache-2.0
 
 Linux private window streaming uses ANGLE software GLES for WebGL by default, with software compositing so the stream still sends only damaged regions. Explicit browser arguments override that preset, and the existing `--webgpu` preset keeps its backend. A fresh driver-owned profile opens `about:blank`; retained profiles and caller-selected startup arguments keep their existing startup behavior.
 
-`agent-browser run-playwright --stdin` runs an async JavaScript body with the actual `page`, `context`, and `browser` from the current native Chromium session. The body runs in Node: `document` and `window` exist only inside `page.evaluate()`. Return a JSON-serializable value. `--target <id>` selects another existing CDP target; `--timeout-ms <ms>` bounds execution to 1 through 120000 milliseconds (default 30000). The MCP equivalent is `agent_browser_run_playwright` with `code`, optional `targetId`, and optional `timeoutMs`.
+`agent-browser run-playwright --stdin` runs an async JavaScript body with the actual `page`, `context`, and `browser` from the current native Chromium session. An untargeted first program in CODE or standalone use starts the browser through its ordinary managed launch, policy and window preparation; later programs reuse it. The body runs in Node: `document` and `window` exist only inside `page.evaluate()`. Return a JSON-serializable value. `--target <id>` selects an existing CDP target and never creates a replacement browser; `--timeout-ms <ms>` bounds execution to 1 through 120000 milliseconds (default 30000). The MCP equivalent is `agent_browser_run_playwright` with `code`, optional `targetId`, and optional `timeoutMs`.
 
-The platform reserves `AMBIT_WORKSPACE_ROLE` for the workspace manifest: `code`, `browser_host`, or absent for standalone use. The daemon fixes it at startup and refuses invalid values. A browser host rejects local `run-playwright` with `browser_operation_rejected` before launching Chrome or Node, even before its first site-state offer; programs belong in the conversation's code workspace. A launch or model argument cannot change this role. Standalone and code-workspace use retain the existing local program behavior. The marker identifies a process role and grants no site access.
+The platform reserves `AMBIT_WORKSPACE_ROLE` for the workspace manifest: `code`, `browser_host`, or absent for standalone use. The daemon fixes it at startup and refuses invalid values. A browser host rejects local `run-playwright` with `browser_operation_rejected` before launching Chrome or Node, even before its first site-state offer; programs belong in the conversation's code workspace. A launch or model argument cannot change this role. The marker identifies a process role and grants no site access.
 
 Fresh automatically owned profiles in a browser host start with Chrome's offer to save new passwords turned off. Chrome-account and website sign-in remain available. Retained and caller-selected profiles are not rewritten. This preference does not establish that previously saved or account-stored passwords cannot be filled, and the person may change it in Chrome; persistent vault custody and model redaction remain separate boundaries.
 
