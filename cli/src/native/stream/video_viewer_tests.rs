@@ -39,7 +39,17 @@ async fn receive(viewer: &mut Viewer) -> Received {
             Message::Text(text) => return Received::Record(serde_json::from_str(&text).unwrap()),
             Message::Binary(bytes) => {
                 let end = 4 + u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
-                return Received::Binary(serde_json::from_slice(&bytes[4..end]).unwrap());
+                let header: Value = serde_json::from_slice(&bytes[4..end]).unwrap();
+                if header["track"] == "video" {
+                    // This connection negotiates whole legacy units. The
+                    // transport fixture consumes a complete body; real
+                    // decoder/paint acknowledgement is qualified separately.
+                    assert_eq!(
+                        header["byteLength"].as_u64(),
+                        Some((bytes.len() - end) as u64)
+                    );
+                }
+                return Received::Binary(header);
             }
             _ => continue,
         }
@@ -61,7 +71,10 @@ async fn video_record(viewer: &mut Viewer) -> Value {
 async fn video_unit(viewer: &mut Viewer) -> Value {
     loop {
         match receive(viewer).await {
-            Received::Binary(header) if header["track"] == "video" => return header,
+            Received::Binary(header) if header["track"] == "video" => {
+                send(viewer, json!({"type":"ack","track":"video","streamId":header["streamId"],"seq":header["seq"]})).await;
+                return header;
+            }
             Received::Binary(header) => panic!("a frame while served video: {header}"),
             Received::Record(_) => continue,
         }
@@ -176,17 +189,22 @@ async fn a_video_viewer_is_sent_units_instead_of_frames_and_returns_to_frames_wh
         "no frame captures while on video"
     );
 
-    // A video acknowledgement is not frame credit, and damage follows.
+    // Video consumption is not frame credit. A faster encoder can already
+    // have queued refinement of the first picture; consume it before the
+    // picture captured after this damage, retaining gap-free stream order.
     let stream = first["streamId"].clone();
-    send(
-        &mut viewer,
-        json!({"type":"ack","track":"video","streamId":stream,"seq":1}),
-    )
-    .await;
+    let initial_picture = first["ts"].as_u64().unwrap();
     screen.paint(100, 140, RED);
-    let mut last = video_unit(&mut viewer).await;
-    assert_eq!(last["seq"], 2);
-    assert_eq!(last["streamId"], stream);
+    let mut previous = first["seq"].as_u64().unwrap();
+    let mut last = loop {
+        let unit = video_unit(&mut viewer).await;
+        assert_eq!(unit["seq"], previous + 1, "no gap");
+        assert_eq!(unit["streamId"], stream);
+        previous += 1;
+        if unit["ts"].as_u64().unwrap() > initial_picture {
+            break unit;
+        }
+    };
 
     // A key request is answered with a key unit, in the same epoch.
     send(
