@@ -41,6 +41,28 @@ pub(crate) struct PictureRequest {
     pub cursor_identity: bool,
 }
 
+/// Pointer priority is capture metadata, not input authority or pixel geometry.
+#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq)]
+pub(crate) struct PicturePointer {
+    pub x: i32,
+    pub y: i32,
+}
+
+impl PicturePointer {
+    fn read(value: &Value) -> Option<Self> {
+        value
+            .get("x")
+            .and_then(Value::as_i64)
+            .zip(value.get("y").and_then(Value::as_i64))
+            .and_then(|(x, y)| {
+                Some(Self {
+                    x: i32::try_from(x).ok()?,
+                    y: i32::try_from(y).ok()?,
+                })
+            })
+    }
+}
+
 /// A picture as the helper answered it.
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
@@ -58,6 +80,18 @@ pub(crate) struct PictureReply {
     pub visible: Option<Rect>,
     #[serde(default)]
     pub timings: Option<Value>,
+    /// Fresh native-query coordinates from this capture, in framebuffer device
+    /// pixels. Older helpers omit them; identity-image coordinates are never
+    /// substituted for a current pointer position.
+    #[serde(default, deserialize_with = "read_optional_pointer")]
+    pub pointer: Option<PicturePointer>,
+}
+
+fn read_optional_pointer<'de, D: serde::Deserializer<'de>>(
+    input: D,
+) -> Result<Option<PicturePointer>, D::Error> {
+    let value = Value::deserialize(input)?;
+    Ok(PicturePointer::read(&value))
 }
 
 impl PictureReply {
@@ -277,6 +311,8 @@ impl PictureChannel {
                 let unchanged = PictureReply {
                     rows: Vec::new(),
                     timings: None,
+                    // Unchanged pixels do not make an earlier pointer current.
+                    pointer: PicturePointer::read(&data["pointer"]),
                     ..last.clone()
                 };
                 read(&unchanged, self.slot(&unchanged))
@@ -378,6 +414,16 @@ pub(crate) mod fake {
             }
         }
 
+        /// Writes an exact test framebuffer through the same shared slot.
+        pub(crate) fn paint_image(&mut self, width: u32, height: u32, bgrx: &[u8]) {
+            let bytes = width as usize * height as usize * 4;
+            assert_eq!(bgrx.len(), bytes);
+            assert!(bytes <= SLOT_BYTES);
+            // SAFETY: the test owns SLOT_BYTES of writable mapped memory.
+            let slot = unsafe { std::slice::from_raw_parts_mut(self.pixels.as_ptr(), bytes) };
+            slot.copy_from_slice(bgrx);
+        }
+
         pub(crate) fn answer(&mut self, request: &Value, data: Value) {
             let reply = json!({"id": request["id"], "success": true, "data": data});
             self.socket
@@ -399,6 +445,50 @@ pub(crate) mod fake {
 mod tests {
     use super::fake::FakeHelper;
     use super::*;
+
+    #[test]
+    fn optional_pointer_metadata_never_becomes_pixel_geometry_or_input_authority() {
+        for value in [
+            Value::Null,
+            json!({}),
+            json!({"x":"bad","y":1}),
+            json!({"x":1.5,"y":2}),
+            json!({"x":i64::MAX,"y":1}),
+        ] {
+            let reply:PictureReply=serde_json::from_value(json!({"width":2,"height":2,"stride":8,"rows":[[0,2]],"cursorIncluded":false,"pointer":value})).unwrap();
+            assert_eq!(reply.pointer, None);
+            assert!(reply.coherent(PictureRequest::default()));
+        }
+        let reply:PictureReply=serde_json::from_value(json!({"width":2,"height":2,"stride":8,"rows":[[0,2]],"cursorIncluded":false,"pointer":{"x":-4,"y":20}})).unwrap();
+        assert_eq!(reply.pointer, Some(PicturePointer { x: -4, y: 20 }));
+        assert!(
+            reply.coherent(PictureRequest::default()),
+            "off-window native position is neutral priority, not a broken picture"
+        );
+    }
+
+    #[test]
+    fn aperture_admission_accepts_real_nonzero_origins_only_within_the_framebuffer() {
+        let header = json!({"width":1536,"height":2048,"stride":6144,"rows":[[0,2048]],"cursorIncluded":false,
+            "visible":{"x":100,"y":80,"width":1418,"height":1888},"pointer":{"x":400,"y":500}});
+        let reply: PictureReply = serde_json::from_value(header.clone()).unwrap();
+        assert!(reply.coherent(PictureRequest {
+            force: true,
+            ..Default::default()
+        }));
+        for invalid in [
+            json!({"x":-1,"y":80,"width":1418,"height":1888}),
+            json!({"x":119,"y":80,"width":1418,"height":1888}),
+            json!({"x":100,"y":161,"width":1418,"height":1888}),
+            json!({"x":i32::MAX,"y":80,"width":u32::MAX,"height":1888}),
+            json!({"x":100,"y":80,"width":0,"height":1888}),
+        ] {
+            let mut header = header.clone();
+            header["visible"] = invalid;
+            let reply: PictureReply = serde_json::from_value(header).unwrap();
+            assert!(!reply.coherent(PictureRequest::default()));
+        }
+    }
 
     fn request() -> PictureRequest {
         PictureRequest {
@@ -433,7 +523,7 @@ mod tests {
             helper.answer(
                 &first,
                 json!({"changed":true,"width":8,"height":6,"stride":32,"rows":[[2,4]],
-                    "cursorIncluded":false,"timings":{"waitUs":42},"cursor":{"serial":3,"css":"text"}}),
+                    "cursorIncluded":false,"timings":{"waitUs":42},"cursor":{"serial":3,"css":"text"},"pointer":{"x":7,"y":5}}),
             );
             let second = helper.request();
             helper.answer(&second, json!({"changed":false}));
@@ -446,6 +536,7 @@ mod tests {
             .picture(request(), |reply, pixels| {
                 assert_eq!(reply.rows, vec![[2, 4]]);
                 assert_eq!(reply.wait_us(), 42);
+                assert_eq!(reply.pointer, Some(PicturePointer { x: 7, y: 5 }));
                 assert_eq!(
                     reply.window(),
                     Rect {
@@ -463,6 +554,7 @@ mod tests {
         let unchanged = channel
             .picture(request(), |reply, pixels| {
                 assert!(reply.rows.is_empty(), "nothing new was written");
+                assert_eq!(reply.pointer,None,"an old helper's omitted position must not replay a previous capture's coordinates");
                 assert_eq!((reply.width, reply.height, reply.stride), (8, 6, 32));
                 pixels[2 * 32..4 * 32].to_vec()
             })

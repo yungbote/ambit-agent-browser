@@ -135,12 +135,10 @@ impl Planar {
         source: &[u8],
         stride: usize,
         source_size: (usize, usize),
-        visible: crate::native::display::Rect,
+        visible: super::EncoderRegion,
         rows: (usize, usize),
     ) -> bool {
-        let (Ok(left), Ok(top)) = (usize::try_from(visible.x), usize::try_from(visible.y)) else {
-            return false;
-        };
+        let (left, top) = (visible.x as usize, visible.y as usize);
         let (Some(right), Some(bottom)) = (
             left.checked_add(visible.width as usize),
             top.checked_add(visible.height as usize),
@@ -470,7 +468,7 @@ mod tests {
                 &source,
                 32,
                 (8, 6),
-                crate::native::display::Rect {
+                super::super::EncoderRegion {
                     x: 1,
                     y: 1,
                     width: 5,
