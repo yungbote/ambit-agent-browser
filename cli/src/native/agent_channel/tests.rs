@@ -23,6 +23,9 @@ const ACTION: &str = "8c1f0e2a-3b4c-4d5e-8f60-718293a4b5c6";
 /// `agent_browser_get_html` answers with as many bytes as its selector says.
 #[derive(Default)]
 struct Scripted {
+    values: crate::native::site_sessions::redaction::Redaction,
+    landed: Option<Value>,
+    result_text: Option<String>,
     custody: Option<tokio::sync::broadcast::Sender<(ChannelId, Value)>>,
     ran: StdMutex<Vec<String>>,
     started: Notify,
@@ -43,6 +46,13 @@ impl Scripted {
 }
 
 impl Browser for Scripted {
+    fn redact(&self, value: &mut Value) {
+        self.values.scrub_protocol(value);
+    }
+
+    fn redact_step(&self, op: &str, value: &mut Value) {
+        self.values.scrub_tool(value, op);
+    }
     async fn action_files(
         &self,
         _: ChannelId,
@@ -115,6 +125,7 @@ impl Browser for Scripted {
             }
             op => op.to_string(),
         };
+        let text = self.result_text.as_ref().cloned().unwrap_or(text);
         let succeeded = step.op != "agent_browser_get_url";
         let response = if succeeded {
             json!({ "success": true, "data": { "text": text } })
@@ -127,7 +138,7 @@ impl Browser for Scripted {
                 "content": [{ "type": "text", "text": text }],
                 "structuredContent": { "response": response } }),
             succeeded,
-            landed: None,
+            landed: self.landed.clone(),
             timing: StepTiming {
                 queue_us: 10,
                 op_us: 100,
@@ -190,7 +201,11 @@ struct Host {
 
 impl Host {
     /// Opens a connection whose first line is `first`.
-    async fn open(endpoint: &Arc<Endpoint>, browser: &Arc<Scripted>, first: Value) -> Self {
+    async fn open<B: Browser + Send + Sync + 'static>(
+        endpoint: &Arc<Endpoint>,
+        browser: &Arc<B>,
+        first: Value,
+    ) -> Self {
         let (host, daemon) = tokio::io::duplex(16 << 20);
         let (lines, mut writer) = tokio::io::split(host);
         writer.write_all(line(&first).as_bytes()).await.unwrap();
@@ -220,9 +235,9 @@ impl Host {
     }
 
     /// Opens a channel and says hello, answering the hello's reply.
-    async fn hello(
+    async fn hello<B: Browser + Send + Sync + 'static>(
         endpoint: &Arc<Endpoint>,
-        browser: &Arc<Scripted>,
+        browser: &Arc<B>,
         extra: Value,
     ) -> (Self, Value) {
         let mut host = Self::open(endpoint, browser, hello(CHANNEL_A, extra)).await;
@@ -299,6 +314,268 @@ fn step(op: &str, arguments: Value) -> Value {
 
 fn title() -> Value {
     step("agent_browser_get_title", json!({}))
+}
+
+fn semantic_landing(texts: Value) -> Value {
+    json!({"changedNodes": 2, "target":{"backendNodeId":42},
+        "changedText":{"texts":texts,"omitted":0,"pageGeneration":"G","backendNodeId":42}})
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore]
+async fn e2e_semantic_registered_values_survive_real_dispatch_only_as_redacted_bounded_data() {
+    use tokio::io::AsyncReadExt;
+    let (_d, path) = directory();
+    let env = crate::test_utils::EnvGuard::new(&[
+        "AGENT_BROWSER_WINDOW_STREAM",
+        "DISPLAY",
+        "AGENT_BROWSER_SESSION",
+        "AGENT_BROWSER_NAMESPACE",
+        "AGENT_BROWSER_SOCKET_DIR",
+    ]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    env.set("AGENT_BROWSER_SESSION", "browser");
+    env.set("AGENT_BROWSER_NAMESPACE", "thread");
+    env.set("AGENT_BROWSER_SOCKET_DIR", path.to_str().unwrap());
+    // nosecret: synthetic values in an isolated tool-owned fixture/browser.
+    let canary = "fixture-registered-credential-canary";
+    let html = format!("<!doctype html><title>Report</title><h2 id=result>Waiting</h2><button id=run type=button onclick=\"result.textContent='Report ready {canary}'\">Generate report</button><!--{}-->","h".repeat(70_000));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                break;
+            };
+            let html = html.clone();
+            tokio::spawn(async move {
+                let mut request = [0; 4096];
+                let _ = stream.read(&mut request).await;
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}",html.len());
+                let _ = stream.write_all(response.as_bytes()).await;
+            });
+        }
+    });
+    let state = Arc::new(tokio::sync::Mutex::new(
+        crate::native::actions::DaemonState::new(),
+    ));
+    let browser = Arc::new(super::dispatch::DaemonBrowser::new(state.clone()));
+    let endpoint = endpoint_role(true);
+    let (mut host, admitted) = Host::hello(&endpoint, &browser,
+        json!({"binding":{"version":1,"namespace":"thread","session":"browser","requireSandbox":true,"browserHost":true}})).await;
+    assert_eq!(admitted["success"], true, "{admitted}");
+    host.send(json!({"type":"site_sessions.offer","id":2,"sites":[]}))
+        .await;
+    let offered = host.reply().await;
+    assert_eq!(offered["success"], true, "{offered}");
+    let mut open = sequence(
+        3,
+        "41",
+        json!([step("agent_browser_open", json!({"url":url}))]),
+        &path,
+    );
+    open["observe"] = json!(true);
+    host.send(open).await;
+    let opened = host.reply().await;
+    assert_eq!(opened["success"], true, "{opened}");
+    let generation = opened["browser"]["page"]["pageGeneration"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let target = opened["observation"]["candidates"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|candidate| candidate["name"] == "Generate report")
+        .unwrap()["backendNodeId"]
+        .clone();
+    {
+        let state = state.lock().await;
+        let client = &state.browser.as_ref().unwrap().client;
+        let values = client.site_context().values;
+        values.register(canary);
+        values.register(&generation);
+    }
+    let mut click = step("agent_browser_click", json!({"selector":"#run"}));
+    click["preconditions"] =
+        json!({"pageGeneration":generation,"backendNodeId":target,"effects":"read"});
+    host.send(sequence(4, "41", json!([click.clone()]), &path))
+        .await;
+    let refused = host.reply().await;
+    assert_eq!(
+        refused["steps"][0]["result"]["structuredContent"]["response"]["code"],
+        "browser_effect_refused"
+    );
+    assert_eq!(refused["steps"][0]["timing"]["motionUs"], 0);
+    // The fixture's named commit grants only this observed node/document.
+    click["preconditions"]["effects"] = json!("commit");
+    host.send(sequence(
+        5,
+        "41",
+        json!([
+            click,
+            step("agent_browser_get_html", json!({"selector":"body"}))
+        ]),
+        &path,
+    ))
+    .await;
+    let acted = host.reply().await;
+    assert_eq!(acted["success"], true, "{acted}");
+    assert!(!acted.to_string().contains(canary));
+    assert_eq!(acted["browser"]["page"]["pageGeneration"], generation);
+    let landed = &acted["steps"][0]["landed"];
+    assert_eq!(landed["changedText"]["pageGeneration"], generation);
+    assert_eq!(
+        landed["changedText"]["backendNodeId"],
+        landed["target"]["backendNodeId"]
+    );
+    assert_eq!(
+        landed["changedText"]["texts"],
+        json!([format!(
+            "Report ready {}",
+            crate::native::site_sessions::redaction::MARKER
+        )])
+    );
+    host.send(op_status(6, "41", Some((CHANNEL_A, 5)), 0)).await;
+    let status = host.reply().await;
+    assert!(!status.to_string().contains(canary));
+    assert_eq!(status["data"]["result"]["steps"][0]["landed"], *landed);
+    let saved = std::fs::read_to_string(
+        status["data"]["result"]["steps"][1]["result"]["path"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(!saved.contains(canary));
+    assert!(saved.contains(crate::native::site_sessions::redaction::MARKER));
+    drop(host.writer);
+    drop(host.lines);
+    tokio::time::timeout(Duration::from_secs(10), host.served)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut state = state.lock().await;
+    let closed =
+        crate::native::actions::execute_command(&json!({"action":"close"}), &mut state).await;
+    assert_eq!(closed["success"], true);
+    server.abort();
+}
+
+#[tokio::test]
+async fn semantic_registry_scrubs_before_reply_ledger_and_retained_result_without_erasing_identity()
+{
+    let canary = "synthetic-credential-canary";
+    let browser = Arc::new(Scripted {
+        landed: Some(semantic_landing(json!(["Report ready", canary]))),
+        result_text: Some(format!("{} {canary}", "h".repeat(70_000))),
+        ..Scripted::default()
+    });
+    browser.values.register(canary);
+    // Even when a stored value equals an identity, typed native identity survives.
+    browser.values.register("G");
+    let endpoint = endpoint();
+    let (_d, path) = directory();
+    let (mut host, _) = Host::hello(&endpoint, &browser, json!({})).await;
+    host.send(sequence(2, "41", json!([title()]), &path)).await;
+    let reply = host.reply().await;
+    assert!(!reply.to_string().contains(canary));
+    assert_eq!(reply["browser"]["page"]["pageGeneration"], "G");
+    let landing = &reply["steps"][0]["landed"];
+    assert_eq!(landing["changedText"]["pageGeneration"], "G");
+    assert_eq!(landing["changedText"]["backendNodeId"], 42);
+    assert_eq!(
+        landing["changedText"]["texts"],
+        json!([
+            "Report ready",
+            crate::native::site_sessions::redaction::MARKER
+        ])
+    );
+    host.send(op_status(3, "41", Some((CHANNEL_A, 2)), 0)).await;
+    let status = host.reply().await;
+    assert!(!status.to_string().contains(canary));
+    let kept = &status["data"]["result"]["steps"][0];
+    assert_eq!(kept["landed"], *landing);
+    let saved = std::fs::read_to_string(kept["result"]["path"].as_str().unwrap()).unwrap();
+    assert!(!saved.contains(canary));
+    assert!(saved.contains(crate::native::site_sessions::redaction::MARKER));
+    drop(host.writer);
+    drop(host.lines);
+    tokio::time::timeout(Duration::from_secs(10), host.served)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut reopened = Host::open(&endpoint, &browser, hello(CHANNEL_B, json!({}))).await;
+    assert_eq!(reopened.reply().await["success"], true);
+    reopened
+        .send(op_status(2, "41", Some((CHANNEL_A, 2)), 0))
+        .await;
+    let recovered = reopened.reply().await;
+    assert!(!recovered.to_string().contains(canary));
+    assert_eq!(recovered["data"]["result"]["steps"][0]["landed"], *landing);
+}
+
+#[tokio::test]
+async fn semantic_registry_expansion_drops_only_optional_text_before_retention() {
+    // 4 x 113 chars / 972 UTF-8 bytes before scrub; expansion stays below
+    // each 200-char cap but exceeds the aggregate 1024-byte contract.
+    let secret = "canary88";
+    let original = format!("{}{}", secret.repeat(6), "界".repeat(65));
+    assert!(original.chars().count() <= 200 && original.len() * 4 <= 1024);
+    let browser = Arc::new(Scripted {
+        landed: Some(semantic_landing(json!([
+            original, original, original, original
+        ]))),
+        ..Scripted::default()
+    });
+    browser.values.register(secret);
+    let endpoint = endpoint();
+    let (_d, path) = directory();
+    let (mut host, _) = Host::hello(&endpoint, &browser, json!({})).await;
+    host.send(sequence(2, "41", json!([title()]), &path)).await;
+    let reply = host.reply().await;
+    assert!(
+        reply["steps"][0]["landed"].get("changedText").is_none(),
+        "{reply}"
+    );
+    assert_eq!(reply["steps"][0]["landed"]["changedNodes"], 2);
+    assert_eq!(reply["steps"][0]["landed"]["target"]["backendNodeId"], 42);
+    assert_eq!(reply["browser"]["page"]["pageGeneration"], "G");
+    host.send(op_status(3, "41", Some((CHANNEL_A, 2)), 0)).await;
+    assert!(host.reply().await["data"]["result"]["steps"][0]["landed"]
+        .get("changedText")
+        .is_none());
+}
+
+#[tokio::test]
+async fn semantic_registry_remains_scrubbed_when_a_new_owner_fences_the_running_channel() {
+    let canary = "cancelled-credential-canary";
+    let browser = Arc::new(Scripted {
+        landed: Some(semantic_landing(json!([canary]))),
+        result_text: Some(canary.into()),
+        ..Scripted::default()
+    });
+    browser.values.register(canary);
+    let endpoint = endpoint();
+    let (_d, path) = directory();
+    let (mut old, _) = Host::hello(&endpoint, &browser, json!({})).await;
+    old.send(sequence(2, "41", json!([wait(), title()]), &path))
+        .await;
+    browser.started.notified().await;
+    let mut new = Host::open(&endpoint, &browser, hello(CHANNEL_B, json!({}))).await;
+    assert_eq!(new.reply().await["success"], true);
+    new.send(op_status(2, "42", Some((CHANNEL_A, 2)), 0)).await;
+    assert_eq!(new.reply().await["data"]["state"], "running");
+    browser.go.notify_one();
+    let stopped = old.reply().await;
+    assert_eq!(stopped["steps"].as_array().unwrap().len(), 1);
+    assert!(!stopped.to_string().contains(canary));
+    new.send(op_status(3, "42", Some((CHANNEL_A, 2)), 0)).await;
+    let status = new.reply().await;
+    assert_eq!(status["data"]["state"], "settled");
+    assert!(!status.to_string().contains(canary));
+    assert_eq!(browser.ran(), ["agent_browser_wait_ms"]);
 }
 
 fn wait() -> Value {
