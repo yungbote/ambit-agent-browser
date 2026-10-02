@@ -458,7 +458,7 @@ fn a_capture_admitted_before_backpressure_is_marked_but_not_encoded_after_blocki
     let encoding = Arc::new(Encoding::new(VideoCodec::Av1Full));
     let subscriber = Arc::new(Subscriber::new(rate(60)));
     lock(&encoding.subscribers).push(subscriber.clone());
-    let Decision::Capture(plan) = decide(&[encoding.clone()], Instant::now()) else {
+    let Decision::Capture(plan) = decide(std::slice::from_ref(&encoding), Instant::now()) else {
         panic!("a ready first viewer admits its initial capture")
     };
     assert_eq!(plan.encodings.len(), 1);
