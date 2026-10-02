@@ -2272,17 +2272,18 @@ Examples:
 
         "run-playwright" => {
             r##"
-agent-browser run-playwright - Run Playwright in the existing browser
+agent-browser run-playwright - Run Playwright in the managed browser
 
 Usage: agent-browser run-playwright [--target <id>] [--timeout-ms <ms>] <code|--stdin>
 
 Run an async JavaScript body with page, context and browser. Return a JSON value.
 The body runs in Node; document and window exist only inside page.evaluate().
-The default page is the native driver's current tab. Open the browser first.
+The default page is the native driver's current tab. An untargeted first program
+in CODE or standalone use starts the browser through ordinary managed startup.
 Requires Node and installed playwright-core 1.62.1 or a qualified newer version.
 
 Browser hosts reject local programs before Chrome or Node starts; run them
-in the conversation workspace. Standalone and code-workspace use are unchanged.
+in the conversation workspace. An explicit target always names an existing tab.
 AMBIT_WORKSPACE_ROLE is reserved for the platform's workspace manifest and
 is fixed at daemon startup, not selected by a launch or model argument.
 Fresh owned browser-host profiles start with Chrome's new-password saving
@@ -4012,7 +4013,7 @@ Core Commands:
   pdf <path>                 Save as PDF
   snapshot                   Accessibility tree with refs (for AI)
   eval <js>                  Run JavaScript
-  run-playwright <code>       Run async Playwright code in the existing browser
+  run-playwright <code>       Run async Playwright code in the managed browser
   connect <port|url>         Connect to browser via CDP
   close [--all]              Close browser (--all closes every session)
 

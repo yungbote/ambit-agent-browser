@@ -2714,7 +2714,12 @@ fn provider_plugin_launch_options_from_command(cmd: &Value) -> Value {
     Value::Object(options)
 }
 
-fn skip_launch_action(action: &str) -> bool {
+fn skip_launch_action(cmd: &Value, action: &str) -> bool {
+    // A named target addresses an existing browser/tab. An untargeted
+    // program uses the same managed startup as any ordinary first action.
+    if action == "run_playwright" {
+        return cmd.get("targetId").is_some();
+    }
     if action == INTERNAL_DAEMON_SHUTDOWN_ACTION {
         return true;
     }
@@ -2724,7 +2729,6 @@ fn skip_launch_action(action: &str) -> bool {
         "" | "launch"
             | "close"
             | "read"
-            | "run_playwright"
             | "har_stop"
             | "credentials_set"
             | "credentials_get"
@@ -2760,7 +2764,7 @@ fn addresses_active_tab(cmd: &Value, action: &str) -> bool {
         "run_playwright" => cmd.get("targetId").is_none(),
         "tab_close" => cmd.get("tabId").and_then(Value::as_str).is_none(),
         "dialog" => cmd.get("response").and_then(Value::as_str) != Some("status"),
-        _ => !skip_launch_action(action) && !window_actions::explicit_browser_action(cmd),
+        _ => !skip_launch_action(cmd, action) && !window_actions::explicit_browser_action(cmd),
     }
 }
 
@@ -2802,7 +2806,7 @@ fn policy_actions_for_command(
         if local_launch {
             append_launch_mutator_policy_actions_for(&mut actions, &plugins);
         }
-    } else if !skip_launch_action(action) && needs_implicit_launch {
+    } else if !skip_launch_action(cmd, action) && needs_implicit_launch {
         let plugins = plugins_from_command_or_env(cmd);
         let provider_launch = env::var("AGENT_BROWSER_PROVIDER")
             .ok()
@@ -2995,11 +2999,9 @@ pub(crate) async fn run_host_command(
         refusal
     } else {
         let operation = async {
-            if let Some(launch) = request
-                .launch
-                .as_ref()
-                .filter(|_| !skip_launch_action(command["action"].as_str().unwrap_or_default()))
-            {
+            if let Some(launch) = request.launch.as_ref().filter(|_| {
+                !skip_launch_action(&command, command["action"].as_str().unwrap_or_default())
+            }) {
                 let mut launch = launch.clone();
                 launch["id"] = command["id"].clone();
                 let response = Box::pin(execute_command_inner(&launch, state)).await;
@@ -3538,7 +3540,7 @@ async fn execute_command_inner(cmd: &Value, state: &mut DaemonState) -> Value {
         _ => {}
     }
 
-    let skip_launch = skip_launch_action(action);
+    let skip_launch = skip_launch_action(cmd, action);
     let restore_key_change_needs_launch = !skip_launch
         && command_changes_restore_key(cmd, state)
         && has_active_browser_session(state);
@@ -15001,6 +15003,63 @@ mod tests {
         let actions = policy_actions_for_command(&cmd, "navigate", false);
 
         assert_eq!(actions, vec!["navigate".to_string()]);
+    }
+
+    #[test]
+    fn test_playwright_first_call_uses_the_current_launch_policy() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_PROVIDER"]);
+        guard.remove("AGENT_BROWSER_PROVIDER");
+        let mut cmd = json!({
+            "action":"run_playwright","code":"return 1;","timeoutMs":1000,
+            "plugins":[{"name":"stealth","command":"agent-browser-plugin-stealth","capabilities":["launch.mutate"]}]
+        });
+        let actions = policy_actions_for_command(&cmd, "run_playwright", true);
+        assert!(
+            actions.contains(&"plugin:stealth:launch.mutate".to_string()),
+            "{actions:?}"
+        );
+        for target in [json!("missing"), json!(""), Value::Null] {
+            cmd["targetId"] = target;
+            assert_eq!(
+                policy_actions_for_command(&cmd, "run_playwright", true),
+                vec!["run_playwright".to_string()]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_playwright_first_call_denied_launch_mutator_keeps_browser_absent() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_PROVIDER"]);
+        guard.remove("AGENT_BROWSER_PROVIDER");
+        let directory = tempfile::tempdir().unwrap();
+        let policy_path = directory.path().join("policy.json");
+        fs::write(&policy_path, r#"{"deny":["plugin:stealth:launch.mutate"]}"#).unwrap();
+        let mut state = DaemonState::new();
+        state.policy = Some(ActionPolicy::load(policy_path.to_str().unwrap()).unwrap());
+        let cmd = json!({"id":"first-program-denied","action":"run_playwright","code":"return 1;","timeoutMs":1000,"plugins":[{"name":"stealth","command":"agent-browser-plugin-stealth","capabilities":["launch.mutate"]}]});
+        let response = execute_command(&cmd, &mut state).await;
+        assert_eq!(response["success"], false, "{response}");
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap()
+                .contains("plugin:stealth:launch.mutate"),
+            "{response}"
+        );
+        assert!(state.browser.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_playwright_named_target_never_creates_a_replacement_browser() {
+        for target in [json!("missing"), json!(""), Value::Null] {
+            let mut state = DaemonState::new();
+            let response = execute_command(&json!({"id":"named-program","action":"run_playwright","code":"return 1;","timeoutMs":1000,"targetId":target}),&mut state).await;
+            assert_eq!(response["success"], false, "{response}");
+            assert!(
+                state.browser.is_none(),
+                "A named target never authorizes a new browser: {response}"
+            );
+        }
     }
 
     #[test]
