@@ -4,6 +4,8 @@ Stream the browser viewport via WebSocket for live preview or "pair browsing" wh
 
 ## Streaming
 
+Host agent-channel landings may carry an optional `changedText` diff of visible, non-editable text, bounded to eight fragments and 1024 UTF-8 bytes. Its original page generation and addressed node identify the evidence. Field values, secret/editor ancestry, pending/takeover reads and replaced documents are omitted; the diff never authorizes or replays input.
+
 Every session automatically starts a WebSocket stream server on an OS-assigned port. The server streams viewport frames and accepts input events (mouse, keyboard, touch).
 
 To bind to a specific port, set `AGENT_BROWSER_STREAM_PORT`:

@@ -536,11 +536,7 @@ async fn handle_connection<S>(
                         idle_activity.mark();
                         if let Some(browser) = &s.browser {
                             let values = browser.client.site_context().values;
-                            if matches!(action.as_str(), "evaluate" | "run_playwright") {
-                                values.scrub_response(&mut response);
-                            } else {
-                                values.scrub_browser_response(&mut response);
-                            }
+                            values.scrub_response(&action, &mut response);
                         }
                         response
                     }

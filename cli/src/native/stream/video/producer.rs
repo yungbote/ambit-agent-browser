@@ -447,6 +447,16 @@ impl Encoding {
         }
     }
 
+    /// Hands an admitted capture to the encoder only while some subscriber's
+    /// path still has room. Readiness can change after `decide` selected this
+    /// encoding and while the helper was waiting for damage; marking above
+    /// retains the changed rows so the next ready capture catches up.
+    fn take_if_ready(&self, capture: &Capture, reply: &PictureReply, pixels: &[u8]) {
+        if self.rate().is_some() {
+            self.take(capture, reply, pixels);
+        }
+    }
+
     /// Converts the screen into a free buffer and hands it to the encoder,
     /// when this encoding has not seen it yet; an unencoded picture it
     /// supersedes goes back to the free buffers.
@@ -644,6 +654,11 @@ fn capture_loop(inner: Weak<Inner>) {
                 input_seq: inner.source.media.applied_input_at(ts),
                 pointer: reply.pointer.map(|point| (point.x, point.y)),
             };
+            // Remember every encoding's damage before a snapshot wakes its
+            // caller; a blocked viewer must already owe this same picture.
+            for encoding in &encodings {
+                encoding.mark(reply);
+            }
             lock(&inner.state).snapshots.captured(
                 reply,
                 pixels,
@@ -656,11 +671,8 @@ fn capture_loop(inner: Weak<Inner>) {
                 },
                 capture.input_seq,
             );
-            for encoding in &encodings {
-                encoding.mark(reply);
-            }
             for encoding in &plan.encodings {
-                encoding.take(&capture, reply, pixels);
+                encoding.take_if_ready(&capture, reply, pixels);
             }
             ts
         });

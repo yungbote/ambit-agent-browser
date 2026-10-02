@@ -310,15 +310,31 @@ async fn capture(request: &FeedbackRequest, state: &DaemonState) -> Result<Value
         quality: Some(75),
         ..ScreenshotOptions::default()
     };
-    let encoded = capture_screenshot_base64(
-        &browser.client,
-        session_id,
-        &state.ref_map,
-        &options,
-        &state.iframe_sessions,
-    )
-    .await
-    .map_err(|_| "capture_failed")?;
+    #[cfg(target_os = "linux")]
+    let shared = super::viewport_screenshot::capture_base64(state, &options)
+        .await
+        .map_err(|error| {
+            if error == super::viewport_screenshot::PAGE_CHANGED {
+                "capture_page_changed"
+            } else {
+                "capture_failed"
+            }
+        })?;
+    #[cfg(not(target_os = "linux"))]
+    let shared = None;
+    let encoded = if let Some(shared) = shared {
+        shared
+    } else {
+        capture_screenshot_base64(
+            &browser.client,
+            session_id,
+            &state.ref_map,
+            &options,
+            &state.iframe_sessions,
+        )
+        .await
+        .map_err(|_| "capture_failed")?
+    };
     if encoded.len() > MAX_CAPTURE_BYTES.div_ceil(3) * 4 {
         return Err("capture_too_large");
     }

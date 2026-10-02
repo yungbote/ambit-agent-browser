@@ -145,13 +145,7 @@ impl Custody {
     }
 
     pub(crate) fn scrub_tool(&self, op: &str, value: &mut Value) {
-        self.context.values.scrub_tool(
-            value,
-            matches!(
-                op,
-                "agent_browser_eval" | "agent_browser_evaluate" | "agent_browser_run_playwright"
-            ),
-        );
+        self.context.values.scrub_tool(value, op);
     }
 
     fn site_origins(&self, state: &State, site: &str) -> Result<Vec<String>, &'static str> {

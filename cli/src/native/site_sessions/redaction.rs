@@ -93,40 +93,25 @@ impl Redaction {
 
     /// Native response metadata belongs to the protocol. Only model data
     /// and error text are values copied from the page or a program.
-    pub(crate) fn scrub_response(&self, response: &mut Value) {
+    pub(crate) fn scrub_response(&self, op: &str, response: &mut Value) {
         if let Some(data) = response.get_mut("data") {
-            self.scrub(data);
+            self.scrub_tool_data(op, data);
         }
         if let Some(error) = response.get_mut("error") {
             self.scrub(error);
         }
     }
 
-    pub(crate) fn scrub_browser_response(&self, response: &mut Value) {
-        if let Some(data) = response.get_mut("data") {
-            self.scrub_protocol(data);
-        }
-        if let Some(error) = response.get_mut("error") {
-            self.scrub(error);
-        }
-    }
-
-    pub(crate) fn scrub_tool(&self, result: &mut Value, arbitrary_data: bool) {
+    pub(crate) fn scrub_tool(&self, result: &mut Value, op: &str) {
         if let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) {
             for item in content {
                 if item["type"] == "text" {
                     if let Some(text) = item["text"].as_str() {
                         if let Ok(mut parsed) = serde_json::from_str::<Value>(text) {
                             if parsed.get("success").is_some() {
-                                if arbitrary_data {
-                                    self.scrub_response(&mut parsed);
-                                } else {
-                                    self.scrub_browser_response(&mut parsed);
-                                }
-                            } else if arbitrary_data {
-                                self.scrub(&mut parsed);
+                                self.scrub_response(op, &mut parsed);
                             } else {
-                                self.scrub_protocol(&mut parsed);
+                                self.scrub_tool_data(op, &mut parsed);
                             }
                             item["text"] = Value::String(parsed.to_string());
                         } else {
@@ -137,14 +122,37 @@ impl Redaction {
             }
         }
         if let Some(response) = result.pointer_mut("/structuredContent/response") {
-            if arbitrary_data {
-                self.scrub_response(response);
-            } else {
-                self.scrub_browser_response(response);
-            }
+            self.scrub_response(op, response);
         }
         if let Some(browser) = result.pointer_mut("/structuredContent/browser") {
             self.scrub_protocol(browser);
+        }
+    }
+
+    fn scrub_tool_data(&self, op: &str, data: &mut Value) {
+        let op = op.strip_prefix("agent_browser_").unwrap_or(op);
+        if matches!(op, "eval" | "evaluate" | "run_playwright") {
+            self.scrub(data);
+        } else {
+            // An invocation's native envelope is protocol; its output is arbitrary
+            // website data and cannot borrow identity exemptions from that envelope.
+            if matches!(op, "webmcp_invoke" | "webmcp_result" | "webmcp_cancel") {
+                if let Some(output) = data.get_mut("output") {
+                    self.scrub(output);
+                }
+            }
+            if op == "webmcp_list" {
+                if let Some(tools) = data.get_mut("tools").and_then(Value::as_array_mut) {
+                    for tool in tools {
+                        for field in ["inputSchema", "annotations"] {
+                            if let Some(value) = tool.get_mut(field) {
+                                self.scrub(value);
+                            }
+                        }
+                    }
+                }
+            }
+            self.scrub_protocol(data);
         }
     }
 
@@ -189,6 +197,7 @@ impl Redaction {
                         "targetId",
                         "frameId",
                         "loaderId",
+                        "pageGeneration",
                         "channel",
                         "namespace",
                         "session",
@@ -301,6 +310,84 @@ fn scrub(value: &mut Value, values: &[&str]) {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn semantic_page_generation_is_typed_identity_but_runtime_data_is_not() {
+        let registry = Redaction::default();
+        registry.register("generation-canary");
+        let mut protocol = json!({"pageGeneration":"generation-canary", "result":{
+            "type":"object","value":{"pageGeneration":"generation-canary","targetId":"generation-canary"}}});
+        registry.scrub_protocol(&mut protocol);
+        assert_eq!(protocol["pageGeneration"], "generation-canary");
+        assert_eq!(protocol["result"]["value"]["pageGeneration"], MARKER);
+        assert_eq!(protocol["result"]["value"]["targetId"], MARKER);
+    }
+
+    #[test]
+    fn webmcp_output_does_not_inherit_native_identity_exemptions() {
+        let registry = Redaction::default();
+        let canary = "website-result-canary";
+        registry.register(canary);
+        let response = json!({"success":true,"data":{"invocationId":"invocation-1",
+            "toolName":"report","frameId":canary,"status":"completed",
+            "output":{"id":canary,"targetId":canary,"pageGeneration":canary,
+                canary:{"nested":{"sessionId":canary}}}}});
+        for op in [
+            "agent_browser_webmcp_invoke",
+            "agent_browser_webmcp_result",
+            "agent_browser_webmcp_cancel",
+            "webmcp_invoke",
+            "webmcp_result",
+            "webmcp_cancel",
+        ] {
+            let mut result = json!({"content":[{"type":"text","text":response.to_string()}],
+            "structuredContent":{"response":response}});
+            registry.scrub_tool(&mut result, op);
+            let text: Value =
+                serde_json::from_str(result["content"][0]["text"].as_str().unwrap()).unwrap();
+            for response in [&text, &result["structuredContent"]["response"]] {
+                assert_eq!(response["data"]["frameId"], canary);
+                assert!(!response["data"]["output"].to_string().contains(canary));
+                assert_eq!(response["data"]["output"]["id"], MARKER);
+                assert_eq!(
+                    response["data"]["output"][MARKER]["nested"]["sessionId"],
+                    MARKER
+                );
+            }
+            let mut native = response.clone();
+            registry.scrub_response(op, &mut native);
+            assert_eq!(native, result["structuredContent"]["response"]);
+        }
+    }
+
+    #[test]
+    fn website_schemas_and_program_json_are_data_even_when_their_keys_look_like_identity() {
+        let registry = Redaction::default();
+        let canary = "schema-canary";
+        registry.register(canary);
+        let arbitrary = json!({"pageGeneration":canary,"targetId":canary,canary:canary});
+        for op in [
+            "evaluate",
+            "eval",
+            "run_playwright",
+            "agent_browser_evaluate",
+            "agent_browser_eval",
+            "agent_browser_run_playwright",
+        ] {
+            let mut response = json!({"success":true,"data":arbitrary});
+            registry.scrub_response(op, &mut response);
+            assert!(!response.to_string().contains(canary), "{op}");
+        }
+        for op in ["webmcp_list", "agent_browser_webmcp_list"] {
+            let mut response = json!({"success":true,"data":{"tools":[{"frameId":canary,
+                "inputSchema":arbitrary,"annotations":arbitrary}]}});
+            registry.scrub_response(op, &mut response);
+            let tool = &response["data"]["tools"][0];
+            assert_eq!(tool["frameId"], canary);
+            assert!(!tool["inputSchema"].to_string().contains(canary));
+            assert!(!tool["annotations"].to_string().contains(canary));
+        }
+    }
 
     #[test]
     fn exact_values_and_their_common_encodings_leave_no_model_value() {

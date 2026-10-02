@@ -511,6 +511,57 @@ pub(super) struct NativeMouse {
 }
 
 impl NativeMouse {
+    /// Read-only reuse of an already measured foreground page-to-display
+    /// mapping. Screenshots must never guess Chrome UI height or move the
+    /// pointer merely to manufacture a crop; an absent proof uses CDP.
+    pub(super) async fn viewport_picture_crop(
+        &self,
+        client: &CdpClient,
+        session: &str,
+        display: &DisplayClient,
+    ) -> Result<Option<(crate::native::display::Rect, i64)>, String> {
+        let Some(mapping) = self.mappings.get(session) else {
+            return Ok(None);
+        };
+        if !display.layout_proven() || self.current(mapping, client, display).await.is_err() {
+            return Ok(None);
+        };
+        let focused=client.send_command("Runtime.evaluate",Some(json!({
+            "expression":"document.hasFocus()","contextId":mapping.pointer.context,"returnByValue":true,
+        })),Some(session)).await?;
+        if focused.get("exceptionDetails").is_some() || focused["result"]["value"] != true {
+            return Ok(None);
+        };
+        let Some((width, height)) = mapping.viewport() else {
+            return Ok(None);
+        };
+        let surface = display.surface();
+        let (x, y) = mapping.point(0.0, 0.0, &surface)?;
+        let scale = mapping.scale()?;
+        let (width, height) = ((width * scale).round(), (height * scale).round());
+        let (_, left, top, window_width, window_height) = mapping.window;
+        if !(width > 0.0
+            && height > 0.0
+            && x >= f64::from(left)
+            && y >= f64::from(top)
+            && x + width <= f64::from(left) + f64::from(window_width)
+            && y + height <= f64::from(top) + f64::from(window_height)
+            && x + width <= f64::from(surface.width)
+            && y + height <= f64::from(surface.height))
+        {
+            return Ok(None);
+        };
+        Ok(Some((
+            crate::native::display::Rect {
+                x: x as i32,
+                y: y as i32,
+                width: width as u32,
+                height: height as u32,
+            },
+            mapping.pointer.context,
+        )))
+    }
+
     /// Layouts land between atomic inputs, not between commands, and a
     /// layout is proven only by the agent's next command. Checked under
     /// atomic input custody, so no layout lands between this check and the
