@@ -18,6 +18,8 @@ mod cpu_bench;
 mod policy;
 #[cfg(target_os = "linux")]
 mod producer;
+#[cfg(target_os = "linux")]
+pub(crate) mod snapshot;
 mod subscription;
 #[cfg(all(test, target_os = "linux"))]
 pub(super) mod testing;
@@ -36,6 +38,7 @@ use super::track::{self, Demand, Offer};
 use super::StreamMedia;
 use crate::native::display::DisplayClient;
 use crate::native::video::{Declared, VideoCodec, VideoError};
+use policy::LinkRate;
 #[cfg(test)]
 pub(super) use policy::Quality;
 #[cfg(all(test, target_os = "linux"))]
@@ -85,21 +88,16 @@ impl VideoHub {
     /// A subscription to `display`'s pictures in `codec`, from the producer
     /// that already serves it or a new one.
     #[cfg(target_os = "linux")]
-    fn subscribe(
-        &self,
-        display: &Arc<DisplayClient>,
-        codec: VideoCodec,
-        rate: u32,
-    ) -> Result<Subscription, VideoError> {
+    fn producer_for(&self, display: &Arc<DisplayClient>) -> Result<Arc<Producer>, VideoError> {
         let mut current = self
             .producer
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        let producer = match current
+        match current
             .upgrade()
             .filter(|producer| producer.serves(display))
         {
-            Some(producer) => producer,
+            Some(producer) => Ok(producer),
             None => {
                 let producer = Producer::start(producer::Source {
                     display: display.clone(),
@@ -108,10 +106,57 @@ impl VideoHub {
                     runtime: tokio::runtime::Handle::current(),
                 })?;
                 *current = Arc::downgrade(&producer);
-                producer
+                Ok(producer)
             }
-        };
-        producer.subscribe(codec, rate)
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn subscribe(
+        &self,
+        display: &Arc<DisplayClient>,
+        codec: VideoCodec,
+        rate: u32,
+    ) -> Result<Subscription, VideoError> {
+        self.producer_for(display)?.subscribe(codec, rate)
+    }
+
+    /// Demand on the same producer used by every video subscriber, retaining
+    /// that producer until the capture answers even when there is no viewer.
+    #[cfg(target_os = "linux")]
+    pub(super) async fn snapshot(
+        &self,
+        display: &Arc<DisplayClient>,
+        after_us: u64,
+    ) -> Result<Arc<snapshot::Snapshot>, String> {
+        let current = self.display.read().await.clone();
+        if !current
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, display))
+        {
+            return Err("The display changed before screenshot capture.".into());
+        }
+        let producer = self
+            .producer_for(display)
+            .map_err(|error| error.to_string())?;
+        let receive = producer
+            .snapshot(after_us)
+            .map_err(|error| error.to_string())?;
+        let picture = tokio::time::timeout(std::time::Duration::from_secs(2), receive)
+            .await
+            .map_err(|_| "The picture producer did not capture a screenshot before its deadline.")?
+            .map_err(|_| "The picture producer ended before screenshot capture.")??;
+        drop(producer);
+        if !self
+            .display
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, display))
+        {
+            return Err("The display changed during screenshot capture.".into());
+        }
+        Ok(picture)
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -149,6 +194,9 @@ mod producer {
         pub(crate) fn set_rate(&self, _: u32) {
             match *self {}
         }
+        pub(crate) fn set_link_rate(&self, _: super::LinkRate) {
+            match *self {}
+        }
         pub(crate) fn queued_bytes(&self) -> usize {
             match *self {}
         }
@@ -161,6 +209,7 @@ mod producer {
 pub(super) struct Feedback {
     pub ack: Option<(Uuid, u64)>,
     pub keyframes: u64,
+    pub rate: Option<(u64, LinkRate)>,
 }
 
 /// The reader's half of a video track.
@@ -170,10 +219,19 @@ pub(super) struct VideoInbox {
 }
 
 impl VideoInbox {
+    /// A `rate` budget is feedback of the current enabled video generation,
+    /// never input authority. Without one the producer keeps fixed quality.
     /// A `video` message: a subscription request is returned for the
     /// connection's config (enabling only once offered); a request for a key
     /// unit counts only for the current enabled generation.
     pub(super) fn receive(&self, message: &Value, demand: Demand) -> Option<(bool, u64)> {
+        if message["type"] == "rate" {
+            if let Some(rate) = LinkRate::read(message, demand.generation, demand.enabled) {
+                self.feedback
+                    .send_modify(|feedback| feedback.rate = Some((demand.generation, rate)));
+            }
+            return None;
+        }
         if let Some(request) = track::admit(Some(&self.offered), message) {
             return Some(request);
         }
@@ -224,6 +282,7 @@ pub(super) struct VideoTrack {
     flow: Flow,
     /// The key unit requests already passed on.
     keyframes: u64,
+    link_rate: Option<LinkRate>,
 }
 
 impl VideoTrack {
@@ -252,6 +311,7 @@ impl VideoTrack {
             epoch: None,
             flow: Flow::default(),
             keyframes: 0,
+            link_rate: None,
         };
         (track, inbox, feedback_rx)
     }
@@ -294,6 +354,9 @@ impl VideoTrack {
         }
         match self.hub.subscribe(&display, codec, self.rate) {
             Ok(subscription) => {
+                if let Some(rate) = self.link_rate {
+                    subscription.set_link_rate(rate);
+                }
                 self.subscription = Some(subscription);
                 self.epoch = None;
                 self.flow.reset();
@@ -322,6 +385,8 @@ impl VideoTrack {
             return records;
         }
         self.demand = demand;
+        self.link_rate = None;
+        self.flow.set_link_rate(None);
         let previous = self.retire();
         if !demand.enabled {
             records.push(self.offer.stopped(demand.generation));
@@ -417,6 +482,19 @@ impl VideoTrack {
     /// Applies the viewer's newest feedback: its cumulative acknowledgement
     /// of the current epoch, and any key unit it asked for.
     pub(super) fn feedback(&mut self, feedback: Feedback) {
+        if let Some((generation, rate)) = feedback.rate {
+            if self.demand.enabled
+                && self.demand.generation == generation
+                && self.link_rate != Some(rate)
+            {
+                self.link_rate = Some(rate);
+                self.flow.set_link_rate(Some(rate));
+                if let Some(subscription) = &self.subscription {
+                    subscription.set_link_rate(rate);
+                }
+                self.update_ready();
+            }
+        }
         if let (Some((stream, seq)), Some(epoch)) = (feedback.ack, self.epoch.as_ref()) {
             // An acknowledgement of a retired epoch, or beyond what was
             // written, releases nothing.
@@ -652,13 +730,15 @@ mod tests {
             sent,
             Feedback {
                 ack: Some((stream, 1)),
-                keyframes: 1
+                keyframes: 1,
+                rate: None,
             }
         );
         assert_eq!(track.flow.last_sent(), Some(1));
         track.feedback(Feedback {
             ack: Some((Uuid::new_v4(), 1)),
             keyframes: 0,
+            rate: None,
         });
         assert_eq!(
             track.flow.last_sent(),
@@ -668,6 +748,7 @@ mod tests {
         track.feedback(Feedback {
             ack: Some((stream, 9)),
             keyframes: 0,
+            rate: None,
         });
         assert_eq!(
             track.flow.last_sent(),
@@ -686,6 +767,32 @@ mod tests {
         };
         assert!(asked["seq"].as_u64() >= Some(2));
         drop(screen);
+    }
+
+    #[tokio::test]
+    async fn rate_feedback_is_current_generation_only_and_resubscription_restores_legacy_flow() {
+        let (mut track, inbox, feedback) = VideoTrack::new(hub(None), declared("av1-444"), true, 0);
+        track.demand = demand(true, 7);
+        let message =
+            json!({"type":"rate","generation":7,"bitsPerSecond":5_000_000,"burstBytes":125_000});
+        inbox.receive(&message, track.demand);
+        track.feedback(*feedback.borrow());
+        assert_eq!(
+            track.link_rate,
+            Some(LinkRate {
+                bits_per_second: 5_000_000,
+                burst_bytes: 125_000
+            })
+        );
+        assert_eq!(track.flow.budget(), 125_000);
+        track.request(demand(true, 8));
+        assert_eq!(track.link_rate, None);
+        track.feedback(*feedback.borrow());
+        assert_eq!(
+            track.link_rate, None,
+            "a late feedback of generation seven cannot cap eight"
+        );
+        assert_eq!(track.flow.budget(), 2 * 1024 * 1024);
     }
 
     /// A display without pictures cannot serve: its request is answered

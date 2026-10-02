@@ -6,6 +6,8 @@ Stream a session's viewport over WebSocket and drive it with remote input. This 
 
 ## Contents
 
+Host agent-channel landings can include bounded `changedText` after-state: non-editable visible text changed in the addressed original document. Its source generation and node identify the evidence; field/secret/editor text and pending/takeover reads are excluded. Treat it as optional observational data, never input authority.
+
 - [Enabling the stream](#enabling-the-stream)
 - [Owned Chromium window](#owned-chromium-window)
 - [Connecting](#connecting)
@@ -51,6 +53,8 @@ Append `frames=binary` to receive JPEG bytes without base64. Each binary WebSock
 For a viewer across a network, negotiate `pacing=ack&frameWindow=8` to allow up to eight delivered frames and at most 12 MiB awaiting acknowledgment. The default window is one for compatibility. A cumulative ACK names the newest frame actually painted; it also retires the preceding delivered frames whose pixels that composed frame includes. A slow viewer stops at the count or byte bound, and skipped delta dependencies still require a whole frame.
 
 ## Video track
+
+The media relay can send `{"type":"rate","generation":1,"bitsPerSecond":5000000,"burstBytes":200000}` for an enabled video generation. `bitsPerSecond` is an integer from 1000 through 4294967295; `burstBytes` is an integer from 1 through 12582912. Malformed feedback and other generations are ignored. Motion uses libaom CBR, quantizers 20 through 48 and a 300 ms buffer, with real picture periods and a cadence no faster than the viewer requested or the path's measured picture cost allows. Several viewers of one encoding use the smallest path budget. An explicit burst replaces the delivery estimate's capture budget; it is not a claim that every possible picture fits that budget. No feedback preserves the existing fixed-quality path. This motion-control checkpoint keeps full-picture still refinement; bounded refinement steps and worst-case unit qualification must land before a constrained-link release.
 
 A binary viewer (`frames=binary`) that draws the pointer itself (`cursor=viewer`) can declare the video codecs it decodes: `video=av1-444,av1` (the closed vocabulary is `av1-444`, `av1`, `vp9-444`, `vp9`; list only what `VideoDecoder.isConfigSupported` confirmed). The driver answers once with `{"type":"video","state":"available","codec":"av1-444"}`, the first codec in its own order that the viewer listed and it can encode, or `{"type":"video","state":"unavailable","generation":0}` and keeps sending frames. Video needs the owned window on Linux, a display helper that serves pictures, and `libaom.so.3` at run time; pictures never contain the pointer.
 

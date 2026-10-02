@@ -48,6 +48,8 @@ const QUIET: Duration = Duration::from_millis(50);
 const SETTLE_LIMIT: Duration = Duration::from_millis(400);
 /// The most mutation records `changedNodes` counts.
 const MOST_CHANGES: u64 = 10_000;
+const TEXT_ITEMS: usize = 8;
+const TEXT_BYTES: usize = 1024;
 /// The most characters of an element's value `target.value` reports.
 const MOST_VALUE_CHARS: usize = 1024;
 /// How long making a page paint may take: a page too busy to answer is left
@@ -58,15 +60,80 @@ const PAINT_WAIT: Duration = Duration::from_millis(1000);
 /// world, so page script can neither call it nor see it.
 pub(crate) const BINDING: &str = "__ambitLanded";
 
-/// Starts a watcher for one step, reporting `<token> <records>` per batch of
-/// mutation records, and `<token> 0` per scroll.
-const WATCH: &str = r#"function(token) {
+/// The existing bounded diff: counts/quiet signals plus optional current
+/// non-editable changed text for the addressed original document. No body
+/// scan, field value, permission or action authority is introduced.
+/// Reports `<token> <records> [text-diff-json]` and the same scroll signal.
+const WATCH: &str = r#"function(token, semantic) {
     const report = globalThis.__ambitLanded;
     if (typeof report !== 'function') return false;
     const watchers = globalThis.__ambitWatchers || (globalThis.__ambitWatchers = new Map());
-    const observer = new MutationObserver((records) => report(token + ' ' + records.length));
+    const facts = __FACTS__;
+    let leaves = [], omitted = 0, budget = 128;
+    const safe = (node) => {
+        if (!node.isConnected || node.ownerDocument !== document || !node.parentElement) return false;
+        let el = node.parentElement;
+        for (let parent = el; parent; parent = parent.parentElement || (parent.getRootNode().host || null)) {
+            if (--budget < 0) { omitted = Math.min(10000, omitted + 1); return false; }
+            const f = facts(parent);
+            if (f.secret || f.kind === 'field' || parent.isContentEditable) return false;
+            const style = getComputedStyle(parent);
+            if (style.visibility === 'hidden' || style.visibility === 'collapse' || Number(style.opacity) === 0) return false;
+        }
+        const range = document.createRange();
+        range.selectNodeContents(node);
+        const box = range.getBoundingClientRect();
+        return box.width > 0 && box.height > 0 && box.right > 0 && box.bottom > 0 && box.left < innerWidth && box.top < innerHeight;
+    };
+    const keep = (node) => {
+        if (node.nodeType !== Node.TEXT_NODE || !safe(node) || leaves.includes(node)) return;
+        if (leaves.length < 8) leaves.push(node); else omitted = Math.min(10000, omitted + 1);
+    };
+    const changed = (node) => {
+        if (node.nodeType === Node.TEXT_NODE) { keep(node); return; }
+        if (node.nodeType !== Node.ELEMENT_NODE) return;
+        const walker = document.createTreeWalker(node, NodeFilter.SHOW_TEXT);
+        for (let leaf = walker.nextNode(); leaf; leaf = walker.nextNode()) {
+            if (--budget < 0) { omitted = Math.min(10000, omitted + 1); break; }
+            keep(leaf);
+        }
+    };
+    const projection = () => {
+        budget = 128;
+        const texts = [], encoder = new TextEncoder();
+        let bytes = 0, dropped = omitted;
+        for (const node of leaves) {
+            if (!safe(node)) continue;
+            const chars = Array.from(node.data.slice(0, 512).replace(/\s+/gu, ' ').trim());
+            if (node.data.length > 512 || chars.length > 200) dropped++;
+            const text = chars.slice(0, 200).join('');
+            if (!text || texts.includes(text)) continue;
+            const length = encoder.encode(text).length;
+            if (bytes + length > 1024) { dropped++; continue; }
+            bytes += length; texts.push(text);
+        }
+        return {texts, omitted: Math.min(10000, dropped)};
+    };
+    const observer = new MutationObserver((records) => {
+        if (semantic) {
+            budget = 128;
+            leaves = leaves.filter(node => node.isConnected && node.ownerDocument === document);
+            for (const record of records) {
+                if (--budget < 0) { omitted = Math.min(10000, omitted + 1); break; }
+                if (record.type === 'characterData') changed(record.target);
+                else if (record.type === 'childList') {
+                    for (const node of record.addedNodes) {
+                        if (--budget < 0) { omitted = Math.min(10000, omitted + 1); break; }
+                        changed(node);
+                    }
+                }
+                else if (record.type === 'attributes') changed(record.target);
+            }
+        }
+        report(token + ' ' + records.length + (semantic ? ' ' + JSON.stringify(projection()) : ''));
+    });
     observer.observe(document, { subtree: true, childList: true, attributes: true, characterData: true });
-    const scrolled = () => report(token + ' 0');
+    const scrolled = () => report(token + ' 0' + (semantic ? ' ' + JSON.stringify(projection()) : ''));
     document.addEventListener('scroll', scrolled, { capture: true, passive: true });
     watchers.set(token, () => {
         observer.disconnect();
@@ -164,6 +231,7 @@ struct Page {
     /// The document's loader when the input began; empty when the page was
     /// between documents then.
     loader: String,
+    generation: String,
     /// The channel's world, when the watcher runs there.
     watched: Option<i64>,
 }
@@ -182,6 +250,7 @@ struct Recorded {
     statuses: HashMap<String, i64>,
     dialog: Option<Value>,
     changes: u64,
+    changed_text: Option<Value>,
     /// When the page last mutated or scrolled.
     activity: Option<Instant>,
     /// When the agent's last input was acknowledged.
@@ -191,8 +260,14 @@ struct Recorded {
 }
 
 impl Recorded {
-    fn note(&mut self, event: &CdpEvent, page: (&str, &str), token: &str, now: Instant) {
-        let (session, frame) = page;
+    fn note(
+        &mut self,
+        event: &CdpEvent,
+        page: (&str, &str, Option<i64>),
+        token: &str,
+        now: Instant,
+    ) {
+        let (session, frame, context) = page;
         let params = &event.params;
         if event.method == crate::native::activity::EVENT {
             if params["source"] == "agent" {
@@ -214,12 +289,19 @@ impl Recorded {
         match event.method.as_str() {
             "Runtime.bindingCalled" if params["name"] == BINDING => {
                 let reported = params["payload"].as_str().and_then(|payload| {
-                    let (from, records) = payload.split_once(' ')?;
-                    (from == token).then(|| records.parse::<u64>().ok())?
+                    let mut pieces = payload.splitn(3, ' ');
+                    let from = pieces.next()?;
+                    let records = pieces.next()?.parse::<u64>().ok()?;
+                    (from == token).then(|| (records, pieces.next()))
                 });
-                if let Some(records) = reported {
+                if let Some((records, text)) = reported {
                     self.changes = self.changes.saturating_add(records);
                     self.activity = Some(now);
+                    if context.is_some() && params["executionContextId"].as_i64() == context {
+                        if let Some(text) = text.and_then(read_changed_text) {
+                            self.changed_text = Some(text);
+                        }
+                    }
                 }
             }
             "Page.frameNavigated" if params["frame"]["id"] == frame => {
@@ -286,6 +368,26 @@ impl Recorded {
             "httpStatus": null }),
         )
     }
+}
+
+fn read_changed_text(payload: &str) -> Option<Value> {
+    if payload.len() > TEXT_BYTES * 6 + 512 {
+        return None;
+    }
+    let value: Value = serde_json::from_str(payload).ok()?;
+    let texts = value["texts"].as_array()?;
+    if texts.len() > TEXT_ITEMS || value["omitted"].as_u64()? > MOST_CHANGES {
+        return None;
+    }
+    let mut bytes = 0;
+    for text in texts {
+        let text = text.as_str()?;
+        if text.chars().count() > 200 {
+            return None;
+        }
+        bytes += text.len();
+    }
+    (bytes <= TEXT_BYTES).then(|| json!({"texts":texts,"omitted":value["omitted"]}))
 }
 
 /// The instant a media-clock timestamp (`stream::monotonic_us`) names.
@@ -364,6 +466,7 @@ impl Landing {
             (frame.to_string(), loader.to_string())
         };
         let mut page = Page {
+            generation: client.page_generation(session),
             client,
             session: session.to_string(),
             frame,
@@ -372,13 +475,27 @@ impl Landing {
         };
         if watch && !leaving {
             if let Ok(context) = recorders.world(&page.client, &page.session).await {
+                // Semantic text belongs only to the addressed document.
+                // A foreign realm/frame retains the old counts-only diff.
+                let semantic = if let Some(node) = landing
+                    .target
+                    .as_ref()
+                    .filter(|node| node.session == page.session)
+                {
+                    page.client.send_command("Runtime.callFunctionOn",Some(json!({
+                        "functionDeclaration":"function(node) { return node.ownerDocument === document; }",
+                        "executionContextId":context,"arguments":[{"objectId":node.object}],"returnByValue":true,
+                    })),Some(&page.session)).await.is_ok_and(|read|read["result"]["value"]==true)
+                } else {
+                    false
+                };
                 let started = page
                     .client
                     .send_command(
                         "Runtime.callFunctionOn",
                         Some(
-                            json!({ "functionDeclaration": WATCH, "executionContextId": context,
-                            "arguments": [{ "value": landing.token }], "returnByValue": true }),
+                            json!({ "functionDeclaration": WATCH.replace("__FACTS__",FACTS), "executionContextId": context,
+                            "arguments": [{ "value": landing.token },{"value":semantic}], "returnByValue": true }),
                         ),
                         Some(&page.session),
                     )
@@ -400,7 +517,7 @@ impl Landing {
             match events.try_recv() {
                 Ok(event) => self.recorded.note(
                     &event,
-                    (&page.session, &page.frame),
+                    (&page.session, &page.frame, page.watched),
                     &self.token,
                     Instant::now(),
                 ),
@@ -449,7 +566,7 @@ impl Landing {
             match (received, &self.page) {
                 (Some(Ok(event)), Some(page)) => self.recorded.note(
                     &event,
-                    (&page.session, &page.frame),
+                    (&page.session, &page.frame, page.watched),
                     &self.token,
                     Instant::now(),
                 ),
@@ -555,6 +672,24 @@ impl Landing {
     fn block(&self, target: Option<Value>, opened: Vec<Value>, pending: bool) -> Value {
         let recorded = &self.recorded;
         let mut landed = json!({ "changedNodes": recorded.changes.min(MOST_CHANGES) });
+        if !pending
+            && !recorded.closed
+            && !recorded.navigating
+            && recorded.committed.is_none()
+            && self
+                .page
+                .as_ref()
+                .is_some_and(|page| page.client.page_generation(&page.session) == page.generation)
+        {
+            if let Some(text) = recorded.changed_text.as_ref() {
+                if let (Some(page), Some(node)) = (self.page.as_ref(), self.target.as_ref()) {
+                    landed["changedText"] = json!({
+                        "texts":text["texts"],"omitted":text["omitted"],
+                        "pageGeneration":page.generation,"backendNodeId":node.backend_node_id,
+                    });
+                }
+            }
+        }
         let loader = self.page.as_ref().map_or("", |page| page.loader.as_str());
         if let Some(navigation) = recorded.navigation(loader) {
             landed["navigation"] = navigation;
@@ -589,7 +724,7 @@ impl Landing {
 /// the same way, so the next step's input reaches the page. The check reads
 /// the page's own paint timing: a page that misreports it keeps only its
 /// own input from arriving, as it could by ignoring that input.
-async fn painted(client: &CdpClient, session: &str) {
+async fn painted(client: &Arc<CdpClient>, session: &str) {
     let paint = async {
         let read = client
             .send_command(
@@ -602,14 +737,10 @@ async fn painted(client: &CdpClient, session: &str) {
             )
             .await;
         if !read.is_ok_and(|read| read["result"]["value"] == true) {
-            let _ = client
-                .send_command(
-                    "Page.captureScreenshot",
-                    Some(json!({ "format": "jpeg", "quality": 1,
-                        "clip": { "x": 0, "y": 0, "width": 1, "height": 1, "scale": 1 } })),
-                    Some(session),
-                )
-                .await;
+            // A tiny clipped capture forces paint but leaves a temporary
+            // clip raster in the native surface until restoration paints.
+            // Use the canonical full viewport fence for the same guarantee.
+            let _ = super::super::screenshot::paint_viewport(client, session).await;
         }
     };
     let _ = tokio::time::timeout(PAINT_WAIT, paint).await;
@@ -683,7 +814,7 @@ mod tests {
     fn noted(events: &[CdpEvent]) -> Recorded {
         let mut recorded = Recorded::default();
         for event in events {
-            recorded.note(event, (SESSION, FRAME), "7", Instant::now());
+            recorded.note(event, (SESSION, FRAME, None), "7", Instant::now());
         }
         recorded
     }
@@ -880,6 +1011,33 @@ mod tests {
         assert!(lands(&json!({ "success": false, "error": "Timed out" })));
         for code in REFUSALS {
             assert!(!lands(&json!({ "success": false, "code": code })), "{code}");
+        }
+    }
+    #[test]
+    fn semantic_diff_accepts_only_its_watcher_realm_and_bounded_known_fields() {
+        let mut recorded = Recorded::default();
+        let payload = r#"7 2 {"texts":["Report ready"],"omitted":0,"foreign":"discard"}"#;
+        let mut note = event(
+            "Runtime.bindingCalled",
+            json!({"name":BINDING,"payload":payload,"executionContextId":99}),
+        );
+        recorded.note(&note, (SESSION, FRAME, Some(7)), "7", Instant::now());
+        assert_eq!(recorded.changes, 2);
+        assert!(recorded.changed_text.is_none());
+        note.params["executionContextId"] = json!(7);
+        recorded.note(&note, (SESSION, FRAME, Some(7)), "7", Instant::now());
+        assert_eq!(
+            recorded.changed_text,
+            Some(json!({"texts":["Report ready"],"omitted":0}))
+        );
+        for invalid in [
+            json!({"texts":["x".repeat(201)],"omitted":0}),
+            json!({"texts":vec!["x";9],"omitted":0}),
+            json!({"texts":[0],"omitted":0}),
+            json!({"texts":[],"omitted":10001}),
+            json!({"texts":vec!["x".repeat(180);8],"omitted":0}),
+        ] {
+            assert!(read_changed_text(&invalid.to_string()).is_none());
         }
     }
 }

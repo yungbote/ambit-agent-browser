@@ -2188,6 +2188,9 @@ Captures a screenshot of the current page. If no path is provided,
 saves to a temporary directory with a generated filename.
 Headless Chromium screenshots hide native scrollbars for consistent image output.
 Pass --hide-scrollbars false when launching to keep native scrollbars visible.
+Owned Linux windows share the proven foreground viewport picture for default
+screenshots and image comparisons, including without a video viewer.
+Full-page, element and annotated captures retain renderer capture.
 
 Options:
   --full, -f           Capture full page (not just viewport)
@@ -3771,6 +3774,9 @@ Host-bound mode reads version 1 JSON with namespace, session, requireSandbox
 (targetId, loaderId, pageGeneration, geometrySha256). It pins ambit-host-bound-v1 and publishes
 its descriptor in experimental io.ambit/browser. Per-call host overrides and
 process-management tools are excluded. Browser auth and state stay available.
+Host agent-channel landings may include bounded non-editable changedText,
+bound to the original page and node. It is optional evidence, never input
+authority; field values and pending/takeover reads are excluded.
 Operations include a native viewport JPEG reference when capture succeeds;
 capture failure never replaces the primary outcome. The host owns admission
 of the file bytes. --describe-host-bound prints the full catalog without

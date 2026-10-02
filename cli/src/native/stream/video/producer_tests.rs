@@ -227,6 +227,123 @@ fn near(actual: [u8; 3], bgrx: [u8; 4]) -> bool {
         .all(|(actual, expected)| actual.abs_diff(expected) <= 6)
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_demand_without_video_uses_the_one_capture_thread_and_has_fresh_opaque_pixels() {
+    let rig = rig();
+    assert!(rig.requested().is_empty());
+    rig.paint(100, 140, RED);
+    let after = crate::native::stream::monotonic_us();
+    let receive = rig.producer.snapshot(after).unwrap();
+    let picture = tokio::time::timeout(Duration::from_secs(5), receive)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert!(picture.bounds.requested_us >= after);
+    assert!(picture.bounds.picture_us >= picture.bounds.requested_us);
+    assert!(picture.bounds.received_us >= picture.bounds.picture_us);
+    assert!(!picture.surface.cursor_included);
+    assert_eq!(
+        picture.visible,
+        Rect {
+            x: 0,
+            y: 0,
+            width: 640,
+            height: 480
+        }
+    );
+    assert_eq!(
+        picture
+            .rgba(Rect {
+                x: 320,
+                y: 120,
+                width: 1,
+                height: 1
+            })
+            .unwrap()
+            .into_raw(),
+        [255, 0, 0, 255]
+    );
+    assert!(
+        lock(&rig.producer.inner.state).encodings.is_empty(),
+        "a raw demand starts no encoder"
+    );
+    let requests = rig.requested();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0]["force"], true);
+    // Zero wait is omitted by the existing request serializer; the helper
+    // reads absence as zero, which the fake uses too.
+    assert_eq!(requests[0]["waitMs"].as_u64().unwrap_or(0), 0);
+    assert_eq!(requests[0]["cursor"], false);
+    assert!(lock(&rig.producer.inner.state).snapshots.pending() == false);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn snapshot_demand_does_not_encode_for_a_blocked_viewer() {
+    let rig = rig();
+    let subscription = rig.subscribe();
+    unit(&subscription).await;
+    subscription.set_ready(false);
+    rig.paint(100, 140, BLUE);
+    let receive = rig
+        .producer
+        .snapshot(crate::native::stream::monotonic_us())
+        .unwrap();
+    let picture = tokio::time::timeout(Duration::from_secs(5), receive)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        picture
+            .rgba(Rect {
+                x: 320,
+                y: 120,
+                width: 1,
+                height: 1
+            })
+            .unwrap()
+            .into_raw(),
+        [0, 0, 255, 255]
+    );
+    let encoding = lock(&rig.producer.inner.state).encodings[0].clone();
+    let mailbox = lock(&encoding.mailbox);
+    assert!(
+        mailbox.behind,
+        "normal motion catches up when its viewer is ready"
+    );
+    assert!(
+        mailbox.job.is_none(),
+        "snapshot demand never bypasses video backpressure"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cancelled_snapshot_demand_has_no_plan_and_stopped_or_failed_producers_retire_requests() {
+    let stopped = rig();
+    // Hold the state lock so the capture thread cannot begin this canceled demand.
+    {
+        let mut state = lock(&stopped.producer.inner.state);
+        drop(state.snapshots.request(0));
+        assert!(!state.snapshots.pending());
+        assert!(matches!(
+            decide(&state.encodings, Instant::now()),
+            Decision::Wait(None)
+        ));
+    }
+    assert!(stopped.requested().is_empty());
+    let receive = lock(&stopped.producer.inner.state).snapshots.request(0);
+    stopped.producer.inner.stop();
+    assert!(receive.await.unwrap().unwrap_err().contains("stopped"));
+    assert!(stopped.producer.snapshot(0).is_err());
+
+    let rig = rig();
+    let receive = lock(&rig.producer.inner.state).snapshots.request(0);
+    rig.producer.inner.fail("picture channel ended".into());
+    assert_eq!(receive.await.unwrap().unwrap_err(), "picture channel ended");
+    assert!(rig.producer.snapshot(0).is_err());
+}
+
 /// A new stream's first picture is taken whole and encoded as a key unit
 /// at the window's size class; damage then travels as dependent units that
 /// carry exactly what changed, and a still picture is refined to the still
