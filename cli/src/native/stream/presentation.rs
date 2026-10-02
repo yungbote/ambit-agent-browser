@@ -126,6 +126,16 @@ pub(crate) struct PresentationState {
     attempt: Option<Attempt>,
 }
 
+impl PresentationState {
+    fn current_attempt(&self) -> Option<&Attempt> {
+        self.attempt.as_ref().filter(|attempt| {
+            self.owner.as_ref().is_some_and(|owner| {
+                owner.connection == attempt.connection && owner.config == attempt.config
+            })
+        })
+    }
+}
+
 pub(crate) struct Presentation {
     cell: watch::Sender<PresentationState>,
 }
@@ -144,6 +154,13 @@ impl Presentation {
 
     pub(crate) fn subscribe(&self) -> watch::Receiver<PresentationState> {
         self.cell.subscribe()
+    }
+
+    /// The current owner's actually applied layout, never merely requested
+    /// dimensions. Media retirement and the public acknowledgement read the
+    /// same canonical attempt.
+    pub(crate) fn applied(&self) -> Option<Applied> {
+        self.cell.borrow().current_attempt()?.applied.clone()
     }
 
     pub(crate) fn configured(&self) -> bool {
@@ -383,11 +400,7 @@ impl Presentation {
         });
         let mut value = json!({ "type": "presentation", "role": if primary { "primary" } else { "secondary" },
             "requested": { "width": config.width, "height": config.height } });
-        if let Some(attempt) = state.attempt.as_ref().filter(|attempt| {
-            state.owner.as_ref().is_some_and(|owner| {
-                owner.connection == attempt.connection && owner.config == attempt.config
-            })
-        }) {
+        if let Some(attempt) = state.current_attempt() {
             if let Some(applied) = attempt.applied.as_ref() {
                 value["applied"] = json!(applied.surface);
             } else if primary {
