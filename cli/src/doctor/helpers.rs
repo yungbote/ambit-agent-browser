@@ -28,7 +28,10 @@ pub(super) fn human_size(bytes: u64) -> String {
     }
 }
 
+// `f_bavail` is 32-bit on macOS and 64-bit on Linux: its cast is needed on
+// one and a no-op on the other.
 #[cfg(unix)]
+#[allow(clippy::unnecessary_cast)]
 pub(super) fn disk_free_bytes(path: &Path) -> Option<u64> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
