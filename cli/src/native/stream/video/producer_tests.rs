@@ -227,6 +227,141 @@ fn near(actual: [u8; 3], bgrx: [u8; 4]) -> bool {
         .all(|(actual, expected)| actual.abs_diff(expected) <= 6)
 }
 
+#[test]
+fn aperture_offset_window_fits_its_complete_framebuffer_extent() {
+    let encoding = Encoding::new(VideoCodec::Av1Full);
+    let reply: PictureReply = serde_json::from_value(serde_json::json!({"width":2048,"height":2048,"stride":8192,"rows":[[0,2048]],"cursorIncluded":false,
+        "visible":{"x":500,"y":80,"width":1418,"height":1888}})).unwrap();
+    let pixels = vec![128u8; 2048 * 2048 * 4];
+    let capture = Capture {
+        ts: 1,
+        read: Instant::now(),
+        visible: reply.window(),
+        surface: Surface::new(2048, 2048),
+        input_seq: None,
+        pointer: None,
+    };
+    encoding.mark(&reply);
+    encoding.take(&capture, &reply, &pixels);
+    let job = lock(&encoding.mailbox).job.take().unwrap();
+    assert!(job.buffer.coded.0 >= 1918 && job.buffer.coded.1 >= 1968);
+    assert_eq!(job.capture.visible, reply.window());
+}
+
+#[test]
+fn aperture_gutter_cannot_change_any_decoded_coded_pixel() {
+    for codec in [VideoCodec::Av1Full, VideoCodec::Av1] {
+        // Odd origins challenge420 boundary averaging, not only flat padding.
+        let visible = Rect {
+            x: 101,
+            y: 81,
+            width: 63,
+            height: 47,
+        };
+        let reply: PictureReply = serde_json::from_value(serde_json::json!({"width":256,"height":192,"stride":1024,"rows":[[0,192]],"cursorIncluded":false,"visible":visible})).unwrap();
+        let mut results = Vec::new();
+        for secret in [RED, BLUE] {
+            let mut pixels = Vec::new();
+            for y in 0..192 {
+                for x in 0..256 {
+                    pixels.extend_from_slice(
+                        if (101..164).contains(&x) && (81..128).contains(&y) {
+                            &GREEN
+                        } else {
+                            &secret
+                        },
+                    );
+                }
+            }
+            let encoding = Encoding::new(codec);
+            let capture = Capture {
+                ts: 1,
+                read: Instant::now(),
+                visible,
+                surface: Surface::new(256, 192),
+                input_seq: None,
+                pointer: None,
+            };
+            encoding.mark(&reply);
+            encoding.take(&capture, &reply, &pixels);
+            let job = lock(&encoding.mailbox).job.take().unwrap();
+            let mut encoder =
+                crate::native::video::open(codec, job.buffer.coded.0, job.buffer.coded.1, 2)
+                    .unwrap();
+            let unit = encoder
+                .encode(
+                    &job.buffer.picture.picture(),
+                    EncodeRequest {
+                        key: true,
+                        quantizer: 32,
+                        refine: false,
+                    },
+                )
+                .unwrap();
+            let decoded = Decoder::new().decode(&unit.data).rgb();
+            assert!(decoded[..3].iter().all(|channel| *channel <= 2));
+            results.push((unit.data, decoded));
+        }
+        assert_eq!(
+            results[0], results[1],
+            "secret gutter must influence neither bytes nor any decoded pixel"
+        );
+    }
+}
+
+#[test]
+fn aperture_metadata_change_rebuilds_padding_without_pixel_damage() {
+    let encoding = Encoding::new(VideoCodec::Av1Full);
+    let mut reply: PictureReply = serde_json::from_value(serde_json::json!({"width":256,"height":192,"stride":1024,"rows":[[0,192]],"cursorIncluded":false})).unwrap();
+    let pixels: Vec<u8> = (0..256 * 192).flat_map(|_| GREEN).collect();
+    let capture = |reply: &PictureReply, ts| Capture {
+        ts,
+        read: Instant::now(),
+        visible: reply.window(),
+        surface: Surface::new(256, 192),
+        input_seq: None,
+        pointer: None,
+    };
+    encoding.mark(&reply);
+    encoding.take(&capture(&reply, 1), &reply, &pixels);
+    let first = lock(&encoding.mailbox).job.take().unwrap();
+    lock(&encoding.mailbox).free.push(first.buffer);
+    reply.visible = Some(Rect {
+        x: 101,
+        y: 81,
+        width: 63,
+        height: 47,
+    });
+    reply.rows.clear();
+    encoding.mark(&reply);
+    encoding.take(&capture(&reply, 2), &reply, &pixels);
+    let second = lock(&encoding.mailbox)
+        .job
+        .take()
+        .expect("new aperture is new work without pixel damage");
+    let mut encoder = crate::native::video::open(
+        VideoCodec::Av1Full,
+        second.buffer.coded.0,
+        second.buffer.coded.1,
+        2,
+    )
+    .unwrap();
+    let unit = encoder
+        .encode(
+            &second.buffer.picture.picture(),
+            EncodeRequest {
+                key: true,
+                quantizer: 32,
+                refine: false,
+            },
+        )
+        .unwrap();
+    let decoded = Decoder::new().decode(&unit.data).rgb();
+    assert!(decoded[..3].iter().all(|channel| *channel <= 2));
+    let inside = (100 * second.buffer.coded.0 as usize + 120) * 4;
+    assert!(decoded[inside + 1] >= 250 && decoded[inside] <= 6 && decoded[inside + 2] <= 6);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn snapshot_demand_without_video_uses_the_one_capture_thread_and_has_fresh_opaque_pixels() {
     let rig = rig();
