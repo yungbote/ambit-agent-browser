@@ -26,6 +26,7 @@ pub(super) struct DesktopPortal {
     directory: PathBuf,
     display: String,
     authority: PathBuf,
+    backend_process: Option<crate::native::display::DesktopProcess>,
 }
 
 impl DesktopPortal {
@@ -62,6 +63,7 @@ impl DesktopPortal {
             directory,
             display: display.into(),
             authority: authority.into(),
+            backend_process: None,
         };
         write_private_configuration(&owner.configuration, &bus_configuration(&owner.address))?;
         write_private_configuration(&owner.directory.join("config/xdg-desktop-portal/portals.conf"),
@@ -90,7 +92,11 @@ impl DesktopPortal {
         {
             return Err("Private GSettings writer did not become ready".into());
         }
-        owner.spawn(BACKEND, &[], canceled)?;
+        let backend_pid = owner.spawn(BACKEND, &[], canceled)?;
+        owner.backend_process = Some(
+            crate::native::display::DesktopProcess::owned(backend_pid)
+                .ok_or("Private GTK process identity is unavailable")?,
+        );
         if !owner.await_condition(deadline, canceled, |owner, deadline| {
             owner.name_owned(
                 "org.freedesktop.impl.portal.desktop.gtk",
@@ -136,7 +142,7 @@ impl DesktopPortal {
         program: &str,
         arguments: &[&str],
         canceled: &AtomicBool,
-    ) -> Result<(), String> {
+    ) -> Result<u32, String> {
         if canceled.load(Ordering::Relaxed) {
             return Err("Private desktop startup canceled".into());
         }
@@ -148,8 +154,9 @@ impl DesktopPortal {
             .stderr(Stdio::null())
             .spawn()
             .map_err(|error| format!("Private desktop service is unavailable: {error}"))?;
+        let pid = child.id();
         self.children.push(child);
-        Ok(())
+        Ok(pid)
     }
 
     pub(super) fn running(&mut self) -> bool {
@@ -261,6 +268,10 @@ impl DesktopPortal {
 
     pub(super) fn apply_chrome_environment(&self, command: &mut Command) {
         command.env("DBUS_SESSION_BUS_ADDRESS", &self.address);
+    }
+
+    pub(super) fn display_process(&self) -> Option<crate::native::display::DesktopProcess> {
+        self.backend_process
     }
 }
 
@@ -395,6 +406,7 @@ mod tests {
             directory: directory.clone(),
             display: ":994".into(),
             authority: root.path().join("authority"),
+            backend_process: None,
         };
         for theme in Theme::ALL {
             fs::write(&setter, format!("#!/usr/bin/python3\nimport json,os,sys\nfrom pathlib import Path\nPath({record:?}).write_text(json.dumps(dict(args=sys.argv[1:],config=os.environ['XDG_CONFIG_HOME'],backend=os.environ['GSETTINGS_BACKEND'],profile=os.environ['DCONF_PROFILE'])))\n")).unwrap();
@@ -473,6 +485,7 @@ mod tests {
             directory: directory.clone(),
             display: ":994".into(),
             authority: root.path().join("authority"),
+            backend_process: None,
         };
         let configuration = directory.join("bus.conf");
         write_private_configuration(&configuration, &bus_configuration(&owner.address)).unwrap();

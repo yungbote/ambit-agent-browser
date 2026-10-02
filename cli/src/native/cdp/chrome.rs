@@ -225,6 +225,12 @@ impl ChromeProcess {
             &display.server.display,
             &display.server.auth_file,
             self.child.id(),
+            display
+                .server
+                .system_theme
+                .lock()
+                .ok()
+                .and_then(|settings| settings.as_ref().and_then(SystemTheme::display_process)),
         )?);
         Ok(())
     }

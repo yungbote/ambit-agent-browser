@@ -157,6 +157,12 @@ impl SystemTheme {
         }
     }
 
+    pub(super) fn display_process(&self) -> Option<crate::native::display::DesktopProcess> {
+        self.portal
+            .as_ref()
+            .and_then(DesktopPortal::display_process)
+    }
+
     fn await_acknowledgment(&mut self, theme: Theme, canceled: &AtomicBool) -> bool {
         let deadline = Instant::now() + ACKNOWLEDGMENT;
         while !canceled.load(Ordering::Relaxed) && Instant::now() < deadline && self.running() {
