@@ -461,7 +461,7 @@ mod tests {
 
     #[test]
     fn aperture_boundary_sampling_keeps_the_owned_colour_at_odd_chroma_edges() {
-        let source = bgrx(&vec![[0, 255, 0]; 8 * 6]);
+        let source = bgrx(&[[0, 255, 0]; 8 * 6]);
         for chroma in [Chroma::Full, Chroma::Subsampled] {
             let mut picture = Planar::new(chroma, 8, 6);
             assert!(picture.convert_visible(

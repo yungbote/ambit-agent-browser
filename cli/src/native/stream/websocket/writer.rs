@@ -93,6 +93,39 @@ impl WireDebt {
     }
 }
 
+pub(super) struct Writer {
+    sink: SplitSink<Socket, Message>,
+    written: Arc<AtomicU64>,
+    accounted: u64,
+    pub debt: WireDebt,
+}
+impl Writer {
+    /// Called after upgrade: HTTP handshake bytes never become media debt.
+    pub fn new(sink: SplitSink<Socket, Message>, written: Arc<AtomicU64>) -> Self {
+        let accounted = written.load(Ordering::Acquire);
+        Self {
+            sink,
+            written,
+            accounted,
+            debt: WireDebt::new(Instant::now()),
+        }
+    }
+    pub fn settle(&mut self, at: Instant) {
+        let total = self.written.load(Ordering::Acquire);
+        self.debt.charge(total - self.accounted, at);
+        self.accounted = total;
+    }
+    pub async fn send(&mut self, message: Message) -> Result<(), Error> {
+        let at = Instant::now();
+        self.settle(at);
+        let result = self.sink.send(message).await;
+        // Charge from send start, not completion: blocking I/O already spent
+        // part of this serialization time. Partial successful writes count.
+        self.settle(at);
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -248,38 +281,5 @@ mod tests {
             Message::Close(_)
         ));
         server.await.unwrap();
-    }
-}
-
-pub(super) struct Writer {
-    sink: SplitSink<Socket, Message>,
-    written: Arc<AtomicU64>,
-    accounted: u64,
-    pub debt: WireDebt,
-}
-impl Writer {
-    /// Called after upgrade: HTTP handshake bytes never become media debt.
-    pub fn new(sink: SplitSink<Socket, Message>, written: Arc<AtomicU64>) -> Self {
-        let accounted = written.load(Ordering::Acquire);
-        Self {
-            sink,
-            written,
-            accounted,
-            debt: WireDebt::new(Instant::now()),
-        }
-    }
-    pub fn settle(&mut self, at: Instant) {
-        let total = self.written.load(Ordering::Acquire);
-        self.debt.charge(total - self.accounted, at);
-        self.accounted = total;
-    }
-    pub async fn send(&mut self, message: Message) -> Result<(), Error> {
-        let at = Instant::now();
-        self.settle(at);
-        let result = self.sink.send(message).await;
-        // Charge from send start, not completion: blocking I/O already spent
-        // part of this serialization time. Partial successful writes count.
-        self.settle(at);
-        result
     }
 }
