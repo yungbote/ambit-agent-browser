@@ -495,12 +495,10 @@ fn aligned_regional_updates_bound_noisy_steps_on_the_measured_consumer_link() {
                         old_error += u64::from(source[at + bgr].abs_diff(before[at + rgb])).pow(2);
                         new_error += u64::from(source[at + bgr].abs_diff(after[at + rgb])).pow(2);
                     }
-                } else {
-                    if before[at..at + 3] != after[at..at + 3] {
-                        changed += 1;
-                        if first_changes.len() < 20 {
-                            first_changes.push((x, y));
-                        }
+                } else if before[at..at + 3] != after[at..at + 3] {
+                    changed += 1;
+                    if first_changes.len() < 20 {
+                        first_changes.push((x, y));
                     }
                 }
             }

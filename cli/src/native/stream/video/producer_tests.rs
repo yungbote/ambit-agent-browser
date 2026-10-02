@@ -410,7 +410,7 @@ async fn snapshot_demand_without_video_uses_the_one_capture_thread_and_has_fresh
     // reads absence as zero, which the fake uses too.
     assert_eq!(requests[0]["waitMs"].as_u64().unwrap_or(0), 0);
     assert_eq!(requests[0]["cursor"], false);
-    assert!(lock(&rig.producer.inner.state).snapshots.pending() == false);
+    assert!(!lock(&rig.producer.inner.state).snapshots.pending());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
