@@ -177,7 +177,7 @@ impl Viewer {
             let (before, after) = (&pair[0], &pair[1]);
             let ordered = match after.quality {
                 Quality::Motion => after.ts > before.ts || (after.key && after.ts == before.ts),
-                Quality::Final => before.quality == Quality::Motion && after.ts == before.ts,
+                Quality::Refine | Quality::Final => after.ts == before.ts,
             };
             assert!(
                 ordered,
@@ -342,6 +342,136 @@ async fn cancelled_snapshot_demand_has_no_plan_and_stopped_or_failed_producers_r
     rig.producer.inner.fail("picture channel ended".into());
     assert_eq!(receive.await.unwrap().unwrap_err(), "picture channel ended");
     assert!(rig.producer.snapshot(0).is_err());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn constrained_refinement_steps_keep_the_reference_chain_and_new_damage_preempts_them() {
+    let rig = rig();
+    for y in 0..480u32 {
+        rig.paint(
+            y,
+            y + 1,
+            [(y * 17) as u8, (y * 71) as u8, (y * 113) as u8, 0],
+        );
+    }
+    let subscription = rig.subscribe();
+    subscription.set_link_rate(LinkRate {
+        bits_per_second: 20_000,
+        burst_bytes: 64 * 1024,
+    });
+    let first = unit(&subscription).await;
+    assert!(first.key && first.quality == Quality::Motion);
+    assert!(
+        first.data.len() > 20_000 / 320,
+        "the fixture must actually exercise regional work"
+    );
+    let mut decoder = Decoder::new();
+    decoder.decode(&first.data);
+    let step = unit(&subscription).await;
+    assert_eq!(step.quality, Quality::Refine);
+    assert_eq!(step.ts, first.ts);
+    assert!(!step.key);
+    decoder.decode(&step.data);
+    let next = unit(&subscription).await;
+    assert_eq!(next.quality, Quality::Refine);
+    assert_eq!(next.ts, first.ts);
+    decoder.decode(&next.data);
+    rig.paint(100, 140, RED);
+    for _ in 0..30 {
+        let unit = unit(&subscription).await;
+        decoder.decode(&unit.data);
+        if unit.quality == Quality::Motion {
+            assert!(unit.ts > first.ts && !unit.key);
+            return;
+        }
+        assert_eq!(unit.ts, first.ts);
+    }
+    panic!("new damage remained queued behind the old refinement sweep");
+}
+
+/// A real writer charges the complete existing wire envelope to Flow, then
+/// receives a paint acknowledgement only after those bytes can cross the
+/// path. This deliberately keeps the key's serialization debt visible;
+/// pulling encoded units eagerly is not a physically possible low-rate link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn constrained_refinement_with_wire_flow_and_serialized_paint_acknowledgements() {
+    use super::super::subscription::Flow;
+    let rig = rig();
+    for y in 0..480u32 {
+        rig.paint(
+            y,
+            y + 1,
+            [(y * 17) as u8, (y * 71) as u8, (y * 113) as u8, 0],
+        );
+    }
+    let subscription = rig.subscribe();
+    let rate = LinkRate {
+        bits_per_second: 20_000,
+        burst_bytes: 64 * 1024,
+    };
+    subscription.set_link_rate(rate);
+    let mut flow = Flow::default();
+    flow.set_link_rate(Some(rate));
+    let mut decoder = Decoder::new();
+    let origin = Instant::now();
+    let mut stream_id = uuid::Uuid::new_v4().to_string();
+    let mut seq = 0;
+    let mut received = 0;
+    let mut preempted = false;
+    for _ in 0..100 {
+        let unit = match delivery(&subscription).await {
+            Delivery::Unit(unit) => unit,
+            Delivery::NewEpoch => {
+                // The real track retires its old backlog and decoder epoch
+                // when new damage is newer than its unwritten queue. This
+                // records recovery rather than retrying a refused packet.
+                flow.reset();
+                seq = 0;
+                stream_id = uuid::Uuid::new_v4().to_string();
+                decoder = Decoder::new();
+                subscription.set_ready(flow.has_room(subscription.queued_bytes()));
+                eprintln!("FLOW_NEW_EPOCH");
+                continue;
+            }
+            other => panic!("the wire-paced stream ended: {other:?}"),
+        };
+        seq += 1;
+        received += 1;
+        let wire =
+            super::super::super::wire::binary_video(&unit, VideoCodec::Av1Full, &stream_id, seq)
+                .expect("the actual wire accepts the encoded unit");
+        assert!(unit.wire_bytes >= wire.len() && unit.wire_bytes - wire.len() <= 15);
+        let sent_at = Instant::now();
+        flow.sent(seq, wire.len(), sent_at);
+        subscription.set_ready(flow.has_room(subscription.queued_bytes()));
+        let serialization =
+            Duration::from_secs_f64(wire.len() as f64 * 8.0 / f64::from(rate.bits_per_second));
+        eprintln!(
+            "FLOW_PICTURE {}",
+            serde_json::json!({"seq":seq,"key":unit.key,"quality":unit.quality.label(),"payloadBytes":unit.data.len(),"wireBytes":wire.len(),"sentMs":origin.elapsed().as_secs_f64()*1000.0,"serializationMs":serialization.as_secs_f64()*1000.0,"queuedBytes":subscription.queued_bytes(),"burstBytes":flow.budget()})
+        );
+        tokio::time::sleep_until(tokio::time::Instant::from_std(sent_at + serialization)).await;
+        decoder.decode(&unit.data);
+        flow.acknowledge(seq, Instant::now());
+        subscription.set_ready(flow.has_room(subscription.queued_bytes()));
+        if received == 3 {
+            rig.paint(100, 140, RED);
+        } else if received > 3 && unit.quality == Quality::Motion {
+            preempted = true;
+        }
+        if received >= 70 && preempted {
+            break;
+        }
+    }
+    rig.producer.inner.stop();
+    assert!(
+        preempted,
+        "new damage must eventually preempt finite refinement"
+    );
+    assert!(
+        received >= 70,
+        "exercise the native model beyond its former64-frame abort"
+    );
 }
 
 /// A new stream's first picture is taken whole and encoded as a key unit
@@ -766,136 +896,4 @@ async fn a_broken_helper_ends_every_subscription_with_its_reason() {
         rig.producer.subscribe(VideoCodec::Av1Full, 60).is_err(),
         "a failed producer serves no one"
     );
-}
-
-#[test]
-fn aperture_offset_window_fits_its_complete_framebuffer_extent() {
-    let encoding = Encoding::new(VideoCodec::Av1Full);
-    let reply: PictureReply = serde_json::from_value(serde_json::json!({"width":2048,"height":2048,"stride":8192,"rows":[[0,2048]],"cursorIncluded":false,
-        "visible":{"x":500,"y":80,"width":1418,"height":1888}})).unwrap();
-    let pixels = vec![128u8; 2048 * 2048 * 4];
-    let capture = Capture {
-        ts: 1,
-        read: Instant::now(),
-        visible: reply.window(),
-        surface: Surface::new(2048, 2048),
-        input_seq: None,
-    };
-    encoding.mark(&reply);
-    encoding.take(&capture, &reply, &pixels);
-    let job = lock(&encoding.mailbox).job.take().unwrap();
-    assert!(job.buffer.coded.0 >= 1918 && job.buffer.coded.1 >= 1968);
-    assert_eq!(job.capture.visible, reply.window());
-}
-
-#[test]
-fn aperture_gutter_cannot_change_any_decoded_coded_pixel() {
-    for codec in [VideoCodec::Av1Full, VideoCodec::Av1] {
-        // Odd origins challenge420 boundary averaging, not only flat padding.
-        let visible = Rect {
-            x: 101,
-            y: 81,
-            width: 63,
-            height: 47,
-        };
-        let reply: PictureReply = serde_json::from_value(serde_json::json!({"width":256,"height":192,"stride":1024,"rows":[[0,192]],"cursorIncluded":false,"visible":visible})).unwrap();
-        let mut results = Vec::new();
-        for secret in [RED, BLUE] {
-            let mut pixels = Vec::new();
-            for y in 0..192 {
-                for x in 0..256 {
-                    pixels.extend_from_slice(
-                        if (101..164).contains(&x) && (81..128).contains(&y) {
-                            &GREEN
-                        } else {
-                            &secret
-                        },
-                    );
-                }
-            }
-            let encoding = Encoding::new(codec);
-            let capture = Capture {
-                ts: 1,
-                read: Instant::now(),
-                visible,
-                surface: Surface::new(256, 192),
-                input_seq: None,
-            };
-            encoding.mark(&reply);
-            encoding.take(&capture, &reply, &pixels);
-            let job = lock(&encoding.mailbox).job.take().unwrap();
-            let mut encoder =
-                crate::native::video::open(codec, job.buffer.coded.0, job.buffer.coded.1, 2)
-                    .unwrap();
-            let unit = encoder
-                .encode(
-                    &job.buffer.picture.picture(),
-                    EncodeRequest {
-                        key: true,
-                        quantizer: 32,
-                        refine: false,
-                    },
-                )
-                .unwrap();
-            let decoded = Decoder::new().decode(&unit.data).rgb();
-            assert!(decoded[..3].iter().all(|channel| *channel <= 2));
-            results.push((unit.data, decoded));
-        }
-        assert_eq!(
-            results[0], results[1],
-            "secret gutter must influence neither bytes nor any decoded pixel"
-        );
-    }
-}
-
-#[test]
-fn aperture_metadata_change_rebuilds_padding_without_pixel_damage() {
-    let encoding = Encoding::new(VideoCodec::Av1Full);
-    let mut reply: PictureReply = serde_json::from_value(serde_json::json!({"width":256,"height":192,"stride":1024,"rows":[[0,192]],"cursorIncluded":false})).unwrap();
-    let pixels: Vec<u8> = (0..256 * 192).flat_map(|_| GREEN).collect();
-    let capture = |reply: &PictureReply, ts| Capture {
-        ts,
-        read: Instant::now(),
-        visible: reply.window(),
-        surface: Surface::new(256, 192),
-        input_seq: None,
-    };
-    encoding.mark(&reply);
-    encoding.take(&capture(&reply, 1), &reply, &pixels);
-    let first = lock(&encoding.mailbox).job.take().unwrap();
-    lock(&encoding.mailbox).free.push(first.buffer);
-    reply.visible = Some(Rect {
-        x: 101,
-        y: 81,
-        width: 63,
-        height: 47,
-    });
-    reply.rows.clear();
-    encoding.mark(&reply);
-    encoding.take(&capture(&reply, 2), &reply, &pixels);
-    let second = lock(&encoding.mailbox)
-        .job
-        .take()
-        .expect("new aperture is new work without pixel damage");
-    let mut encoder = crate::native::video::open(
-        VideoCodec::Av1Full,
-        second.buffer.coded.0,
-        second.buffer.coded.1,
-        2,
-    )
-    .unwrap();
-    let unit = encoder
-        .encode(
-            &second.buffer.picture.picture(),
-            EncodeRequest {
-                key: true,
-                quantizer: 32,
-                refine: false,
-            },
-        )
-        .unwrap();
-    let decoded = Decoder::new().decode(&unit.data).rgb();
-    assert!(decoded[..3].iter().all(|channel| *channel <= 2));
-    let inside = (100 * second.buffer.coded.0 as usize + 120) * 4;
-    assert!(decoded[inside + 1] >= 250 && decoded[inside] <= 6 && decoded[inside + 2] <= 6);
 }

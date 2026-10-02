@@ -59,6 +59,27 @@ impl VideoCodec {
         }
     }
 
+    /// Current source/resource allowance, derived from the pinned native
+    /// encoder's compressed storage: eight aligned input pictures, at least
+    ///8192 bytes (libaom3.12.1 av1_cx_iface.c3112–3148). This is not a bitrate
+    /// target or an allocation request. VP9 retains the same negotiated
+    /// format allowance; this build has no VP9 producer/allocation claim.
+    pub(crate) fn coded_capacity(self, width: u32, height: u32) -> Option<usize> {
+        if !(1..=4096).contains(&width) || !(1..=4096).contains(&height) {
+            return None;
+        }
+        let (width, height) = (
+            width.div_ceil(32) as usize * 32,
+            height.div_ceil(32) as usize * 32,
+        );
+        Some(
+            self.chroma()
+                .picture_bytes(width, height)
+                .checked_mul(8)?
+                .max(8192),
+        )
+    }
+
     const fn bit(self) -> u8 {
         1 << self as u8
     }
@@ -163,6 +184,8 @@ pub(crate) struct EncodeRequest {
 pub(crate) struct EncodedUnit {
     pub data: Vec<u8>,
     pub key: bool,
+    /// The key's actual codec configuration, read from its encoded header.
+    pub codec_string: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -182,22 +205,34 @@ impl std::fmt::Display for VideoError {
     }
 }
 
-/// The path's bitrate, actual picture period and payload target for keys.
+/// The path's bitrate and actual period for dependent pictures.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EncoderRate {
     pub bits_per_second: u32,
     pub pictures_per_second: u32,
-    pub key_bytes: u32,
+}
+
+/// Coded pixels changed by one refinement; other blocks retain their reference pixels.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct EncoderRegion {
+    pub x: u32,
+    pub y: u32,
+    pub width: u32,
+    pub height: u32,
 }
 
 /// One picture in, one temporal unit out, without lookahead or reordering.
 pub(crate) trait VideoEncoder: Send {
     /// The encoded picture size.
     fn coded(&self) -> (u32, u32);
-    /// The WebCodecs codec string of this stream.
-    fn codec_string(&self) -> String;
     /// A path's explicit rate budget; absence preserves fixed-quality encoding.
     fn set_rate(&mut self, rate: Option<EncoderRate>) -> Result<(), VideoError>;
+    /// Configure a refinement and return the actual codec-aligned region it
+    /// updates. Callers reason about this region, not an assumed block size.
+    fn set_refinement_region(
+        &mut self,
+        region: Option<EncoderRegion>,
+    ) -> Result<Option<EncoderRegion>, VideoError>;
     fn encode(
         &mut self,
         picture: &Picture<'_>,
@@ -249,6 +284,32 @@ pub(crate) fn open(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coded_capacity_is_dimensional_format_storage_without_allocating_it() {
+        assert_eq!(
+            VideoCodec::Av1Full.coded_capacity(4096, 4096),
+            Some(402_653_184)
+        );
+        assert_eq!(
+            VideoCodec::Av1.coded_capacity(4096, 4096),
+            Some(201_326_592)
+        );
+        assert_eq!(VideoCodec::Av1Full.coded_capacity(64, 64), Some(98_304));
+        assert_eq!(
+            VideoCodec::Vp9Full.coded_capacity(4096, 4096),
+            VideoCodec::Av1Full.coded_capacity(4096, 4096)
+        );
+        for codec in VideoCodec::ALL {
+            for size in [(0, 64), (64, 0), (4097, 4096), (u32::MAX, u32::MAX)] {
+                assert_eq!(codec.coded_capacity(size.0, size.1), None);
+            }
+        }
+        assert!(
+            !encodes(VideoCodec::Vp9) && !encodes(VideoCodec::Vp9Full),
+            "resource allowance is not a VP9 encoder availability claim"
+        );
+    }
 
     #[test]
     fn a_declaration_is_distinct_known_tokens_or_nothing() {

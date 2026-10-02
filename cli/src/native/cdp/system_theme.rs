@@ -10,6 +10,7 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
+use super::desktop_portal::DesktopPortal;
 use crate::native::theme::Theme;
 
 const ACKNOWLEDGMENT: Duration = Duration::from_secs(2);
@@ -23,6 +24,7 @@ pub(super) struct SystemTheme {
     authority: PathBuf,
     observer: PathBuf,
     acknowledged: Option<Theme>,
+    portal: Option<DesktopPortal>,
 }
 
 impl SystemTheme {
@@ -37,14 +39,24 @@ impl SystemTheme {
         theme: Theme,
         canceled: &AtomicBool,
     ) -> Result<Self, String> {
-        Self::start_with_programs(
+        let mut owner = Self::start_with_programs(
             display,
             authority,
             theme,
             canceled,
             Path::new("/usr/bin/xsettingsd"),
             Path::new("/usr/bin/dump_xsettings"),
-        )
+        )?;
+        if DesktopPortal::installed() {
+            owner.portal = Some(DesktopPortal::start(
+                &owner.directory,
+                display,
+                authority,
+                theme,
+                canceled,
+            )?);
+        }
+        Ok(owner)
     }
 
     fn start_with_programs(
@@ -93,6 +105,7 @@ impl SystemTheme {
             authority: authority.into(),
             observer: observer.into(),
             acknowledged: None,
+            portal: None,
         };
         if !owner.await_acknowledgment(theme, canceled) {
             return Err("Private XSettings service did not acknowledge the theme".into());
@@ -102,13 +115,23 @@ impl SystemTheme {
     }
 
     pub(super) fn apply(&mut self, theme: Theme, canceled: &AtomicBool) -> bool {
-        if canceled.load(Ordering::Relaxed) || !self.running() {
+        if canceled.load(Ordering::Relaxed)
+            || !self.running()
+            || self.portal.as_mut().is_some_and(|portal| !portal.running())
+        {
             return false;
         }
         if self.acknowledged == Some(theme) {
             return true;
         }
         self.acknowledged = None;
+        if self
+            .portal
+            .as_mut()
+            .is_some_and(|portal| !portal.apply(theme, canceled))
+        {
+            return false;
+        }
         if write_configuration(&self.configuration, theme).is_err() {
             return false;
         }
@@ -128,6 +151,18 @@ impl SystemTheme {
         matches!(self.child.try_wait(), Ok(None))
     }
 
+    pub(super) fn apply_chrome_environment(&self, command: &mut Command) {
+        if let Some(portal) = &self.portal {
+            portal.apply_chrome_environment(command);
+        }
+    }
+
+    pub(super) fn display_process(&self) -> Option<crate::native::display::DesktopProcess> {
+        self.portal
+            .as_ref()
+            .and_then(DesktopPortal::display_process)
+    }
+
     fn await_acknowledgment(&mut self, theme: Theme, canceled: &AtomicBool) -> bool {
         let deadline = Instant::now() + ACKNOWLEDGMENT;
         while !canceled.load(Ordering::Relaxed) && Instant::now() < deadline && self.running() {
@@ -142,66 +177,76 @@ impl SystemTheme {
     }
 
     fn read_acknowledgment(&self, theme: Theme, deadline: Instant, canceled: &AtomicBool) -> bool {
-        let Ok(child) = Command::new(&self.observer)
+        let mut command = Command::new(&self.observer);
+        command
             .env("DISPLAY", &self.display)
-            .env("XAUTHORITY", &self.authority)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-        else {
-            return false;
-        };
-        let mut observer = Observer(child);
-        let Some(mut stdout) = observer.0.stdout.take() else {
-            return false;
-        };
-        // The deadline also bounds a wedged observer or inherited pipe writer.
-        // Never call blocking read_to_end merely because the child exited.
-        let descriptor = stdout.as_raw_fd();
-        let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
-        if flags < 0
-            || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
-        {
-            return false;
+            .env("XAUTHORITY", &self.authority);
+        read_owned_output(command, deadline, canceled)
+            .is_some_and(|bytes| acknowledged_theme(&bytes, theme))
+    }
+}
+
+/// Bound an owned readiness reader even if it hangs or leaves an inherited pipe writer.
+pub(super) fn read_owned_output(
+    mut command: Command,
+    deadline: Instant,
+    canceled: &AtomicBool,
+) -> Option<Vec<u8>> {
+    if canceled.load(Ordering::Relaxed) || Instant::now() >= deadline {
+        return None;
+    }
+    let child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    let mut observer = Observer(child);
+    let mut stdout = observer.0.stdout.take()?;
+    // The deadline also bounds a wedged observer or inherited pipe writer.
+    // Never call blocking read_to_end merely because the child exited.
+    let descriptor = stdout.as_raw_fd();
+    let flags = unsafe { libc::fcntl(descriptor, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(descriptor, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0
+    {
+        return None;
+    }
+    let mut bytes = Vec::new();
+    let mut eof = false;
+    loop {
+        if canceled.load(Ordering::Relaxed) || Instant::now() >= deadline {
+            return None;
         }
-        let mut bytes = Vec::new();
-        let mut eof = false;
         loop {
-            if canceled.load(Ordering::Relaxed) || Instant::now() >= deadline {
-                return false;
-            }
-            loop {
-                let mut chunk = [0u8; 4096];
-                match stdout.read(&mut chunk) {
-                    Ok(0) => {
-                        eof = true;
-                        break;
-                    }
-                    Ok(size) => {
-                        bytes.extend_from_slice(&chunk[..size]);
-                        if bytes.len() as u64 > OBSERVER_BYTES {
-                            return false;
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => return false,
+            let mut chunk = [0u8; 4096];
+            match stdout.read(&mut chunk) {
+                Ok(0) => {
+                    eof = true;
+                    break;
                 }
-            }
-            match observer.0.try_wait() {
-                Ok(Some(status)) => {
-                    if !status.success() {
-                        return false;
-                    }
-                    if eof {
-                        return acknowledged_theme(&bytes, theme);
+                Ok(size) => {
+                    bytes.extend_from_slice(&chunk[..size]);
+                    if bytes.len() as u64 > OBSERVER_BYTES {
+                        return None;
                     }
                 }
-                Ok(None) => {}
-                Err(_) => return false,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => return None,
             }
-            std::thread::sleep(Duration::from_millis(2));
         }
+        match observer.0.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
+                }
+                if eof {
+                    return Some(bytes);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => return None,
+        }
+        std::thread::sleep(Duration::from_millis(2));
     }
 }
 
@@ -215,6 +260,7 @@ impl Drop for Observer {
 
 impl Drop for SystemTheme {
     fn drop(&mut self) {
+        self.portal = None;
         let _ = self.child.kill();
         let _ = self.child.wait();
         let _ = fs::remove_dir_all(&self.directory);
@@ -232,6 +278,10 @@ fn configuration(theme: Theme) -> String {
 }
 
 fn write_configuration(path: &Path, theme: Theme) -> Result<(), String> {
+    write_private_configuration(path, &configuration(theme))
+}
+
+pub(super) fn write_private_configuration(path: &Path, contents: &str) -> Result<(), String> {
     let temporary = path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
     let result = (|| -> std::io::Result<()> {
         let mut file = OpenOptions::new()
@@ -239,7 +289,7 @@ fn write_configuration(path: &Path, theme: Theme) -> Result<(), String> {
             .write(true)
             .mode(0o600)
             .open(&temporary)?;
-        file.write_all(configuration(theme).as_bytes())?;
+        file.write_all(contents.as_bytes())?;
         drop(file);
         fs::rename(&temporary, path)
     })();
@@ -527,6 +577,7 @@ while True: signal.pause()
             authority: fixture.path().join("authority"),
             observer: observer.clone(),
             acknowledged: None,
+            portal: None,
         };
         for body in [
             "import sys; sys.stdout.buffer.write(b'x' * 65537); sys.stdout.flush()",

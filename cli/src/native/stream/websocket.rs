@@ -1,17 +1,16 @@
 use serde_json::{json, Value};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::Arc;
 use std::time::Duration;
 
-use futures_util::stream::{SplitSink, SplitStream};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::stream::SplitStream;
+use futures_util::StreamExt;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{broadcast, watch, Mutex, Notify, RwLock};
 use tokio::time::Instant;
 use tokio_tungstenite::tungstenite::Message;
-use tokio_tungstenite::WebSocketStream;
 
 use crate::native::audio::{AudioCodec, AudioError, AudioSource};
 use crate::native::browser_control::{custody_active, BrowserControl};
@@ -30,6 +29,9 @@ use super::BrowserNote;
 use super::{
     is_allowed_origin, timestamp_ms, Audience, FrameNeeds, IdleActivity, StreamFrame, StreamMedia,
 };
+
+mod writer;
+use writer::{Socket, Writer, Written};
 
 /// Highest per-client frame rate a client may request via the `config` message.
 const MAX_CONFIGURABLE_FPS: u32 = 120;
@@ -71,6 +73,8 @@ struct ClientConfig {
     /// The video codecs the viewer declared (`video=<token>,...`, binary
     /// viewers only), and its newest subscription request.
     video: Option<Declared>,
+    video_coded_capacity: bool,
+    video_chunks: bool,
     video_demand: Demand,
 }
 
@@ -99,6 +103,8 @@ impl Default for ClientConfig {
             audio: None,
             audio_demand: Demand::default(),
             video: None,
+            video_coded_capacity: false,
+            video_chunks: false,
             video_demand: Demand::default(),
         }
     }
@@ -306,6 +312,8 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
             "frames" => cfg.binary = value == "binary",
             "audio" => cfg.audio = AudioCodec::parse(value),
             "video" => cfg.video = Declared::parse(value),
+            "videoCapacity" => cfg.video_coded_capacity = value == "coded",
+            "videoFraming" => cfg.video_chunks = value == "chunks",
             "frameWindow" => {
                 if let Some(window) = value
                     .parse::<usize>()
@@ -655,7 +663,16 @@ async fn handle_ws_client(
             Ok(resp)
         };
 
-    let ws_stream = match tokio_tungstenite::accept_hdr_async(stream, callback).await {
+    let written = Arc::new(AtomicU64::new(0));
+    let ws_stream = match tokio_tungstenite::accept_hdr_async(
+        Written {
+            inner: stream,
+            bytes: written.clone(),
+        },
+        callback,
+    )
+    .await
+    {
         Ok(ws) => ws,
         Err(_) => return,
     };
@@ -672,7 +689,8 @@ async fn handle_ws_client(
     // The viewer's place in the roster, left on every path out.
     let mut seat = media.seat(initial_config.frame_needs());
 
-    let (mut ws_tx, ws_rx) = ws_stream.split();
+    let (ws_tx, ws_rx) = ws_stream.split();
+    let mut ws_tx = Writer::new(ws_tx, written);
 
     // Watch channels, not atomics, so a mid-stream change wakes the writer's
     // select! below instead of leaving it asleep on a stale deadline.
@@ -681,12 +699,15 @@ async fn handle_ws_client(
     let (input_error_tx, mut input_error_rx) = watch::channel::<Option<Value>>(None);
     let mut audio = initial_config.audio.map(AudioTrack::new);
     let declared_video = initial_config.video.map(|declared| {
-        VideoTrack::new(
+        let (mut track, inbox, feedback) = VideoTrack::new(
             video_hub.clone(),
             declared,
             initial_config.draws_pointer,
             initial_config.max_fps,
-        )
+        );
+        track.declare_coded_capacity(initial_config.video_coded_capacity);
+        track.declare_chunks(initial_config.video_chunks);
+        (track, inbox, feedback)
     });
     let (mut video, video_inbox, mut video_feedback) = match declared_video {
         Some((track, inbox, feedback)) => (Some(track), Some(inbox), Some(feedback)),
@@ -798,6 +819,11 @@ async fn handle_ws_client(
     let mut framed = true;
 
     loop {
+        let now = std::time::Instant::now();
+        ws_tx.settle(now);
+        ws_tx
+            .debt
+            .set_rate(video.as_ref().and_then(VideoTrack::link_rate), now);
         // The viewer is served video while its track holds a subscription,
         // frames otherwise. Frames resume whole: nothing sent before the video
         // is a base, and nothing in flight is awaited.
@@ -916,7 +942,9 @@ async fn handle_ws_client(
                     && !video_display.has_changed().unwrap_or(true);
                 let (records, message) = track.deliver(delivery, fresh);
                 if !send_records(&mut ws_tx, records).await { break; }
-                if let Some(message) = message {
+                let fresh = track.current(config_rx.borrow().video_demand)
+                    && !video_display.has_changed().unwrap_or(true);
+                if let Some(message) = message.filter(|_| fresh) {
                     if ws_tx.send(message).await.is_err() { break; }
                 }
             }
@@ -926,13 +954,23 @@ async fn handle_ws_client(
                 }
                 pending_frame = true;
             }
-            changed = presentation_rx.changed(), if initial_config.presentation.is_some() => {
+            changed = presentation_rx.changed(), if initial_config.presentation.is_some()
+                || (initial_config.video_chunks && initial_config.video_coded_capacity) => {
                 if changed.is_err() { break; }
-                let config = config_rx.borrow().presentation.unwrap();
-                presentation.claim_if_available(connection_id, config);
+                let config = config_rx.borrow().presentation;
+                if let Some(config) = config {
+                    presentation.claim_if_available(connection_id, config);
+                }
                 presentation_rx.borrow_and_update();
+                let records = match (video.as_mut(), presentation.applied()) {
+                    (Some(track), Some(applied)) => track.applied(&applied),
+                    _ => Vec::new(),
+                };
                 next_allowed = deadline_from(last_sent, presentation.client_fps(connection_id, config_rx.borrow().max_fps, controlled));
-                if ws_tx.send(Message::Text(presentation.acknowledgment(connection_id, config).to_string())).await.is_err() { break; }
+                if let Some(config) = config {
+                    if ws_tx.send(Message::Text(presentation.acknowledgment(connection_id, config).to_string())).await.is_err() { break; }
+                }
+                if !send_records(&mut ws_tx, records).await { break; }
             }
             changed = custody_rx.changed() => {
                 if changed.is_err() { break; }
@@ -955,6 +993,22 @@ async fn handle_ws_client(
                 // Painting it also settles every earlier delivered frame.
                 in_flight.acknowledge(acked, Instant::now(), true);
                 byte_blocked = false;
+            }
+            _ = next_video_part(&video, &ws_tx) => {
+                // The reader may have serialized an automatic control frame
+                // while readiness waited. Reconcile and recheck before admission.
+                ws_tx.settle(std::time::Instant::now());
+                if std::time::Instant::now() < ws_tx.debt.next_at { continue; }
+                let Some(track) = video.as_mut() else { continue };
+                // Return through this priority loop after each bounded part:
+                // source/config, audio, records and feedback can all progress.
+                let fresh = track.current(config_rx.borrow().video_demand)
+                    && !video_display.has_changed().unwrap_or(true);
+                if !fresh { continue; }
+                if let Some(message) = track.part() {
+                    if ws_tx.send(message).await.is_err() { break; }
+                    track.part_sent();
+                }
             }
             _ = tokio::time::sleep_until(next_allowed), if framed && pending_frame && !byte_blocked && (!config_rx.borrow().ack_pacing || in_flight.has_slot(config_rx.borrow().frame_window)) => {
                 // Invariant: read at send time, not arrival time. That is what
@@ -1003,10 +1057,7 @@ async fn handle_ws_client(
 }
 
 /// Writes a track's records in order; false when the connection is gone.
-async fn send_records(
-    writer: &mut SplitSink<WebSocketStream<TcpStream>, Message>,
-    records: Vec<Value>,
-) -> bool {
+async fn send_records(writer: &mut Writer, records: Vec<Value>) -> bool {
     for record in records {
         if writer
             .send(Message::Text(record.to_string()))
@@ -1023,6 +1074,16 @@ async fn send_records(
 async fn next_video(track: &Option<VideoTrack>) -> Delivery {
     match track {
         Some(track) => track.next().await,
+        None => std::future::pending().await,
+    }
+}
+
+async fn next_video_part(track: &Option<VideoTrack>, writer: &Writer) {
+    match track {
+        Some(track) => {
+            track.part_ready().await;
+            tokio::time::sleep_until(tokio::time::Instant::from_std(writer.debt.next_at)).await;
+        }
         None => std::future::pending().await,
     }
 }
@@ -1054,7 +1115,7 @@ async fn next_audio(
 /// must not be reordered.
 #[allow(clippy::too_many_arguments)]
 async fn reader_loop(
-    mut ws_rx: SplitStream<WebSocketStream<TcpStream>>,
+    mut ws_rx: SplitStream<Socket>,
     client_slot: Arc<RwLock<Option<Arc<CdpClient>>>>,
     cdp_session_id: Arc<RwLock<Option<String>>>,
     config: watch::Sender<ClientConfig>,
@@ -1155,6 +1216,12 @@ async fn reader_loop(
                     }
                     continue;
                 }
+                if msg_type == "received" {
+                    if let Some(video) = &video {
+                        video.received(&parsed);
+                    }
+                    continue;
+                }
                 if !is_user_input_message_type(msg_type) {
                     continue;
                 }
@@ -1201,6 +1268,41 @@ fn is_user_input_message_type(msg_type: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn coded_video_capacity_is_an_optional_existing_upgrade_declaration() {
+        let legacy =
+            config_from_upgrade("GET /?frames=binary&cursor=viewer&video=av1-444 HTTP/1.1\r\n");
+        let coded = config_from_upgrade(
+            "GET /?frames=binary&cursor=viewer&video=av1-444&videoCapacity=coded HTTP/1.1\r\n",
+        );
+        assert!(!legacy.video_coded_capacity && coded.video_coded_capacity);
+        assert_eq!(legacy.video, coded.video);
+        assert_eq!(legacy.frame_needs(), coded.frame_needs());
+        for value in ["", "legacy", "unknown"] {
+            assert!(
+                !config_from_upgrade(&format!("GET /?videoCapacity={value} HTTP/1.1\r\n"))
+                    .video_coded_capacity
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_framing_is_an_explicit_upgrade_and_never_inferred_from_capacity() {
+        for (query, capacity, chunks) in [
+            ("", false, false),
+            ("videoCapacity=coded", true, false),
+            ("videoFraming=chunks", false, true),
+            ("videoCapacity=coded&videoFraming=chunks", true, true),
+            ("videoCapacity=coded&videoFraming=unknown", true, false),
+        ] {
+            let cfg = config_from_upgrade(&format!(
+                "GET /?frames=binary&cursor=viewer&video=av1-444&{query} HTTP/1.1\r\n"
+            ));
+            assert_eq!(cfg.video_coded_capacity, capacity);
+            assert_eq!(cfg.video_chunks, chunks);
+        }
+    }
 
     #[test]
     fn audio_negotiation_is_fixed_to_a_supported_binary_codec() {

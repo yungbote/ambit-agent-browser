@@ -3,6 +3,619 @@ use crate::native::video::convert::{to_rgb, Colour, Planar};
 use std::mem::{offset_of, size_of};
 
 #[test]
+fn active_map_layout_and_region_bounds_match_the_coded_picture() {
+    assert_eq!(size_of::<ActiveMap>(), 16);
+    assert_eq!(offset_of!(ActiveMap, cells), 0);
+    assert_eq!(offset_of!(ActiveMap, rows), 8);
+    assert_eq!(offset_of!(ActiveMap, columns), 12);
+    let mut encoder = AomEncoder::new(VideoCodec::Av1Full, 64, 64, 1).unwrap();
+    let valid = EncoderRegion {
+        x: 16,
+        y: 16,
+        width: 16,
+        height: 16,
+    };
+    let actual = encoder.set_refinement_region(Some(valid)).unwrap().unwrap();
+    assert_eq!(
+        actual,
+        EncoderRegion {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 32
+        }
+    );
+    encoder.configure_region(Some(actual)).unwrap();
+    assert_eq!(
+        encoder
+            .active_cells
+            .iter()
+            .filter(|cell| **cell == 1)
+            .count(),
+        4
+    );
+    assert_eq!(encoder.active_cells[5], 1);
+    for region in [
+        EncoderRegion {
+            x: 0,
+            y: 0,
+            width: 0,
+            height: 16,
+        },
+        EncoderRegion {
+            x: 0,
+            y: 0,
+            width: 16,
+            height: 0,
+        },
+        EncoderRegion {
+            x: 63,
+            y: 0,
+            width: 2,
+            height: 16,
+        },
+        EncoderRegion {
+            x: 0,
+            y: 63,
+            width: 16,
+            height: 2,
+        },
+        EncoderRegion {
+            x: u32::MAX,
+            y: 0,
+            width: 1,
+            height: 16,
+        },
+    ] {
+        assert!(encoder.set_refinement_region(Some(region)).is_err());
+        assert_eq!(encoder.region, Some(actual));
+    }
+    encoder.set_refinement_region(None).unwrap();
+    encoder.configure_region(None).unwrap();
+    assert_eq!(encoder.region, None);
+    assert!(encoder.active_map.cells.is_null());
+}
+
+#[test]
+fn a_regional_refinement_preserves_unmodified_reference_pixels() {
+    let mut source = text_fixture(LIGHT);
+    let mut planar = Planar::new(Chroma::Full, FIXTURE.0 as u32, FIXTURE.1 as u32);
+    assert!(planar.convert(&source, FIXTURE.0 * 4, FIXTURE, (0, FIXTURE.1)));
+    let mut encoder =
+        AomEncoder::new(VideoCodec::Av1Full, FIXTURE.0 as u32, FIXTURE.1 as u32, 2).unwrap();
+    let mut decoder = Decoder::new();
+    let motion = encoder
+        .encode(
+            &planar.picture(),
+            EncodeRequest {
+                key: true,
+                quantizer: 48,
+                refine: false,
+            },
+        )
+        .unwrap();
+    decoder.decode(&motion.data);
+    for step in 0..4 {
+        source = text_fixture(LIGHT);
+        for y in 32 + step * 16..64 + step * 16 {
+            for x in 200..232 {
+                let at = (y * FIXTURE.0 + x) * 4;
+                source[at..at + 4].copy_from_slice(&[255, 0, 0, 0]);
+            }
+        }
+        assert!(planar.convert(&source, FIXTURE.0 * 4, FIXTURE, (0, FIXTURE.1)));
+        let motion = encoder
+            .encode(
+                &planar.picture(),
+                EncodeRequest {
+                    key: false,
+                    quantizer: 48,
+                    refine: false,
+                },
+            )
+            .unwrap();
+        decoder.decode(&motion.data);
+    }
+    let coarse = decoder.decode(
+        &encoder
+            .encode(
+                &planar.picture(),
+                EncodeRequest {
+                    key: false,
+                    quantizer: 48,
+                    refine: false,
+                },
+            )
+            .unwrap()
+            .data,
+    );
+    let before = coarse.rgb();
+    let preview = unsafe {
+        (encoder.api.preview_frame)(&mut *encoder.context)
+            .as_ref()
+            .unwrap()
+    };
+    let preview_errors: Vec<_> = (0..3)
+        .map(|plane| {
+            let mut changed = 0;
+            let mut maximum = 0;
+            for y in 0..FIXTURE.1 {
+                for x in 0..FIXTURE.0 {
+                    let error = unsafe {
+                        *preview.planes[plane].add(y * preview.strides[plane] as usize + x)
+                    }
+                    .abs_diff(coarse.planes[plane][y * FIXTURE.0 + x]);
+                    changed += usize::from(error != 0);
+                    maximum = maximum.max(error);
+                }
+            }
+            (changed, maximum)
+        })
+        .collect();
+    encoder
+        .set_rate(Some(EncoderRate {
+            bits_per_second: 500_000,
+            pictures_per_second: 60,
+        }))
+        .unwrap();
+    encoder
+        .set_refinement_region(Some(EncoderRegion {
+            x: 0,
+            y: 0,
+            width: 128,
+            height: 128,
+        }))
+        .unwrap();
+    let refined = encoder
+        .encode(
+            &planar.picture(),
+            EncodeRequest {
+                key: false,
+                quantizer: 8,
+                refine: true,
+            },
+        )
+        .unwrap();
+    assert!(!refined.key);
+    let after = decoder.decode(&refined.data).rgb();
+    let mut outside_max = 0u8;
+    let mut outside_changed = 0usize;
+    let mut inside_before = 0u64;
+    let mut inside_after = 0u64;
+    let mut first_changes = Vec::new();
+    for y in 0..FIXTURE.1 {
+        for x in 0..FIXTURE.0 {
+            let at = (y * FIXTURE.0 + x) * 4;
+            if x < 128 && y < 128 {
+                for (rgb, bgr) in [(0, 2), (1, 1), (2, 0)] {
+                    inside_before += u64::from(source[at + bgr].abs_diff(before[at + rgb])).pow(2);
+                    inside_after += u64::from(source[at + bgr].abs_diff(after[at + rgb])).pow(2);
+                }
+            }
+            if x < 128 && y < 128 {
+                continue;
+            }
+            let error = (0..3)
+                .map(|channel| before[at + channel].abs_diff(after[at + channel]))
+                .max()
+                .unwrap();
+            outside_max = outside_max.max(error);
+            outside_changed += usize::from(error != 0);
+            if error != 0 && first_changes.len() < 10 {
+                first_changes.push((x, y, error));
+            }
+        }
+    }
+    println!(
+        "REGION_SCOPE {}",
+        serde_json::json!({"outsideMaxRgbDelta":outside_max,"outsideChangedPixels":outside_changed,"unitBytes":refined.data.len(),"insideErrorBefore":inside_before,"insideErrorAfter":inside_after,"previewErrors":preview_errors,"firstChanges":first_changes})
+    );
+    assert_eq!(
+        outside_max, 0,
+        "inactive-reference gate remains exact until scope is understood"
+    );
+    assert!(
+        inside_after < inside_before,
+        "a refinement must improve its active region"
+    );
+    encoder.set_refinement_region(None).unwrap();
+    let motion = encoder
+        .encode(
+            &planar.picture(),
+            EncodeRequest {
+                key: false,
+                quantizer: 32,
+                refine: false,
+            },
+        )
+        .unwrap();
+    assert!(!motion.key);
+    decoder.decode(&motion.data);
+}
+
+/// Challenge the native dock dimensions and valid high-entropy screen content;
+/// every unit decodes before its measured size is compared with the contract.
+#[test]
+fn regional_steps_preserve_other_reference_pixels_including_already_exact_regions() {
+    let (width, height) = (512u32, 256u32);
+    let fixture = text_fixture(LIGHT);
+    let mut source = Vec::with_capacity(width as usize * height as usize * 4);
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let at = ((y % FIXTURE.1) * FIXTURE.0 + x % FIXTURE.0) * 4;
+            source.extend_from_slice(&[fixture[at], fixture[at + 1], fixture[at + 2], 0]);
+        }
+    }
+    let mut planar = Planar::new(Chroma::Full, width, height);
+    assert!(planar.convert(
+        &source,
+        width as usize * 4,
+        (width as usize, height as usize),
+        (0, height as usize)
+    ));
+    let mut encoder = AomEncoder::new(VideoCodec::Av1Full, width, height, 4).unwrap();
+    let mut decoder = Decoder::new();
+    let key = encoder
+        .encode(
+            &planar.picture(),
+            EncodeRequest {
+                key: true,
+                quantizer: 48,
+                refine: false,
+            },
+        )
+        .unwrap();
+    let mut before = decoder.decode(&key.data).rgb();
+    // The first key can code flat text exactly even at a coarse target. Give
+    // the regions a normal moving history so each owes actual codec error.
+    for step in 0..4 {
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let at = (y * width as usize + x) * 4;
+                let from = ((y % FIXTURE.1) * FIXTURE.0 + (x + step * 3) % FIXTURE.0) * 4;
+                source[at..at + 4].copy_from_slice(&fixture[from..from + 4]);
+            }
+        }
+        assert!(planar.convert(
+            &source,
+            width as usize * 4,
+            (width as usize, height as usize),
+            (0, height as usize)
+        ));
+        let motion = encoder
+            .encode(
+                &planar.picture(),
+                EncodeRequest {
+                    key: false,
+                    quantizer: 48,
+                    refine: false,
+                },
+            )
+            .unwrap();
+        before = decoder.decode(&motion.data).rgb();
+    }
+    encoder
+        .set_rate(Some(EncoderRate {
+            bits_per_second: 500_000,
+            pictures_per_second: 60,
+        }))
+        .unwrap();
+    for requested in [
+        EncoderRegion {
+            x: 0,
+            y: 0,
+            width: 64,
+            height: 64,
+        },
+        EncoderRegion {
+            x: 128,
+            y: 0,
+            width: 64,
+            height: 64,
+        },
+        EncoderRegion {
+            x: 448,
+            y: 192,
+            width: 64,
+            height: 64,
+        },
+        EncoderRegion {
+            x: 200,
+            y: 70,
+            width: 30,
+            height: 45,
+        },
+    ] {
+        let region = encoder
+            .set_refinement_region(Some(requested))
+            .unwrap()
+            .unwrap();
+        let unit = encoder
+            .encode(
+                &planar.picture(),
+                EncodeRequest {
+                    key: false,
+                    quantizer: 8,
+                    refine: true,
+                },
+            )
+            .unwrap();
+        assert!(!unit.key);
+        let after = decoder.decode(&unit.data).rgb();
+        let mut error_before = 0u64;
+        let mut error_after = 0u64;
+        for y in 0..height {
+            for x in 0..width {
+                let at = (y as usize * width as usize + x as usize) * 4;
+                if (region.x..region.x + region.width).contains(&x)
+                    && (region.y..region.y + region.height).contains(&y)
+                {
+                    for (rgb, bgr) in [(0, 2), (1, 1), (2, 0)] {
+                        error_before +=
+                            u64::from(source[at + bgr].abs_diff(before[at + rgb])).pow(2);
+                        error_after += u64::from(source[at + bgr].abs_diff(after[at + rgb])).pow(2);
+                    }
+                } else {
+                    assert_eq!(
+                        after[at..at + 3],
+                        before[at..at + 3],
+                        "outside region{region:?} at{x},{y}"
+                    );
+                }
+            }
+        }
+        println!(
+            "REGION_STEP {}",
+            serde_json::json!({"region":[region.x,region.y,region.width,region.height],"bytes":unit.data.len(),"insideBefore":error_before,"insideAfter":error_after})
+        );
+        let pixels = f64::from(region.width) * f64::from(region.height) * 3.0;
+        let already_sharp =
+            error_after as f64 / pixels <= 255.0f64.powi(2) / 10.0f64.powf(49.0 / 10.0);
+        assert!(
+            error_after <= error_before && (error_after < error_before || already_sharp),
+            "refinement must not degrade{region:?} and must improve it unless it already meets the measured49dB text target"
+        );
+        assert!(
+            unit.data.len() <= 500_000 / 320,
+            "region exceeded its25ms byte budget"
+        );
+        before = after;
+    }
+    // Subsequent motion returns to ordinary CBR with a complete active map;
+    // the previously improved blocks still belong to the same reference chain.
+    source[0..4].copy_from_slice(&[0, 0, 255, 0]);
+    assert!(planar.convert(
+        &source,
+        width as usize * 4,
+        (width as usize, height as usize),
+        (0, 1)
+    ));
+    let motion = encoder
+        .encode(
+            &planar.picture(),
+            EncodeRequest {
+                key: false,
+                quantizer: 32,
+                refine: false,
+            },
+        )
+        .unwrap();
+    assert!(!motion.key);
+    decoder.decode(&motion.data);
+    assert_eq!(encoder.region, None);
+    assert!(encoder.active_map.cells.is_null());
+}
+
+#[test]
+#[ignore]
+fn aligned_regional_updates_bound_noisy_steps_on_the_measured_consumer_link() {
+    let (width, height) = (1536u32, 2048u32);
+    let mut random = 0x1234_5678u32;
+    let mut source = Vec::with_capacity(width as usize * height as usize * 4);
+    for _ in 0..width * height {
+        for _ in 0..3 {
+            random ^= random << 13;
+            random ^= random >> 17;
+            random ^= random << 5;
+            source.push(random as u8);
+        }
+        source.push(0);
+    }
+    let mut planar = Planar::new(Chroma::Full, width, height);
+    assert!(planar.convert(
+        &source,
+        width as usize * 4,
+        (width as usize, height as usize),
+        (0, height as usize)
+    ));
+    let mut encoder = AomEncoder::new(VideoCodec::Av1Full, width, height, 4).unwrap();
+    let mut decoder = Decoder::new();
+    let key = encoder
+        .encode(
+            &planar.picture(),
+            EncodeRequest {
+                key: true,
+                quantizer: 48,
+                refine: false,
+            },
+        )
+        .unwrap();
+    let mut before = decoder.decode(&key.data).rgb();
+    encoder
+        .set_rate(Some(EncoderRate {
+            bits_per_second: 3_000_000,
+            pictures_per_second: 60,
+        }))
+        .unwrap();
+    for region in [
+        EncoderRegion {
+            x: 0,
+            y: 0,
+            width: 32,
+            height: 32,
+        },
+        EncoderRegion {
+            x: 736,
+            y: 992,
+            width: 32,
+            height: 32,
+        },
+        EncoderRegion {
+            x: 1504,
+            y: 2016,
+            width: 32,
+            height: 32,
+        },
+    ] {
+        encoder.set_refinement_region(Some(region)).unwrap();
+        let began = std::time::Instant::now();
+        let unit = encoder
+            .encode(
+                &planar.picture(),
+                EncodeRequest {
+                    key: false,
+                    quantizer: 8,
+                    refine: true,
+                },
+            )
+            .unwrap();
+        let elapsed = began.elapsed();
+        let after = decoder.decode(&unit.data).rgb();
+        let mut old_error = 0u64;
+        let mut new_error = 0u64;
+        let mut changed = 0usize;
+        let mut first_changes = Vec::new();
+        for y in 0..height {
+            for x in 0..width {
+                let at = (y as usize * width as usize + x as usize) * 4;
+                if (region.x..region.x + region.width).contains(&x)
+                    && (region.y..region.y + region.height).contains(&y)
+                {
+                    for (rgb, bgr) in [(0, 2), (1, 1), (2, 0)] {
+                        old_error += u64::from(source[at + bgr].abs_diff(before[at + rgb])).pow(2);
+                        new_error += u64::from(source[at + bgr].abs_diff(after[at + rgb])).pow(2);
+                    }
+                } else {
+                    if before[at..at + 3] != after[at..at + 3] {
+                        changed += 1;
+                        if first_changes.len() < 20 {
+                            first_changes.push((x, y));
+                        }
+                    }
+                }
+            }
+        }
+        println!(
+            "MINIMUM_REGION {}",
+            serde_json::json!({"region":[region.x,region.y,region.width,region.height],"bytes":unit.data.len(),"budget":3_000_000/320,"encodeMs":elapsed.as_millis(),"outsideChanged":changed,"insideBefore":old_error,"insideAfter":new_error,"firstChanges":first_changes})
+        );
+        assert_eq!(
+            changed, 0,
+            "regional step modified inactive reference pixels"
+        );
+        assert!(
+            new_error < old_error,
+            "regional step failed to sharpen noisy pixels"
+        );
+        assert!(
+            unit.data.len() <= 3_000_000 / 320,
+            "even the smallest native block exceeds the link step budget"
+        );
+        before = after;
+    }
+}
+
+/// A native key's bytes are observed independently of replenishment credit.
+/// Native quality stays unchanged; legacy and coded-capacity admission are
+/// distinct from the first key's physical serialization time.
+#[test]
+#[ignore = "qualification: wide high-entropy native keys"]
+fn wide_fixed_quality_keys_preserve_native_pixels_and_report_the_wire_boundary() {
+    for (width, height, bits_per_second, former_level) in [
+        (320u32, 192u32, 20_000u32, 8),
+        (1536, 2048, 3_000_000, 12),
+        (4096, 4096, 500_000, 16),
+    ] {
+        let mut source = Vec::with_capacity(width as usize * height as usize * 4);
+        let mut random = 0x01234567u32;
+        for _ in 0..width * height {
+            for _ in 0..3 {
+                random ^= random << 13;
+                random ^= random >> 17;
+                random ^= random << 5;
+                source.push(random as u8);
+            }
+            source.push(0);
+        }
+        let mut planar = Planar::new(Chroma::Full, width, height);
+        assert!(planar.convert(
+            &source,
+            width as usize * 4,
+            (width as usize, height as usize),
+            (0, height as usize)
+        ));
+        let request = EncodeRequest {
+            key: true,
+            quantizer: 32,
+            refine: false,
+        };
+        let mut baseline = AomEncoder::new(VideoCodec::Av1Full, width, height, 4).unwrap();
+        baseline.tune(54, former_level).unwrap();
+        let before = baseline.encode(&planar.picture(), request).unwrap();
+        let mut candidate = AomEncoder::new(VideoCodec::Av1Full, width, height, 4).unwrap();
+        candidate
+            .set_rate(Some(EncoderRate {
+                bits_per_second,
+                pictures_per_second: 60,
+            }))
+            .unwrap();
+        let key = candidate.encode(&planar.picture(), request).unwrap();
+        assert_eq!(
+            frame_obus(&before.data),
+            frame_obus(&key.data),
+            "native coded-frame byte parity at{width}x{height}"
+        );
+        let mut decoder = Decoder::new();
+        let after = decoder.decode(&key.data);
+        assert_eq!(after.rgb(), Decoder::new().decode(&before.data).rgb());
+        let bytes = key.data.len();
+        let capacity = VideoCodec::Av1Full.coded_capacity(width, height).unwrap();
+        assert!(bytes <= capacity);
+        if let Ok(directory) = std::env::var("AMBIT_NATIVE_KEY_EVIDENCE") {
+            let directory = std::path::Path::new(&directory);
+            std::fs::create_dir_all(directory).unwrap();
+            std::fs::write(
+                directory.join(format!("native-q32-noise-{width}x{height}.av1")),
+                &key.data,
+            )
+            .unwrap();
+        }
+        println!(
+            "NATIVE_WIDE_KEY {}",
+            serde_json::json!({"width":width,"height":height,"rate":bits_per_second,"codecString":key.codec_string,"keyBytes":bytes,"fitsLegacyEnvelope":bytes <= 4*1024*1024,"codedCapacity":capacity,"fitsCodedCapacity":true,"serializationFloorMs":bytes as f64*8000.0/f64::from(bits_per_second),"codedFrameBytesEqual":true,"pixelsEqual":true})
+        );
+        // Transport admission does not poison native state: a valid dependent
+        // unit still decodes. The track owns legacy refusal and retirement.
+        let delta = candidate
+            .encode(
+                &planar.picture(),
+                EncodeRequest {
+                    key: false,
+                    quantizer: 32,
+                    refine: false,
+                },
+            )
+            .unwrap();
+        assert!(!delta.key && delta.codec_string.is_none());
+        let decoded = decoder.decode(&delta.data);
+        assert_eq!(
+            (decoded.width, decoded.height, decoded.colour),
+            (width, height, COLOUR)
+        );
+    }
+}
+
+#[test]
 fn rate_control_uses_real_picture_periods_and_preserves_the_reference_chain() {
     let source = text_fixture(LIGHT);
     let mut planar = Planar::new(Chroma::Full, FIXTURE.0 as u32, FIXTURE.1 as u32);
@@ -13,7 +626,6 @@ fn rate_control_uses_real_picture_periods_and_preserves_the_reference_chain() {
     let rate = EncoderRate {
         bits_per_second: 500_000,
         pictures_per_second: 60,
-        key_bytes: 15_625,
     };
     encoder.set_rate(Some(rate)).unwrap();
     assert_eq!(
@@ -45,22 +657,19 @@ fn rate_control_uses_real_picture_periods_and_preserves_the_reference_chain() {
         bytes.push(unit.data.len());
     }
     assert_eq!(
-        encoder.pictures,
-        60 * 16_666,
-        "CBR receives one actual frame period per picture"
+        encoder.pictures, 60,
+        "the encoder clock counts frames rather than mixing frame and microsecond units"
     );
     assert!(
-        bytes[0] <= rate.key_bytes as usize,
-        "key unit {} bytes, budget {}",
-        bytes[0],
-        rate.key_bytes
+        bytes[0] <= 4 * 1024 * 1024,
+        "key exceeds the existing wire bound"
     );
     assert!(bytes[1..]
         .iter()
         .all(|bytes| *bytes <= (rate.bits_per_second as usize / 8 / 60) * 115 / 100));
     println!(
         "RATE_FIXTURE {}",
-        serde_json::json!({"codec":"av1-444","width":FIXTURE.0,"height":FIXTURE.1,"bitsPerSecond":rate.bits_per_second,"picturesPerSecond":rate.pictures_per_second,"keyBudgetBytes":rate.key_bytes,"unitBytes":bytes})
+        serde_json::json!({"codec":"av1-444","width":FIXTURE.0,"height":FIXTURE.1,"bitsPerSecond":rate.bits_per_second,"picturesPerSecond":rate.pictures_per_second,"unitBytes":bytes})
     );
     // A refinement is fixed-quality against the same references; motion returns to CBR without a key unit.
     let refined = encoder
@@ -105,34 +714,157 @@ fn rate_control_uses_real_picture_periods_and_preserves_the_reference_chain() {
 }
 
 #[test]
+fn first_and_reset_keys_preserve_native_fixed_quality_across_rate_and_refinement_modes() {
+    for codec in [VideoCodec::Av1, VideoCodec::Av1Full] {
+        let source = text_fixture(LIGHT);
+        let mut picture = Planar::new(codec.chroma(), FIXTURE.0 as u32, FIXTURE.1 as u32);
+        assert!(picture.convert(&source, FIXTURE.0 * 4, FIXTURE, (0, FIXTURE.1)));
+        let key_request = EncodeRequest {
+            key: true,
+            quantizer: 32,
+            refine: false,
+        };
+        let mut native = AomEncoder::new(codec, FIXTURE.0 as u32, FIXTURE.1 as u32, 2).unwrap();
+        // Independent fixed-Q baseline retains the former explicit target
+        // level. Automatic metadata may change its sequence-header bytes;
+        // frame payload and reconstructed pixels must retain native quality.
+        native.tune(54, 8).unwrap();
+        let native_key = native.encode(&picture.picture(), key_request).unwrap();
+        let mut encoder = AomEncoder::new(codec, FIXTURE.0 as u32, FIXTURE.1 as u32, 2).unwrap();
+        encoder
+            .set_rate(Some(EncoderRate {
+                bits_per_second: 3_000_000,
+                pictures_per_second: 60,
+            }))
+            .unwrap();
+        let first = encoder.encode(&picture.picture(), key_request).unwrap();
+        assert_eq!(
+            frame_obus(&first.data),
+            frame_obus(&native_key.data),
+            "first-key coded-frame parity with the native fixed-quality encoder"
+        );
+        assert_eq!(encoder.config.end_usage, Q);
+        let mut decoder = Decoder::new();
+        let first_pixels = decoder.decode(&first.data).rgb();
+        let native_pixels = Decoder::new().decode(&native_key.data).rgb();
+        assert_eq!(first_pixels, native_pixels);
+        let motion = encoder
+            .encode(
+                &picture.picture(),
+                EncodeRequest {
+                    key: false,
+                    quantizer: 32,
+                    refine: false,
+                },
+            )
+            .unwrap();
+        assert!(!motion.key);
+        decoder.decode(&motion.data);
+        assert_eq!(encoder.config.end_usage, CBR);
+        let actual = encoder
+            .set_refinement_region(Some(EncoderRegion {
+                x: 10,
+                y: 10,
+                width: 20,
+                height: 20,
+            }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            actual,
+            EncoderRegion {
+                x: 0,
+                y: 0,
+                width: 32,
+                height: 32
+            }
+        );
+        let refined = encoder
+            .encode(
+                &picture.picture(),
+                EncodeRequest {
+                    key: false,
+                    quantizer: 8,
+                    refine: true,
+                },
+            )
+            .unwrap();
+        assert!(!refined.key);
+        decoder.decode(&refined.data);
+        let reset = encoder.encode(&picture.picture(), key_request).unwrap();
+        assert!(reset.key);
+        assert_eq!(encoder.config.end_usage, Q);
+        assert_eq!(encoder.region, None);
+        assert!(encoder.active_map.cells.is_null());
+        let reset_pixels = decoder.decode(&reset.data);
+        assert_eq!(reset_pixels.colour, COLOUR);
+        assert_eq!(
+            (reset_pixels.width, reset_pixels.height),
+            (FIXTURE.0 as u32, FIXTURE.1 as u32)
+        );
+    }
+}
+
+#[test]
 fn malformed_rate_budgets_do_not_mutate_the_encoder() {
     let mut encoder = AomEncoder::new(VideoCodec::Av1Full, 64, 64, 1).unwrap();
     for rate in [
         EncoderRate {
             bits_per_second: 999,
             pictures_per_second: 60,
-            key_bytes: 20_000,
         },
         EncoderRate {
             bits_per_second: 1_000_000,
             pictures_per_second: 0,
-            key_bytes: 20_000,
         },
         EncoderRate {
             bits_per_second: 1_000_000,
             pictures_per_second: 61,
-            key_bytes: 20_000,
-        },
-        EncoderRate {
-            bits_per_second: 1_000_000,
-            pictures_per_second: 60,
-            key_bytes: 0,
         },
     ] {
         assert!(encoder.set_rate(Some(rate)).is_err());
         assert_eq!(encoder.rate, None);
         assert_eq!(encoder.config.end_usage, Q);
     }
+}
+
+#[test]
+fn changing_picture_rates_keeps_one_decodable_native_reference_chain() {
+    let source = text_fixture(LIGHT);
+    let mut planar = Planar::new(Chroma::Full, FIXTURE.0 as u32, FIXTURE.1 as u32);
+    assert!(planar.convert(&source, FIXTURE.0 * 4, FIXTURE, (0, FIXTURE.1)));
+    let mut encoder =
+        AomEncoder::new(VideoCodec::Av1Full, FIXTURE.0 as u32, FIXTURE.1 as u32, 2).unwrap();
+    let mut decoder = Decoder::new();
+    let mut frame = 0;
+    for pictures_per_second in [60, 10, 1, 30, 60] {
+        encoder
+            .set_rate(Some(EncoderRate {
+                bits_per_second: 500_000,
+                pictures_per_second,
+            }))
+            .unwrap();
+        for _ in 0..8 {
+            let unit = encoder
+                .encode(
+                    &planar.picture(),
+                    EncodeRequest {
+                        key: frame == 0,
+                        quantizer: 32,
+                        refine: false,
+                    },
+                )
+                .unwrap();
+            assert_eq!(unit.key, frame == 0);
+            let decoded = decoder.decode(&unit.data);
+            assert_eq!(
+                (decoded.width, decoded.height, decoded.colour),
+                (FIXTURE.0 as u32, FIXTURE.1 as u32, COLOUR)
+            );
+            frame += 1;
+        }
+    }
+    assert_eq!(encoder.pictures, frame);
 }
 
 /// The layout this FFI relies on, against the values `offsetof` measured
@@ -194,17 +926,218 @@ fn every_field_sits_where_the_pinned_headers_put_it() {
 }
 
 #[test]
-fn the_level_is_the_smallest_that_holds_the_stream_at_sixty_pictures() {
-    assert_eq!(level(64, 64), 8);
-    assert_eq!(level(1280, 720), 8);
-    assert_eq!(
-        level(1920, 1080),
-        9,
-        "124.4 M samples/s exceed 4.0's 70.8 M"
-    );
-    assert_eq!(level(2048, 2048), 12);
-    assert_eq!(level(4096, 2176), 13);
-    assert_eq!(level(4096, 4096), 16);
+fn malformed_sequence_metadata_is_refused_without_panicking() {
+    for bytes in [
+        vec![],
+        vec![0x0a],
+        vec![0x0a, 255],
+        vec![0x0a, 1, 0],
+        vec![0x0a, 3, 0],
+        vec![0x0e],
+        vec![0x8a, 0],
+        vec![0x0b, 0],
+        vec![0x0a, 255, 255, 255, 255, 255, 255, 255, 255],
+    ] {
+        assert!(key_codec_string(&bytes).is_none(), "{bytes:?}");
+    }
+    let mut noise = 0xabcdef01u32;
+    for length in 0..128 {
+        let bytes: Vec<u8> = (0..length)
+            .map(|_| {
+                noise ^= noise << 13;
+                noise ^= noise >> 17;
+                noise ^= noise << 5;
+                noise as u8
+            })
+            .collect();
+        let _ = key_codec_string(&bytes);
+    }
+}
+
+#[test]
+fn automatic_level_repeated_regional_sequence_decodes_beyond_the_former_native_abort() {
+    let codec = VideoCodec::Av1Full;
+    let mut encoder = AomEncoder::new(codec, 1024, 768, 2).unwrap();
+    if std::env::var_os("AMBIT_TEST_FORMER_FORCED_LEVEL").is_some() {
+        encoder.tune(54, 8).unwrap();
+    }
+    encoder
+        .set_rate(Some(EncoderRate {
+            bits_per_second: 20_000,
+            pictures_per_second: 60,
+        }))
+        .unwrap();
+    let mut source = vec![0u8; 1024 * 768 * 4];
+    for y in 0..768usize {
+        for x in 0..1024usize {
+            source[(y * 1024 + x) * 4..(y * 1024 + x) * 4 + 4].copy_from_slice(&[
+                (y * 17) as u8,
+                (y * 71) as u8,
+                (y * 113) as u8,
+                0,
+            ]);
+        }
+    }
+    let mut planar = Planar::new(Chroma::Full, 1024, 768);
+    assert!(planar.convert(&source, 4096, (1024, 768), (0, 768)));
+    let mut decoder = Decoder::new();
+    for frame in 0..80 {
+        encoder
+            .set_refinement_region((frame > 0).then_some(EncoderRegion {
+                x: (frame % 20) * 32,
+                y: (frame / 20) * 32,
+                width: 32,
+                height: 32,
+            }))
+            .unwrap();
+        let unit = encoder
+            .encode(
+                &planar.picture(),
+                EncodeRequest {
+                    key: frame == 0,
+                    quantizer: if frame == 0 { 32 } else { 8 },
+                    refine: frame > 0,
+                },
+            )
+            .unwrap();
+        let decoded = decoder.decode(&unit.data);
+        assert_eq!(
+            (
+                decoded.width,
+                decoded.height,
+                decoded.colour,
+                decoded.chroma
+            ),
+            (1024, 768, COLOUR, Chroma::Full)
+        );
+        if frame == 0 {
+            let header = sequence_header(&unit.data).unwrap();
+            assert_eq!(
+                unit.codec_string.as_deref(),
+                Some(format!("av01.{}.{:02}M.08", header.profile, header.level).as_str())
+            );
+            assert!(unit.data.len() <= 4 * 1024 * 1024);
+            println!(
+                "AUTOMATIC_KEY {}",
+                serde_json::json!({"codecString":unit.codec_string,"bytes":unit.data.len(),"level":header.level,"profile":header.profile})
+            );
+        } else {
+            assert!(unit.codec_string.is_none());
+        }
+    }
+}
+
+/// Native first/reset keys at the accepted dimensional and rate boundaries,
+/// exported for the real Chromium decoder, never substituted by ffmpeg.
+#[test]
+#[ignore = "qualification matrix: AMBIT_AUTOMATIC_LEVEL_FIXTURE output path"]
+fn export_automatic_level_dimension_rate_reset_matrix() {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    let mut cases = Vec::new();
+    for (codec, width, height, bits_per_second) in [
+        (VideoCodec::Av1Full, 64, 64, 1000),
+        (VideoCodec::Av1, 64, 64, 20_000),
+        (VideoCodec::Av1Full, 1280, 720, 500_000),
+        (VideoCodec::Av1, 1280, 720, 3_000_000),
+        (VideoCodec::Av1Full, 1536, 2048, 20_000),
+        (VideoCodec::Av1, 1536, 2048, 500_000),
+        (VideoCodec::Av1Full, 2048, 2048, 3_000_000),
+        (VideoCodec::Av1, 2048, 2048, 20_000),
+        (VideoCodec::Av1Full, 4096, 4096, 500_000),
+        (VideoCodec::Av1, 4096, 4096, 3_000_000),
+    ] {
+        let mut source = vec![0u8; width as usize * height as usize * 4];
+        for y in 0..height as usize {
+            for x in 0..width as usize {
+                let rgb = match x * 4 / width as usize {
+                    0 => [255, 255, 255, 0],
+                    1 => [48, 48, 48, 0],
+                    2 => [0, 0, 255, 0],
+                    _ => [218, 105, 9, 0],
+                };
+                source[(y * width as usize + x) * 4..(y * width as usize + x) * 4 + 4]
+                    .copy_from_slice(&rgb);
+            }
+        }
+        let mut planar = Planar::new(codec.chroma(), width, height);
+        assert!(planar.convert(
+            &source,
+            width as usize * 4,
+            (width as usize, height as usize),
+            (0, height as usize)
+        ));
+        let mut encoder = AomEncoder::new(codec, width, height, 4).unwrap();
+        encoder
+            .set_rate(Some(EncoderRate {
+                bits_per_second,
+                pictures_per_second: 60,
+            }))
+            .unwrap();
+        let mut decoder = Decoder::new();
+        let mut units = Vec::new();
+        for frame in 0..3 {
+            let key = frame != 1;
+            let unit = encoder
+                .encode(
+                    &planar.picture(),
+                    EncodeRequest {
+                        key,
+                        quantizer: 32,
+                        refine: false,
+                    },
+                )
+                .unwrap();
+            assert_eq!(unit.key, key);
+            assert!(unit.data.len() <= 4 * 1024 * 1024);
+            if key {
+                let header = sequence_header(&unit.data).unwrap();
+                assert_eq!(
+                    unit.codec_string.as_deref(),
+                    Some(format!("av01.{}.{:02}M.08", header.profile, header.level).as_str())
+                );
+                assert_eq!(
+                    (
+                        header.primaries,
+                        header.transfer,
+                        header.matrix,
+                        header.full_range
+                    ),
+                    (Some(1), Some(1), Some(1), true)
+                );
+            } else {
+                assert!(unit.codec_string.is_none());
+            }
+            let decoded = decoder.decode(&unit.data);
+            assert_eq!(
+                (
+                    decoded.width,
+                    decoded.height,
+                    decoded.chroma,
+                    decoded.colour
+                ),
+                (width, height, codec.chroma(), COLOUR)
+            );
+            let rgb = decoded.rgb();
+            let samples: Vec<_> = (0..4u32)
+                .map(|bar| {
+                    let (x, y) = ((bar * 2 + 1) * width / 8, height / 2);
+                    let at = (y as usize * width as usize + x as usize) * 4;
+                    serde_json::json!({"x":x,"y":y,"rgb":rgb[at..at+3]})
+                })
+                .collect();
+            units.push(serde_json::json!({"key":key,"codecString":unit.codec_string,"bytes":unit.data.len(),"data":STANDARD.encode(&unit.data),"samples":samples}));
+        }
+        println!(
+            "NATIVE_CONFIGURATION {}",
+            serde_json::json!({"codec":codec.token(),"width":width,"height":height,"rate":bits_per_second,"keys":units.iter().filter(|unit|unit["key"]==true).map(|unit|(&unit["codecString"],&unit["bytes"])).collect::<Vec<_>>()})
+        );
+        cases.push(serde_json::json!({"codec":codec.token(),"width":width,"height":height,"rate":bits_per_second,"units":units}));
+    }
+    std::fs::write(
+        std::env::var("AMBIT_AUTOMATIC_LEVEL_FIXTURE").unwrap(),
+        serde_json::to_vec(&cases).unwrap(),
+    )
+    .unwrap();
 }
 
 #[test]
@@ -338,10 +1271,9 @@ fn the_sequence_header_signals_the_codec_string_and_colour_description() {
         let profile = u8::from(codec.chroma() == Chroma::Full);
         assert_eq!(header.profile, profile);
         assert_eq!(
-            encoder.codec_string(),
-            format!("av01.{profile}.{:02}M.08", header.level)
+            unit.codec_string.as_deref(),
+            Some(format!("av01.{profile}.{:02}M.08", header.level).as_str())
         );
-        assert_eq!(header.level, level(width, height));
         assert_eq!(header.tier, 0);
         assert_eq!(
             (
@@ -360,12 +1292,6 @@ fn the_sequence_header_signals_the_codec_string_and_colour_description() {
             }
         );
     }
-    let encoder = AomEncoder::new(VideoCodec::Av1Full, 2048, 2048, 1).unwrap();
-    assert_eq!(
-        encoder.codec_string(),
-        "av01.1.12M.08",
-        "the contract's probe string"
-    );
 }
 
 /// A screen of text (1 px strokes, grey antialiasing, coloured links) on a
@@ -638,7 +1564,8 @@ pub(crate) fn still_unit(codec: VideoCodec, source: &[u8]) -> (Planar, EncodedUn
         ..Default::default()
     };
     let unit = encoder.encode(&picture.picture(), request).unwrap();
-    (picture, unit, encoder.codec_string())
+    let codec_string = unit.codec_string.clone().unwrap();
+    (picture, unit, codec_string)
 }
 
 /// The pixels inside the bars, 4 px from their sides and 8 px from their
@@ -893,6 +1820,28 @@ struct SequenceHeader {
     matrix: Option<u8>,
     full_range: bool,
     subsampling: (u8, u8),
+}
+
+/// Trusted native output, independent of the production configuration parser.
+/// Only the sequence header may differ when libaom selects its own level.
+fn frame_obus(unit: &[u8]) -> Vec<Vec<u8>> {
+    let mut at = 0;
+    let mut frames = Vec::new();
+    while at < unit.len() {
+        let begin = at;
+        let header = unit[at];
+        at += 1 + usize::from(header & 4 != 0);
+        let size = if header & 2 != 0 {
+            leb128(unit, &mut at)
+        } else {
+            unit.len() - at
+        };
+        at += size;
+        if (header >> 3) & 15 != 1 {
+            frames.push(unit[begin..at].to_vec());
+        }
+    }
+    frames
 }
 
 struct Bits<'a> {

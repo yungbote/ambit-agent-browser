@@ -22,6 +22,42 @@ const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// The descriptor the helper serves captures on; see `DisplayProcess::spawn`.
 const FRAME_CHANNEL_FD: i32 = 3;
 
+/// An already-owned private desktop child, bound beyond reusable PID identity.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, Serialize)]
+pub(crate) struct DesktopProcess {
+    pid: u32,
+    started: u64,
+}
+
+#[cfg(target_os = "linux")]
+impl DesktopProcess {
+    pub(crate) fn owned(pid: u32) -> Option<Self> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let fields: Vec<_> = stat.rsplit_once(')')?.1.split_whitespace().collect();
+        let started = fields.get(19)?.parse().ok()?;
+        (pid > 0 && started > 0 && !matches!(fields.first().copied(), Some("Z" | "X")))
+            .then_some(Self { pid, started })
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod desktop_process_tests {
+    use super::DesktopProcess;
+
+    #[test]
+    fn private_desktop_binding_uses_a_live_process_birth_and_exact_wire_shape() {
+        let pid = std::process::id();
+        let process = DesktopProcess::owned(pid).unwrap();
+        let value = serde_json::to_value(process).unwrap();
+        assert_eq!(value["pid"], pid);
+        assert!(value["started"].as_u64().is_some_and(|started| started > 0));
+        assert_eq!(value.as_object().unwrap().len(), 2);
+        assert!(DesktopProcess::owned(0).is_none());
+        assert!(DesktopProcess::owned(u32::MAX).is_none());
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct Surface {
@@ -977,6 +1013,7 @@ mod platform {
             display: &str,
             authority: &Path,
             chrome_pid: u32,
+            desktop_process: Option<super::DesktopProcess>,
         ) -> Result<Self, String> {
             let executable = std::env::var_os("AGENT_BROWSER_DISPLAY_HELPER")
                 .map(std::path::PathBuf::from)
@@ -1000,6 +1037,15 @@ mod platform {
             // is spawned as before and simply never advertises them.
             let pictures = PictureChannel::create().ok();
             let mut command = Command::new(executable);
+            if let Some(process) = desktop_process {
+                command.env(
+                    "BROWSER_DISPLAY_DESKTOP_PROCESS",
+                    serde_json::to_string(&process)
+                        .map_err(|_| "Private desktop binding is unavailable")?,
+                );
+            } else {
+                command.env_remove("BROWSER_DISPLAY_DESKTOP_PROCESS");
+            }
             command
                 .args([
                     "--chrome-pid",

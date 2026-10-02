@@ -1,5 +1,7 @@
 pub mod chrome;
 pub mod client;
+#[cfg(target_os = "linux")]
+mod desktop_portal;
 pub mod discovery;
 pub mod lightpanda;
 mod pointer;

@@ -26,7 +26,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
-use super::policy::{period, rate, CodedSize, LinkRate, Quality, Refinement};
+use super::policy::{
+    period, rate, CodedSize, LinkRate, Quality, Refinement, RefinementCredit, RefinementSweep,
+};
 use super::subscription::{Delivery, Subscriber, Unit};
 use crate::native::display::pictures::{PictureReply, PictureRequest};
 use crate::native::display::{DisplayClient, Rect, Surface};
@@ -131,6 +133,7 @@ struct Capture {
     visible: Rect,
     surface: Surface,
     input_seq: Option<u64>,
+    pointer: Option<(i32, i32)>,
 }
 
 /// One capture: the request, and the encodings its picture is for.
@@ -455,7 +458,8 @@ impl Encoding {
         let Some(mut buffer) = mailbox.free.pop() else {
             return;
         };
-        // PictureChannel checked these global extents inside the framebuffer.
+        // Admission checked these global device extents inside the source.
+        // Cropping must never discard the right/bottom edge of an offset window.
         let window = (
             capture.visible.x as u32 + capture.visible.width,
             capture.visible.y as u32 + capture.visible.height,
@@ -500,6 +504,7 @@ impl Encoding {
         &self,
         holds: bool,
         refinement: &Refinement,
+        credit: &mut RefinementCredit,
         geometry: &dyn Fn() -> Instant,
     ) -> Option<Work> {
         let mut mailbox = lock(&self.mailbox);
@@ -516,7 +521,12 @@ impl Encoding {
             }
             let due = refinement
                 .due(geometry())
-                .filter(|_| holds && self.rate().is_some());
+                .filter(|_| holds && !mailbox.behind && self.rate().is_some())
+                .map(|at| {
+                    self.link_rate().map_or(at, |path| {
+                        at.max(credit.due(path.bits_per_second, Instant::now()))
+                    })
+                });
             mailbox = match due {
                 Some(at) => {
                     let now = Instant::now();
@@ -568,6 +578,8 @@ fn convert(
         whole = true;
     }
     if buffer.source != Some(source) {
+        // A new aperture may expose old gutter rows without pixel damage.
+        // Clear stale padding and reconvert the complete coherent slot.
         buffer.picture.clear_outside(0, 0);
         buffer.source = Some(source);
         whole = true;
@@ -590,7 +602,12 @@ fn convert(
             pixels,
             reply.stride as usize,
             (reply.width as usize, height),
-            window,
+            codec::EncoderRegion {
+                x: window.x as u32,
+                y: window.y as u32,
+                width: window.width,
+                height: window.height,
+            },
             (top, row),
         );
     }
@@ -625,6 +642,7 @@ fn capture_loop(inner: Weak<Inner>) {
                 visible: reply.window(),
                 surface,
                 input_seq: inner.source.media.applied_input_at(ts),
+                pointer: reply.pointer.map(|point| (point.x, point.y)),
             };
             lock(&inner.state).snapshots.captured(
                 reply,
@@ -787,12 +805,17 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
     let mut encoder: Option<Box<dyn VideoEncoder>> = None;
     let mut held: Option<(Buffer, Capture)> = None;
     let mut refinement = Refinement::default();
+    let mut credit = RefinementCredit::default();
+    let mut sweep: Option<RefinementSweep> = None;
+    let mut native_key_bytes = 0usize;
     loop {
-        let Some(work) = encoding.next_work(held.is_some(), &refinement, &geometry) else {
+        let Some(work) = encoding.next_work(held.is_some(), &refinement, &mut credit, &geometry)
+        else {
             return;
         };
-        let (quality, asked) = match work {
+        let (mut quality, asked) = match work {
             Work::Picture(job, asked) => {
+                sweep = None;
                 if let Some((previous, _)) = held.replace((job.buffer, job.capture)) {
                     lock(&encoding.mailbox).free.push(previous);
                     if let Some(producer) = producer.upgrade() {
@@ -801,7 +824,10 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
                 }
                 (Quality::Motion, asked)
             }
-            Work::Key => (Quality::Motion, true),
+            Work::Key => {
+                sweep = None;
+                (Quality::Motion, true)
+            }
             Work::Refine => (Quality::Final, false),
         };
         let (buffer, capture) = held.as_ref().expect("work needs a held picture");
@@ -829,15 +855,64 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
         if let Err(error) = encoder.set_rate(path.map(|path| EncoderRate {
             bits_per_second: path.bits_per_second,
             pictures_per_second: encoding.rate().unwrap_or(10),
-            key_bytes: path.key_bytes(),
         })) {
             fail(&producer, &encoding, error);
             return;
         }
+        // Native key size is an observed entropy estimate, not a packet-size
+        // proof. Cheap whole refinements retain the existing fast path;
+        // constrained paths cover the same capture in finite aligned regions.
+        let region = if quality == Quality::Final {
+            if let Some(path) =
+                path.filter(|path| native_key_bytes > path.bits_per_second as usize / 320)
+            {
+                let plan = sweep.get_or_insert_with(|| {
+                    let pixels =
+                        u64::from(capture.visible.width) * u64::from(capture.visible.height);
+                    let affordable = pixels.saturating_mul(u64::from(path.bits_per_second) / 320)
+                        / native_key_bytes.max(1) as u64;
+                    let mut edge = 32u32;
+                    while edge < 1024 && u64::from(edge * 2).pow(2) <= affordable {
+                        edge *= 2;
+                    }
+                    RefinementSweep::new(
+                        // PictureChannel has validated this rectangle inside
+                        // its framebuffer. Keep its signed device origin in
+                        // the same space as the helper's fresh pointer.
+                        crate::native::video::EncoderRegion {
+                            x: capture.visible.x as u32,
+                            y: capture.visible.y as u32,
+                            width: capture.visible.width,
+                            height: capture.visible.height,
+                        },
+                        edge,
+                        capture.pointer,
+                    )
+                });
+                plan.next()
+            } else {
+                sweep = None;
+                None
+            }
+        } else {
+            None
+        };
+        let actual = match encoder.set_refinement_region(region) {
+            Ok(actual) => actual,
+            Err(error) => {
+                fail(&producer, &encoding, error);
+                return;
+            }
+        };
+        if let (Some(plan), Some(actual)) = (sweep.as_mut(), actual) {
+            if !plan.covered(actual) {
+                quality = Quality::Refine;
+            }
+        }
         let request = EncodeRequest {
             key: asked || fresh,
             quantizer: quality.quantizer(),
-            refine: quality == Quality::Final,
+            refine: matches!(quality, Quality::Refine | Quality::Final),
         };
         #[cfg(test)]
         let encoding_started = Instant::now();
@@ -848,6 +923,9 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
                 return;
             }
         };
+        if unit.key {
+            native_key_bytes = unit.data.len();
+        }
         if quality == Quality::Motion && !unit.key {
             let previous = encoding.motion_bytes.load(Ordering::Acquire);
             encoding.motion_bytes.store(
@@ -867,10 +945,12 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
         });
         match quality {
             Quality::Motion => refinement.moved(capture.read),
+            Quality::Refine => {}
             Quality::Final => refinement.refined(),
         }
-        encoding.publish(Arc::new(Unit {
+        let mut unit = Unit {
             data: unit.data,
+            wire_bytes: 0,
             key: unit.key,
             ts: capture.ts,
             coded: buffer.coded,
@@ -878,8 +958,25 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
             surface: capture.surface.clone(),
             input_seq: capture.input_seq,
             quality,
-            codec_string: unit.key.then(|| encoder.codec_string()),
-        }));
+            codec_string: unit.codec_string,
+        };
+        let Some(wire_bytes) =
+            crate::native::stream::wire::video_budget_bytes(&unit, encoding.codec)
+        else {
+            fail(
+                &producer,
+                &encoding,
+                VideoError::Failed("encoded picture is outside the video wire contract".into()),
+            );
+            return;
+        };
+        unit.wire_bytes = wire_bytes;
+        if matches!(quality, Quality::Refine | Quality::Final) {
+            if let Some(path) = path {
+                credit.spent(path.bits_per_second, wire_bytes, Instant::now());
+            }
+        }
+        encoding.publish(Arc::new(unit));
     }
 }
 
@@ -919,6 +1016,9 @@ impl Subscription {
     /// wakes both a skipped capture and a deferred refinement.
     pub(crate) fn set_ready(&self, ready: bool) {
         if self.subscriber.set_ready(ready) && ready {
+            if self.subscriber.needs_key() {
+                self.encoding.request_key();
+            }
             self.encoding.nudge();
             self.producer.inner.nudge();
         }
