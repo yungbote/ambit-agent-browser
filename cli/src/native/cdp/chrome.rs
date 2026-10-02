@@ -269,6 +269,29 @@ impl ChromeProcess {
     }
 }
 
+#[cfg(test)]
+impl ChromeProcess {
+    /// A browser process of `child`, launched with `launch` and nothing
+    /// else attached, for tests of what owns a browser.
+    pub(crate) fn for_test(child: Child, launch: LaunchOptions) -> Self {
+        Self {
+            child,
+            devtools_url: None,
+            launch: Box::new(launch),
+            executable: PathBuf::from("/opt/ambit/browser/chrome/chrome"),
+            temp_user_data_dir: None,
+            temp_nss_home: None,
+            #[cfg(unix)]
+            pgid: None,
+            #[cfg(target_os = "linux")]
+            xvfb: None,
+            window_theme: WindowTheme::NextLaunch,
+            #[cfg(target_os = "linux")]
+            display_process: None,
+        }
+    }
+}
+
 impl Drop for ChromeProcess {
     fn drop(&mut self) {
         #[cfg(target_os = "linux")]
@@ -2440,24 +2463,6 @@ mod tests {
         }
     }
 
-    fn test_process(child: Child, launch: LaunchOptions) -> ChromeProcess {
-        ChromeProcess {
-            child,
-            devtools_url: None,
-            launch: Box::new(launch),
-            executable: PathBuf::from("/opt/ambit/browser/chrome/chrome"),
-            temp_user_data_dir: None,
-            temp_nss_home: None,
-            #[cfg(unix)]
-            pgid: None,
-            #[cfg(target_os = "linux")]
-            xvfb: None,
-            window_theme: WindowTheme::NextLaunch,
-            #[cfg(target_os = "linux")]
-            display_process: None,
-        }
-    }
-
     /// Sign-in mode removes the one automation switch and nothing else:
     /// every other managed flag stays byte-identical and in order.
     #[test]
@@ -2598,7 +2603,7 @@ mod tests {
                 system_theme: Mutex::new(None),
             }),
         };
-        let mut process = test_process(
+        let mut process = ChromeProcess::for_test(
             spawn_noop_child(),
             LaunchOptions {
                 window_stream: true,
@@ -2667,7 +2672,7 @@ mod tests {
             child
         };
 
-        let mut graceful = test_process(
+        let mut graceful = ChromeProcess::for_test(
             started_shell("trap 'exit 0' TERM; while :; do sleep 0.05; done"),
             LaunchOptions::default(),
         );
@@ -2680,7 +2685,7 @@ mod tests {
             "SIGTERM let it exit on its own: {status:?}"
         );
 
-        let mut stubborn = test_process(
+        let mut stubborn = ChromeProcess::for_test(
             started_shell("trap '' TERM; while :; do sleep 0.05; done"),
             LaunchOptions::default(),
         );
@@ -3190,7 +3195,7 @@ mod tests {
 
     #[tokio::test]
     async fn pinned_window_theme_reports_the_limit_without_starting_a_settings_worker() {
-        let mut process = test_process(spawn_noop_child(), LaunchOptions::default());
+        let mut process = ChromeProcess::for_test(spawn_noop_child(), LaunchOptions::default());
         process.window_theme = WindowTheme::Pinned;
         assert_eq!(process.apply_window_theme(Theme::Light).await, "pinned");
         assert_eq!(process.apply_window_theme(Theme::Dark).await, "pinned");
