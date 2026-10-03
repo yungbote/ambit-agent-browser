@@ -10196,6 +10196,97 @@ async fn e2e_tab_new_inherits_user_agent_and_headers() {
     assert_success(&resp);
 }
 
+/// New tabs in a displayed Chrome are created by actual Ctrl+T input,
+/// while setup still applies before their first destination request.
+#[tokio::test]
+#[ignore]
+async fn e2e_native_tab_new_keeps_setup_and_label_admission() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let (base, server) = start_echo_server().await;
+    let mut state = DaemonState::new();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"launch","headless":true,"userAgent":"native-tab-proof"}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"headers","headers":{"X-Native-Setup":"installed"}}),
+            &mut state,
+        )
+        .await,
+    );
+    // Fixture-only observation; a CDP-created target would not send native
+    // modifier events into the old page.
+    assert_success(&control_test_command(&json!({"action":"evaluate","script":"window.nativeKeys=[];addEventListener('keydown',e=>nativeKeys.push({key:e.key,trusted:e.isTrusted}))"}),&mut state).await);
+    let first_session = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .active_session_id()
+        .unwrap()
+        .to_string();
+    let new_tab = control_test_command(
+        &json!({"action":"tab_new","url":format!("{base}/new"),"label":"new-proof"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&new_tab);
+    let mgr = state.browser.as_ref().unwrap();
+    assert_eq!(mgr.page_count(), 2);
+    assert_eq!(new_tab["data"]["label"], "new-proof");
+    let key_events = mgr
+        .client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({"expression":"nativeKeys","returnByValue":true})),
+            Some(&first_session),
+        )
+        .await
+        .unwrap();
+    assert!(
+        key_events["result"]["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["key"] == "Control" && event["trusted"] == true),
+        "native Ctrl+T modifier reached old page: {key_events}"
+    );
+    let headers = control_test_command(
+        &json!({"action":"evaluate","script":"JSON.parse(document.body.innerText).headers"}),
+        &mut state,
+    )
+    .await;
+    assert_success(&headers);
+    assert_eq!(headers["data"]["result"]["User-Agent"], "native-tab-proof");
+    assert_eq!(headers["data"]["result"]["X-Native-Setup"], "installed");
+    for label in ["new-proof", "bad label"] {
+        let denied =
+            control_test_command(&json!({"action":"tab_new","label":label}), &mut state).await;
+        assert_eq!(denied["success"], false, "{denied}");
+        assert_eq!(
+            state.browser.as_ref().unwrap().page_count(),
+            2,
+            "label validation caused no new tab"
+        );
+    }
+    for url in ["not-a-url","https://example.test/\nother"] {
+        let denied = control_test_command(&json!({"action":"tab_new","url":url}),&mut state).await;
+        assert_eq!(denied["success"],false,"{denied}");
+        assert_eq!(state.browser.as_ref().unwrap().page_count(),2,"invalid address caused no new tab");
+    }
+    let blank = control_test_command(&json!({"action":"tab_new"}), &mut state).await;
+    assert_success(&blank);
+    assert_eq!(blank["data"]["url"], "about:blank");
+    assert_eq!(state.browser.as_ref().unwrap().page_count(), 3);
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+    server.abort();
+}
+
 /// `set credentials` uses target-scoped extra headers, so a new tab must send
 /// the resulting Authorization header on its first document request.
 #[tokio::test]
