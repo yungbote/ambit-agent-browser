@@ -835,3 +835,91 @@ async fn wait_default_context(
     .await
     .expect("the iframe publishes its actual default execution context");
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_site_state_capacity_cancel_closes_its_private_document() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let origin = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+    let server = tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut request = [0u8; 4096];
+                let _ = socket.read(&mut request).await;
+                let _ = socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type:text/html\r\nContent-Length:38\r\nConnection:close\r\n\r\n<!doctype html><title>Capacity</title>").await;
+            });
+        }
+    });
+    let mut owned = browser().await;
+    owned.navigate(&origin, WaitUntil::Load).await.unwrap();
+    assert_eq!(evaluate(&owned,r#"new Promise((resolve,reject)=>{const opening=indexedDB.open('cancel-fixture',1);opening.onupgradeneeded=()=>opening.result.createObjectStore('rows');opening.onerror=()=>reject(opening.error);opening.onsuccess=()=>{const db=opening.result;const writing=db.transaction('rows','readwrite');const store=writing.objectStore('rows');store.put('nosecret-cancel-value',1);let stopped=false;globalThis.stopCapacityWriter=()=>{stopped=true};const hold=()=>{const pending=store.count();pending.onsuccess=()=>{if(!stopped)hold()}};hold();writing.oncomplete=()=>db.close();resolve(true)}})"#).await,true);
+    let mut events = owned.client.subscribe();
+    let client = owned.client.clone();
+    let capture_origin = origin.clone();
+    let capturing = tokio::spawn(async move {
+        storage::capture(&client, "http://127.0.0.1", &[capture_origin]).await
+    });
+    let target = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.method == "Target.targetInfoChanged"
+                && event.params["targetInfo"]["url"]
+                    .as_str()
+                    .is_some_and(|url| url.contains("/.ambit-site-custody-"))
+            {
+                break event.params["targetInfo"]["targetId"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+            }
+        }
+    })
+    .await
+    .unwrap();
+    capturing.abort();
+    match capturing.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(_) => panic!("the held fixture capture was cancelled"),
+    }
+    let retired = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = events.recv().await.unwrap();
+            if event.method == "Target.targetDestroyed" && event.params["targetId"] == target {
+                break;
+            }
+        }
+    })
+    .await
+    .is_ok();
+    let targets = owned
+        .client
+        .send_command("Target.getTargets", Some(json!({})), None)
+        .await
+        .unwrap();
+    let remains = targets["targetInfos"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|entry| entry["targetId"] == target);
+    assert_eq!(evaluate(&owned, "stopCapacityWriter(); true").await, true);
+    let database = evaluate(&owned,"new Promise((resolve,reject)=>{const opening=indexedDB.open('cancel-fixture');opening.onerror=()=>reject(opening.error);opening.onsuccess=()=>{const db=opening.result;const reading=db.transaction('rows').objectStore('rows').get(1);reading.onsuccess=()=>{db.close();resolve(reading.result==='nosecret-cancel-value')};reading.onerror=()=>reject(reading.error)}})").await;
+    storage::clear_site(
+        &owned.client,
+        "http://127.0.0.1",
+        std::slice::from_ref(&origin),
+    )
+    .await
+    .unwrap();
+    let closed = owned.close().await;
+    server.abort();
+    let _ = server.await;
+    assert!(closed.is_ok());
+    assert_eq!(
+        database, true,
+        "cancellation neither corrupts the site nor retains a storage transaction"
+    );
+    assert!(
+        retired && !remains,
+        "cancelled capture closes the private document before completion"
+    );
+}
