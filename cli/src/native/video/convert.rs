@@ -7,9 +7,65 @@
 //! converting its chroma.
 //!
 //! Only rows that changed are converted: a picture is kept between frames
-//! and updated in place.
+//! and updated in place. Many 4:4:4 rows at once (a resize repaints the
+//! whole window) are converted on several threads: each row is independent.
 
 use super::{Chroma, Picture};
+
+/// Threads a large 4:4:4 conversion runs on, beside the encoder's own.
+const CONVERT_THREADS: usize = 4;
+/// Samples per plane below which a conversion stays on its caller's thread:
+/// about a sixth of a 1840 px window, so a typed key's rows never pay for
+/// threads.
+const PARALLEL_SAMPLES: usize = 1 << 19;
+
+/// Converts rows `rows` of a 4:4:4 picture `width` samples wide, each with
+/// `row(y, luma, cb, cr)` on that row of every plane, split across up to
+/// `CONVERT_THREADS` threads when they hold `PARALLEL_SAMPLES` or more.
+fn full_rows(
+    (luma, cb, cr): (&mut [u8], &mut [u8], &mut [u8]),
+    width: usize,
+    rows: std::ops::Range<usize>,
+    row: impl Fn(usize, &mut [u8], &mut [u8], &mut [u8]) + Sync,
+) {
+    let span = rows.start * width..rows.end * width;
+    let (luma, cb, cr) = (
+        &mut luma[span.clone()],
+        &mut cb[span.clone()],
+        &mut cr[span],
+    );
+    let threads = if rows.len() * width >= PARALLEL_SAMPLES {
+        CONVERT_THREADS
+    } else {
+        1
+    };
+    let chunk = rows.len().div_ceil(threads).max(1) * width;
+    let convert = |first: usize, luma: &mut [u8], cb: &mut [u8], cr: &mut [u8]| {
+        let planes = luma
+            .chunks_mut(width)
+            .zip(cb.chunks_mut(width))
+            .zip(cr.chunks_mut(width));
+        for (offset, ((luma, cb), cr)) in planes.enumerate() {
+            row(first + offset, luma, cb, cr);
+        }
+    };
+    let convert = &convert;
+    std::thread::scope(|scope| {
+        let mut parts = luma
+            .chunks_mut(chunk)
+            .zip(cb.chunks_mut(chunk))
+            .zip(cr.chunks_mut(chunk))
+            .enumerate()
+            .map(|(part, ((luma, cb), cr))| (rows.start + part * chunk / width, luma, cb, cr));
+        let own = parts.next();
+        for (first, luma, cb, cr) in parts {
+            scope.spawn(move || convert(first, luma, cb, cr));
+        }
+        if let Some((first, luma, cb, cr)) = own {
+            convert(first, luma, cb, cr);
+        }
+    });
+}
 
 /// How samples map to colour, as the ITU-T H.273 code points a bitstream
 /// signals.
@@ -177,22 +233,24 @@ impl Planar {
         let (luma, chroma) = self.data.split_at_mut(luma_size);
         let (cb, cr) = chroma.split_at_mut(chroma.len() / 2);
         match self.chroma {
-            Chroma::Full => {
-                for y in row_top..row_bottom {
-                    let at = y * self.width;
-                    luma[at..at + self.width].fill(MATRIX.black);
-                    cb[at..at + self.width].fill(NEUTRAL);
-                    cr[at..at + self.width].fill(NEUTRAL);
+            Chroma::Full => full_rows(
+                (luma, cb, cr),
+                self.width,
+                row_top..row_bottom,
+                |y, luma, cb, cr| {
+                    luma.fill(MATRIX.black);
+                    cb.fill(NEUTRAL);
+                    cr.fill(NEUTRAL);
                     if (top..bottom).contains(&y) {
                         convert_full(
                             &source[y * stride + left * 4..y * stride + right * 4],
-                            &mut luma[at + left..at + right],
-                            &mut cb[at + left..at + right],
-                            &mut cr[at + left..at + right],
+                            &mut luma[left..right],
+                            &mut cb[left..right],
+                            &mut cr[left..right],
                         );
                     }
-                }
-            }
+                },
+            ),
             Chroma::Subsampled => {
                 self.masked_rows.resize(width * 8, 0);
                 for y in (row_top..row_bottom).step_by(2) {
@@ -296,17 +354,19 @@ impl Planar {
         let (cb_plane, cr_plane) = chroma_planes.split_at_mut(chroma_size);
         let row = |index: usize| &source[index * stride..index * stride + width * BYTES_PER_PIXEL];
         match self.chroma {
-            Chroma::Full => {
-                for index in top..bottom {
-                    let at = index * self.width;
+            Chroma::Full => full_rows(
+                (luma_plane, cb_plane, cr_plane),
+                self.width,
+                top..bottom,
+                |index, luma, cb, cr| {
                     convert_full(
                         row(index),
-                        &mut luma_plane[at..at + width],
-                        &mut cb_plane[at..at + width],
-                        &mut cr_plane[at..at + width],
-                    );
-                }
-            }
+                        &mut luma[..width],
+                        &mut cb[..width],
+                        &mut cr[..width],
+                    )
+                },
+            ),
             Chroma::Subsampled => {
                 for index in (top..bottom).step_by(2) {
                     let next = (index + 1).min(height - 1);
@@ -663,6 +723,42 @@ mod tests {
         };
         assert_eq!((planes[1].0[0], planes[2].0[0]), averaged);
         assert_eq!((planes[1].0[1], planes[2].0[1]), (NEUTRAL, NEUTRAL));
+    }
+
+    /// A conversion large enough to run on several threads writes exactly
+    /// what converting each of its rows alone does, whole and at an
+    /// aperture.
+    #[test]
+    fn a_large_conversion_on_several_threads_matches_each_row_converted_alone() {
+        let (width, height) = (1024usize, 768usize);
+        assert!(width * height >= PARALLEL_SAMPLES);
+        let mut seed = 0x9e37_79b9u32;
+        let source: Vec<u8> = (0..width * height * 4)
+            .map(|_| {
+                seed ^= seed << 13;
+                seed ^= seed >> 17;
+                seed ^= seed << 5;
+                seed as u8
+            })
+            .collect();
+        let visible = crate::native::video::EncoderRegion {
+            x: 100,
+            y: 40,
+            width: 700,
+            height: 600,
+        };
+        let size = (width, height);
+        let fresh = || Planar::new(Chroma::Full, width as u32, height as u32);
+        let (mut whole, mut aperture) = (fresh(), fresh());
+        assert!(whole.convert(&source, width * 4, size, (0, height)));
+        assert!(aperture.convert_visible(&source, width * 4, size, visible, (0, height)));
+        let (mut each_whole, mut each_aperture) = (fresh(), fresh());
+        for y in 0..height {
+            assert!(each_whole.convert(&source, width * 4, size, (y, y + 1)));
+            assert!(each_aperture.convert_visible(&source, width * 4, size, visible, (y, y + 1)));
+        }
+        assert!(whole.data == each_whole.data);
+        assert!(aperture.data == each_aperture.data);
     }
 
     /// Only the named rows change; rows outside them keep their pixels, and
