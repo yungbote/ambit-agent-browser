@@ -254,6 +254,57 @@ async fn e2e_w11_viewport_screenshot_uses_shared_picture_without_a_video_viewer(
     {
         assert!(actual.abs_diff(expected) <= 3)
     }
+    assert_success(&control_test_command(&json!({"action":"screenshot","format":"jpeg","path":format!("{directory}/default-quality.jpg")}),&mut state).await);
+    assert_success(&control_test_command(&json!({"action":"screenshot","format":"jpeg","quality":80,"path":format!("{directory}/explicit-quality80.jpg")}),&mut state).await);
+    assert_eq!(
+        std::fs::read(format!("{directory}/default-quality.jpg")).unwrap(),
+        std::fs::read(format!("{directory}/explicit-quality80.jpg")).unwrap(),
+        "Default screenshot JPEG quality changed from the original80"
+    );
+    if std::env::var("AMBIT_W11_CAPTURE_BENCH").as_deref() == Ok("1") {
+        for sample in 0..5 {
+            for format in ["png", "jpeg"] {
+                let options = super::screenshot::ScreenshotOptions {
+                    format: format.into(),
+                    quality: (format == "jpeg").then_some(75),
+                    ..Default::default()
+                };
+                let started = std::time::Instant::now();
+                let shared = super::viewport_screenshot::take(&state, &options)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let shared_ms = started.elapsed().as_secs_f64() * 1000.;
+                let browser = state.browser.as_ref().unwrap();
+                let started = std::time::Instant::now();
+                let renderer = super::screenshot::take_screenshot(
+                    &browser.client,
+                    browser.active_session_id().unwrap(),
+                    &state.ref_map,
+                    &options,
+                    &state.iframe_sessions,
+                )
+                .await
+                .unwrap();
+                let renderer_ms = started.elapsed().as_secs_f64() * 1000.;
+                let shared = image::open(shared.path).unwrap().to_rgba8();
+                let renderer = image::open(renderer.path).unwrap().to_rgba8();
+                assert_eq!(shared.dimensions(), renderer.dimensions());
+                for (left, right) in shared
+                    .get_pixel(20, 20)
+                    .0
+                    .into_iter()
+                    .zip(renderer.get_pixel(20, 20).0)
+                {
+                    assert!(left.abs_diff(right) <= 3);
+                }
+                println!(
+                    "W11_FORMAT_CAPTURE {}",
+                    json!({"sample":sample,"format":format,"sharedToFileMs":shared_ms,"rendererToFileMs":renderer_ms,"dimensions":shared.dimensions()})
+                );
+            }
+        }
+    }
     // Previous input ACK does not prove that its effect is on screen.
     // Capture immediately through the actual vision consumer, with no
     // intervening DOM observation or renderer screenshot to force paint.
