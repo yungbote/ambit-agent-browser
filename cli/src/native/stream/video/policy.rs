@@ -298,9 +298,160 @@ pub(super) fn period(rate: u32) -> Duration {
     Duration::from_micros(1_000_000 / u64::from(rate.max(1)))
 }
 
+/// A stream's rate as a budget of pictures, not a phase: a picture may be
+/// taken as soon as the screen changes, so the picture that shows a person's
+/// key or click never waits for the next slot of a cadence, while over any
+/// longer stretch the stream takes at most one picture a period. Damage that
+/// keeps coming (a scroll, a drag) is paced one period apart; after a still
+/// moment one picture may follow the last at once. (A virtual scheduling
+/// cell rate rule with a tolerance of one period.)
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct Pace {
+    next: Option<Instant>,
+}
+
+impl Pace {
+    /// The earliest the next picture may be taken; none before the first.
+    pub(super) fn next(&self) -> Option<Instant> {
+        self.next
+    }
+
+    /// A picture was read from the screen at `read`, at a rate whose period
+    /// is `period`.
+    pub(super) fn took(&mut self, read: Instant, period: Duration) {
+        self.next = Some(self.next.map_or(read, |next| (next + period).max(read)));
+    }
+
+    /// A stream whose next picture is due at `at`.
+    #[cfg(test)]
+    pub(super) fn due_at(at: Instant) -> Self {
+        Self { next: Some(at) }
+    }
+}
+
+/// Framebuffer rows `[top, bottom)` that changed since the encoder last
+/// coded them: one band holding every change, so a unit codes the rows a
+/// typed key or a caret changed instead of the whole window.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct Band {
+    pub top: u32,
+    pub bottom: u32,
+}
+
+impl Band {
+    /// Every row of a framebuffer `height` rows tall.
+    pub(super) fn whole(height: u32) -> Self {
+        Self {
+            top: 0,
+            bottom: height,
+        }
+    }
+
+    /// The band holding both.
+    pub(super) fn union(self, other: Self) -> Self {
+        Self {
+            top: self.top.min(other.top),
+            bottom: self.bottom.max(other.bottom),
+        }
+    }
+
+    /// What of the window `visible` (framebuffer coordinates, as the coded
+    /// picture keeps them) a unit coding this band covers: the window's
+    /// columns on the band's rows. None means the whole picture: the band
+    /// holds every visible row, or none of them (a change beside the window
+    /// is coded whole rather than not at all).
+    pub(super) fn within(self, visible: crate::native::display::Rect) -> Option<EncoderRegion> {
+        let (x, y) = (u32::try_from(visible.x).ok()?, u32::try_from(visible.y).ok()?);
+        let top = self.top.max(y);
+        let bottom = self.bottom.min(y + visible.height);
+        (top < bottom && bottom - top < visible.height).then_some(EncoderRegion {
+            x,
+            y: top,
+            width: visible.width,
+            height: bottom - top,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A key or click after a still moment is captured as soon as it
+    /// paints, even right after the last picture; changes that keep coming
+    /// are held to one picture a period, and a long still moment earns one
+    /// picture of burst, never a run of them.
+    #[test]
+    fn the_rate_bounds_pictures_without_holding_back_the_first_change() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        let period = period(60);
+        let mut pace = Pace::default();
+        assert_eq!(pace.next(), None, "the first picture is due at once");
+        pace.took(start, period);
+        assert_eq!(pace.next(), Some(start), "a change right after it too");
+        // A scroll: each picture is taken the moment it is allowed.
+        let mut read = start + ms(2);
+        let mut taken = vec![read];
+        pace.took(read, period);
+        for _ in 0..58 {
+            read = pace.next().unwrap().max(read);
+            pace.took(read, period);
+            taken.push(read);
+        }
+        let second = taken
+            .iter()
+            .filter(|at| **at < start + Duration::from_secs(1))
+            .count();
+        assert!((59..=61).contains(&second), "{second} pictures in a second");
+        for pair in taken[1..].windows(2) {
+            assert_eq!(pair[1] - pair[0], period, "steady damage is paced");
+        }
+        // Still for a second: the next change is taken at once, and so is
+        // one more, but a third waits a period.
+        let key = read + Duration::from_secs(1);
+        assert!(pace.next().unwrap() <= key);
+        pace.took(key, period);
+        assert_eq!(pace.next(), Some(key));
+        pace.took(key + ms(5), period);
+        assert_eq!(pace.next(), Some(key + period));
+    }
+
+    /// A unit codes the window's columns on the rows that changed; a band
+    /// holding every visible row, or none, is the whole picture.
+    #[test]
+    fn a_band_is_coded_only_where_it_meets_the_window() {
+        let visible = crate::native::display::Rect {
+            x: 0,
+            y: 64,
+            width: 1840,
+            height: 1000,
+        };
+        let band = |top, bottom| Band { top, bottom };
+        assert_eq!(
+            band(100, 148).within(visible),
+            Some(EncoderRegion {
+                x: 0,
+                y: 100,
+                width: 1840,
+                height: 48
+            })
+        );
+        assert_eq!(
+            band(0, 80).within(visible),
+            Some(EncoderRegion {
+                x: 0,
+                y: 64,
+                width: 1840,
+                height: 16
+            }),
+            "cut to the window"
+        );
+        assert_eq!(band(0, 2048).within(visible), None, "every row");
+        assert_eq!(band(1064, 1200).within(visible), None, "beside it");
+        assert_eq!(band(100, 148).union(band(40, 120)), band(40, 148));
+        assert_eq!(Band::whole(1888), band(0, 1888));
+    }
 
     #[test]
     fn refinement_sweep_covers_each_visible_pixel_and_prioritizes_the_native_pointer() {

@@ -845,6 +845,7 @@ fn attribute(typed: &[Typed], lines: &[Value], arrivals: &HashMap<u64, u64>) -> 
     ];
     let mut samples: Vec<Vec<f64>> = vec![Vec::new(); STAGES.len()];
     let (mut totals, mut missing, mut waiting) = (Vec::new(), 0, 0);
+    let mut marked = Vec::new();
     let field = |line: &Value, name: &str| line[name].as_u64().unwrap();
     for key in typed {
         let Some(line) = lines
@@ -890,6 +891,7 @@ fn attribute(typed: &[Typed], lines: &[Value], arrivals: &HashMap<u64, u64>) -> 
         for (stage, pair) in marks.windows(2).enumerate() {
             samples[stage].push(ms(pair[1].saturating_sub(pair[0])));
         }
+        marked.push(marks.map(|mark| mark - key.sent));
         totals.push(ms(arrival - key.sent));
     }
     let mut stages = serde_json::Map::new();
@@ -904,6 +906,9 @@ fn attribute(typed: &[Typed], lines: &[Value], arrivals: &HashMap<u64, u64>) -> 
         "sendToAcknowledgedMs": stats(&typed.iter().map(|key| ms(key.acknowledged - key.sent)).collect::<Vec<_>>()),
         "sendToArrivalMs": stats(&totals),
         "stagesMs": stages,
+        // Each key's marks in µs after its send, in `STAGES` order with the
+        // send first: for recomputing the table.
+        "marksUs": marked,
     })
 }
 
@@ -1002,13 +1007,16 @@ async fn e2e_native_input_latency_stages() {
         .await;
         rest(&mut received, &mut all).await;
         let lines = super::video::stages::logged::take();
-        let arrivals: HashMap<u64, u64> = all[from..]
-            .iter()
-            .filter_map(|seen| match seen {
-                Seen::Unit(header, _, at) => Some((header["ts"].as_u64().unwrap(), *at)),
-                _ => None,
-            })
-            .collect();
+        // A still picture's refinement carries its capture's `ts` too: only
+        // the picture of motion is the one that showed the key.
+        let mut arrivals: HashMap<u64, u64> = HashMap::new();
+        for seen in &all[from..] {
+            if let Seen::Unit(header, _, at) = seen {
+                if header["quality"] == "motion" {
+                    arrivals.entry(header["ts"].as_u64().unwrap()).or_insert(*at);
+                }
+            }
+        }
         let attributed = attribute(&typed, &lines, &arrivals);
         assert_eq!(
             attributed["missing"], 0,

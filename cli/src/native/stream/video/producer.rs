@@ -27,7 +27,8 @@ use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
 use super::policy::{
-    period, rate, CodedSize, LinkRate, Quality, Refinement, RefinementCredit, RefinementSweep,
+    period, rate, Band, CodedSize, LinkRate, Pace, Quality, Refinement, RefinementCredit,
+    RefinementSweep,
 };
 use super::stages::{self, Stages};
 use super::subscription::{Delivery, Subscriber, Unit};
@@ -99,14 +100,16 @@ struct Mailbox {
     /// Rows changed since each buffer was last converted into.
     stale: [Vec<bool>; 2],
     coded: CodedSize,
-    /// When a picture was last converted for this encoding; none before its
-    /// first, which is then captured whole.
-    pictured: Option<Instant>,
+    /// When this encoding may take its next picture; none before its first,
+    /// which is then captured whole.
+    pace: Pace,
     visible: Option<Rect>,
     /// The screen changed since this encoding's latest picture. The helper
     /// reports each change once, to whichever picture came next, so an
     /// encoding that picture was not for catches up from the slot.
     behind: bool,
+    /// The rows that changed since the last picture handed to the encoder.
+    changed: Option<Band>,
     key_requested: bool,
     stop: bool,
 }
@@ -122,6 +125,8 @@ struct Buffer {
 struct Job {
     buffer: Buffer,
     capture: Capture,
+    /// The rows that differ from the picture the encoder coded before it.
+    changed: Band,
 }
 
 /// What a unit says about the picture it encodes.
@@ -354,9 +359,10 @@ impl Encoding {
                 job: None,
                 stale: [Vec::new(), Vec::new()],
                 coded: CodedSize::new(),
-                pictured: None,
+                pace: Pace::default(),
                 visible: None,
                 behind: true,
+                changed: None,
                 key_requested: false,
                 stop: false,
             }),
@@ -422,21 +428,37 @@ impl Encoding {
         }
         let period = period(self.rate()?);
         Some(Due {
-            at: mailbox.pictured.map_or(now, |last| last + period),
+            at: mailbox.pace.next().unwrap_or(now),
             period,
-            whole: mailbox.pictured.is_none(),
+            whole: mailbox.pace.next().is_none(),
             behind: mailbox.behind,
             busy: mailbox.free.is_empty(),
         })
     }
 
-    /// Remembers the rows a picture wrote, for both buffers.
+    /// Remembers the rows a picture wrote, for both buffers and for the
+    /// encoder: a window that moved changed every row.
     fn mark(&self, reply: &PictureReply) {
         let mut mailbox = lock(&self.mailbox);
         let moved = mailbox.visible != Some(reply.window());
         mailbox.visible = Some(reply.window());
         if !reply.rows.is_empty() || moved {
             mailbox.behind = true;
+        }
+        let wrote = if moved {
+            Some(Band::whole(reply.height))
+        } else {
+            reply
+                .rows
+                .iter()
+                .map(|[top, bottom]| Band {
+                    top: *top,
+                    bottom: *bottom,
+                })
+                .reduce(Band::union)
+        };
+        if let Some(wrote) = wrote {
+            mailbox.changed = Some(mailbox.changed.map_or(wrote, |changed| changed.union(wrote)));
         }
         let height = reply.height as usize;
         for rows in mailbox.stale.iter_mut() {
@@ -462,8 +484,10 @@ impl Encoding {
 
     /// Converts the screen into a free buffer and hands it to the encoder,
     /// when this encoding has not seen it yet; an unencoded picture it
-    /// supersedes goes back to the free buffers.
+    /// supersedes goes back to the free buffers, and its changed rows go
+    /// with the picture that replaces it.
     fn take(&self, capture: &Capture, reply: &PictureReply, pixels: &[u8]) {
+        let period = period(self.rate().unwrap_or(super::policy::MAX_RATE));
         let mut mailbox = lock(&self.mailbox);
         if !mailbox.behind {
             return;
@@ -478,8 +502,12 @@ impl Encoding {
             capture.visible.y as u32 + capture.visible.height,
         );
         let coded = mailbox.coded.fit(window, capture.read);
-        mailbox.pictured = Some(capture.read);
+        mailbox.pace.took(capture.read, period);
         mailbox.behind = false;
+        let changed = mailbox
+            .changed
+            .take()
+            .unwrap_or_else(|| Band::whole(reply.height));
         // Only the capture thread marks or converts, so the rows can leave
         // the mailbox while the encoder keeps using it.
         let mut stale = std::mem::take(&mut mailbox.stale[buffer.id]);
@@ -502,10 +530,16 @@ impl Encoding {
         }
         let mut mailbox = lock(&self.mailbox);
         mailbox.stale[buffer.id] = stale;
-        let job = Job { buffer, capture };
-        if let Some(superseded) = mailbox.job.replace(job) {
+        let mut job = Job {
+            buffer,
+            capture,
+            changed,
+        };
+        if let Some(superseded) = mailbox.job.take() {
+            job.changed = job.changed.union(superseded.changed);
             mailbox.free.push(superseded.buffer);
         }
+        mailbox.job = Some(job);
         drop(mailbox);
         self.changed.notify_all();
     }
@@ -835,12 +869,16 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
     let mut credit = RefinementCredit::default();
     let mut sweep: Option<RefinementSweep> = None;
     let mut native_key_bytes = 0usize;
+    // The rows the stream shows below the still target: each unit of motion
+    // adds the rows it coded, a key unit all of them, and a refinement codes
+    // only these.
+    let mut unrefined: Option<Band> = None;
     loop {
         let Some(work) = encoding.next_work(held.is_some(), &refinement, &mut credit, &geometry)
         else {
             return;
         };
-        let (mut quality, asked) = match work {
+        let (mut quality, asked, changed) = match work {
             Work::Picture(job, asked) => {
                 sweep = None;
                 if let Some((previous, _)) = held.replace((job.buffer, job.capture)) {
@@ -849,13 +887,13 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
                         producer.nudge();
                     }
                 }
-                (Quality::Motion, asked)
+                (Quality::Motion, asked, Some(job.changed))
             }
             Work::Key => {
                 sweep = None;
-                (Quality::Motion, true)
+                (Quality::Motion, true, None)
             }
-            Work::Refine => (Quality::Final, false),
+            Work::Refine => (Quality::Final, false, None),
         };
         let (buffer, capture) = held.as_ref().expect("work needs a held picture");
         // A new coded size needs a new encoder, whose first unit is a key
@@ -886,45 +924,62 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
             fail(&producer, &encoding, error);
             return;
         }
-        // Native key size is an observed entropy estimate, not a packet-size
-        // proof. Cheap whole refinements retain the existing fast path;
-        // constrained paths cover the same capture in finite aligned regions.
-        let region = if quality == Quality::Final {
-            if let Some(path) =
-                path.filter(|path| native_key_bytes > path.bits_per_second as usize / 320)
-            {
-                let plan = sweep.get_or_insert_with(|| {
-                    let pixels =
-                        u64::from(capture.visible.width) * u64::from(capture.visible.height);
-                    let affordable = pixels.saturating_mul(u64::from(path.bits_per_second) / 320)
-                        / native_key_bytes.max(1) as u64;
-                    let mut edge = 32u32;
-                    while edge < 1024 && u64::from(edge * 2).pow(2) <= affordable {
-                        edge *= 2;
-                    }
-                    RefinementSweep::new(
-                        // PictureChannel has validated this rectangle inside
-                        // its framebuffer. Keep its signed device origin in
-                        // the same space as the helper's fresh pointer.
-                        crate::native::video::EncoderRegion {
-                            x: capture.visible.x as u32,
-                            y: capture.visible.y as u32,
-                            width: capture.visible.width,
-                            height: capture.visible.height,
-                        },
-                        edge,
-                        capture.pointer,
-                    )
-                });
-                plan.next()
-            } else {
-                sweep = None;
+        let key = asked || fresh;
+        let visible = crate::native::video::EncoderRegion {
+            // PictureChannel has validated this rectangle inside its
+            // framebuffer. Keep its signed device origin in the same space
+            // as the helper's fresh pointer.
+            x: capture.visible.x as u32,
+            y: capture.visible.y as u32,
+            width: capture.visible.width,
+            height: capture.visible.height,
+        };
+        let whole = Band::whole(capture.surface.height);
+        // A unit of motion codes only the rows that changed since the last
+        // one; a key unit codes every row.
+        let region = match (quality, changed) {
+            (Quality::Motion, _) if key => {
+                unrefined = Some(whole);
                 None
             }
-        } else {
-            None
+            (Quality::Motion, changed) => {
+                let changed = changed.unwrap_or(whole);
+                unrefined = Some(unrefined.map_or(changed, |rows| rows.union(changed)));
+                changed.within(capture.visible)
+            }
+            // A refinement codes the rows below the still target. Native key
+            // size is an observed entropy estimate, not a packet-size proof:
+            // when refining them would exceed a path's step budget, they are
+            // covered in finite aligned regions instead.
+            _ => {
+                let scope = unrefined.unwrap_or(whole).within(capture.visible);
+                let target = scope.unwrap_or(visible);
+                let affordable = path.map(|path| {
+                    let pixels = u64::from(visible.width) * u64::from(visible.height);
+                    pixels.saturating_mul(u64::from(path.bits_per_second) / 320)
+                        / native_key_bytes.max(1) as u64
+                });
+                match affordable.filter(|affordable| {
+                    u64::from(target.width) * u64::from(target.height) > *affordable
+                }) {
+                    Some(affordable) => {
+                        let plan = sweep.get_or_insert_with(|| {
+                            let mut edge = 32u32;
+                            while edge < 1024 && u64::from(edge * 2).pow(2) <= affordable {
+                                edge *= 2;
+                            }
+                            RefinementSweep::new(target, edge, capture.pointer)
+                        });
+                        plan.next()
+                    }
+                    None => {
+                        sweep = None;
+                        scope
+                    }
+                }
+            }
         };
-        let actual = match encoder.set_refinement_region(region) {
+        let actual = match encoder.set_region(region) {
             Ok(actual) => actual,
             Err(error) => {
                 fail(&producer, &encoding, error);
@@ -937,7 +992,7 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
             }
         }
         let request = EncodeRequest {
-            key: asked || fresh,
+            key,
             quantizer: quality.quantizer(),
             refine: matches!(quality, Quality::Refine | Quality::Final),
         };
@@ -970,11 +1025,15 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
             bytes: unit.data.len(),
             encode: encoding_started.elapsed(),
             coded: buffer.coded,
+            region: actual,
         });
         match quality {
             Quality::Motion => refinement.moved(capture.read),
             Quality::Refine => {}
-            Quality::Final => refinement.refined(),
+            Quality::Final => {
+                refinement.refined();
+                unrefined = None;
+            }
         }
         let mut unit = Unit {
             data: unit.data,
@@ -1105,6 +1164,8 @@ pub(crate) mod measured {
         pub bytes: usize,
         pub encode: Duration,
         pub coded: (u32, u32),
+        /// The region the unit coded; none for the whole picture.
+        pub region: Option<crate::native::video::EncoderRegion>,
     }
 
     /// One picture converted for an encoding, with the helper's own timings

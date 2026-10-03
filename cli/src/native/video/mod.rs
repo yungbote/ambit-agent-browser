@@ -212,7 +212,7 @@ pub(crate) struct EncoderRate {
     pub pictures_per_second: u32,
 }
 
-/// Coded pixels changed by one refinement; other blocks retain their reference pixels.
+/// Coded pixels one dependent unit changes; other blocks retain their reference pixels.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct EncoderRegion {
     pub x: u32,
@@ -227,9 +227,12 @@ pub(crate) trait VideoEncoder: Send {
     fn coded(&self) -> (u32, u32);
     /// A path's explicit rate budget; absence preserves fixed-quality encoding.
     fn set_rate(&mut self, rate: Option<EncoderRate>) -> Result<(), VideoError>;
-    /// Configure a refinement and return the actual codec-aligned region it
-    /// updates. Callers reason about this region, not an assumed block size.
-    fn set_refinement_region(
+    /// Confine the dependent units that follow to `region` (none: the whole
+    /// picture; a key unit is always whole) and return the actual
+    /// codec-aligned region they update; blocks outside it keep their
+    /// reference pixels. Callers reason about this region, not an assumed
+    /// block size.
+    fn set_region(
         &mut self,
         region: Option<EncoderRegion>,
     ) -> Result<Option<EncoderRegion>, VideoError>;

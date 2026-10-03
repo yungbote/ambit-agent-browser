@@ -696,6 +696,59 @@ async fn a_stream_starts_whole_follows_damage_and_refines_a_still_picture() {
     assert!(near(viewer.painted(200), GREY));
 }
 
+/// A unit of motion codes only the rows that changed since the unit before
+/// it, and the refinement that follows only those rows: a typed key costs
+/// the encoder its line, not the window, and every other row a viewer paints
+/// stays exactly as it was. A key unit, and the refinement after it, code
+/// the whole picture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_unit_codes_only_the_rows_that_changed() {
+    let rig = rig();
+    let mut viewer = Viewer::new(rig.subscribe());
+    let first = viewer.motion().await;
+    let first_refined = viewer.refined().await;
+    viewer.painted(0);
+    let before = viewer.shown.as_ref().unwrap().planes.clone();
+    rig.paint(100, 140, RED);
+    let moved = viewer.until_shows(120, RED).await;
+    let refined = viewer.refined().await;
+    viewer.painted(0);
+    let shown = viewer.shown.as_ref().unwrap();
+    let (width, rows) = (shown.width as usize, shown.height as usize);
+    let after = &shown.planes;
+    let (encoded, _) = measured::take();
+    let region = |unit: &Unit| {
+        encoded
+            .iter()
+            .find(|sample| sample.ts == unit.ts && sample.quality == unit.quality.label())
+            .expect("the unit was measured")
+            .region
+    };
+    assert!(first.key);
+    assert_eq!(region(&first), None);
+    assert_eq!(region(&first_refined), None);
+    // Rows 100 to 140, on the encoder's 32 px block rows.
+    let band = Some(crate::native::video::EncoderRegion {
+        x: 0,
+        y: 96,
+        width: 640,
+        height: 64,
+    });
+    assert_eq!(region(&moved), band);
+    assert_eq!(region(&refined), band);
+    for (plane, (before, after)) in before.iter().zip(after).enumerate() {
+        for row in (0..rows).filter(|row| !(96..160).contains(row)) {
+            assert_eq!(
+                before[row * width..(row + 1) * width],
+                after[row * width..(row + 1) * width],
+                "plane {plane} row {row} is painted as before"
+            );
+        }
+    }
+    assert!(near(viewer.painted(120), RED));
+    viewer.assert_ordered();
+}
+
 /// A still picture is refined only once the window's geometry holds too. A
 /// drag lays the window out again within a frame or two of each picture, so
 /// none of its pictures is refined: while a layout is in flight the
@@ -970,9 +1023,31 @@ fn a_capture_asks_for_what_its_encodings_need() {
     assert!(matches!(decide(&[], now), Decision::Wait(None)));
 }
 
+/// The picture that shows a person's key or click never waits for a
+/// cadence: after a still moment, a change right after the last picture is
+/// captured as soon as it paints (the capture waits in the helper for its
+/// damage), and only damage that keeps coming is paced a period apart.
+#[test]
+fn a_change_after_a_still_moment_is_captured_as_it_paints() {
+    let now = Instant::now();
+    let ms = Duration::from_millis;
+    let encoding = encoding(60, None, false, false, now);
+    lock(&encoding.mailbox)
+        .pace
+        .took(now - ms(3), period(60));
+    let request = captured(decide(std::slice::from_ref(&encoding), now));
+    assert_eq!((request.force, request.wait_ms), (false, PICTURE_WAIT_MS));
+    lock(&encoding.mailbox).pace.took(now, period(60));
+    match decide(&[encoding], now) {
+        Decision::Wait(at) => assert_eq!(at, Some(now - ms(3) + period(60))),
+        Decision::Capture(_) => panic!("a third picture waits a period"),
+    }
+}
+
 /// An encoding of `rate` whose last picture was `ago` before `now` (none:
-/// it has none yet), that has seen the screen or not, and whose encoder
-/// holds both buffers or not.
+/// it has none yet) in a stream of steady damage, so its next picture is due
+/// a period after that one; that has seen the screen or not, and whose
+/// encoder holds both buffers or not.
 fn encoding(
     rate: u32,
     ago: Option<Duration>,
@@ -983,7 +1058,9 @@ fn encoding(
     let encoding = Arc::new(Encoding::new(VideoCodec::Av1Full));
     lock(&encoding.subscribers).push(Arc::new(Subscriber::new(rate)));
     let mut mailbox = lock(&encoding.mailbox);
-    mailbox.pictured = ago.map(|ago| now - ago);
+    if let Some(ago) = ago {
+        mailbox.pace = Pace::due_at(now - ago + period(rate));
+    }
     mailbox.behind = behind;
     if busy {
         mailbox.free.clear();

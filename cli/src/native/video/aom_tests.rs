@@ -15,7 +15,7 @@ fn active_map_layout_and_region_bounds_match_the_coded_picture() {
         width: 16,
         height: 16,
     };
-    let actual = encoder.set_refinement_region(Some(valid)).unwrap().unwrap();
+    let actual = encoder.set_region(Some(valid)).unwrap().unwrap();
     assert_eq!(
         actual,
         EncoderRegion {
@@ -67,10 +67,10 @@ fn active_map_layout_and_region_bounds_match_the_coded_picture() {
             height: 16,
         },
     ] {
-        assert!(encoder.set_refinement_region(Some(region)).is_err());
+        assert!(encoder.set_region(Some(region)).is_err());
         assert_eq!(encoder.region, Some(actual));
     }
-    encoder.set_refinement_region(None).unwrap();
+    encoder.set_region(None).unwrap();
     encoder.configure_region(None).unwrap();
     assert_eq!(encoder.region, None);
     assert!(encoder.active_map.cells.is_null());
@@ -159,7 +159,7 @@ fn a_regional_refinement_preserves_unmodified_reference_pixels() {
         }))
         .unwrap();
     encoder
-        .set_refinement_region(Some(EncoderRegion {
+        .set_region(Some(EncoderRegion {
             x: 0,
             y: 0,
             width: 128,
@@ -218,7 +218,7 @@ fn a_regional_refinement_preserves_unmodified_reference_pixels() {
         inside_after < inside_before,
         "a refinement must improve its active region"
     );
-    encoder.set_refinement_region(None).unwrap();
+    encoder.set_region(None).unwrap();
     let motion = encoder
         .encode(
             &planar.picture(),
@@ -327,7 +327,7 @@ fn regional_steps_preserve_other_reference_pixels_including_already_exact_region
         },
     ] {
         let region = encoder
-            .set_refinement_region(Some(requested))
+            .set_region(Some(requested))
             .unwrap()
             .unwrap();
         let unit = encoder
@@ -467,7 +467,7 @@ fn aligned_regional_updates_bound_noisy_steps_on_the_measured_consumer_link() {
             height: 32,
         },
     ] {
-        encoder.set_refinement_region(Some(region)).unwrap();
+        encoder.set_region(Some(region)).unwrap();
         let began = std::time::Instant::now();
         let unit = encoder
             .encode(
@@ -760,7 +760,7 @@ fn first_and_reset_keys_preserve_native_fixed_quality_across_rate_and_refinement
         decoder.decode(&motion.data);
         assert_eq!(encoder.config.end_usage, CBR);
         let actual = encoder
-            .set_refinement_region(Some(EncoderRegion {
+            .set_region(Some(EncoderRegion {
                 x: 10,
                 y: 10,
                 width: 20,
@@ -981,7 +981,7 @@ fn automatic_level_repeated_regional_sequence_decodes_beyond_the_former_native_a
     let mut decoder = Decoder::new();
     for frame in 0..80 {
         encoder
-            .set_refinement_region((frame > 0).then_some(EncoderRegion {
+            .set_region((frame > 0).then_some(EncoderRegion {
                 x: (frame % 20) * 32,
                 y: (frame / 20) * 32,
                 width: 32,

@@ -487,7 +487,7 @@ pub(crate) struct AomEncoder {
     region: Option<EncoderRegion>,
     active_cells: Vec<u8>,
     active_map: Box<ActiveMap>,
-    refinement_data: Vec<u8>,
+    region_data: Vec<u8>,
     /// The quantizer and speed the encoder holds; set only when a request
     /// differs.
     quantizer: Option<u8>,
@@ -563,7 +563,7 @@ impl AomEncoder {
             region: None,
             active_cells,
             active_map,
-            refinement_data: Vec::new(),
+            region_data: Vec::new(),
             quantizer: None,
             speed: MOTION_SPEED,
             pictures: 0,
@@ -683,15 +683,15 @@ impl AomEncoder {
         Ok(())
     }
 
-    /// Refinement reuses reconstructed pixels outside its region; source pixels there would invite a different prediction.
-    fn prepare_refinement(
+    /// A regional unit reuses reconstructed pixels outside its region; source pixels there would invite a different prediction.
+    fn prepare_region(
         &mut self,
         picture: &Picture<'_>,
         region: EncoderRegion,
     ) -> Result<(), VideoError> {
         // SAFETY: initialized encoder; preview remains owned by it until the next codec call and is copied here.
         let preview = unsafe { (self.api.preview_frame)(&mut *self.context).as_ref() }
-            .ok_or_else(|| VideoError::Failed("no reconstructed picture for refinement".into()))?;
+            .ok_or_else(|| VideoError::Failed("no reconstructed picture for a regional unit".into()))?;
         let format = match self.codec.chroma() {
             Chroma::Full => IMG_FMT_I444,
             Chroma::Subsampled => IMG_FMT_I420,
@@ -701,17 +701,17 @@ impl AomEncoder {
             || preview.display_height != self.height
         {
             return Err(VideoError::Failed(
-                "reconstructed refinement geometry differs from its stream".into(),
+                "reconstructed regional geometry differs from its stream".into(),
             ));
         }
         let chroma = self.codec.chroma();
-        self.refinement_data.resize(
+        self.region_data.resize(
             chroma.picture_bytes(self.width as usize, self.height as usize),
             0,
         );
         let source = picture
             .planes()
-            .ok_or_else(|| VideoError::Failed("invalid refinement source".into()))?;
+            .ok_or_else(|| VideoError::Failed("invalid regional source".into()))?;
         let mut offset = 0usize;
         for (index, (capture, capture_stride)) in source.iter().enumerate() {
             let scale = if index > 0 && chroma == Chroma::Subsampled {
@@ -724,10 +724,10 @@ impl AomEncoder {
             let stride = preview.strides[index];
             if preview.planes[index].is_null() || stride < width as c_int {
                 return Err(VideoError::Failed(
-                    "invalid reconstructed refinement plane".into(),
+                    "invalid reconstructed regional plane".into(),
                 ));
             }
-            let target = &mut self.refinement_data[offset..offset + width * height];
+            let target = &mut self.region_data[offset..offset + width * height];
             for row in 0..height {
                 // SAFETY: validated coded plane dimensions/stride; the preview owns every referenced row for this call.
                 let pixels = unsafe {
@@ -825,7 +825,7 @@ impl VideoEncoder for AomEncoder {
         .map_err(VideoError::Failed)
     }
 
-    fn set_refinement_region(
+    fn set_region(
         &mut self,
         region: Option<EncoderRegion>,
     ) -> Result<Option<EncoderRegion>, VideoError> {
@@ -842,12 +842,12 @@ impl VideoEncoder for AomEncoder {
                     .is_none_or(|end| end > self.height)
             {
                 return Err(VideoError::Failed(
-                    "refinement region is outside the coded picture".into(),
+                    "region is outside the coded picture".into(),
                 ));
             }
         }
-        // This realtime preset codes mixed active-map cells in32px blocks.
-        // Return its actual update scope instead of pretending16px map cells
+        // This realtime preset codes mixed active-map cells in 32 px blocks.
+        // Return its actual update scope instead of pretending 16 px map cells
         // are independent coding units. Source pixels outside it stay exact.
         self.region = region.map(|region| {
             let x = region.x / 32 * 32;
@@ -892,13 +892,13 @@ impl VideoEncoder for AomEncoder {
                 request.quantizer
             )));
         }
-        if !request.refine || request.key {
+        if request.key {
             self.region = None;
         }
         let region = self.region;
         let regional = region.is_some();
         if let Some(region) = region {
-            self.prepare_refinement(picture, region)?;
+            self.prepare_region(picture, region)?;
         }
         self.rate_configuration(request.refine, request.key)?;
         if (self.rate.is_none() || request.refine || request.key)
@@ -929,7 +929,7 @@ impl VideoEncoder for AomEncoder {
                 chroma: self.codec.chroma(),
                 width: self.width,
                 height: self.height,
-                data: &self.refinement_data,
+                data: &self.region_data,
             };
             (
                 &refined,
