@@ -1,7 +1,8 @@
 //! Sign-in mode through a real Chrome, its private display and the display
 //! helper: the same launch without any automation channel while a person
-//! signs in, native input and frames without DevTools, and the relaunch
-//! with DevTools when the browser is handed back.
+//! signs in, native input and frames without it, the relaunch with
+//! automation when the browser is handed back, and the quit that keeps the
+//! person's sign-in across it.
 //!
 //! These tests need a Chromium executable, Xvfb and the `browser-display`
 //! helper, so they are `#[ignore]`d. Run them serially against the qualified
@@ -115,7 +116,8 @@ impl ChromeMain {
         Self { pid, args }
     }
 
-    fn automation_switches(&self) -> Vec<&str> {
+    /// Every switch that opens DevTools or can mark the browser automated.
+    fn devtools_switches(&self) -> Vec<&str> {
         self.args
             .iter()
             .map(String::as_str)
@@ -125,6 +127,18 @@ impl ChromeMain {
                     || arg.starts_with("--headless")
             })
             .collect()
+    }
+
+    /// A browser without automation has one DevTools switch: the private
+    /// port its owner quits it through, never the automation port 0.
+    fn assert_without_automation(&self) {
+        let [switch] = self.devtools_switches()[..] else {
+            panic!("one private DevTools port: {:?}", self.args);
+        };
+        let port = switch
+            .strip_prefix("--remote-debugging-port=")
+            .and_then(|port| port.parse::<u16>().ok());
+        assert!(port.is_some_and(|port| port != 0), "{switch}");
     }
 
     pub(super) fn has(&self, arg: &str) -> bool {
@@ -138,17 +152,15 @@ impl ChromeMain {
             .expect("a managed profile")
     }
 
-    /// Every switch but the automation channel and session restoration, in
-    /// order. A first launch's startup URL is not a switch.
+    /// Every switch but DevTools and session restoration, in order. A first
+    /// launch's startup URL is not a switch.
     fn managed_switches(&self) -> Vec<&str> {
-        let automation = self.automation_switches();
+        let devtools = self.devtools_switches();
         self.args[1..]
             .iter()
             .map(String::as_str)
             .filter(|arg| {
-                arg.starts_with("--")
-                    && !automation.contains(arg)
-                    && *arg != "--restore-last-session"
+                arg.starts_with("--") && !devtools.contains(arg) && *arg != "--restore-last-session"
             })
             .collect()
     }
@@ -178,6 +190,22 @@ const report=(kind,extra)=>fetch('/report?'+new URLSearchParams({kind,webdriver:
 report('load',{cookie:document.cookie});
 for(const type of ['pointermove','pointerdown','keydown','paste'])document.addEventListener(type,e=>report('event',{type}),true);
 form.addEventListener('submit',event=>{event.preventDefault();report('submit',{value:email.value}).then(()=>report('signed_in',{}))});
+</script>"#;
+
+/// A page a person leaves mid-task: without automation, the first key a
+/// person presses arms its `beforeunload` guard (sticky activation), signs
+/// in, and opens a modal dialog that stays open.
+const GUARDED: &str = r#"<!doctype html><title>Guarded fixture</title>
+<style>html,body{margin:0;height:100%}#field{position:fixed;inset:0;width:100%;height:100%;box-sizing:border-box;border:0;padding:24px;font:32px sans-serif}</style>
+<input id=field autocomplete=off aria-label="Field">
+<script>
+const report=(kind,extra)=>fetch('/report?'+new URLSearchParams({kind,webdriver:String(navigator.webdriver),...extra}));
+report('load',{cookie:document.cookie});
+document.addEventListener('pointermove',e=>report('event',{type:'pointermove'}),true);
+if(!navigator.webdriver){
+addEventListener('beforeunload',e=>{e.preventDefault();e.returnValue=''});
+field.addEventListener('keydown',()=>report('guarded',{}).then(()=>{alert('Unsaved changes');report('dismissed',{})}),{once:true});
+}
 </script>"#;
 
 impl Site {
@@ -233,7 +261,10 @@ impl Site {
                                 url::form_urlencoded::parse(query.as_bytes())
                                     .into_owned()
                                     .collect();
-                            let submitted = report.get("kind").is_some_and(|kind| kind == "submit");
+                            // A person signs in on the form or the guarded page.
+                            let signs_in = report
+                                .get("kind")
+                                .is_some_and(|kind| kind == "submit" || kind == "guarded");
                             // Deliberate nosecret fixture cookie; only its presence is
                             // reported, never a credential or cookie value.
                             let signed_in = request.lines().any(|line| {
@@ -247,11 +278,12 @@ impl Site {
                             });
                             report.insert("recentSession".into(), signed_in_session.to_string());
                             recorded.lock().unwrap().push(report);
-                            ("204 No Content", if submitted {
+                            ("204 No Content", if signs_in {
                                 "Set-Cookie: ambit_recent_sign_in=1; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax\r\nSet-Cookie: ambit_recent_session=1; Path=/; HttpOnly; SameSite=Lax\r\n"
                             } else { "" }, "")
                         }
                         "/" => ("200 OK", "Content-Type: text/html\r\n", FORM),
+                        "/guarded" => ("200 OK", "Content-Type: text/html\r\n", GUARDED),
                         _ => ("404 Not Found", "", ""),
                     };
                     let response = format!(
@@ -458,6 +490,48 @@ async fn dump_window(state: &DaemonState, name: &str) -> std::path::PathBuf {
     path
 }
 
+/// A person points at `(x, y)` through the controller's input line on the
+/// window `surface` until the page sees the pointer: a person moves again
+/// when nothing reacts, and a Chrome that has just started can miss native
+/// input for its first moments. Answers the moves it took; `sequence` is the
+/// next one.
+async fn point_until_seen(
+    state: &mut DaemonState,
+    site: &Site,
+    (controller, surface): (&str, &str),
+    sequence: &mut u64,
+    (x, y): (f64, f64),
+) -> u32 {
+    let pointing = tokio::time::timeout(Duration::from_secs(10), async {
+        for attempt in 0u32.. {
+            let mut pointed = control("input", controller);
+            pointed["sequence"] = json!(*sequence);
+            pointed["expectedSurfaceGeneration"] = json!(surface);
+            pointed["events"] = json!([{ "type": "input_mouse", "eventType": "mouseMoved",
+                "x": x + f64::from(attempt % 2) * 8.0, "y": y, "button": "none", "buttons": 0 }]);
+            assert_eq!(
+                assert_success(&command(&pointed, state).await)["status"],
+                "applied"
+            );
+            *sequence += 1;
+            if site.sees_native_pointer(Duration::from_millis(250)).await {
+                return attempt + 1;
+            }
+        }
+        unreachable!()
+    })
+    .await;
+    let Ok(attempts) = pointing else {
+        let window = dump_window(state, "pointing").await;
+        panic!(
+            "the page never saw the person's pointer; the window: {}; page reports: {:?}",
+            window.display(),
+            site.reports.lock().unwrap()
+        );
+    };
+    attempts
+}
+
 async fn evaluate(state: &mut DaemonState, script: &str) -> Value {
     let response = command(&json!({ "action": "evaluate", "script": script }), state).await;
     assert_success(&response)["result"].clone()
@@ -648,10 +722,7 @@ async fn e2e_new_profile_credential_save_preference_preserves_human_signin() {
     let controller = acquire(&mut state).await;
     assert_success(&sign_in(&mut state, &controller, 1, 600_000).await.0);
     let person = ChromeMain::observe(&state).await;
-    assert!(
-        person.automation_switches().is_empty(),
-        "human sign-in has no DevTools"
-    );
+    person.assert_without_automation();
     assert_eq!(person.user_data_dir(), profile);
     // Accept only a fresh human page's trusted pointer, never a delayed
     // report from the automated page used for coordinate calibration.
@@ -874,7 +945,7 @@ async fn e2e_sign_in_relaunches_without_automation_and_hands_back() {
     // Under automation the page truthfully sees automation.
     let automation = ChromeMain::observe(&state).await;
     assert_eq!(
-        automation.automation_switches(),
+        automation.devtools_switches(),
         ["--remote-debugging-port=0"]
     );
     assert_eq!(evaluate(&mut state, "navigator.webdriver").await, true);
@@ -896,14 +967,14 @@ async fn e2e_sign_in_relaunches_without_automation_and_hands_back() {
         .to_string();
     assert!(enter_time < Duration::from_secs(8), "{enter_time:?}");
 
-    // The same browser, profile and flags, with no automation channel at all.
+    // The same browser, profile and flags, without the automation channel.
     let person = ChromeMain::observe(&state).await;
     assert_ne!(person.pid, automation.pid);
     assert!(
         !process_alive(automation.pid),
         "the automation browser still runs"
     );
-    assert!(person.automation_switches().is_empty(), "{:?}", person.args);
+    person.assert_without_automation();
     assert!(person.has("--restore-last-session"));
     assert_eq!(person.args[0], automation.args[0]);
     assert_eq!(person.user_data_dir(), automation.user_data_dir());
@@ -964,39 +1035,17 @@ async fn e2e_sign_in_relaunches_without_automation_and_hands_back() {
     assert!(message.contains("address bar"), "{message}");
     assert_success(&renew(&mut state, &controller).await);
 
-    // The person's own input reaches the page through the display alone. A
-    // person points at the field before clicking and moves again when
-    // nothing reacts; a Chrome that has just started can miss native input
-    // for its first moments. Point until the page sees the pointer.
+    // The person's own input reaches the page through the display alone.
     let mut sequence = 2;
-    let pointing = tokio::time::timeout(Duration::from_secs(10), async {
-        for attempt in 0u32.. {
-            let mut pointed = control("input", &controller);
-            pointed["sequence"] = json!(sequence);
-            pointed["expectedSurfaceGeneration"] = json!(signing_in);
-            pointed["events"] = json!([{ "type": "input_mouse", "eventType": "mouseMoved",
-                "x": x + f64::from(attempt % 2) * 8.0, "y": y, "button": "none", "buttons": 0 }]);
-            assert_eq!(
-                assert_success(&command(&pointed, &mut state).await)["status"],
-                "applied"
-            );
-            sequence += 1;
-            if site.sees_native_pointer(Duration::from_millis(250)).await {
-                return attempt + 1;
-            }
-        }
-        unreachable!()
-    })
+    let pointing_attempts = point_until_seen(
+        &mut state,
+        &site,
+        (&controller, &signing_in),
+        &mut sequence,
+        (x, y),
+    )
     .await;
     let native_input_ready = entered_at.elapsed();
-    let Ok(pointing_attempts) = pointing else {
-        let window = dump_window(&state, "pointing").await;
-        panic!(
-            "the page never saw the person's pointer; the window: {}; page reports: {:?}",
-            window.display(),
-            site.reports.lock().unwrap()
-        );
-    };
     let mut typed = control("input", &controller);
     typed["sequence"] = json!(sequence);
     typed["expectedSurfaceGeneration"] = json!(signing_in);
@@ -1015,14 +1064,9 @@ async fn e2e_sign_in_relaunches_without_automation_and_hands_back() {
     };
     assert_eq!(submitted["value"], TYPED);
     assert_eq!(submitted["webdriver"], "false");
-    assert_eq!(
-        site.wait_for_report("signed_in", 0).await["recentSignIn"],
-        "true"
-    );
-    assert_eq!(
-        site.wait_for_report("signed_in", 0).await["recentSession"],
-        "true"
-    );
+    let signed_in = site.wait_for_report("signed_in", 0).await;
+    assert_eq!(signed_in["recentSignIn"], "true", "{signed_in:?}");
+    assert_eq!(signed_in["recentSession"], "true", "{signed_in:?}");
     viewer.never_failed_since(before);
 
     // Hand back: automation again, on the same profile, tabs and cookies.
@@ -1042,7 +1086,7 @@ async fn e2e_sign_in_relaunches_without_automation_and_hands_back() {
         .to_string();
     let again = ChromeMain::observe(&state).await;
     assert!(!process_alive(person.pid), "the sign-in browser still runs");
-    assert_eq!(again.automation_switches(), ["--remote-debugging-port=0"]);
+    assert_eq!(again.devtools_switches(), ["--remote-debugging-port=0"]);
     assert!(again.has("--restore-last-session"));
     assert_eq!(again.user_data_dir(), automation.user_data_dir());
     assert_eq!(again.managed_switches(), automation.managed_switches());
@@ -1072,9 +1116,11 @@ async fn e2e_sign_in_relaunches_without_automation_and_hands_back() {
         .as_str()
         .unwrap()
         .contains("ambit_sign_in=1"));
-    // The restored DOM can show the signed-in page even when SIGTERM lost
-    // its recent cookie. A real navigation must still send the new HttpOnly
-    // cookie to the fixture, which a cached page cannot prove.
+    // The restored DOM can show the signed-in page even when its cookies
+    // were lost. A real navigation must send them to the fixture, which a
+    // cached page cannot prove: the persistent and session cookies from
+    // before the sign-in, and the persistent and session HttpOnly cookies
+    // the sign-in set, which only a quit that ends the session keeps.
     let loads = site.reports("load").len();
     assert_success(
         &command(
@@ -1083,16 +1129,14 @@ async fn e2e_sign_in_relaunches_without_automation_and_hands_back() {
         )
         .await,
     );
-    assert_eq!(
-        site.wait_for_report("load", loads).await["recentSignIn"],
-        "true"
-    );
     let restored = site.wait_for_report("load", loads).await;
     assert!(
-        restored["cookie"].contains("ambit_session=1"),
+        restored["cookie"].contains("ambit_sign_in=1")
+            && restored["cookie"].contains("ambit_session=1"),
         "{restored:?}"
     );
-    assert_eq!(restored["recentSession"], "true");
+    assert_eq!(restored["recentSignIn"], "true", "{restored:?}");
+    assert_eq!(restored["recentSession"], "true", "{restored:?}");
     let tabs = command(&json!({ "action": "tab_list" }), &mut state).await;
     let urls: Vec<String> = assert_success(&tabs)["tabs"]
         .as_array()
@@ -1120,6 +1164,120 @@ async fn e2e_sign_in_relaunches_without_automation_and_hands_back() {
             "handBackMs": hand_back_time.as_millis(),
             "firstObservationMs": first_observation_time.as_millis(),
         })
+    );
+    assert_success(&command(&json!({ "action": "close" }), &mut state).await);
+}
+
+/// A person leaves the page mid-task: it guards its unload with
+/// `beforeunload` and shows a modal dialog. The hand-back still quits the
+/// sign-in browser on its own, neither held by the guard nor by the dialog,
+/// and the session cookie the sign-in set survives into automation.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_hand_back_quits_past_an_open_dialog_and_a_beforeunload_guard() {
+    let env = EnvGuard::new(&[
+        "AGENT_BROWSER_WINDOW_STREAM",
+        "DISPLAY",
+        "AGENT_BROWSER_SOCKET_DIR",
+    ]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let logs = tempfile::tempdir().unwrap();
+    env.set("AGENT_BROWSER_SOCKET_DIR", logs.path().to_str().unwrap());
+    let site = Site::start().await;
+    let mut state = DaemonState::new();
+    for path in ["/login", "/guarded"] {
+        assert_success(
+            &command(
+                &json!({ "action": "navigate", "url": site.page(path) }),
+                &mut state,
+            )
+            .await,
+        );
+    }
+    assert_eq!(site.wait_for_report("load", 0).await["webdriver"], "true");
+    let (x, y, _) = window_point(&state, 320.0, 240.0).await;
+
+    let controller = acquire(&mut state).await;
+    let (entered, _) = sign_in(&mut state, &controller, 1, 600_000).await;
+    let surface = assert_success(&entered)["surface"]["generation"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let person = ChromeMain::observe(&state).await;
+    person.assert_without_automation();
+    assert_eq!(site.wait_for_report("load", 1).await["webdriver"], "false");
+
+    // The person's click and key arm the guard, sign in and open the dialog.
+    let mut sequence = 2;
+    point_until_seen(
+        &mut state,
+        &site,
+        (&controller, &surface),
+        &mut sequence,
+        (x, y),
+    )
+    .await;
+    let mut pressed = control("input", &controller);
+    pressed["sequence"] = json!(sequence);
+    pressed["expectedSurfaceGeneration"] = json!(surface);
+    pressed["events"] = json!([
+        { "type": "input_mouse", "eventType": "mousePressed", "x": x, "y": y, "button": "left", "buttons": 1, "clickCount": 1 },
+        { "type": "input_mouse", "eventType": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1 },
+        { "type": "input_keyboard", "eventType": "keyDown", "key": "a", "code": "KeyA", "windowsVirtualKeyCode": 65 },
+        { "type": "input_keyboard", "eventType": "keyUp", "key": "a", "code": "KeyA", "windowsVirtualKeyCode": 65 }
+    ]);
+    assert_eq!(
+        assert_success(&command(&pressed, &mut state).await)["status"],
+        "applied"
+    );
+    let Some(guarded) = site.report("guarded", 0).await else {
+        let window = dump_window(&state, "guarded").await;
+        panic!(
+            "the person's key never reached the page; the window: {}; page reports: {:?}",
+            window.display(),
+            site.reports.lock().unwrap()
+        );
+    };
+    assert_eq!(guarded["webdriver"], "false");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(site.reports("dismissed").is_empty(), "the dialog is open");
+
+    let loads = site.reports("load").len();
+    let started = Instant::now();
+    let released = command(&control("release", &controller), &mut state).await;
+    let hand_back_time = started.elapsed();
+    assert_eq!(assert_success(&released)["status"], "released");
+    assert!(
+        hand_back_time < Duration::from_secs(8),
+        "{hand_back_time:?}"
+    );
+    assert!(!process_alive(person.pid), "the sign-in browser still runs");
+    assert_eq!(
+        ChromeMain::observe(&state).await.devtools_switches(),
+        ["--remote-debugging-port=0"]
+    );
+    let session_log =
+        std::fs::read_to_string(logs.path().join(format!("{}.log", state.session_id)))
+            .unwrap_or_default();
+    assert!(
+        !session_log.contains("did not quit in time"),
+        "{session_log}"
+    );
+
+    // The restored page's own request carries every cookie, including the
+    // session cookie set seconds before the hand-back.
+    let restored = site.wait_for_report("load", loads).await;
+    assert_eq!(restored["webdriver"], "true");
+    assert!(
+        restored["cookie"].contains("ambit_session=1"),
+        "{restored:?}"
+    );
+    assert_eq!(restored["recentSignIn"], "true", "{restored:?}");
+    assert_eq!(restored["recentSession"], "true", "{restored:?}");
+    println!(
+        "HAND_BACK_GUARDED {}",
+        json!({ "handBackMs": hand_back_time.as_millis() })
     );
     assert_success(&command(&json!({ "action": "close" }), &mut state).await);
 }
@@ -1221,7 +1379,7 @@ async fn e2e_sign_in_ends_when_idle_and_when_the_person_closes_the_browser() {
     maintain(&mut state).await;
     let again = ChromeMain::observe(&state).await;
     assert!(!process_alive(person.pid));
-    assert_eq!(again.automation_switches(), ["--remote-debugging-port=0"]);
+    assert_eq!(again.devtools_switches(), ["--remote-debugging-port=0"]);
     assert_eq!(again.user_data_dir(), automation.user_data_dir());
     assert_refused(
         &renew(&mut state, &controller).await,
@@ -1353,7 +1511,7 @@ async fn e2e_sign_in_that_cannot_start_returns_the_browser_to_automation() {
 
     // Automation is back on the same profile and the lease has ended.
     let again = ChromeMain::observe(&state).await;
-    assert_eq!(again.automation_switches(), ["--remote-debugging-port=0"]);
+    assert_eq!(again.devtools_switches(), ["--remote-debugging-port=0"]);
     assert_eq!(again.user_data_dir(), automation.user_data_dir());
     viewer.never_failed_since(before);
     assert_refused(
