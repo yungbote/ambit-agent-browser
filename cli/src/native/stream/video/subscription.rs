@@ -31,6 +31,8 @@ pub(crate) struct Unit {
     pub quality: Quality,
     /// The stream's WebCodecs codec string, on key units only.
     pub codec_string: Option<String>,
+    /// With diagnostics on, when the picture passed each producer stage.
+    pub stages: Option<super::stages::Stages>,
 }
 
 impl Unit {
@@ -350,6 +352,7 @@ mod tests {
             input_seq: None,
             quality: Quality::Motion,
             codec_string: key.then(|| "av01.1.12M.08".into()),
+            stages: None,
         };
         unit.wire_bytes = crate::native::stream::wire::video_budget_bytes(
             &unit,

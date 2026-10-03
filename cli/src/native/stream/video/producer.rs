@@ -29,6 +29,7 @@ use std::time::{Duration, Instant};
 use super::policy::{
     period, rate, CodedSize, LinkRate, Quality, Refinement, RefinementCredit, RefinementSweep,
 };
+use super::stages::{self, Stages};
 use super::subscription::{Delivery, Subscriber, Unit};
 use crate::native::display::pictures::{PictureReply, PictureRequest};
 use crate::native::display::{DisplayClient, Rect, Surface};
@@ -134,6 +135,8 @@ struct Capture {
     surface: Surface,
     input_seq: Option<u64>,
     pointer: Option<(i32, i32)>,
+    /// With diagnostics on, when it passed each stage so far.
+    stages: Option<Stages>,
 }
 
 /// One capture: the request, and the encodings its picture is for.
@@ -481,6 +484,7 @@ impl Encoding {
         // the mailbox while the encoder keeps using it.
         let mut stale = std::mem::take(&mut mailbox.stale[buffer.id]);
         drop(mailbox);
+        let mut capture = capture.clone();
         #[cfg(test)]
         let converting = Instant::now();
         convert(
@@ -493,12 +497,12 @@ impl Encoding {
         );
         #[cfg(test)]
         measured::converted(capture.ts, converting.elapsed(), reply.timings.clone());
+        if let Some(stages) = capture.stages.as_mut() {
+            stages.converted = crate::native::stream::monotonic_us();
+        }
         let mut mailbox = lock(&self.mailbox);
         mailbox.stale[buffer.id] = stale;
-        let job = Job {
-            buffer,
-            capture: capture.clone(),
-        };
+        let job = Job { buffer, capture };
         if let Some(superseded) = mailbox.job.replace(job) {
             mailbox.free.push(superseded.buffer);
         }
@@ -641,7 +645,9 @@ fn capture_loop(inner: Weak<Inner>) {
         let asked = Instant::now();
         let encodings = lock(&inner.state).encodings.clone();
         let answer = pictures.picture(plan.request, |reply, pixels| {
+            let received = crate::native::stream::monotonic_us();
             let ts = requested + reply.wait_us();
+            let applied = inner.source.media.applied_input(ts);
             let mut surface = inner.source.display.surface();
             surface.width = reply.width;
             surface.height = reply.height;
@@ -651,8 +657,17 @@ fn capture_loop(inner: Weak<Inner>) {
                 read: asked + std::time::Duration::from_micros(reply.wait_us()),
                 visible: reply.window(),
                 surface,
-                input_seq: inner.source.media.applied_input_at(ts),
+                input_seq: applied.map(|(sequence, _)| sequence),
                 pointer: reply.pointer.map(|point| (point.x, point.y)),
+                stages: stages::enabled().then(|| Stages {
+                    input: applied,
+                    requested,
+                    read: ts,
+                    waited_us: reply.wait_us(),
+                    received,
+                    rows: reply.rows.iter().map(|[top, bottom]| bottom - top).sum(),
+                    ..Stages::default()
+                }),
             };
             // Remember every encoding's damage before a snapshot wakes its
             // caller; a blocked viewer must already owe this same picture.
@@ -928,6 +943,7 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
         };
         #[cfg(test)]
         let encoding_started = Instant::now();
+        let encode_started = crate::native::stream::monotonic_us();
         let unit = match encoder.encode(&buffer.picture.picture(), request) {
             Ok(unit) => unit,
             Err(error) => {
@@ -971,6 +987,11 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
             input_seq: capture.input_seq,
             quality,
             codec_string: unit.codec_string,
+            stages: capture.stages.map(|stages| Stages {
+                encode_started,
+                encoded: crate::native::stream::monotonic_us(),
+                ..stages
+            }),
         };
         let Some(wire_bytes) =
             crate::native::stream::wire::video_budget_bytes(&unit, encoding.codec)

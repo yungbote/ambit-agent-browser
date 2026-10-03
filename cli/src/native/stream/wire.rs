@@ -350,6 +350,7 @@ mod tests {
             input_seq: Some(4411),
             quality: crate::native::stream::video::Quality::Motion,
             codec_string: key.then(|| "av01.1.12M.08".into()),
+            stages: None,
         }
     }
 

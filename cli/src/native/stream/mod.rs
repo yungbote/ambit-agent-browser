@@ -303,12 +303,18 @@ impl AppliedInput {
     /// The sequence applied at media time `ts`: none before the first
     /// acknowledgement, without a lease, or older than the retained log.
     pub(crate) fn at(&self, ts: u64) -> Option<u64> {
+        self.applied(ts).map(|(sequence, _)| sequence)
+    }
+
+    /// The sequence applied at media time `ts`, and when it was recorded.
+    pub(crate) fn applied(&self, ts: u64) -> Option<(u64, u64)> {
         let log = self.log.lock().unwrap_or_else(|e| e.into_inner());
         let newer = log.iter().rev().take_while(|(at, _)| *at > ts).count();
         if newer == log.len() {
             return None;
         }
-        Some(log[log.len() - newer - 1].1).filter(|sequence| *sequence > 0)
+        let (at, sequence) = log[log.len() - newer - 1];
+        (sequence > 0).then_some((sequence, at))
     }
 }
 
@@ -371,6 +377,11 @@ impl StreamMedia {
     /// The input a capture that began at media time `ts` includes, if any.
     pub(super) fn applied_input_at(&self, ts: u64) -> Option<u64> {
         self.applied_input.at(ts)
+    }
+
+    /// That input and when it was applied.
+    pub(super) fn applied_input(&self, ts: u64) -> Option<(u64, u64)> {
+        self.applied_input.applied(ts)
     }
 }
 

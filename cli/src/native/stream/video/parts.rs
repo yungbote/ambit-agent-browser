@@ -217,6 +217,7 @@ mod tests {
             input_seq: None,
             quality: Quality::Motion,
             codec_string: Some("av01.1.12M.08".into()),
+            stages: None,
         });
         Parts::new(
             unit,
@@ -391,6 +392,7 @@ mod tests {
             input_seq: Some(4411),
             quality: Quality::Motion,
             codec_string: Some("av01.1.16M.08".into()),
+            stages: None,
         });
         let stream = "00000000-0000-4000-8000-000000000001";
         let mut picture = Parts::new(source, VideoCodec::Av1Full, stream.into(), 1);

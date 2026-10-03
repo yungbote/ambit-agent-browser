@@ -946,6 +946,7 @@ async fn handle_ws_client(
                     && !video_display.has_changed().unwrap_or(true);
                 if let Some(message) = message.filter(|_| fresh) {
                     if ws_tx.send(message).await.is_err() { break; }
+                    track.written();
                 }
             }
             changed = frame_watch.changed(), if !pending_frame => {

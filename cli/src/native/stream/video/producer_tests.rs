@@ -240,6 +240,7 @@ fn aperture_offset_window_fits_its_complete_framebuffer_extent() {
         surface: Surface::new(2048, 2048),
         input_seq: None,
         pointer: None,
+        stages: None,
     };
     encoding.mark(&reply);
     encoding.take(&capture, &reply, &pixels);
@@ -281,6 +282,7 @@ fn aperture_gutter_cannot_change_any_decoded_coded_pixel() {
                 surface: Surface::new(256, 192),
                 input_seq: None,
                 pointer: None,
+                stages: None,
             };
             encoding.mark(&reply);
             encoding.take(&capture, &reply, &pixels);
@@ -321,6 +323,7 @@ fn aperture_metadata_change_rebuilds_padding_without_pixel_damage() {
         surface: Surface::new(256, 192),
         input_seq: None,
         pointer: None,
+        stages: None,
     };
     encoding.mark(&reply);
     encoding.take(&capture(&reply, 1), &reply, &pixels);
@@ -479,6 +482,7 @@ fn a_capture_admitted_before_backpressure_is_marked_but_not_encoded_after_blocki
         surface: Surface::new(640, 480),
         input_seq: None,
         pointer: None,
+        stages: None,
     };
     let pixels = vec![128u8; 640 * 480 * 4];
     encoding.mark(&reply);

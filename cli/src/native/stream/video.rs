@@ -23,6 +23,7 @@ mod policy;
 mod producer;
 #[cfg(target_os = "linux")]
 pub(crate) mod snapshot;
+pub(crate) mod stages;
 mod subscription;
 #[cfg(all(test, target_os = "linux"))]
 pub(super) mod testing;
@@ -325,6 +326,8 @@ pub(super) struct VideoTrack {
     /// The key unit requests already passed on.
     keyframes: u64,
     link_rate: Option<LinkRate>,
+    /// With diagnostics on, the unit being written, logged once it is.
+    writing: Option<Arc<Unit>>,
 }
 
 impl VideoTrack {
@@ -360,6 +363,7 @@ impl VideoTrack {
             flow: Flow::default(),
             keyframes: 0,
             link_rate: None,
+            writing: None,
         };
         (track, inbox, feedback_rx)
     }
@@ -516,6 +520,7 @@ impl VideoTrack {
             return self.refused();
         }
         let mut records = Vec::new();
+        self.writing = unit.stages.is_some().then(|| unit.clone());
         if self.epoch.is_none() {
             let (Some(codec_string), true) = (unit.codec_string.as_deref(), unit.key) else {
                 return self.refused();
@@ -644,8 +649,25 @@ impl VideoTrack {
                     parts.first_at().expect("issued picture"),
                 );
             }
+            self.written();
         }
         self.update_ready();
+    }
+
+    /// The unit `deliver` handed over is now written in full: with
+    /// diagnostics on, its stages are logged (`stages`).
+    pub(super) fn written(&mut self) {
+        if let Some(unit) = self.writing.take() {
+            if let Some(stages) = unit.stages {
+                stages.written(
+                    unit.ts,
+                    unit.quality.label(),
+                    unit.key,
+                    unit.data.len(),
+                    super::monotonic_us(),
+                );
+            }
+        }
     }
 
     /// Applies the viewer's newest feedback: its cumulative acknowledgement
@@ -752,6 +774,7 @@ mod tests {
             input_seq: Some(4411),
             quality: Quality::Motion,
             codec_string: Some("av01.1.12M.08".into()),
+            stages: None,
         })
     }
 
@@ -761,6 +784,59 @@ mod tests {
         };
         let end = 4 + u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
         &bytes[end..]
+    }
+
+    /// With diagnostics on, a unit's stages are logged once, when its last
+    /// part is written, with the write time after every producer stage; a
+    /// unit recorded without them logs nothing.
+    #[test]
+    fn a_unit_s_stages_are_logged_once_it_is_written() {
+        let stages = super::stages::Stages {
+            input: Some((4411, 10)),
+            requested: 12,
+            read: 30,
+            waited_us: 18,
+            received: 31,
+            rows: 40,
+            converted: 33,
+            encode_started: 34,
+            encoded: 44,
+        };
+        let ts = 987_654_321;
+        let written = |unit: Unit| {
+            let (mut track, inbox, feedback) = chunk_track();
+            let (records, _) = track.deliver(Delivery::Unit(Arc::new(unit)), true);
+            let stream = records[0]["streamId"].as_str().unwrap().to_owned();
+            let (mut parts, mut offset) = (0, 0);
+            while !track.parts.as_ref().unwrap().complete() {
+                let part = track.part().expect("room for the next part");
+                offset += part_payload(&part).len();
+                parts += 1;
+                track.part_sent();
+                inbox.received(&json!({"type":"received","track":"video","streamId":stream,
+                    "seq":1,"offset":offset}));
+                track.feedback(*feedback.borrow());
+            }
+            assert!(parts > 1, "a picture of several parts");
+            super::stages::logged::take()
+                .into_iter()
+                .filter(|line| line["ts"] == ts)
+                .collect::<Vec<_>>()
+        };
+        let unit = |stages| Unit {
+            ts,
+            stages,
+            ..Arc::try_unwrap(chunk_unit()).expect("its only owner")
+        };
+        let logged = written(unit(Some(stages)));
+        assert_eq!(logged.len(), 1, "{logged:?}");
+        let line = &logged[0];
+        assert_eq!(line["inputSeq"], 4411);
+        assert_eq!(line["applied"], 10);
+        assert_eq!(line["read"], 30);
+        assert_eq!(line["encoded"], 44);
+        assert!(line["written"].as_u64().unwrap() >= 44, "{line}");
+        assert!(written(unit(None)).is_empty());
     }
 
     #[test]
@@ -917,6 +993,7 @@ mod tests {
             input_seq: None,
             quality: Quality::Motion,
             codec_string: Some("av01.1.16M.08".into()),
+            stages: None,
         });
         let (records, body) = make_track(false).deliver(Delivery::Unit(unit.clone()), true);
         assert!(body.is_none());
@@ -1257,6 +1334,7 @@ mod tests {
                 input_seq: None,
                 quality: Quality::Motion,
                 codec_string: key.then(|| "av01.1.08M.08".into()),
+                stages: None,
             })
         };
         let (records, message) = track.deliver(Delivery::Unit(unit(false, 1)), false);
