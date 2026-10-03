@@ -768,6 +768,60 @@ async fn small_damage_after_a_final_picture_leaves_exact_and_owes_no_refinement(
     viewer.assert_ordered();
 }
 
+/// The one rule that holds exact units and pictures together (contract
+/// browser-presentation-units): a viewer that applies units in sequence
+/// order, a picture replacing the window and an exact unit drawing its
+/// rectangle over it, shows after every unit the capture of that unit, here
+/// through interleaved small and large changes. Exact rows are exact; the
+/// rest is within the motion picture's coding error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_surface_equals_the_newest_applied_capture_under_interleaved_units() {
+    let rig = rig();
+    let mut viewer = Viewer::new(rig.subscribe_exact());
+    viewer.motion().await;
+    viewer.refined().await;
+    let mut screen = vec![GREY; 480];
+    let big = EXACT_ROWS + 40;
+    let changes = [
+        (100, 140, RED),
+        (200, 200 + big, BLUE),
+        (300, 330, GREEN),
+        (40, 60, BLUE),
+        (0, big, GREEN),
+        (120, 125, RED),
+        (110, 130, BLUE),
+    ];
+    let (mut exact, mut pictures) = (0, 0);
+    for (top, bottom, colour) in changes {
+        rig.paint(top, bottom, colour);
+        screen[top as usize..bottom as usize].fill(colour);
+        let shown = viewer.until_shows((top + bottom) / 2, colour).await;
+        if shown.exact.is_some() {
+            exact += 1;
+        } else {
+            pictures += 1;
+        }
+        for row in (0..480).step_by(5) {
+            let painted = viewer.painted(row as u32);
+            let expected = screen[row];
+            let inside = shown.exact.is_some_and(|rect| {
+                (rect.y..rect.y + rect.height as i32).contains(&(row as i32))
+            });
+            if inside {
+                assert_eq!(painted, [expected[2], expected[1], expected[0]], "row {row}");
+            } else {
+                assert!(near(painted, expected), "row {row}: {painted:?} for {expected:?}");
+            }
+        }
+        if shown.exact.is_none() {
+            // A picture owes its refinement before small damage leaves exact.
+            viewer.refined().await;
+        }
+    }
+    assert_eq!((exact, pictures), (5, 2), "both kinds interleaved");
+    viewer.assert_ordered();
+}
+
 /// A viewer that asks for a key unit after an exact unit gets one of a
 /// fresh capture: a key of the held picture would take back what the exact
 /// unit showed.

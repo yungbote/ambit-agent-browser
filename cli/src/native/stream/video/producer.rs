@@ -829,6 +829,13 @@ fn capture_loop(inner: Weak<Inner>) {
                     waited_us: reply.wait_us(),
                     received,
                     rows: reply.rows.iter().map(|[top, bottom]| bottom - top).sum(),
+                    band: reply
+                        .rows
+                        .iter()
+                        .map(|[top, bottom]| (*top, *bottom))
+                        .reduce(|(top, bottom), (next_top, next_bottom)| {
+                            (top.min(next_top), bottom.max(next_bottom))
+                        }),
                     ..Stages::default()
                 }),
             };

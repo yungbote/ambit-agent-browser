@@ -30,6 +30,8 @@ pub(crate) struct Stages {
     pub received: u64,
     /// Rows the picture changed; none for a capture that saw no damage.
     pub rows: u32,
+    /// The first and the end row of those changes.
+    pub band: Option<(u32, u32)>,
     /// The picture was converted for its encoding and handed to its encoder.
     pub converted: u64,
     /// The encoder began and finished this unit.
@@ -52,7 +54,9 @@ impl Stages {
             "inputSeq": self.input.map(|(sequence, _)| sequence),
             "applied": self.input.map(|(_, at)| at),
             "requested": self.requested, "read": self.read, "waitedUs": self.waited_us,
-            "received": self.received, "rows": self.rows, "converted": self.converted,
+            "received": self.received, "rows": self.rows,
+            "rowsTop": self.band.map(|(top, _)| top), "rowsBottom": self.band.map(|(_, bottom)| bottom),
+            "converted": self.converted,
             "encodeStarted": self.encode_started, "encoded": self.encoded, "written": written,
         });
         #[cfg(test)]
