@@ -53,7 +53,9 @@ const SESSION_OPERATIONS: &[&str] = &[TOOL_SET_THEME];
 /// no host-bound call reads or sets cookies or site storage, saves or loads
 /// browser state, keeps or types a password, or records a capture that
 /// holds request headers and cookies (a HAR, a trace, a profile). The host
-/// keeps sign-ins for the person, who signs in themselves.
+/// keeps sign-ins for the person, who signs in themselves. And the agent acts
+/// on a page only as a person would, through visible input: rewriting the
+/// page's history by script has no input to show (`open` navigates visibly).
 pub(super) fn allows(name: &str) -> bool {
     !matches!(
         name,
@@ -110,6 +112,7 @@ pub(super) fn allows(name: &str) -> bool {
             | TOOL_STREAM_STATUS
             | TOOL_DEVICE
             | TOOL_BATCH
+            | TOOL_PUSHSTATE
     )
 }
 
@@ -479,6 +482,24 @@ mod tests {
         );
     }
 
+    /// An effect with no visible input is not offered: the canonical catalog
+    /// keeps `pushstate`, the host-bound one withholds it, and neither
+    /// transport prepares a call to it.
+    #[test]
+    fn an_effect_without_visible_input_is_withheld() {
+        assert!(super::super::tools()
+            .iter()
+            .any(|tool| tool["name"] == TOOL_PUSHSTATE));
+        assert!(tool(TOOL_PUSHSTATE).is_none());
+        let flags = HostFlags::new("host", "browser", None).unwrap();
+        assert_eq!(
+            flags
+                .prepare(TOOL_PUSHSTATE, &json!({"url": "https://example.com/next"}))
+                .unwrap_err(),
+            "Tool is not in the host-bound browser profile."
+        );
+    }
+
     /// The person's sign-ins stay with the host. No host-bound tool reads or
     /// sets cookies or site storage, saves or loads browser state, keeps or
     /// types a password, or records a capture that holds request headers and
@@ -627,7 +648,7 @@ mod tests {
     #[test]
     fn theme_is_a_host_operation_and_host_configuration() {
         let tools = tools();
-        assert_eq!(tools.len(), 106);
+        assert_eq!(tools.len(), 105);
         let set_theme = tools
             .iter()
             .find(|tool| tool["name"] == TOOL_SET_THEME)
