@@ -15,7 +15,7 @@ use serde_json::{json, Value};
 
 use super::agent_channel::target::Recorders;
 use super::cdp::client::{CdpClient, PendingCommand};
-use super::input::{input_command, stream_event, HeldInputs};
+use super::input::{input_command, presses, stream_event, HeldInputs};
 use super::secret_fields::FocusedField;
 use tokio::sync::watch;
 
@@ -995,6 +995,7 @@ impl BrowserControl {
 
     /// Stateful low-level agent input shares custody and held-input tracking
     /// with dashboard input. Complete gestures keep their interaction helpers.
+    /// A press is refused while the page shows Chrome's error page.
     pub(crate) async fn agent_input(
         &mut self,
         kind: &str,
@@ -1025,6 +1026,11 @@ impl BrowserControl {
             return result.map(|_| ());
         }
         let event = stream_event(kind, &params);
+        if presses(&event) {
+            if let Some(page) = client.error_page(session_id) {
+                return Err(page.refused());
+            }
+        }
         if !self
             .stream_held
             .accepts(std::iter::once((session_id, &event)))

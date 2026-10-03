@@ -174,6 +174,21 @@ pub(crate) fn stream_event(kind: &str, params: &Value) -> Value {
     event
 }
 
+/// Whether `event`, in the stream's shape, presses: a button or a touch
+/// going down, a key going down, or text going in. Moves, the wheel and
+/// releases never do.
+pub(crate) fn presses(event: &Value) -> bool {
+    matches!(
+        (event["type"].as_str(), event["eventType"].as_str()),
+        (Some("input_mouse"), Some("mousePressed"))
+            | (Some("input_touch"), Some("touchStart"))
+            | (
+                Some("input_keyboard"),
+                Some("keyDown" | "rawKeyDown" | "char" | "insertText")
+            )
+    )
+}
+
 /// `Input.dispatchKeyEvent` params for a client `input_keyboard` message.
 ///
 /// Invariant: an omitted optional string is left out, never sent as `null`.

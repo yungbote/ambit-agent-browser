@@ -7,6 +7,7 @@ use super::browser_control::BrowserControl;
 use super::cdp::client::CdpClient;
 use super::cdp::types::*;
 use super::element::{resolve_element_center, resolve_element_object_id, RefMap};
+use super::error_pages::ERROR_PAGE;
 use tokio::sync::Mutex;
 
 /// Outcome of a click. `dialog_opened` is true if a JavaScript dialog opened
@@ -443,8 +444,8 @@ async fn click_field(
 }
 
 /// Keys that go after the field was clicked. Typing refused before its
-/// first key (a person's takeover, a secret field that took focus) is
-/// interrupted, not refused: the click happened.
+/// first key (a person's takeover, a secret field that took focus, an error
+/// page the click led to) is interrupted, not refused: the click happened.
 async fn type_after_click(
     control: &Mutex<BrowserControl>,
     client: &CdpClient,
@@ -462,7 +463,7 @@ async fn type_after_click(
             "browser_operation_interrupted: The user took control of this browser after the field was clicked and before any text was typed. Inspect the page before continuing; do not replay the text.",
             json!({"interruptedBy":"human","executionStopped":true,"effectsMayHaveOccurred":true,"charactersTyped":0}),
         ),
-        Some(("browser_effect_refused" | "browser_observation_stale", why)) => {
+        Some(("browser_effect_refused" | "browser_observation_stale" | ERROR_PAGE, why)) => {
             CommandError::with_data(
                 format!("browser_operation_interrupted: The field was clicked, then typing was refused: {why}"),
                 json!({"executionStopped":true,"effectsMayHaveOccurred":true,"charactersTyped":0}),

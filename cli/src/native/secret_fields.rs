@@ -30,6 +30,7 @@ use super::agent_channel::target::{self, Recorders, FACTS, FOCUSED, WORLD};
 use super::cdp::client::CdpClient;
 use super::cdp::types::CdpEvent;
 use super::documents::{self, NAVIGATION_PENDING, NAVIGATION_PENDING_MESSAGE};
+use super::error_pages::ErrorPage;
 
 /// The refusal of an effect no ceiling admits, as the channel answers it.
 const REFUSED: &str = "browser_effect_refused";
@@ -151,6 +152,9 @@ pub(crate) enum KeyRefusal {
     /// The page began loading another document: it answers nothing until
     /// that commits, and its keys would reach whichever document then shows.
     Leaving,
+    /// The page shows Chrome's error page, where no key is the agent's to
+    /// press (`error_pages`).
+    ErrorPage(ErrorPage),
     /// The field that has focus could not be read.
     Unread(String),
 }
@@ -172,7 +176,11 @@ impl KeyRefusal {
             (Self::Leaving, false) => {
                 return format!("{NAVIGATION_PENDING}: {NAVIGATION_PENDING_MESSAGE}").into()
             }
+            (Self::ErrorPage(page), false) => return page.refused(),
             (Self::Secret, true) => format!("focus moved into {SECRET}"),
+            (Self::ErrorPage(page), true) => {
+                format!("{} began showing, and agent input is refused on it", page.describe())
+            }
             (Self::Unread(error), true) => format!("the field that has focus could not be read ({error})"),
             (Self::Leaving, true) => "the page began loading another document".to_string(),
             (Self::Dialog, _) => "a JavaScript dialog opened for the page; answer it first".to_string(),
@@ -248,7 +256,8 @@ impl FocusedField {
 
     /// Why `event`, a keyboard event in the display helper's shape, must not
     /// reach the field that has focus in `session`'s page; `None` when it
-    /// may. An event that cannot type is admitted without a reading. A
+    /// may. No key is pressed while the page shows Chrome's error page. An
+    /// event that cannot type is otherwise admitted without a reading. A
     /// JavaScript dialog opening for the page, or the page beginning to load
     /// another document, ends the reading: the page answers nothing until
     /// the dialog is answered or the document commits.
@@ -259,7 +268,13 @@ impl FocusedField {
         event: &Value,
         events: &mut broadcast::Receiver<CdpEvent>,
     ) -> Option<KeyRefusal> {
-        let interaction = key_interaction(event).filter(|interaction| may_type(*interaction))?;
+        let interaction = key_interaction(event)?;
+        if let Some(page) = client.error_page(session) {
+            return Some(KeyRefusal::ErrorPage(page));
+        }
+        if !may_type(interaction) {
+            return None;
+        }
         let page = client.page_of(session);
         let facts = tokio::select! {
             biased;

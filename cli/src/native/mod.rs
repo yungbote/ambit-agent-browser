@@ -24,6 +24,7 @@ pub(crate) mod documents;
 pub(crate) mod downloads;
 #[allow(dead_code)]
 pub mod element;
+pub(crate) mod error_pages;
 pub(crate) mod feedback;
 pub(crate) mod input;
 #[allow(dead_code)]

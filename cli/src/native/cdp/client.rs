@@ -427,6 +427,7 @@ pub struct CdpClient {
     event_tx: broadcast::Sender<CdpEvent>,
     pub(crate) downloads: Arc<super::super::downloads::Downloads>,
     pub(crate) files: Arc<super::super::browser_files::FileDestinations>,
+    error_pages: Arc<super::super::error_pages::ErrorPages>,
     raw_tx: broadcast::Sender<RawCdpMessage>,
     private_sessions: PrivateSessions,
     target_sessions: Arc<std::sync::Mutex<HashMap<String, String>>>,
@@ -632,6 +633,8 @@ impl CdpClient {
         let downloads_reader = downloads.clone();
         let files = Arc::new(super::super::browser_files::FileDestinations::default());
         let files_reader = files.clone();
+        let error_pages = Arc::new(super::super::error_pages::ErrorPages::default());
+        let error_pages_reader = error_pages.clone();
         let (event_tx, _) = broadcast::channel(4096);
         let (raw_tx, _) = broadcast::channel(4096);
 
@@ -937,6 +940,12 @@ impl CdpClient {
                         parsed.params.as_ref().unwrap_or(&Value::Null),
                         parsed.session_id.as_deref(),
                     );
+                    // Input admitted after this event sees the page it shows.
+                    error_pages_reader.observe(
+                        method,
+                        parsed.params.as_ref().unwrap_or(&Value::Null),
+                        parsed.session_id.as_deref(),
+                    );
                     let page = parsed.session_id.as_deref().map(|session| {
                         frame_page(&frames_clone, session).unwrap_or_else(|| session.to_owned())
                     });
@@ -1070,6 +1079,7 @@ impl CdpClient {
             event_tx,
             downloads,
             files,
+            error_pages,
             raw_tx,
             private_sessions,
             target_sessions,
@@ -1356,6 +1366,15 @@ impl CdpClient {
     /// itself when it is no frame.
     pub(crate) fn page_of(&self, session: &str) -> String {
         frame_page(&self.frame_pages, session).unwrap_or_else(|| session.to_owned())
+    }
+
+    /// The error page that `session`'s page shows, as the reader kept it
+    /// from the events it has passed on (`error_pages`).
+    pub(crate) fn error_page(
+        &self,
+        session: &str,
+    ) -> Option<crate::native::error_pages::ErrorPage> {
+        self.error_pages.showing(&self.page_of(session))
     }
 
     /// The target a session is attached to: for an out-of-process frame,

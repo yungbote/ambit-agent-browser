@@ -463,6 +463,97 @@ async fn e2e_semantic_registered_values_survive_real_dispatch_only_as_redacted_b
     server.abort();
 }
 
+/// A plan step is agent input like any other: on Chrome's error page the
+/// channel runs a typing step its ceiling admits, and the driver refuses it
+/// (`error_pages`), while a plan's navigation away from the page still runs.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore]
+async fn e2e_a_plan_step_is_refused_on_chrome_error_pages() {
+    let (_d, path) = directory();
+    let env = crate::test_utils::EnvGuard::new(&[
+        "AGENT_BROWSER_WINDOW_STREAM",
+        "DISPLAY",
+        "AGENT_BROWSER_SESSION",
+        "AGENT_BROWSER_NAMESPACE",
+        "AGENT_BROWSER_SOCKET_DIR",
+    ]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    env.set("AGENT_BROWSER_SESSION", "browser");
+    env.set("AGENT_BROWSER_NAMESPACE", "thread");
+    env.set("AGENT_BROWSER_SOCKET_DIR", path.to_str().unwrap());
+    let (url, server) =
+        crate::native::e2e_tests::serve_self_signed("<title>Proceeded</title>").await;
+    let state = Arc::new(tokio::sync::Mutex::new(
+        crate::native::actions::DaemonState::new(),
+    ));
+    let browser = Arc::new(super::dispatch::DaemonBrowser::new(state.clone()));
+    let endpoint = endpoint_role(true);
+    let (mut host, admitted) = Host::hello(&endpoint, &browser,
+        json!({"binding":{"version":1,"namespace":"thread","session":"browser","requireSandbox":true,"browserHost":true}})).await;
+    assert_eq!(admitted["success"], true, "{admitted}");
+    host.send(json!({"type":"site_sessions.offer","id":2,"sites":[]}))
+        .await;
+    let offered = host.reply().await;
+    assert_eq!(offered["success"], true, "{offered}");
+    // The warning, then the page as the plan observes it.
+    host.send(sequence(
+        3,
+        "41",
+        json!([step("agent_browser_open", json!({ "url": url }))]),
+        &path,
+    ))
+    .await;
+    let opened = host.reply().await;
+    let mut observe = sequence(4, "41", json!([title()]), &path);
+    observe["observe"] = json!(true);
+    host.send(observe).await;
+    let observed = host.reply().await;
+    assert_eq!(observed["success"], true, "{opened} {observed}");
+    let generation = observed["browser"]["page"]["pageGeneration"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut typing = step(
+        "agent_browser_keyboard_type",
+        json!({ "text": "thisisunsafe" }),
+    );
+    typing["preconditions"] = json!({ "pageGeneration": generation, "effects": "fill" });
+    host.send(sequence(5, "41", json!([typing]), &path)).await;
+    let refused = host.reply().await;
+    let response = &refused["steps"][0]["result"]["structuredContent"]["response"];
+    assert_eq!(response["code"], "browser_error_page", "{refused}");
+    assert_eq!(
+        response["data"],
+        json!({ "failedUrl": url, "netError": "net::ERR_CERT_AUTHORITY_INVALID" }),
+        "{refused}"
+    );
+    host.send(sequence(
+        6,
+        "41",
+        json!([step(
+            "agent_browser_open",
+            json!({ "url": "data:text/html,<title>Plain</title>" })
+        )]),
+        &path,
+    ))
+    .await;
+    let left = host.reply().await;
+    assert_eq!(left["success"], true, "{left}");
+    drop(host.writer);
+    drop(host.lines);
+    tokio::time::timeout(Duration::from_secs(10), host.served)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut state = state.lock().await;
+    let closed =
+        crate::native::actions::execute_command(&json!({"action":"close"}), &mut state).await;
+    assert_eq!(closed["success"], true);
+    server.abort();
+}
+
 #[tokio::test]
 async fn semantic_registry_scrubs_before_reply_ledger_and_retained_result_without_erasing_identity()
 {

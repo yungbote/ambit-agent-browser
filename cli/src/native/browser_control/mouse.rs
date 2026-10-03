@@ -308,6 +308,14 @@ fn stopped(reason: InterruptReason, acted: Acted) -> CommandError {
     }
 }
 
+/// A press is never the agent's while the page shows Chrome's error page
+/// (`error_pages`); moves and the wheel are.
+fn admit_press(client: &CdpClient, session: &str) -> Result<(), CommandError> {
+    client
+        .error_page(session)
+        .map_or(Ok(()), |page| Err(page.refused()))
+}
+
 /// A layout that lands while the wheel turns stops it: the notches before
 /// it were sent, and the rest would land on content that moved.
 const RESIZED_TURNING: &str = "browser_operation_interrupted: The browser window was resized while the wheel was turning, so the page scrolled only part of the way. Observe the page before choosing the next action; do not replay the scroll.";
@@ -1155,7 +1163,8 @@ impl NativeMouse {
 
     /// One mouse event and the travel that brings the pointer to it: proven
     /// before it starts, stopped by a pending interruption, and for a press
-    /// proven again and hit tested at the end of travel.
+    /// proven again and hit tested at the end of travel. A press is admitted
+    /// before anything moves and again as it is sent (`admit_press`).
     #[allow(clippy::too_many_arguments)]
     async fn gesture(
         &mut self,
@@ -1192,6 +1201,10 @@ impl NativeMouse {
         self.same_layout(display)?;
         if let Some(reason) = interrupts.pending() {
             return Err(stopped(reason, Acted::of(self.buttons != 0)));
+        }
+        let pressing = event_type == "mousePressed";
+        if pressing {
+            admit_press(client, session)?;
         }
         let mapping = match self.prepare(client, session, display).await {
             Ok(mapping) => mapping,
@@ -1265,6 +1278,9 @@ impl NativeMouse {
         }
         let atomic = display.atomic_input().await;
         self.same_layout(display)?;
+        if pressing {
+            admit_press(client, session)?;
+        }
         Ok(self
             .dispatch_at(
                 params,

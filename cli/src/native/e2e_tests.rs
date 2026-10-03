@@ -11827,6 +11827,187 @@ async fn e2e_native_tab_close_selects_the_tab_and_presses_ctrl_w() {
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
 
+/// An HTTPS origin on 127.0.0.1 whose certificate Chrome does not trust: a
+/// self-signed one made for these tests alone. Every response is `html`.
+pub(super) async fn serve_self_signed(html: &'static str) -> (String, tokio::task::JoinHandle<()>) {
+    use std::io::{Read, Write};
+    // nosecret: a self-signed certificate and key made for this fixture only
+    // (`openssl req -x509 -newkey ec ... -subj /CN=127.0.0.1`).
+    const PEM: &str = include_str!("test_fixtures/self_signed_127.0.0.1.pem");
+    let certs = rustls_pemfile::certs(&mut PEM.as_bytes())
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    let key = rustls_pemfile::private_key(&mut PEM.as_bytes())
+        .unwrap()
+        .unwrap();
+    let config = Arc::new(
+        rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(certs, key)
+            .unwrap(),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("https://{}/", listener.local_addr().unwrap());
+    let server = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            let config = config.clone();
+            let stream = stream.into_std().unwrap();
+            stream.set_nonblocking(false).unwrap();
+            // Chrome ends the handshake of a certificate it refuses.
+            tokio::task::spawn_blocking(move || -> Option<()> {
+                let connection = rustls::ServerConnection::new(config).ok()?;
+                let mut tls = rustls::StreamOwned::new(connection, stream);
+                let mut request = Vec::new();
+                let mut buffer = [0; 4096];
+                while !request.windows(4).any(|end| end == b"\r\n\r\n") {
+                    let read = tls.read(&mut buffer).ok().filter(|read| *read > 0)?;
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{html}", html.len());
+                tls.write_all(response.as_bytes()).ok()?;
+                tls.conn.send_close_notify();
+                tls.flush().ok()
+            });
+        }
+    });
+    (url, server)
+}
+
+/// Chrome's error pages take no agent input (`error_pages`). A certificate
+/// Chrome does not trust leaves the tab on its warning, a `chrome-error:`
+/// document: the agent's pointer press, single key and typed text are each
+/// refused there with the failed address and Chrome's net error, while
+/// navigation still works from it. The person's own input is not refused:
+/// they type Chrome's bypass phrase, the origin's page loads, and the agent's
+/// input works again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires installed Chromium, Xvfb and browser-display"]
+async fn e2e_native_agent_input_is_refused_on_chrome_error_pages() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let (url, server) =
+        serve_self_signed("<title>Proceeded</title><input id=field autofocus>").await;
+    let mut state = DaemonState::new();
+    assert_success(
+        &control_test_command(&json!({"action":"launch","headless":true}), &mut state).await,
+    );
+    const NET_ERROR: &str = "net::ERR_CERT_AUTHORITY_INVALID";
+    // Navigation reaches the warning or reports its net error; it is never
+    // refused as input.
+    let reaches_the_warning = |response: &Value| {
+        assert!(
+            response["success"] == true
+                || response["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains(NET_ERROR)),
+            "{response}"
+        );
+    };
+    reaches_the_warning(
+        &control_test_command(&json!({"action":"navigate","url":url}), &mut state).await,
+    );
+    let refused = |response: &Value| {
+        assert_error_code(response, "browser_error_page");
+        assert_eq!(
+            response["data"],
+            json!({ "failedUrl": url, "netError": NET_ERROR }),
+            "{response}"
+        );
+    };
+    // Each input is attempted before any is judged, so a run without the
+    // rule shows what each one did.
+    let inputs = [
+        json!({"action":"click","selector":"body"}),
+        json!({"action":"press","key":"Enter"}),
+        json!({"action":"keyboard","subaction":"type","text":"thisisunsafe"}),
+    ];
+    let mut outcomes = Vec::new();
+    for input in &inputs {
+        outcomes.push(control_test_command(input, &mut state).await);
+    }
+    for outcome in &outcomes {
+        refused(outcome);
+    }
+    // Navigation from the warning: reload it, leave it, come back to it.
+    reaches_the_warning(&control_test_command(&json!({"action":"reload"}), &mut state).await);
+    assert_success(
+        &control_test_command(
+            &json!({"action":"navigate","url":"data:text/html,<title>Plain</title><input id=plain autofocus>"}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#plain"}), &mut state).await,
+    );
+    reaches_the_warning(&control_test_command(&json!({"action":"back"}), &mut state).await);
+    refused(&control_test_command(&inputs[0], &mut state).await);
+
+    // The person proceeds with their own keys.
+    let controller = uuid::Uuid::new_v4().to_string();
+    assert_success(&control_test_command(&json!({"action":"ambit_browser_control","op":"acquire","controllerId":controller,"expiresAt":super::stream::timestamp_ms()+25000}), &mut state).await);
+    for (index, key) in "thisisunsafe".chars().enumerate() {
+        let generation = state
+            .browser
+            .as_ref()
+            .unwrap()
+            .display_client()
+            .unwrap()
+            .surface()
+            .generation;
+        let (key, code, virtual_key) = (
+            key.to_string(),
+            format!("Key{}", key.to_ascii_uppercase()),
+            key.to_ascii_uppercase() as u32,
+        );
+        assert_success(&control_test_command(&json!({"action":"ambit_browser_control","op":"input","controllerId":controller,"sequence":index+1,"expectedSurfaceGeneration":generation,"events":[
+            {"type":"input_keyboard","eventType":"keyDown","key":key,"code":code,"text":key,"windowsVirtualKeyCode":virtual_key},
+            {"type":"input_keyboard","eventType":"keyUp","key":key,"code":code,"windowsVirtualKeyCode":virtual_key}]}), &mut state).await);
+    }
+    assert_success(
+        &control_test_command(
+            &json!({"action":"ambit_browser_control","op":"release","controllerId":controller}),
+            &mut state,
+        )
+        .await,
+    );
+    // After a person's control the agent observes before it acts.
+    assert_success(&control_test_command(&json!({"action":"snapshot"}), &mut state).await);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let shown = control_test_command(
+            &json!({"action":"evaluate","script":"location.href"}),
+            &mut state,
+        )
+        .await;
+        if shown["data"]["result"] == url.as_str() {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{shown}");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_success(&control_test_command(&json!({"action":"snapshot"}), &mut state).await);
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#field"}), &mut state).await,
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"keyboard","subaction":"type","text":"after"}),
+            &mut state,
+        )
+        .await,
+    );
+    let value = control_test_command(
+        &json!({"action":"evaluate","script":"field.value"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(value["data"]["result"], "after", "{value}");
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+    server.abort();
+}
+
 /// Native strip order may differ from stable daemon tab IDs after a person's
 /// reorder; switching observes each actual target rather than guessing CtrlN.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
