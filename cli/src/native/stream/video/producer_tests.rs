@@ -697,10 +697,9 @@ async fn a_stream_starts_whole_follows_damage_and_refines_a_still_picture() {
 }
 
 /// A unit of motion codes only the rows that changed since the unit before
-/// it, and the refinement that follows only those rows: a typed key costs
-/// the encoder its line, not the window, and every other row a viewer paints
-/// stays exactly as it was. A key unit, and the refinement after it, code
-/// the whole picture.
+/// it, and the refinement that follows only those rows, so every other row a
+/// viewer paints stays exactly as it was. A key unit, and the refinement
+/// after it, code the whole picture.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_unit_codes_only_the_rows_that_changed() {
     let rig = rig();
