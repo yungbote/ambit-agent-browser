@@ -605,12 +605,13 @@ impl Encoding {
             return;
         }
         if let Some((rows, coded)) = self.exact(&mailbox, capture) {
-            drop(mailbox);
+            // One critical section from the check to `exact_since_held`: the
+            // encoder cannot begin a key unit of the held picture in between,
+            // which would follow this newer unit and take its pixels back.
             let stride = reply.stride as usize;
             let change = lock(&self.shown)
                 .as_mut()
                 .and_then(|shown| shown.change(pixels, stride, capture.visible, rows));
-            mailbox = lock(&self.mailbox);
             if let Some(change) = change {
                 mailbox.behind = false;
                 mailbox.unsent = None;
