@@ -70,7 +70,13 @@ mod control {
     pub(super) const SUPERBLOCK_SIZE: c_int = 56;
     pub(super) const ENABLE_CDEF: c_int = 58;
     pub(super) const ENABLE_ORDER_HINT: c_int = 79;
+    pub(super) const ENABLE_FILTER_INTRA: c_int = 98;
+    pub(super) const ENABLE_SMOOTH_INTRA: c_int = 99;
+    pub(super) const ENABLE_PAETH_INTRA: c_int = 100;
+    pub(super) const ENABLE_CFL_INTRA: c_int = 101;
     pub(super) const ENABLE_PALETTE: c_int = 104;
+    pub(super) const ENABLE_ANGLE_DELTA: c_int = 106;
+    pub(super) const ENABLE_DIAGONAL_INTRA: c_int = 141;
     pub(super) const DELTAQ_MODE: c_int = 107;
     pub(super) const COEFF_COST_UPD_FREQ: c_int = 126;
     pub(super) const MODE_COST_UPD_FREQ: c_int = 127;
@@ -573,10 +579,24 @@ impl AomEncoder {
         // make scrolled text 29x and key units 31% smaller; 128x128
         // superblocks, no CDEF and frozen cost tables cut 10-20% of the CPU
         // for 1% more bytes. Speeds 9, 10 and 11 cost the same here.
+        // Screen content is coded by the palette and the plain directional
+        // predictors; searching the filter, smooth, Paeth, chroma-from-luma,
+        // angle-delta and diagonal predictors as well tripled the cost of
+        // every intra-coded block for no bytes. On the two rendered pages at
+        // the motion quantizer, without them a key unit took 147 ms instead
+        // of 401 for 1% more bytes, and a whole change of dense text 142 to
+        // 152 ms instead of 294 to 542 for the same bytes (unit 2 of
+        // ab-native-20261003, `a_whole_page_change`).
         for (id, value) in [
             (control::CPU_USED, MOTION_SPEED),
             (control::TUNE_CONTENT, CONTENT_SCREEN),
             (control::ENABLE_PALETTE, 1),
+            (control::ENABLE_FILTER_INTRA, 0),
+            (control::ENABLE_SMOOTH_INTRA, 0),
+            (control::ENABLE_PAETH_INTRA, 0),
+            (control::ENABLE_CFL_INTRA, 0),
+            (control::ENABLE_ANGLE_DELTA, 0),
+            (control::ENABLE_DIAGONAL_INTRA, 0),
             (control::SUPERBLOCK_SIZE, SUPERBLOCK_128),
             (control::ENABLE_CDEF, 0),
             (control::COEFF_COST_UPD_FREQ, COST_UPDATE_OFF),

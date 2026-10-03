@@ -188,6 +188,7 @@ fn a_whole_page_change() {
     for codec in [VideoCodec::Av1Full] {
         for quantizer in [32u8, 40, 48, 56] {
             let mut encoder = tuned(codec, 4);
+            let mut decoder = super::aom::tests::Decoder::new();
             let mut picture = Planar::new(codec.chroma(), WIDTH as u32, HEIGHT as u32);
             let mut times = Vec::new();
             for (index, page) in [&page_b, &page_a, &page_b, &page_a, &page_b]
@@ -206,16 +207,19 @@ fn a_whole_page_change() {
                         },
                     )
                     .unwrap();
-                times.push((started.elapsed().as_secs_f64() * 1000.0, unit.data.len()));
+                let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+                let decoded = decode(&mut decoder, &unit.data, codec.chroma());
+                times.push((elapsed, unit.data.len(), rgb_psnr(&page.window(0), &decoded)));
             }
             println!(
-                "PAGE_CHANGE q{quantizer} controls[{}] key {:.0}ms {}KB, changes {:?}",
+                "PAGE_CHANGE q{quantizer} controls[{}] key {:.0}ms {}KB {:.2}dB, changes {:?}",
                 std::env::var("VIDEO_BENCH_CONTROLS").unwrap_or_default(),
                 times[0].0,
                 times[0].1 / 1024,
+                times[0].2,
                 times[1..]
                     .iter()
-                    .map(|(ms, bytes)| format!("{ms:.0}ms {}KB", bytes / 1024))
+                    .map(|(ms, bytes, psnr)| format!("{ms:.0}ms {}KB {psnr:.2}dB", bytes / 1024))
                     .collect::<Vec<_>>()
             );
         }
@@ -478,6 +482,145 @@ fn a_refinement_after_a_scroll() {
             let entry = json!({"history": history, "refinementSpeed": refine, "passes": passes});
             println!("VIDEO_BENCH {entry}");
             results.push(entry);
+        }
+    }
+    if let Some(out) = std::env::var_os("VIDEO_BENCH_OUT") {
+        std::fs::write(out, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
+    }
+}
+
+/// A synthetic page of text: dark glyph strokes in lines on white, BGRX.
+fn text_page(width: usize, height: usize) -> Vec<u8> {
+    let mut source = vec![255u8; width * height * 4];
+    let mut seed = 0x2545_f491u32;
+    for line in (140..height.saturating_sub(40)).step_by(44) {
+        for cell in (48..width.saturating_sub(64)).step_by(18) {
+            seed ^= seed << 13;
+            seed ^= seed >> 17;
+            seed ^= seed << 5;
+            if seed % 7 == 0 {
+                continue;
+            }
+            for y in line..line + 30 {
+                for x in cell..cell + 14 {
+                    if (seed >> ((x - cell + y - line) % 24)) & 1 == 1 {
+                        source[(y * width + x) * 4..][..3].fill(32);
+                    }
+                }
+            }
+        }
+    }
+    source
+}
+
+/// One typed key's encode cost by the coded picture's size, whether the
+/// unit codes only the changed rows, and the encoder's threads, on a
+/// synthetic page of text: what a unit of motion costs that does not scale
+/// with what changed. `VIDEO_BENCH_OUT` names a file for the results.
+#[test]
+#[ignore = "measurement harness"]
+fn a_typed_key_by_coded_size_region_and_threads() {
+    let mut results = Vec::new();
+    for (width, height) in [(2048usize, 2048usize), (1856, 1920), (2816, 2048)] {
+        for threads in [4u32, 8] {
+            for regional in [false, true] {
+                let mut encoder =
+                    AomEncoder::new(VideoCodec::Av1Full, width as u32, height as u32, threads)
+                        .unwrap();
+                let mut source = text_page(width, height);
+                let mut planar = Planar::new(Chroma::Full, width as u32, height as u32);
+                assert!(planar.convert(&source, width * 4, (width, height), (0, height)));
+                let request = |key| EncodeRequest {
+                    key,
+                    quantizer: 32,
+                    refine: false,
+                };
+                encoder.encode(&planar.picture(), request(true)).unwrap();
+                let (top, bottom) = (16usize, 112usize);
+                let (mut wall, cpu_before) = (Vec::new(), cpu_seconds());
+                for key in 0..40usize {
+                    let left = 48 + key * 40;
+                    for y in 24..104 {
+                        for x in left..left + 28 {
+                            source[(y * width + x) * 4..][..3].fill(if (x + y) % 5 == 0 { 0 } else { 40 });
+                        }
+                    }
+                    assert!(planar.convert(&source, width * 4, (width, height), (top, bottom)));
+                    encoder
+                        .set_region(regional.then_some(super::EncoderRegion {
+                            x: 0,
+                            y: top as u32,
+                            width: width as u32,
+                            height: (bottom - top) as u32,
+                        }))
+                        .unwrap();
+                    let started = Instant::now();
+                    encoder.encode(&planar.picture(), request(false)).unwrap();
+                    wall.push(started.elapsed().as_secs_f64() * 1000.0);
+                }
+                let result = json!({
+                    "coded": [width, height], "threads": threads, "regional": regional,
+                    "p50Ms": percentile(&wall, 0.5), "p95Ms": percentile(&wall, 0.95),
+                    "meanMs": wall.iter().sum::<f64>() / wall.len() as f64,
+                    "cpuMsPerUnit": (cpu_seconds() - cpu_before) * 1000.0 / wall.len() as f64,
+                });
+                println!("TYPED_KEY {result}");
+                results.push(result);
+            }
+        }
+    }
+    if let Some(out) = std::env::var_os("VIDEO_BENCH_OUT") {
+        std::fs::write(out, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
+    }
+}
+
+/// A key unit's time and size by coded size and intra tools, on a synthetic
+/// page of text: the encoder's own configuration, every intra predictor it
+/// leaves out searched again (`aomcx.h` 98-101, 106, 141), and without the
+/// palette (104) or intra block copy (105). Speed 11 and the quantizer
+/// changed it little. `VIDEO_BENCH_OUT` names a file for the results.
+#[test]
+#[ignore = "measurement harness"]
+fn a_key_unit_by_coded_size_and_intra_tools() {
+    let mut results = Vec::new();
+    let every_predictor: &[(i32, i32)] = &[(98, 1), (99, 1), (100, 1), (101, 1), (106, 1), (141, 1)];
+    for (width, height) in [(2048usize, 2048usize), (2816, 2048)] {
+        for (name, controls) in [
+            ("encoder", &[][..]),
+            ("everyPredictor", every_predictor),
+            ("noPalette", &[(104, 0)][..]),
+            ("noIntraBlockCopy", &[(105, 0)][..]),
+        ] {
+            let source = text_page(width, height);
+            let mut planar = Planar::new(Chroma::Full, width as u32, height as u32);
+            assert!(planar.convert(&source, width * 4, (width, height), (0, height)));
+            let (mut wall, mut bytes) = (Vec::new(), 0);
+            for _ in 0..2 {
+                let mut encoder =
+                    AomEncoder::new(VideoCodec::Av1Full, width as u32, height as u32, 4).unwrap();
+                for (id, value) in controls {
+                    encoder.tune(*id, *value).unwrap();
+                }
+                let started = Instant::now();
+                let unit = encoder
+                    .encode(
+                        &planar.picture(),
+                        EncodeRequest {
+                            key: true,
+                            quantizer: 32,
+                            refine: false,
+                        },
+                    )
+                    .unwrap();
+                wall.push(started.elapsed().as_secs_f64() * 1000.0);
+                bytes = unit.data.len();
+            }
+            let result = json!({
+                "coded": [width, height], "tools": name, "bytes": bytes,
+                "p50Ms": percentile(&wall, 0.5), "minMs": percentile(&wall, 0.0),
+            });
+            println!("KEY_UNIT {result}");
+            results.push(result);
         }
     }
     if let Some(out) = std::env::var_os("VIDEO_BENCH_OUT") {
