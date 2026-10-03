@@ -485,9 +485,11 @@ async fn e2e_new_profile_credential_save_preference_preserves_human_signin() {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}/", listener.local_addr().unwrap());
     let (sent, mut seen) = tokio::sync::mpsc::unbounded_channel::<String>();
+    let loads = Arc::new(std::sync::atomic::AtomicU64::new(0));
     let server = tokio::spawn(async move {
         while let Ok((mut stream, _)) = listener.accept().await {
             let sent = sent.clone();
+            let loads = loads.clone();
             tokio::spawn(async move {
                 let mut buffer = [0u8; 8192];
                 let size = stream.read(&mut buffer).await.unwrap_or(0);
@@ -496,12 +498,26 @@ async fn e2e_new_profile_credential_save_preference_preserves_human_signin() {
                 let target = first.split_whitespace().nth(1).unwrap_or("/");
                 let submitted = first.starts_with("POST /signed-in ");
                 let body = if submitted {
-                    "<!doctype html><title>Fixture signed in</title><body style='background:#f0fff0'><h1>Signed in</h1><script>requestAnimationFrame(()=>requestAnimationFrame(()=>fetch('/settled')))</script>"
+                    "<!doctype html><title>Fixture signed in</title><body style='background:#f0fff0'><h1>Signed in</h1><script>requestAnimationFrame(()=>requestAnimationFrame(()=>fetch('/settled')))</script>".to_string()
                 } else if target == "/" {
-                    "<!doctype html><title>Fixture sign in</title><style>body{font:20px sans-serif}input{display:block;width:400px;height:40px;margin:12px}button{margin:12px}</style><form method=post action=/signed-in><label>Username<input name=username autocomplete=username autofocus></label><label>Password<input name=password type=password autocomplete=current-password></label><button>Sign in</button></form><script>addEventListener('pointermove',()=>fetch('/pointer'),{once:true})</script>"
+                    let metadata = json!({"page":uuid::Uuid::new_v4().to_string(),"load":loads.fetch_add(1,std::sync::atomic::Ordering::SeqCst)+1});
+                    let form = "<!doctype html><title>Fixture sign in</title><style>body{font:20px sans-serif}input{display:block;width:400px;height:40px;margin:12px}button{margin:12px}</style><form method=post action=/signed-in><label>Username<input name=username autocomplete=username autofocus></label><label>Password<input name=password type=password autocomplete=current-password></label><button>Sign in</button></form>";
+                    let script = "const counts={keydown:0,beforeinput:0,input:0};let pending=false;const report=(kind,extra={})=>fetch('/'+kind+'?'+new URLSearchParams({...credentialFixture,webdriver:String(navigator.webdriver),...extra}));const reportCounts=()=>{pending=false;report('event-counts',counts)};for(const name of Object.keys(counts))addEventListener(name,()=>{counts[name]++;if(!pending){pending=true;requestAnimationFrame(reportCounts)}},true);addEventListener('pointermove',e=>{report('pointer',{trusted:String(e.isTrusted)});reportCounts()},{once:true});addEventListener('pointerdown',e=>requestAnimationFrame(()=>report('pointerdown',{trusted:String(e.isTrusted),usernameFocused:String(document.activeElement===document.querySelector('[name=username]'))})),{once:true})";
+                    format!("{form}<script>window.credentialFixture={metadata};{script}</script>")
                 } else {
-                    ""
+                    String::new()
                 };
+                if target.starts_with("/event-counts?")
+                    || target.starts_with("/pointer?")
+                    || target.starts_with("/pointerdown?")
+                    || submitted
+                    || target == "/settled"
+                {
+                    eprintln!(
+                        "baseline_page_path={}",
+                        if submitted { "POST /signed-in" } else { target }
+                    );
+                }
                 let _ = sent.send(if submitted {
                     "submitted".into()
                 } else {
@@ -534,6 +550,10 @@ async fn e2e_new_profile_credential_save_preference_preserves_human_signin() {
             .is_none_or(|signin| signin.get("allowed").is_none()),
         "no Chrome-account sign-in policy is added"
     );
+    let automated_page = evaluate(&mut state, "window.credentialFixture").await;
+    assert!(automated_page["page"].is_string());
+    assert!(automated_page["load"].is_u64());
+    eprintln!("baseline_automated_page={automated_page}");
     let (x, y, _) = window_point(&state, 100.0, 70.0).await;
     while seen.try_recv().is_ok() {}
     let controller = acquire(&mut state).await;
@@ -544,37 +564,118 @@ async fn e2e_new_profile_credential_save_preference_preserves_human_signin() {
         "human sign-in has no DevTools"
     );
     assert_eq!(person.user_data_dir(), profile);
-    // Real pointer receipt proves the new native window/page is ready.
+    // Accept only a fresh human page's trusted pointer, never a delayed
+    // report from the automated page used for coordinate calibration.
     let mut sequence = 2;
-    tokio::time::timeout(Duration::from_secs(8), async {
+    let human_page = tokio::time::timeout(Duration::from_secs(8), async {
         loop {
             let mut input = control("input", &controller);
             input["sequence"] = json!(sequence);
             input["expectedSurfaceGeneration"] = json!(state.window_display().unwrap().surface().generation);
             input["events"] = json!([{"type":"input_mouse","eventType":"mouseMoved","x":x + f64::from((sequence % 2) as u32)*4.0,"y":y,"button":"none","buttons":0}]);
-            assert_success(&command(&input,&mut state).await);
+            assert_eq!(assert_success(&command(&input,&mut state).await)["status"], "applied");
             sequence += 1;
             if let Ok(Some(path)) = tokio::time::timeout(Duration::from_millis(250),seen.recv()).await {
-                if path == "/pointer" {break;}
+                if let Some(query) = path.strip_prefix("/pointer?") {
+                    let report: HashMap<String,String> = url::form_urlencoded::parse(query.as_bytes()).into_owned().collect();
+                    if report.get("page").is_some_and(|page| Some(page.as_str()) != automated_page["page"].as_str())
+                        && report.get("load").and_then(|load| load.parse::<u64>().ok()).is_some_and(|load| load > automated_page["load"].as_u64().unwrap())
+                        && report.get("webdriver").map(String::as_str) == Some("false")
+                        && report.get("trusted").map(String::as_str) == Some("true") {
+                        break report;
+                    }
+                }
             }
         }
-    }).await.expect("sign-in page accepted a real pointer");
+    }).await;
+    if human_page.is_err() {
+        eprintln!(
+            "baseline_failure_window={}",
+            dump_window(&state, "baseline-fresh-page-failed")
+                .await
+                .display()
+        );
+    }
+    let human_page = human_page.expect("fresh human sign-in page accepted a real pointer");
+    eprintln!("baseline_human_page={}", json!(human_page));
+    let before = state.window_display().unwrap().info().await.unwrap();
+    eprintln!(
+        "baseline_focus_before_click={}",
+        json!({"focusWindow":before.focus_window,"windows":before.windows.iter().map(|window|json!({"id":window.id,"pid":window.pid,"mapped":window.mapped,"focused":window.focused})).collect::<Vec<_>>()})
+    );
     let mut input = control("input", &controller);
     input["sequence"] = json!(sequence);
     input["expectedSurfaceGeneration"] =
         json!(state.window_display().unwrap().surface().generation);
-    let mut events = vec![
+    let click = vec![
         json!({"type":"input_mouse","eventType":"mousePressed","x":x,"y":y,"button":"left","buttons":1,"clickCount":1}),
         json!({"type":"input_mouse","eventType":"mouseReleased","x":x,"y":y,"button":"left","buttons":0,"clickCount":1}),
     ];
+    input["events"] = json!(click);
+    assert_eq!(
+        assert_success(&command(&input, &mut state).await)["status"],
+        "applied"
+    );
+    sequence += 1;
+    let clicked = tokio::time::timeout(Duration::from_secs(8), async {
+        while let Some(path) = seen.recv().await {
+            if let Some(query) = path.strip_prefix("/pointerdown?") {
+                let report: HashMap<String, String> = url::form_urlencoded::parse(query.as_bytes())
+                    .into_owned()
+                    .collect();
+                if report.get("page") == human_page.get("page")
+                    && report.get("load") == human_page.get("load")
+                    && report.get("webdriver").map(String::as_str) == Some("false")
+                    && report.get("trusted").map(String::as_str) == Some("true")
+                    && report.get("usernameFocused").map(String::as_str) == Some("true")
+                {
+                    return;
+                }
+            }
+        }
+        panic!("fixture server stopped");
+    })
+    .await;
+    if clicked.is_err() {
+        eprintln!(
+            "baseline_failure_window={}",
+            dump_window(&state, "baseline-fresh-focus-failed")
+                .await
+                .display()
+        );
+    }
+    clicked.expect("fresh human page received the trusted click and focused username");
+    let focused = state.window_display().unwrap().info().await.unwrap();
+    eprintln!(
+        "baseline_focus_before_keys={}",
+        json!({"focusWindow":focused.focus_window,"windows":focused.windows.iter().map(|window|json!({"id":window.id,"pid":window.pid,"mapped":window.mapped,"focused":window.focused})).collect::<Vec<_>>()})
+    );
+    assert!(
+        focused
+            .windows
+            .iter()
+            .any(|window| window.mapped && window.focused && window.pid == Some(person.pid)),
+        "the owned human Chrome window has native focus before keys"
+    );
+    input["sequence"] = json!(sequence);
+    let mut events = Vec::new();
     events.extend(super::interaction::native_inserted_events("fixture"));
     events.extend(super::interaction::native_key_chord_events("Tab", None));
     // Deliberate nosecret test fixture only.
     events.extend(super::interaction::native_inserted_events("nosecret"));
     events.extend(super::interaction::native_key_chord_events("Enter", None));
     input["events"] = json!(events);
-    assert_success(&command(&input, &mut state).await);
-    tokio::time::timeout(Duration::from_secs(8), async {
+    assert_eq!(
+        assert_success(&command(&input, &mut state).await)["status"],
+        "applied"
+    );
+    let focus = state.window_display().unwrap().info().await.unwrap();
+    eprintln!(
+        "baseline_x11_focus={}",
+        json!({"focusWindow":focus.focus_window,
+        "windows":focus.windows.iter().map(|window| json!({"id":window.id,"pid":window.pid,"mapped":window.mapped,"focused":window.focused})).collect::<Vec<_>>() })
+    );
+    let submitted = tokio::time::timeout(Duration::from_secs(8), async {
         while let Some(path) = seen.recv().await {
             if path == "/settled" {
                 return;
@@ -582,8 +683,12 @@ async fn e2e_new_profile_credential_save_preference_preserves_human_signin() {
         }
         panic!("fixture server stopped");
     })
-    .await
-    .expect("human sign-in submitted and rendered success");
+    .await;
+    if submitted.is_err() {
+        let path = dump_window(&state, "baseline-credential-submit-failed").await;
+        eprintln!("baseline_failure_window={}", path.display());
+    }
+    submitted.expect("human sign-in submitted and rendered success");
     let display = state.window_display().unwrap();
     let screenshot = tokio::time::timeout(Duration::from_secs(5), async {
         loop {
