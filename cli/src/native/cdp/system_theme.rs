@@ -332,6 +332,41 @@ mod tests {
     }
 
     #[test]
+    fn private_projection_keeps_nominal_cursor_size_independent_of_viewport_and_theme() {
+        for theme in Theme::ALL {
+            assert!(configuration(theme).lines().any(|line| {
+                line == format!(
+                    "Gtk/CursorThemeSize {}",
+                    24 * crate::native::display::DEVICE_SCALE_FACTOR
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn theme_only_wrong_or_conflicting_cursor_size_cannot_acknowledge_the_projection() {
+        for theme in Theme::ALL {
+            let projected = configuration(theme);
+            let theme_line = projected
+                .lines()
+                .find(|line| line.starts_with("Net/ThemeName "))
+                .unwrap();
+            for size in ["", "Gtk/CursorThemeSize 24", "Gtk/CursorThemeSize 0"] {
+                assert!(!acknowledged_theme(
+                    format!("{theme_line}\n{size}\n").as_bytes(),
+                    theme
+                ));
+            }
+            assert!(!acknowledged_theme(
+                format!("{projected}Gtk/CursorThemeSize 24\n").as_bytes(),
+                theme
+            ));
+            let reordered = projected.lines().rev().collect::<Vec<_>>().join("\n");
+            assert!(acknowledged_theme(reordered.as_bytes(), theme));
+        }
+    }
+
+    #[test]
     fn atomic_projection_is_private_and_leaves_no_intermediate_file() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("settings.conf");
