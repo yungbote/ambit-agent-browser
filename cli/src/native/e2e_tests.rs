@@ -11691,20 +11691,22 @@ async fn e2e_native_tab_new_keeps_setup_and_label_admission() {
 
 /// In an owned window a tab closes as a person closes it: the agent selects
 /// it with native keys and presses Ctrl+W. A protocol close skips a page's
-/// beforeunload guard and Ctrl+W honours it, so a guarded tab stays open
-/// behind its dialog until the agent accepts it; an unguarded tab closes, and
-/// the roster's active tab is the one Chrome then shows.
+/// beforeunload guard and Ctrl+W honours it: a guarded tab closes once the
+/// daemon accepts its dialog (the default), and with that turned off it stays
+/// open behind the dialog until the agent accepts it. The roster's active tab
+/// is the one Chrome then shows.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore = "requires installed Chromium, Xvfb and browser-display"]
 async fn e2e_native_tab_close_selects_the_tab_and_presses_ctrl_w() {
-    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    let env = EnvGuard::new(&[
+        "AGENT_BROWSER_WINDOW_STREAM",
+        "DISPLAY",
+        "AGENT_BROWSER_NO_AUTO_DIALOG",
+    ]);
     env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
     env.set("DISPLAY", "");
-    let mut state = DaemonState::new();
-    assert_success(
-        &control_test_command(&json!({"action":"launch","headless":true}), &mut state).await,
-    );
-    let page = |name: &str, guarded: bool| {
+    env.remove("AGENT_BROWSER_NO_AUTO_DIALOG");
+    fn page(name: &str, guarded: bool) -> String {
         let guard = if guarded {
             "<script>addEventListener('beforeunload',e=>{e.preventDefault();e.returnValue=''})</script>"
         } else {
@@ -11716,28 +11718,34 @@ async fn e2e_native_tab_close_selects_the_tab_and_presses_ctrl_w() {
                 "<title>{name}</title><body style=\"height:100vh;margin:0\"><p>{name}</p>{guard}"
             ))
         )
-    };
-    assert_success(
-        &control_test_command(
-            &json!({"action":"navigate","url":page("alpha", true)}),
-            &mut state,
-        )
-        .await,
-    );
-    let alpha = state.browser.as_ref().unwrap().tab_list()[0]["tabId"]
-        .as_str()
-        .unwrap()
-        .to_string();
-    for name in ["beta", "gamma"] {
+    }
+    // A guarded alpha and unguarded tabs after it; alpha's tab id.
+    async fn open(state: &mut DaemonState, others: &[&str]) -> String {
+        assert_success(
+            &control_test_command(&json!({"action":"launch","headless":true}), state).await,
+        );
         assert_success(
             &control_test_command(
-                &json!({"action":"tab_new","url":page(name, false),"label":name}),
-                &mut state,
+                &json!({"action":"navigate","url":page("alpha", true)}),
+                state,
             )
             .await,
         );
+        for name in others {
+            assert_success(
+                &control_test_command(
+                    &json!({"action":"tab_new","url":page(name, false),"label":name}),
+                    state,
+                )
+                .await,
+            );
+        }
+        state.browser.as_ref().unwrap().tab_list()[0]["tabId"]
+            .as_str()
+            .unwrap()
+            .to_string()
     }
-    let tabs = |state: &DaemonState| {
+    let labels = |state: &DaemonState| {
         state
             .browser
             .as_ref()
@@ -11747,13 +11755,29 @@ async fn e2e_native_tab_close_selects_the_tab_and_presses_ctrl_w() {
             .map(|tab| tab["label"].as_str().unwrap_or_default().to_string())
             .collect::<Vec<_>>()
     };
+    // A native click gives the guard the activation it needs to ask.
+    async fn activate(state: &mut DaemonState, alpha: &str) {
+        assert_success(
+            &control_test_command(&json!({"action":"tab_switch","tabId":alpha}), state).await,
+        );
+        assert_success(
+            &control_test_command(&json!({"action":"click","selector":"p"}), state).await,
+        );
+    }
+
+    let mut state = DaemonState::new();
+    let alpha = open(&mut state, &["beta", "gamma"]).await;
     // Unguarded and not shown: selected natively, then closed by Ctrl+W.
     let closed =
         control_test_command(&json!({"action":"tab_close","tabId":"beta"}), &mut state).await;
     assert_success(&closed);
     assert_eq!(closed["data"]["closed"], true);
     assert_eq!(state.browser.as_ref().unwrap().page_count(), 2);
-    assert!(!tabs(&state).iter().any(|label| label == "beta"), "{:?}", tabs(&state));
+    assert!(
+        !labels(&state).iter().any(|label| label == "beta"),
+        "{:?}",
+        labels(&state)
+    );
     assert_eq!(
         state
             .browser
@@ -11764,12 +11788,20 @@ async fn e2e_native_tab_close_selects_the_tab_and_presses_ctrl_w() {
         Ok(false),
         "the roster's active tab is the one Chrome shows"
     );
-    // Guarded: a native click gives the page the activation its guard
-    // needs, and Ctrl+W then leaves the tab open behind its dialog.
-    assert_success(
-        &control_test_command(&json!({"action":"tab_switch","tabId":alpha}), &mut state).await,
-    );
-    assert_success(&control_test_command(&json!({"action":"click","selector":"p"}), &mut state).await);
+    // Guarded, with the daemon accepting leave dialogs: the tab closes.
+    activate(&mut state, &alpha).await;
+    let closed = control_test_command(&json!({"action":"tab_close"}), &mut state).await;
+    assert_success(&closed);
+    assert_eq!(closed["data"]["closed"], true);
+    assert_eq!(labels(&state), ["gamma"]);
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+
+    // Guarded, with leave dialogs left to the agent: the tab stays open
+    // behind its dialog until the agent accepts it.
+    env.set("AGENT_BROWSER_NO_AUTO_DIALOG", "1");
+    let mut state = DaemonState::new();
+    let alpha = open(&mut state, &["beta"]).await;
+    activate(&mut state, &alpha).await;
     let held = control_test_command(&json!({"action":"tab_close"}), &mut state).await;
     assert_eq!(held["success"], false, "{held}");
     assert!(
@@ -11779,16 +11811,19 @@ async fn e2e_native_tab_close_selects_the_tab_and_presses_ctrl_w() {
         "{held}"
     );
     assert_eq!(state.browser.as_ref().unwrap().page_count(), 2);
-    assert_success(&control_test_command(&json!({"action":"dialog","response":"accept"}), &mut state).await);
+    assert_success(
+        &control_test_command(&json!({"action":"dialog","response":"accept"}), &mut state).await,
+    );
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     loop {
         assert_success(&control_test_command(&json!({"action":"tab_list"}), &mut state).await);
         if state.browser.as_ref().unwrap().page_count() == 1 {
             break;
         }
-        assert!(std::time::Instant::now() < deadline, "{:?}", tabs(&state));
+        assert!(std::time::Instant::now() < deadline, "{:?}", labels(&state));
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
+    assert_eq!(labels(&state), ["beta"]);
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
 

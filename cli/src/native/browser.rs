@@ -2523,12 +2523,15 @@ impl BrowserManager {
     /// visible one (the caller selected it with native input), `close`
     /// presses the window's close shortcut, and the tab leaves the roster
     /// only once Chrome destroyed it, Chrome's own successor becoming the
-    /// visible tab. A page that asks before it is left keeps its tab open
-    /// behind that dialog, which the agent answers with native input.
+    /// visible tab. A page that asks before it is left closes once its
+    /// dialog is accepted: by the daemon itself when `leave_accepted`
+    /// (`DaemonState::auto_dialog`), otherwise its tab stays open behind the
+    /// dialog for the agent to answer.
     pub(crate) async fn tab_close_native(
         &mut self,
         tab_id: Option<u32>,
         dialog_session: Option<&str>,
+        leave_accepted: bool,
         close: impl Future<Output = Result<(), String>>,
     ) -> Result<Value, String> {
         let index = tab_id.map(|id| self.tab_index(id)).transpose()?;
@@ -2550,7 +2553,8 @@ impl BrowserManager {
                 if event.method == "Target.targetDestroyed" && event.params["targetId"] == target_id.as_str() {
                     return Ok(());
                 }
-                if event.method == "Page.javascriptDialogOpening"
+                if !leave_accepted
+                    && event.method == "Page.javascriptDialogOpening"
                     && event.session_id.as_deref() == Some(session_id.as_str())
                     && event.params["type"] == "beforeunload"
                 {
@@ -2595,7 +2599,11 @@ impl BrowserManager {
     }
 
     /// The close's answer, once the tab is gone, with the successor revived.
-    async fn closed(&mut self, page: PageInfo, dialog_session: Option<&str>) -> Result<Value, String> {
+    async fn closed(
+        &mut self,
+        page: PageInfo,
+        dialog_session: Option<&str>,
+    ) -> Result<Value, String> {
         let mut result = json!({
             "tabId": format_tab_id(page.tab_id),
             "targetId": page.target_id,
