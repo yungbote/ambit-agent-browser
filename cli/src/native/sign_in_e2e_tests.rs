@@ -1606,9 +1606,16 @@ async fn e2e_hand_back_with_a_busy_restored_tab_keeps_the_browser_and_its_tabs()
     );
     // The restored form's own request carries the cookies the site set
     // before the sign-in, its session cookie included: both relaunches kept
-    // them while a tab was busy.
-    let restored = site.wait_for_report("load", loads).await;
-    assert_eq!(restored["webdriver"], "true");
+    // them while a tab was busy. The sign-in browser's own restored pages
+    // may still report their loads after the release began.
+    let mut seen = loads;
+    let restored = loop {
+        let report = site.wait_for_report("load", seen).await;
+        if report["webdriver"] == "true" {
+            break report;
+        }
+        seen += 1;
+    };
     assert!(
         restored["cookie"].contains("ambit_session=1")
             && restored["cookie"].contains("ambit_sign_in=1"),
