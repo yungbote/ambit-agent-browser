@@ -70,7 +70,7 @@ impl Fixture {
         client
             .site_profile()
             .documents
-            .seed_fresh(&client, "page")
+            .seed_launched(&client, "page")
             .await
             .unwrap();
         Self {

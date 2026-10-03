@@ -964,12 +964,10 @@ impl BrowserManager {
                 documents: Default::default(),
             };
             manager.discover_and_attach_targets().await?;
+            let documents = manager.client.site_profile().documents.clone();
             for page in &manager.pages {
-                manager
-                    .client
-                    .site_profile()
-                    .documents
-                    .seed_fresh(&manager.client, &page.session_id)
+                documents
+                    .seed_launched(&manager.client, &page.session_id)
                     .await
                     .map_err(|error| error.to_string())?;
             }

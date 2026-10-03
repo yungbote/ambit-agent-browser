@@ -2,7 +2,7 @@
 //! recoverable frames have visited it, until that tab's history is retired.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde_json::{json, Value};
 
@@ -293,38 +293,14 @@ impl Documents {
         }
     }
 
+    /// Records the tab of `session` from its current frames and history. Its
+    /// frames are answered by its renderer, which a busy page holds.
     pub(crate) async fn seed(&self, client: &CdpClient, session: &str) -> Result<(), &'static str> {
-        self.seed_current(client, session, false).await
-    }
-    pub(crate) async fn seed_fresh(
-        &self,
-        client: &CdpClient,
-        session: &str,
-    ) -> Result<(), &'static str> {
-        self.seed_current(client, session, true).await?;
-        client.seed_script_enabled(session);
-        Ok(())
-    }
-    async fn seed_current(
-        &self,
-        client: &CdpClient,
-        session: &str,
-        owned: bool,
-    ) -> Result<(), &'static str> {
-        let page = client.page_of(session);
-        let Some(target) = client.target_for_session(&page) else {
+        let Some((target, page)) = self.tab_of(client, session) else {
             // Preparation may precede the attachment event. It still installs
             // Fetch; an unobserved target gains no history proof from this.
             return Ok(());
         };
-        let target = self
-            .frames
-            .lock()
-            .unwrap_or_else(|error| error.into_inner())
-            .get(&target)
-            .cloned()
-            .unwrap_or(target);
-        let page = client.session_for_target(&target).unwrap_or(page);
         let tree = client
             .send_command_no_params("Page.getFrameTree", Some(session))
             .await
@@ -334,9 +310,6 @@ impl Documents {
             .await
             .map_err(|_| storage::UNCLEARED)?;
         let entries = history["entries"].as_array().ok_or(storage::UNCLEARED)?;
-        let fresh = entries.len() == 1
-            && entries[0]["url"] == "about:blank"
-            && tree["frameTree"]["frame"]["url"] == "about:blank";
         let mut ids = Vec::new();
         frame_ids(&tree["frameTree"], &mut ids);
         let mut nodes = vec![&tree["frameTree"]];
@@ -360,15 +333,60 @@ impl Documents {
         frames.extend(ids.into_iter().map(|id| (id, target.clone())));
         let mut tabs = self.tabs.lock().unwrap_or_else(|error| error.into_inner());
         let tab = tabs.entry(target).or_default();
-        // Only an initially blank target establishes complete history. A
-        // current frame tree cannot attest old embedded/cached documents.
-        tab.known |= owned && fresh;
         frame_origins(&tree["frameTree"], &mut tab.origins);
         for entry in entries {
             if let Some(value) = entry["url"].as_str().and_then(origin) {
                 tab.origins.insert(value);
             }
         }
+        Ok(())
+    }
+
+    /// The tab target of `session` and its page session, once attached.
+    fn tab_of(&self, client: &CdpClient, session: &str) -> Option<(String, String)> {
+        let page = client.page_of(session);
+        let target = client.target_for_session(&page)?;
+        let target = self
+            .frames
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .get(&target)
+            .cloned()
+            .unwrap_or(target);
+        let page = client.session_for_target(&target).unwrap_or(page);
+        Some((target, page))
+    }
+
+    /// Custody of a page this browser process launched with. A launch waits
+    /// only for what the browser itself answers, the page's history, never
+    /// for its renderer, which a busy restored page holds for as long as it
+    /// is busy. A page born blank (one blank entry) has complete history from
+    /// its birth (`known`); a current frame tree could not attest older
+    /// embedded or cached documents, so no other page does. Every page's
+    /// frames are recorded off the launch's path (`seed`); until they are, a
+    /// restored page is untracked, so whatever needs its origins seeds it
+    /// then, and destructive work refuses it.
+    pub(crate) async fn seed_launched(
+        self: &Arc<Self>,
+        client: &Arc<CdpClient>,
+        session: &str,
+    ) -> Result<(), &'static str> {
+        let Some((target, page)) = self.tab_of(client, session) else {
+            return Ok(());
+        };
+        let history = client
+            .send_command_no_params("Page.getNavigationHistory", Some(&page))
+            .await
+            .map_err(|_| storage::UNCLEARED)?;
+        let entries = history["entries"].as_array().ok_or(storage::UNCLEARED)?;
+        if entries.len() == 1 && entries[0]["url"] == "about:blank" {
+            self.created(&target);
+        }
+        client.seed_script_enabled(session);
+        let (documents, client, session) = (self.clone(), client.clone(), session.to_owned());
+        tokio::spawn(async move {
+            let _ = documents.seed(&client, &session).await;
+        });
         Ok(())
     }
 
@@ -1018,6 +1036,106 @@ mod tests {
         );
         assert!(owner.origins("https://private.example").unwrap().is_empty());
         assert_eq!(owner.tabs.lock().unwrap()["unrelated"].origins.len(), 1);
+    }
+
+    /// A launch never waits on a renderer: a restored page whose renderer
+    /// is busy (its frame tree unanswered) does not hold the launch, and
+    /// stays untracked until its frames answer, then is recorded without
+    /// complete history; a page born blank has complete history at once.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_launched_page_never_waits_on_its_renderer() {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (release, mut released) = tokio::sync::watch::channel(false);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for (target, url) in [
+                ("blank", "about:blank"),
+                ("restored", "https://busy.example/"),
+            ] {
+                socket.send(Message::Text(json!({"method":"Target.attachedToTarget","params":{"sessionId":target,"waitingForDebugger":false,"targetInfo":{"targetId":target,"type":"page","url":url}}}).to_string())).await.unwrap();
+            }
+            let tree = json!({"frameTree":{"frame":{"id":"restored","url":"https://busy.example/next","securityOrigin":"https://busy.example"}}});
+            let mut held = None;
+            loop {
+                let request: Value = tokio::select! {
+                    message = socket.next() => match message {
+                        Some(Ok(Message::Text(body))) => serde_json::from_str(&body).unwrap(),
+                        _ => return,
+                    },
+                    _ = released.changed(), if held.is_some() => {
+                        let id: Value = held.take().unwrap();
+                        socket.send(Message::Text(json!({"id":id,"result":tree}).to_string())).await.unwrap();
+                        continue;
+                    }
+                };
+                let session = request["sessionId"].as_str().unwrap_or_default();
+                let busy = !*released.borrow();
+                let result = match request["method"].as_str().unwrap() {
+                    "Page.getNavigationHistory" if session == "blank" => {
+                        json!({"entries":[{"id":1,"url":"about:blank"}],"currentIndex":0})
+                    }
+                    "Page.getNavigationHistory" => {
+                        json!({"entries":[{"id":1,"url":"https://busy.example/"},{"id":2,"url":"https://busy.example/next"}],"currentIndex":1})
+                    }
+                    "Page.getFrameTree" if session == "restored" && busy => {
+                        // A renderer blocked in a synchronous request.
+                        held = Some(request["id"].clone());
+                        continue;
+                    }
+                    "Page.getFrameTree" if session == "restored" => tree.clone(),
+                    "Page.getFrameTree" => {
+                        json!({"frameTree":{"frame":{"id":"blank","url":"about:blank"}}})
+                    }
+                    "Storage.getStorageKeyForFrame" => {
+                        json!({"storageKey":"https://busy.example/"})
+                    }
+                    _ => json!({}),
+                };
+                let reply = json!({"id":request["id"],"result":result});
+                socket.send(Message::Text(reply.to_string())).await.unwrap();
+            }
+        });
+        let client = Arc::new(
+            CdpClient::connect(&format!("ws://{address}"))
+                .await
+                .unwrap(),
+        );
+        client
+            .send_command_no_params("Browser.getVersion", None)
+            .await
+            .unwrap();
+        let documents = Arc::new(Documents::default());
+        let started = std::time::Instant::now();
+        for session in ["blank", "restored"] {
+            documents.seed_launched(&client, session).await.unwrap();
+        }
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert!(documents.tabs.lock().unwrap()["blank"].known);
+        assert!(
+            !documents.tabs.lock().unwrap().contains_key("restored"),
+            "untracked while its renderer is busy"
+        );
+        release.send_replace(true);
+        let recorded = async {
+            loop {
+                if let Some(tab) = documents.tabs.lock().unwrap().get("restored") {
+                    return (tab.known, tab.origins.clone());
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        };
+        let (known, origins) = tokio::time::timeout(std::time::Duration::from_secs(5), recorded)
+            .await
+            .expect("recorded once its frames answer");
+        assert!(!known, "a restored page never has complete history");
+        assert!(origins.contains("https://busy.example"), "{origins:?}");
+        client.disconnect();
+        server.abort();
+        let _ = server.await;
     }
 
     #[test]
