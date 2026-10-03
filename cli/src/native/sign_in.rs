@@ -1,10 +1,16 @@
 //! Sign-in mode: while a person signs in to a site, the owned window runs the
 //! same Chrome (executable, flags, profile, private display and sandbox)
 //! without its automation channel, so it truthfully reports
-//! `navigator.webdriver === false`. Its only DevTools switch is a private
-//! loopback port its process owner uses to quit it (`ChromeProcess::quit`);
-//! Chrome reports automation to pages only for port 0. Handing back relaunches
-//! it with automation. Nothing is masked in either direction.
+//! `navigator.webdriver === false`. Its only DevTools switch is a loopback
+//! port its process owner uses only to quit it (`ChromeProcess::quit`);
+//! Chrome reports automation to pages for port 0 and for a pipe, not for a
+//! numbered port. Handing back relaunches it with automation. Nothing is
+//! masked in either direction.
+//!
+//! The port is private by convention, not by isolation: any process in the
+//! same network namespace can attach to it while a person signs in and read
+//! what they type. Only a browser host that runs apart from untrusted code
+//! confines a sign-in.
 //!
 //! Both transitions quit Chrome as an application quit, so tabs, cookies
 //! (session cookies included) and the profile survive both relaunches.
@@ -28,7 +34,7 @@ use tokio::time::Instant;
 use super::{adopt_launched_browser, close_current_browser, session_log, DaemonState};
 use crate::native::browser::BrowserManager;
 use crate::native::browser_control::{ControlError, ControlRequest, SignInAdmission};
-use crate::native::cdp::chrome::{self, ChromeProcess, LaunchOptions};
+use crate::native::cdp::chrome::{self, ChromeProcess, LaunchOptions, Stop};
 use crate::native::display::{DisplayClient, DEVICE_SCALE_FACTOR};
 use crate::native::stream::ClosedReason;
 
@@ -71,9 +77,9 @@ impl SignInBrowser {
 
     /// Quit the browser so Chrome keeps what the person signed in to, session
     /// cookies included; its profile and display stay retained by whoever
-    /// relaunches into them. Answers whether it quit within `STOP` rather
-    /// than being killed, which can lose a recent sign-in.
-    pub(crate) async fn quit(self) -> bool {
+    /// relaunches into them. Answers whether it quit within `STOP` or was
+    /// stopped by force, which can lose a recent sign-in.
+    pub(crate) async fn quit(self) -> Stop {
         self.chrome.quit(Instant::now() + STOP).await
     }
 }
@@ -205,7 +211,8 @@ pub(super) fn enter<'a>(
         let retired = state.browser.take();
         state.publish_browser_status().await;
         if let Some(mut browser) = retired {
-            let _ = browser.close_within(STOP).await;
+            let stop = browser.close_within(STOP).await;
+            state.stopped(stop);
         }
         super::forget_browser_session(state);
         let ready_by = started + SIGN_IN_READY;
@@ -241,7 +248,8 @@ pub(super) fn enter<'a>(
                 &format!("sign-in could not start: {}", error.message),
             );
             if let Some(sign_in) = state.sign_in.take() {
-                sign_in.quit().await;
+                let stop = sign_in.quit().await;
+                state.stopped(stop);
             }
             let restored = relaunch_automation(
                 state,
@@ -271,33 +279,34 @@ pub(super) fn enter<'a>(
 
 /// Hand the browser back to the agent: quit the sign-in browser, keeping
 /// what the person signed in to, relaunch automation into the same profile
-/// and window, require a fresh observation and end the lease. If the
-/// relaunch fails, custody still returns and the agent's next command
+/// and window, require a fresh observation and end the lease. A sign-in
+/// browser that had to be killed is not handed back as if its sign-in were
+/// kept: the view ends as a failed restart a person can repeat
+/// (`after_stop`). Either way custody returns, and the agent's next command
 /// launches the browser normally.
 pub(super) fn hand_back(state: &mut DaemonState) -> BoxFuture<'_, ()> {
     async move {
         let deadline = Instant::now() + TRANSITION;
+        // The launch to repeat is read while the sign-in browser still owns
+        // the view, in the session's theme now.
+        let relaunch = Relaunch::of_view(state).map(|relaunch| Relaunch {
+            options: LaunchOptions {
+                theme: state.theme,
+                ..relaunch.options
+            },
+            ..relaunch
+        });
         if let Some(sign_in) = state.sign_in.take() {
             state.browser_restarting = true;
             state.publish_browser_status().await;
-            let window = sign_in.display().map(|display| window_size(&display));
-            let automation = sign_in.chrome.relaunch_options();
-            if !sign_in.quit().await {
-                session_log(
-                    &state.session_id,
-                    "the sign-in browser did not quit in time and was stopped; a recent sign-in may not be kept",
-                );
-            }
-            match (automation, window) {
-                (Ok(options), Some(window)) => {
-                    let options = LaunchOptions {
-                        automation: true,
-                        theme: state.theme,
-                        ..options
-                    };
-                    relaunch_automation(state, Relaunch { options, window }, deadline).await;
+            let stop = sign_in.quit().await;
+            state.stopped(stop);
+            match after_stop(stop, relaunch) {
+                Ok(relaunch) => {
+                    relaunch_automation(state, relaunch, deadline).await;
                 }
-                _ => {
+                Err(repeatable) => {
+                    state.restart_from = repeatable;
                     let _ = close_current_browser(state, ClosedReason::RestartFailed).await;
                 }
             }
@@ -306,6 +315,17 @@ pub(super) fn hand_back(state: &mut DaemonState) -> BoxFuture<'_, ()> {
         state.browser_control.lock().await.end_lease();
     }
     .boxed()
+}
+
+/// What follows a sign-in browser's stop: automation relaunches only after
+/// the browser quit on its own. After a forced stop, what the person just
+/// signed in to may be lost, so the hand-back fails with the launch a
+/// person's `restart` repeats; without a launch to repeat it fails too.
+fn after_stop(stop: Stop, relaunch: Option<Relaunch>) -> Result<Relaunch, Option<Relaunch>> {
+    match (stop, relaunch) {
+        (Stop::Quit, Some(relaunch)) => Ok(relaunch),
+        (_, relaunch) => Err(relaunch),
+    }
 }
 
 /// The watchdog, run by every command and maintenance tick: a person closing
@@ -600,12 +620,13 @@ mod tests {
     }
 
     /// A sign-in browser that has not quit by the deadline is killed, so the
-    /// hand-back stays inside the relay's deadline, and the session log says
-    /// a recent sign-in may be lost rather than that it was kept.
+    /// hand-back stays inside the relay's deadline. What follows does not
+    /// claim a clean transfer: the view closes as a failed restart and the
+    /// session log says a recent sign-in may be lost.
     #[tokio::test]
     async fn a_sign_in_browser_that_does_not_quit_is_killed_at_the_deadline() {
         let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR"]);
-        let (mut state, _viewer, directory) = viewed(&guard, "hand-back-hung").await;
+        let (mut state, mut viewer, directory) = viewed(&guard, "hand-back-hung").await;
         let hung = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -629,7 +650,34 @@ mod tests {
         );
         assert!(state.sign_in.is_none());
         assert!(log(&directory, "hand-back-hung").contains("a recent sign-in may not be kept"));
+        // Records before the failure (restarting, a source going away) may
+        // come first; the failure is owed within the status read's timeout,
+        // and no record ever says the browser runs again.
+        let mut after = status(&mut viewer).await;
+        while after["reason"] != "restart_failed" {
+            assert_ne!(after["browser"], "running", "{after}");
+            after = status(&mut viewer).await;
+        }
+        assert_eq!(after["browser"], "closed", "{after}");
         let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// Automation relaunches only after a whole quit. A forced stop fails
+    /// the hand-back with the launch a person's restart repeats, and a
+    /// hand-back with no launch to repeat fails either way.
+    #[test]
+    fn only_a_whole_quit_hands_the_browser_back() {
+        let relaunch = || Some(unlaunchable());
+        assert!(after_stop(Stop::Quit, relaunch()).is_ok());
+        assert!(matches!(
+            after_stop(Stop::Forced, relaunch()),
+            Err(Some(Relaunch {
+                window: (800, 600),
+                ..
+            }))
+        ));
+        assert!(matches!(after_stop(Stop::Quit, None), Err(None)));
+        assert!(matches!(after_stop(Stop::Forced, None), Err(None)));
     }
 
     /// A relaunch that fails keeps its launch: the view is restartable, a

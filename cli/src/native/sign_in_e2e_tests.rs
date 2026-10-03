@@ -1547,9 +1547,15 @@ async fn e2e_sign_in_that_cannot_start_returns_the_browser_to_automation() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[ignore]
 async fn e2e_hand_back_with_a_busy_restored_tab_keeps_the_browser_and_its_tabs() {
-    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    let env = EnvGuard::new(&[
+        "AGENT_BROWSER_WINDOW_STREAM",
+        "DISPLAY",
+        "AGENT_BROWSER_SOCKET_DIR",
+    ]);
     env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
     env.set("DISPLAY", "");
+    let logs = tempfile::tempdir().unwrap();
+    env.set("AGENT_BROWSER_SOCKET_DIR", logs.path().to_str().unwrap());
     let site = Site::start().await;
     let mut state = DaemonState::new();
     let _viewer = open_form(&mut state, &site).await;
@@ -1574,17 +1580,39 @@ async fn e2e_hand_back_with_a_busy_restored_tab_keeps_the_browser_and_its_tabs()
     assert_success(&entered);
     // Hand back while the restored heavy page loads again.
     site.hold_busy_pages(true);
+    let loads = site.reports("load").len();
     let started = Instant::now();
     let released = command(&control("release", &controller), &mut state).await;
+    let hand_back_time = started.elapsed();
+    let session_log =
+        std::fs::read_to_string(logs.path().join(format!("{}.log", state.session_id)))
+            .unwrap_or_default();
+    println!(
+        "HAND_BACK_BUSY {}",
+        json!({ "handBackMs": hand_back_time.as_millis(), "sessionLog": session_log })
+    );
     assert_eq!(assert_success(&released)["status"], "released");
     assert!(
-        started.elapsed() < Duration::from_secs(8),
-        "{:?}",
-        started.elapsed()
+        hand_back_time < Duration::from_secs(8),
+        "{hand_back_time:?}"
     );
     assert!(
         state.browser.is_some(),
-        "automation did not come back: its relaunch failed"
+        "automation did not come back: {session_log}"
+    );
+    assert!(
+        !session_log.contains("did not quit in time"),
+        "{session_log}"
+    );
+    // The restored form's own request carries the cookies the site set
+    // before the sign-in, its session cookie included: both relaunches kept
+    // them while a tab was busy.
+    let restored = site.wait_for_report("load", loads).await;
+    assert_eq!(restored["webdriver"], "true");
+    assert!(
+        restored["cookie"].contains("ambit_session=1")
+            && restored["cookie"].contains("ambit_sign_in=1"),
+        "{restored:?}"
     );
 
     let url = command(&json!({ "action": "url" }), &mut state).await;
