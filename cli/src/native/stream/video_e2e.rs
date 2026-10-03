@@ -152,8 +152,14 @@ fn is_final(seen: &Seen) -> bool {
     matches!(seen, Seen::Unit(header, _, _) if header["quality"] == "final")
 }
 
-/// Takes what comes until the picture is at rest: the newest unit is the
-/// refinement, and nothing has followed it for 300 ms.
+/// A unit at the still target: a refinement, or an exact unit (contract
+/// browser-presentation-units), which owes none.
+fn is_at_rest(seen: &Seen) -> bool {
+    is_final(seen) || matches!(seen, Seen::Unit(header, _, _) if header["kind"] == "exact")
+}
+
+/// Takes what comes until the picture is at rest: the newest unit is at the
+/// still target, and nothing has followed it for 300 ms.
 async fn rest(received: &mut mpsc::UnboundedReceiver<Seen>, all: &mut Vec<Seen>) {
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
@@ -164,7 +170,7 @@ async fn rest(received: &mut mpsc::UnboundedReceiver<Seen>, all: &mut Vec<Seen>)
                 .iter()
                 .rev()
                 .find(|seen| matches!(seen, Seen::Unit(..)))
-                .is_some_and(is_final);
+                .is_some_and(is_at_rest);
             if quiet && refined {
                 return;
             }

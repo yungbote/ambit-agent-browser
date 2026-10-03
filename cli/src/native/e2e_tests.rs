@@ -15762,6 +15762,162 @@ async fn e2e_native_cropping_viewer_resizes_during_an_agent_command_and_gets_cur
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
 
+/// The cursor the private display shows, read through XFixes with the
+/// display and cookie Chrome itself was given (`pid`'s environment): its
+/// width and height in device pixels.
+#[cfg(target_os = "linux")]
+fn displayed_cursor(pid: u32, env: &EnvGuard) -> (u16, u16) {
+    use std::ffi::{c_char, c_int, c_void, CStr, CString};
+    let environ = std::fs::read(format!("/proc/{pid}/environ")).unwrap();
+    let variable = |name: &str| {
+        environ
+            .split(|byte| *byte == 0)
+            .find_map(|entry| entry.strip_prefix(format!("{name}=").as_bytes()))
+            .map(|value| String::from_utf8_lossy(value).into_owned())
+            .unwrap_or_else(|| panic!("Chrome has no {name}"))
+    };
+    env.set("XAUTHORITY", &variable("XAUTHORITY"));
+    let display = CString::new(variable("DISPLAY")).unwrap();
+    /// The leading fields of `XFixesCursorImage`.
+    #[repr(C)]
+    struct CursorImage {
+        x: i16,
+        y: i16,
+        width: u16,
+        height: u16,
+    }
+    type Open = unsafe extern "C" fn(*const c_char) -> *mut c_void;
+    type Close = unsafe extern "C" fn(*mut c_void) -> c_int;
+    type Free = unsafe extern "C" fn(*mut c_void) -> c_int;
+    type Version = unsafe extern "C" fn(*mut c_void, *mut c_int, *mut c_int) -> c_int;
+    type Cursor = unsafe extern "C" fn(*mut c_void) -> *mut CursorImage;
+    // SAFETY: the two system libraries are opened and their documented
+    // entry points called with the signatures above; the cursor image is
+    // read only before it is freed, and the display is closed.
+    unsafe {
+        let open_library = |name: &CStr| {
+            let library = libc::dlopen(name.as_ptr(), libc::RTLD_NOW);
+            assert!(!library.is_null(), "{name:?}");
+            library
+        };
+        let (x11, xfixes) = (open_library(c"libX11.so.6"), open_library(c"libXfixes.so.3"));
+        let symbol = |library: *mut c_void, name: &CStr| {
+            let symbol = libc::dlsym(library, name.as_ptr());
+            assert!(!symbol.is_null(), "{name:?}");
+            symbol
+        };
+        let open: Open = std::mem::transmute(symbol(x11, c"XOpenDisplay"));
+        let close: Close = std::mem::transmute(symbol(x11, c"XCloseDisplay"));
+        let free: Free = std::mem::transmute(symbol(x11, c"XFree"));
+        let version: Version = std::mem::transmute(symbol(xfixes, c"XFixesQueryVersion"));
+        let cursor: Cursor = std::mem::transmute(symbol(xfixes, c"XFixesGetCursorImage"));
+        let connection = open(display.as_ptr());
+        assert!(!connection.is_null(), "the private display {display:?}");
+        let (mut major, mut minor) = (5, 0);
+        assert!(version(connection, &mut major, &mut minor) != 0 && major >= 2);
+        let image = cursor(connection);
+        assert!(!image.is_null());
+        let size = ((*image).width, (*image).height);
+        free(image.cast());
+        close(connection);
+        size
+    }
+}
+
+/// The no-override cursor witness (native-infra N3): with no cursor size in
+/// the environment, the private display's system theme projects the logical
+/// 24 px, so the cursor Chrome shows is 24 CSS px times the device scale at
+/// every presentation width a viewer uses (phone, tablet, laptop, desktop).
+/// Chromium would otherwise derive the size from each screen.
+#[cfg(target_os = "linux")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires the workspace image's xsettingsd and cursor theme (AGENT_BROWSER_SYSTEM_THEME=xsettingsd)"]
+async fn e2e_native_cursor_is_24_css_px_at_every_presentation_width() {
+    use futures_util::SinkExt;
+    use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
+    let env = EnvGuard::new(&[
+        "AGENT_BROWSER_WINDOW_STREAM",
+        "DISPLAY",
+        "XCURSOR_SIZE",
+        "XAUTHORITY",
+        "AGENT_BROWSER_SYSTEM_THEME",
+    ]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    env.remove("XCURSOR_SIZE");
+    env.set("AGENT_BROWSER_SYSTEM_THEME", "xsettingsd");
+    let mut state = DaemonState::new();
+    let enabled =
+        control_test_command(&json!({"action":"stream_enable","port":0}), &mut state).await;
+    assert_success(&enabled);
+    let port = enabled["data"]["port"].as_u64().unwrap();
+    let html = r#"<!doctype html><body style="margin:0"><div id=area style="position:fixed;inset:0;cursor:default"></div>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
+    let mut request = format!(
+        "ws://127.0.0.1:{port}/?frames=binary&pacing=ack&cursor=viewer&visible=crop&width=390&height=844"
+    )
+    .into_client_request()
+    .unwrap();
+    request.headers_mut().insert(
+        "X-Ambit-Browser-Viewer",
+        uuid::Uuid::new_v4().to_string().parse().unwrap(),
+    );
+    let (ws, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let (mut sink, mut source) = futures_util::StreamExt::split(ws);
+    let expected = 24 * crate::native::display::DEVICE_SCALE_FACTOR as u16;
+    let mut seen = Vec::new();
+    for (width, height) in [(390u32, 844u32), (768, 1024), (1280, 800), (1440, 900)] {
+        sink.send(Message::Text(
+            json!({"type":"presentation","width":width,"height":height}).to_string(),
+        ))
+        .await
+        .unwrap();
+        // The window at this width: a frame whose visible area is its size.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            let message = tokio::time::timeout_at(deadline, source.next())
+                .await
+                .unwrap_or_else(|_| panic!("no frame at {width} px"));
+            let Some(Ok(Message::Binary(bytes))) = message else {
+                continue;
+            };
+            let end = 4 + u32::from_be_bytes(bytes[..4].try_into().unwrap()) as usize;
+            let frame: Value = serde_json::from_slice(&bytes[4..end]).unwrap();
+            if frame["type"] != "frame" {
+                continue;
+            }
+            sink.send(Message::Text(json!({"type":"ack","seq":frame["seq"]}).to_string()))
+                .await
+                .unwrap();
+            if frame["visible"]["width"] == width * 2 {
+                break;
+            }
+        }
+        assert_success(
+            &control_test_command(&json!({"action":"hover","selector":"#area"}), &mut state)
+                .await,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let pid = state
+            .browser
+            .as_ref()
+            .unwrap()
+            .display_client()
+            .unwrap()
+            .info()
+            .await
+            .unwrap()
+            .active_window()
+            .and_then(|window| window.pid)
+            .expect("the browser window names its process");
+        let size = displayed_cursor(pid, &env);
+        seen.push(json!({"width": width, "height": height, "cursor": [size.0, size.1]}));
+        assert_eq!(size, (expected, expected), "at {width} by {height}: {seen:?}");
+    }
+    println!("CURSOR_WITNESS {}", json!(seen));
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
 /// A person's keystroke reaches a frame when the browser paints it: with a
 /// helper that waits for damage, the frame that includes key n (its
 /// `inputSeq`) leaves as soon as the paint lands instead of on the next
