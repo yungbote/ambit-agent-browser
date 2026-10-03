@@ -11,8 +11,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use super::desktop_portal::DesktopPortal;
+use crate::native::display::DEVICE_SCALE_FACTOR;
 use crate::native::theme::Theme;
 
+const LOGICAL_CURSOR_SIZE: u32 = 24;
 const ACKNOWLEDGMENT: Duration = Duration::from_secs(2);
 const OBSERVER_BYTES: u64 = 64 * 1024;
 
@@ -268,12 +270,15 @@ impl Drop for SystemTheme {
 }
 
 fn configuration(theme: Theme) -> String {
+    // Chromium otherwise derives an unset cursor size from the current screen.
+    // The private display projects the same logical size at its native scale.
     format!(
-        "Net/ThemeName \"{}\"\n",
+        "Net/ThemeName \"{}\"\nGtk/CursorThemeSize {}\n",
         match theme {
             Theme::Dark => "Adwaita-dark",
             Theme::Light => "Adwaita",
-        }
+        },
+        LOGICAL_CURSOR_SIZE * DEVICE_SCALE_FACTOR
     )
 }
 
@@ -301,8 +306,16 @@ pub(super) fn write_private_configuration(path: &Path, contents: &str) -> Result
 
 fn acknowledged_theme(bytes: &[u8], theme: Theme) -> bool {
     std::str::from_utf8(bytes).is_ok_and(|text| {
-        text.lines()
-            .any(|line| line.trim() == configuration(theme).trim())
+        configuration(theme).lines().all(|expected| {
+            let key = expected.split_whitespace().next();
+            let mut properties = text
+                .lines()
+                .filter(|line| line.split_whitespace().next() == key);
+            properties
+                .next()
+                .is_some_and(|line| line.trim() == expected)
+                && properties.next().is_none()
+        })
     })
 }
 
@@ -329,6 +342,41 @@ mod tests {
             Theme::Light
         ));
         assert!(!acknowledged_theme(&[0xff], Theme::Light));
+    }
+
+    #[test]
+    fn private_projection_keeps_nominal_cursor_size_independent_of_viewport_and_theme() {
+        for theme in Theme::ALL {
+            assert!(configuration(theme).lines().any(|line| {
+                line == format!(
+                    "Gtk/CursorThemeSize {}",
+                    24 * crate::native::display::DEVICE_SCALE_FACTOR
+                )
+            }));
+        }
+    }
+
+    #[test]
+    fn theme_only_wrong_or_conflicting_cursor_size_cannot_acknowledge_the_projection() {
+        for theme in Theme::ALL {
+            let projected = configuration(theme);
+            let theme_line = projected
+                .lines()
+                .find(|line| line.starts_with("Net/ThemeName "))
+                .unwrap();
+            for size in ["", "Gtk/CursorThemeSize 24", "Gtk/CursorThemeSize 0"] {
+                assert!(!acknowledged_theme(
+                    format!("{theme_line}\n{size}\n").as_bytes(),
+                    theme
+                ));
+            }
+            assert!(!acknowledged_theme(
+                format!("{projected}Gtk/CursorThemeSize 24\n").as_bytes(),
+                theme
+            ));
+            let reordered = projected.lines().rev().collect::<Vec<_>>().join("\n");
+            assert!(acknowledged_theme(reordered.as_bytes(), theme));
+        }
     }
 
     #[test]
