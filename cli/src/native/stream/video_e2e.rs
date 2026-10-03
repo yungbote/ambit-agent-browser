@@ -703,3 +703,434 @@ async fn e2e_native_video_producer_proof() {
     drop(send);
     command(&mut state, json!({"action":"close"})).await;
 }
+
+/// The production probe's page (`probe/measure.mjs`): each key echoes into a
+/// fixed box at the top left, and nothing else on the page moves.
+const TYPING_PAGE: &str = r#"<!doctype html><title>viewer probe</title><body style="margin:0;font:18px sans-serif"><div id=t style="position:fixed;left:24px;top:8px;width:520px;height:48px;font:34px monospace;background:#fff;border:2px solid #888;overflow:hidden;white-space:nowrap"></div><div id=l style="padding-top:270px"></div><script>for(let i=1;i<=600;i++){const p=document.createElement('p');p.style.margin='4px 24px';p.textContent='Line '+i+' the quick brown fox jumps over the lazy dog '+'abc'.repeat(i%7);l.append(p)}onkeydown=e=>{if(e.key.length==1)t.textContent+=e.key}</script></body>"#;
+
+/// How keys follow each other.
+#[derive(Clone, Copy)]
+enum Pace {
+    /// As the production probe types: a key once the last one's picture
+    /// arrived, then this long a pause.
+    AfterPicture(Duration),
+    /// A key every interval, whatever arrived.
+    Every(Duration),
+}
+
+/// One key the person typed, on the media clock: sent to the control
+/// channel and acknowledged.
+struct Typed {
+    sequence: u64,
+    sent: u64,
+    acknowledged: u64,
+}
+
+/// Takes or renews the control lease for 25 s (a lease runs at most 30 s
+/// ahead), as a person's viewer does while they keep control; the window's
+/// surface generation, which every input names.
+async fn lease(state: &mut DaemonState, op: &str, controller: &str) -> String {
+    let expires = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+        + 25_000;
+    let request = json!({"action":"ambit_browser_control","op":op,"controllerId":controller,
+        "expiresAt":expires});
+    let response = Box::pin(execute_command(&request, state)).await;
+    assert_eq!(response["success"], true, "{request}: {response}");
+    response["data"]["surface"]["generation"]
+        .as_str()
+        .expect("the window's surface generation")
+        .to_owned()
+}
+
+/// A control input batch on the window `generation` names, as a person's
+/// viewer sends it.
+async fn input(
+    state: &mut DaemonState,
+    (controller, generation): (&str, &str),
+    sequence: u64,
+    events: Value,
+) {
+    let request = json!({"action":"ambit_browser_control","op":"input","controllerId":controller,
+        "expectedSurfaceGeneration":generation,"sequence":sequence,"events":events});
+    let response = Box::pin(execute_command(&request, state)).await;
+    assert_eq!(response["success"], true, "{response}");
+}
+
+async fn type_keys(
+    state: &mut DaemonState,
+    controller: &str,
+    sequence: &mut u64,
+    received: &mut mpsc::UnboundedReceiver<Seen>,
+    all: &mut Vec<Seen>,
+    (keys, pace): (usize, Pace),
+) -> Vec<Typed> {
+    let (mut typed, mut generation) = (Vec::new(), String::new());
+    for index in 0..keys {
+        if index % 10 == 0 {
+            generation = lease(state, "renew", controller).await;
+        }
+        *sequence += 1;
+        let key = if index % 2 == 0 { "a" } else { "b" };
+        let code = if index % 2 == 0 { "KeyA" } else { "KeyB" };
+        let sent = monotonic_us();
+        input(state, (controller, &generation), *sequence, json!([
+            {"type":"input_keyboard","eventType":"keyDown","key":key,"code":code,"text":key,"windowsVirtualKeyCode":if index % 2 == 0 { 65 } else { 66 }},
+            {"type":"input_keyboard","eventType":"keyUp","key":key,"code":code,"windowsVirtualKeyCode":if index % 2 == 0 { 65 } else { 66 }}
+        ]))
+        .await;
+        typed.push(Typed {
+            sequence: *sequence,
+            sent,
+            acknowledged: monotonic_us(),
+        });
+        match pace {
+            Pace::AfterPicture(pause) => {
+                let wanted = *sequence;
+                let _ = tokio::time::timeout(
+                    Duration::from_millis(1500),
+                    until_quiet(received, all, |seen| {
+                        matches!(seen, Seen::Unit(header, _, _)
+                            if header["inputSeq"].as_u64().is_some_and(|input| input >= wanted))
+                    }),
+                )
+                .await;
+                let mut more = gather(received, pause).await;
+                all.append(&mut more);
+            }
+            Pace::Every(interval) => {
+                let next = tokio::time::Instant::now()
+                    + interval.saturating_sub(Duration::from_micros(monotonic_us() - sent));
+                let mut more = gather(received, next - tokio::time::Instant::now()).await;
+                all.append(&mut more);
+            }
+        }
+    }
+    let mut more = gather(received, Duration::from_millis(600)).await;
+    all.append(&mut more);
+    typed
+}
+
+/// Takes what comes until one matches, without a deadline of its own.
+async fn until_quiet(
+    received: &mut mpsc::UnboundedReceiver<Seen>,
+    all: &mut Vec<Seen>,
+    matches: impl Fn(&Seen) -> bool,
+) {
+    while let Some(seen) = received.recv().await {
+        let found = matches(&seen);
+        all.push(seen);
+        if found {
+            return;
+        }
+    }
+}
+
+/// Where each key's time to the viewer went: the first picture with new
+/// damage that includes the key (`inputSeq`), split at its logged stages.
+/// The page changes only where a key echoes, so that picture shows it.
+fn attribute(typed: &[Typed], lines: &[Value], arrivals: &HashMap<u64, u64>) -> Value {
+    const STAGES: [&str; 9] = [
+        "input",
+        "captureAsked",
+        "pageToRead",
+        "helperReply",
+        "convert",
+        "encoderQueue",
+        "encode",
+        "write",
+        "wire",
+    ];
+    let mut samples: Vec<Vec<f64>> = vec![Vec::new(); STAGES.len()];
+    let (mut totals, mut missing, mut waiting) = (Vec::new(), 0, 0);
+    let field = |line: &Value, name: &str| line[name].as_u64().unwrap();
+    for key in typed {
+        let Some(line) = lines
+            .iter()
+            .filter(|line| {
+                line["quality"] == "motion"
+                    && line["rows"].as_u64() > Some(0)
+                    && line["inputSeq"]
+                        .as_u64()
+                        .is_some_and(|input| input >= key.sequence)
+            })
+            .min_by_key(|line| field(line, "read"))
+        else {
+            missing += 1;
+            continue;
+        };
+        let Some(arrival) = arrivals.get(&field(line, "ts")).copied() else {
+            missing += 1;
+            continue;
+        };
+        // The picture names the newest input applied before its read; for
+        // an earlier key, its acknowledgement bounds when it was applied.
+        let applied = if line["inputSeq"].as_u64() == Some(key.sequence) {
+            field(line, "applied")
+        } else {
+            key.acknowledged
+        }
+        .max(key.sent);
+        let requested = field(line, "requested");
+        waiting += usize::from(requested <= applied);
+        let marks = [
+            key.sent,
+            applied,
+            requested.max(applied),
+            field(line, "read"),
+            field(line, "received"),
+            field(line, "converted"),
+            field(line, "encodeStarted"),
+            field(line, "encoded"),
+            field(line, "written"),
+            arrival,
+        ];
+        for (stage, pair) in marks.windows(2).enumerate() {
+            samples[stage].push(ms(pair[1].saturating_sub(pair[0])));
+        }
+        totals.push(ms(arrival - key.sent));
+    }
+    let mut stages = serde_json::Map::new();
+    for (name, values) in STAGES.iter().zip(&samples) {
+        stages.insert(name.to_string(), stats(values));
+    }
+    json!({
+        "keys": typed.len(),
+        "attributed": totals.len(),
+        "missing": missing,
+        "captureWaitingAtInput": waiting,
+        "sendToAcknowledgedMs": stats(&typed.iter().map(|key| ms(key.acknowledged - key.sent)).collect::<Vec<_>>()),
+        "sendToArrivalMs": stats(&totals),
+        "stagesMs": stages,
+    })
+}
+
+/// A person's typing and a dock drag on a real Chrome, display helper and X
+/// server, with the producer's stage diagnostics on: for each key, where
+/// its time from the control channel to the viewer went, and how many
+/// pictures a drag brings. Prints `LATENCY <json>`; with
+/// `$AMBIT_LATENCY_OUT` set to a file, writes it there. The numbers are this
+/// machine's: the assertions hold only that every key was attributed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn e2e_native_input_latency_stages() {
+    let env = EnvGuard::new(&[
+        "AGENT_BROWSER_WINDOW_STREAM",
+        "DISPLAY",
+        "AGENT_BROWSER_DEBUG",
+    ]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    env.set("AGENT_BROWSER_DEBUG", "1");
+    let mut state = DaemonState::new();
+    async fn command(state: &mut DaemonState, command: Value) -> Value {
+        let response = Box::pin(execute_command(&command, state)).await;
+        assert_eq!(response["success"], true, "{command}: {response}");
+        response["data"].clone()
+    }
+    let port = command(&mut state, json!({"action":"stream_enable","port":0})).await["port"]
+        .as_u64()
+        .unwrap();
+    command(
+        &mut state,
+        json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(TYPING_PAGE))}),
+    )
+    .await;
+    let mut request = format!(
+        "ws://127.0.0.1:{port}/?frames=binary&patches=1&cursor=viewer&visible=crop\
+         &video=av1-444,av1&width=920&height=944"
+    )
+    .into_client_request()
+    .unwrap();
+    request.headers_mut().insert(
+        "X-Ambit-Browser-Viewer",
+        uuid::Uuid::new_v4().to_string().parse().unwrap(),
+    );
+    let (socket, _) = tokio_tungstenite::connect_async(request).await.unwrap();
+    let (send, mut received) = viewer(socket);
+    let mut all = Vec::new();
+    until(&mut received, &mut all, |seen| {
+        matches!(seen, Seen::Record(record, _) if record["type"] == "video" && record["state"] == "available")
+    })
+    .await;
+    until(
+        &mut received,
+        &mut all,
+        |seen| matches!(seen, Seen::Frame(header, _) if header["visible"]["width"] == 1840),
+    )
+    .await;
+    send.send(json!({"type":"video","enabled":true,"generation":1}))
+        .unwrap();
+    until(&mut received, &mut all, is_final).await;
+    rest(&mut received, &mut all).await;
+
+    let controller = uuid::Uuid::new_v4().to_string();
+    let generation = lease(&mut state, "acquire", &controller).await;
+    // The person clicks into the page, so keys reach it.
+    let (x, y, _) = crate::native::e2e_tests::window_point(&state, 600.0, 400.0).await;
+    let mut sequence = 1;
+    input(&mut state, (&controller, &generation), sequence, json!([
+        {"type":"input_mouse","eventType":"mousePressed","x":x,"y":y,"button":"left","buttons":1,"clickCount":1},
+        {"type":"input_mouse","eventType":"mouseReleased","x":x,"y":y,"button":"left","buttons":0,"clickCount":1}
+    ]))
+    .await;
+    rest(&mut received, &mut all).await;
+    super::video::stages::logged::take();
+
+    let mut phases = serde_json::Map::new();
+    for (name, plan) in [
+        (
+            "probePace",
+            (40, Pace::AfterPicture(Duration::from_millis(300))),
+        ),
+        (
+            "everyHundredTenMs",
+            (40, Pace::Every(Duration::from_millis(110))),
+        ),
+    ] {
+        let from = all.len();
+        let typed = type_keys(
+            &mut state,
+            &controller,
+            &mut sequence,
+            &mut received,
+            &mut all,
+            plan,
+        )
+        .await;
+        rest(&mut received, &mut all).await;
+        let lines = super::video::stages::logged::take();
+        let arrivals: HashMap<u64, u64> = all[from..]
+            .iter()
+            .filter_map(|seen| match seen {
+                Seen::Unit(header, _, at) => Some((header["ts"].as_u64().unwrap(), *at)),
+                _ => None,
+            })
+            .collect();
+        let attributed = attribute(&typed, &lines, &arrivals);
+        assert_eq!(
+            attributed["missing"], 0,
+            "every key is attributed: {attributed}"
+        );
+        println!("LATENCY_PHASE {name} {attributed}");
+        phases.insert(name.into(), attributed);
+    }
+    command(
+        &mut state,
+        json!({"action":"ambit_browser_control","op":"release","controllerId":controller}),
+    )
+    .await;
+    let typed_text = command(
+        &mut state,
+        json!({"action":"evaluate","script":"document.getElementById('t').textContent.length"}),
+    )
+    .await["result"]
+        .as_u64()
+        .unwrap();
+    assert_eq!(typed_text, 80, "every key reached the page");
+
+    // A dock drag: 300 CSS px out and back, one size a frame, three times.
+    rest(&mut received, &mut all).await;
+    super::video::stages::logged::take();
+    let dragged_from = monotonic_us();
+    let mut steps = Vec::new();
+    for pass in 0..6 {
+        for step in 0..=30u64 {
+            let width = if pass % 2 == 0 {
+                920 + step * 10
+            } else {
+                1220 - step * 10
+            };
+            send.send(json!({"type":"presentation","width":width,"height":944}))
+                .unwrap();
+            steps.push((monotonic_us(), width * 2));
+            tokio::time::sleep(Duration::from_millis(16)).await;
+        }
+    }
+    let released = monotonic_us();
+    let drag = gather(&mut received, Duration::from_millis(1500)).await;
+    let lines = super::video::stages::logged::take();
+    let units: Vec<(&Value, u64)> = drag
+        .iter()
+        .filter_map(|seen| match seen {
+            Seen::Unit(header, _, at) => Some((header, *at)),
+            _ => None,
+        })
+        .collect();
+    let during: Vec<&(&Value, u64)> = units
+        .iter()
+        .filter(|(header, _)| {
+            (dragged_from..released).contains(&header["ts"].as_u64().unwrap())
+                && header["quality"] == "motion"
+        })
+        .collect();
+    let mut shown_after = Vec::new();
+    let mut previous = 1840;
+    for (header, at) in &units {
+        let (width, ts) = (
+            header["visible"]["width"].as_u64().unwrap(),
+            header["ts"].as_u64().unwrap(),
+        );
+        if width != previous {
+            previous = width;
+            if let Some((sent, _)) = steps
+                .iter()
+                .rev()
+                .find(|(sent, asked)| *asked == width && *sent < ts)
+            {
+                shown_after.push(ms(at - sent));
+            }
+        }
+    }
+    let gaps: Vec<f64> = during
+        .windows(2)
+        .map(|pair| ms(pair[1].0["ts"].as_u64().unwrap() - pair[0].0["ts"].as_u64().unwrap()))
+        .collect();
+    let drag_stage = |from: &str, to: &str| -> Value {
+        stats(
+            &lines
+                .iter()
+                .filter(|line| (dragged_from..released).contains(&line["read"].as_u64().unwrap()))
+                .map(|line| ms(line[to].as_u64().unwrap() - line[from].as_u64().unwrap()))
+                .collect::<Vec<_>>(),
+        )
+    };
+    let final_size = units
+        .iter()
+        .find(|(header, at)| *at > released && header["visible"]["width"] == 1840);
+    phases.insert(
+        "drag".into(),
+        json!({
+            "presentations": steps.len(),
+            "pictures": during.len(),
+            "picturesPerSecond": during.len() as f64 / ((released - dragged_from) as f64 / 1e6),
+            "keyUnits": units.iter().filter(|(header, _)| header["key"] == true).count(),
+            "pictureGapMs": stats(&gaps),
+            "sizesShown": shown_after.len(),
+            "presentationToPictureMs": stats(&shown_after),
+            "releaseToFinalSizeMs": final_size.map(|(_, at)| ms(at - released)),
+            "stagesMs": {
+                "helperWait": stats(&lines.iter().filter(|line| (dragged_from..released).contains(&line["read"].as_u64().unwrap())).map(|line| line["waitedUs"].as_f64().unwrap() / 1000.0).collect::<Vec<_>>()),
+                "helperReply": drag_stage("read", "received"),
+                "convert": drag_stage("received", "converted"),
+                "encoderQueue": drag_stage("converted", "encodeStarted"),
+                "encode": drag_stage("encodeStarted", "encoded"),
+            },
+        }),
+    );
+    let report = json!({
+        "venue": {
+            "chrome": std::env::var("AGENT_BROWSER_EXECUTABLE_PATH").ok(),
+            "loadAverage": std::fs::read_to_string("/proc/loadavg").ok(),
+        },
+        "phases": phases,
+    });
+    println!("LATENCY {report}");
+    if let Ok(path) = std::env::var("AMBIT_LATENCY_OUT") {
+        std::fs::write(path, serde_json::to_string_pretty(&report).unwrap()).unwrap();
+    }
+    drop(send);
+    command(&mut state, json!({"action":"close"})).await;
+}
