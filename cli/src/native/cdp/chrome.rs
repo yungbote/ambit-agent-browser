@@ -1263,12 +1263,13 @@ impl Devtools {
     /// only from this Chrome's own stderr, on loopback at exactly its port:
     /// any process of the same user can write a file into the profile. When
     /// another process holds the port on 127.0.0.1, Chrome listens on `[::1]`
-    /// instead, and says so; when it holds both, Chrome has no server.
+    /// instead, and says so; when it holds both, Chrome has no server, and
+    /// the attempt failed only for its port (`AttemptError::PortTaken`).
     fn endpoint(
         self,
         observed: Startup<'_>,
         user_data_dir: &Path,
-    ) -> Option<Result<String, String>> {
+    ) -> Option<Result<String, AttemptError>> {
         let line = match (self, observed) {
             (Self::Automation, Startup::Poll) => {
                 return read_devtools_active_port(user_data_dir)
@@ -1283,9 +1284,9 @@ impl Devtools {
                 .map(|url| Ok(url.trim().to_string()));
         };
         if line.contains(DEVTOOLS_UNBOUND) {
-            return Some(Err(format!(
+            return Some(Err(AttemptError::PortTaken(format!(
                 "Another process took the browser's private DevTools port {port}"
-            )));
+            ))));
         }
         let url = line.strip_prefix(DEVTOOLS_LISTENING)?.trim();
         let browser = ["127.0.0.1", "[::1]"]
@@ -1294,9 +1295,9 @@ impl Devtools {
             .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
         Some(match browser {
             Some(_) => Ok(url.to_string()),
-            None => Err(format!(
+            None => Err(AttemptError::Failed(format!(
                 "The browser opened DevTools at {url}, not at its private port {port}"
-            )),
+            ))),
         })
     }
 }
@@ -1512,18 +1513,9 @@ fn launch_chrome_blocking(
     }
 
     let effective_options = resolved_options.as_ref().unwrap_or(options);
-
-    // A browser without automation serves a person waiting for its window:
-    // its caller falls back promptly instead of retrying. A private DevTools
-    // port another process took on both loopback addresses (Chrome takes
-    // `[::1]` when only 127.0.0.1 is held) fails that launch at once with its
-    // own reason (`Devtools::endpoint`), and the person's next sign-in picks
-    // another port: a retry here would only add a second launch to a rare
-    // race the person already recovers from.
-    let max_attempts = if effective_options.automation { 3 } else { 1 };
     let mut last_err = String::new();
 
-    for attempt in 1..=max_attempts {
+    for attempt in 1.. {
         if canceled.load(Ordering::Relaxed) {
             last_err = "Chrome launch canceled".to_string();
             break;
@@ -1539,22 +1531,20 @@ fn launch_chrome_blocking(
                 }
                 return Ok(process);
             }
-            Err(e) => {
-                last_err = e;
-                if canceled.load(Ordering::Relaxed) {
+            Err(error) => {
+                let pause = another_attempt(effective_options.automation, attempt, &error);
+                last_err = error.into_reason();
+                let Some(pause) = pause.filter(|_| !canceled.load(Ordering::Relaxed)) else {
                     break;
-                }
-                if attempt < max_attempts {
-                    // Use write! instead of eprintln! to avoid panicking
-                    // if the daemon's stderr pipe is broken (parent dropped it).
-                    let _ = writeln!(
-                        std::io::stderr(),
-                        "[chrome] Launch attempt {}/{} failed, retrying in 500ms...",
-                        attempt,
-                        max_attempts
-                    );
-                    std::thread::sleep(Duration::from_millis(500));
-                }
+                };
+                // Use write! instead of eprintln! to avoid panicking
+                // if the daemon's stderr pipe is broken (parent dropped it).
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "[chrome] Launch attempt {attempt} failed, retrying in {} ms: {last_err}",
+                    pause.as_millis()
+                );
+                std::thread::sleep(pause);
             }
         }
     }
@@ -1567,11 +1557,54 @@ fn launch_chrome_blocking(
     Err(last_err)
 }
 
+/// Why one launch attempt started no browser.
+#[derive(Debug, PartialEq, Eq)]
+enum AttemptError {
+    /// Another process held the private DevTools port the attempt chose on
+    /// both loopback addresses: an attempt on a fresh port can start.
+    PortTaken(String),
+    Failed(String),
+}
+
+impl AttemptError {
+    fn into_reason(self) -> String {
+        match self {
+            Self::PortTaken(reason) | Self::Failed(reason) => reason,
+        }
+    }
+}
+
+impl From<String> for AttemptError {
+    fn from(reason: String) -> Self {
+        Self::Failed(reason)
+    }
+}
+
+impl From<&str> for AttemptError {
+    fn from(reason: &str) -> Self {
+        Self::Failed(reason.into())
+    }
+}
+
+/// Whether a failed launch attempt is tried again, and after what pause. An
+/// automation launch gets three attempts in all. A browser without
+/// automation serves a person waiting for its window, so its caller falls
+/// back promptly instead: it is tried once more, at once, only when another
+/// process took its private DevTools port, since the next attempt chooses a
+/// fresh one (`Devtools::for_launch`).
+fn another_attempt(automation: bool, attempt: u32, error: &AttemptError) -> Option<Duration> {
+    match (automation, error) {
+        (true, _) if attempt < 3 => Some(Duration::from_millis(500)),
+        (false, AttemptError::PortTaken(_)) if attempt < 2 => Some(Duration::ZERO),
+        _ => None,
+    }
+}
+
 fn try_launch_chrome(
     chrome_path: &Path,
     options: &LaunchOptions,
     canceled: &AtomicBool,
-) -> Result<ChromeProcess, String> {
+) -> Result<ChromeProcess, AttemptError> {
     let browser_host = crate::native::workspace_role::current()
         .map_err(String::from)?
         .is_browser_host();
@@ -1714,7 +1747,7 @@ fn try_launch_chrome(
     }
 
     if canceled.load(Ordering::Relaxed) {
-        return Err("Chrome launch canceled".to_string());
+        return Err("Chrome launch canceled".into());
     }
     #[cfg(not(windows))]
     let spawned = cmd.spawn();
@@ -1864,21 +1897,21 @@ enum Startup<'a> {
 /// stderr tail reported on failure. The probe answers once what it observed
 /// proves the browser ready, or proves it cannot become ready. Bounded stderr
 /// batches keep a noisy browser from starving the cancellation check.
-fn wait_for_startup<T>(
+fn wait_for_startup<T, E: From<String>>(
     child: &mut Child,
     stderr: &mpsc::Receiver<String>,
     deadline: std::time::Instant,
     canceled: &AtomicBool,
     require_sandbox: bool,
     (exited_message, timeout_message): (&str, &str),
-    mut ready: impl FnMut(Startup<'_>) -> Option<Result<T, String>>,
-) -> Result<T, String> {
+    mut ready: impl FnMut(Startup<'_>) -> Option<Result<T, E>>,
+) -> Result<T, E> {
     let poll_interval = Duration::from_millis(50);
     let mut stderr_lines = std::collections::VecDeque::with_capacity(64);
     let mut stderr_finished = false;
     loop {
         if canceled.load(Ordering::Relaxed) {
-            return Err("Chrome launch canceled".to_string());
+            return Err("Chrome launch canceled".to_string().into());
         }
         if let Some(answer) = ready(Startup::Poll) {
             return answer;
@@ -1913,7 +1946,8 @@ fn wait_for_startup<T>(
                 message,
                 &stderr_lines.into_iter().collect::<Vec<_>>(),
                 require_sandbox,
-            ));
+            )
+            .into());
         }
         std::thread::sleep(poll_interval);
     }
@@ -3261,7 +3295,7 @@ mod tests {
             assert!(
                 matches!(
                     private.endpoint(Startup::Stderr(&listening(other)), &profile),
-                    Some(Err(_))
+                    Some(Err(AttemptError::Failed(_)))
                 ),
                 "{other}"
             );
@@ -3281,7 +3315,11 @@ mod tests {
             .endpoint(Startup::Stderr(&unbound), &profile)
             .unwrap()
             .unwrap_err();
-        assert!(refused.contains("private DevTools port 41873"), "{refused}");
+        assert!(
+            matches!(&refused, AttemptError::PortTaken(reason)
+                if reason.contains("private DevTools port 41873")),
+            "{refused:?}"
+        );
 
         assert_eq!(
             Devtools::Automation.endpoint(Startup::Poll, &profile),
@@ -3292,6 +3330,26 @@ mod tests {
             Some(Ok(own.to_string()))
         );
         std::fs::remove_dir_all(profile).unwrap();
+    }
+
+    /// An automation launch is tried three times in all, after a pause. A
+    /// launch a person waits for is tried once more, at once, only when
+    /// another process took its private DevTools port: the next attempt
+    /// chooses a fresh port, and anything else would keep them waiting for a
+    /// window that fails the same way.
+    #[test]
+    fn only_a_taken_private_port_retries_a_launch_a_person_waits_for() {
+        let taken = AttemptError::PortTaken("taken".into());
+        let failed = AttemptError::Failed("no window".into());
+        let pause = Some(Duration::from_millis(500));
+        for error in [&taken, &failed] {
+            assert_eq!(another_attempt(true, 1, error), pause);
+            assert_eq!(another_attempt(true, 2, error), pause);
+            assert_eq!(another_attempt(true, 3, error), None);
+        }
+        assert_eq!(another_attempt(false, 1, &taken), Some(Duration::ZERO));
+        assert_eq!(another_attempt(false, 2, &taken), None);
+        assert_eq!(another_attempt(false, 1, &failed), None);
     }
 
     /// The readiness loop both launch kinds share returns what its probe
@@ -3320,7 +3378,7 @@ mod tests {
             messages,
             |observed| {
                 polls += usize::from(observed == Startup::Poll);
-                (polls == 3).then_some(Ok("window"))
+                (polls == 3).then_some(Ok::<_, String>("window"))
             },
         );
         assert_eq!(ready.unwrap(), "window");
