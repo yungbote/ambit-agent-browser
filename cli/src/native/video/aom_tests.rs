@@ -326,10 +326,7 @@ fn regional_steps_preserve_other_reference_pixels_including_already_exact_region
             height: 45,
         },
     ] {
-        let region = encoder
-            .set_region(Some(requested))
-            .unwrap()
-            .unwrap();
+        let region = encoder.set_region(Some(requested)).unwrap().unwrap();
         let unit = encoder
             .encode(
                 &planar.picture(),

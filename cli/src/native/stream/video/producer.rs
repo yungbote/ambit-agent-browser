@@ -458,7 +458,11 @@ impl Encoding {
                 .reduce(Band::union)
         };
         if let Some(wrote) = wrote {
-            mailbox.changed = Some(mailbox.changed.map_or(wrote, |changed| changed.union(wrote)));
+            mailbox.changed = Some(
+                mailbox
+                    .changed
+                    .map_or(wrote, |changed| changed.union(wrote)),
+            );
         }
         let height = reply.height as usize;
         for rows in mailbox.stale.iter_mut() {

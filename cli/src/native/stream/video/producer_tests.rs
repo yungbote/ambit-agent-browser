@@ -1031,9 +1031,7 @@ fn a_change_after_a_still_moment_is_captured_as_it_paints() {
     let now = Instant::now();
     let ms = Duration::from_millis;
     let encoding = encoding(60, None, false, false, now);
-    lock(&encoding.mailbox)
-        .pace
-        .took(now - ms(3), period(60));
+    lock(&encoding.mailbox).pace.took(now - ms(3), period(60));
     let request = captured(decide(std::slice::from_ref(&encoding), now));
     assert_eq!((request.force, request.wait_ms), (false, PICTURE_WAIT_MS));
     lock(&encoding.mailbox).pace.took(now, period(60));

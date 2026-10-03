@@ -302,10 +302,10 @@ pub(super) fn hand_back(state: &mut DaemonState) -> BoxFuture<'_, ()> {
             let stop = sign_in.quit().await;
             state.stopped(stop);
             match after_stop(stop, relaunch) {
-                Ok(relaunch) => {
+                HandBack::Relaunch(relaunch) => {
                     relaunch_automation(state, relaunch, deadline).await;
                 }
-                Err(repeatable) => {
+                HandBack::Fail(repeatable) => {
                     state.restart_from = repeatable;
                     let _ = close_current_browser(state, ClosedReason::RestartFailed).await;
                 }
@@ -317,14 +317,22 @@ pub(super) fn hand_back(state: &mut DaemonState) -> BoxFuture<'_, ()> {
     .boxed()
 }
 
+/// What a hand-back does once its sign-in browser stopped.
+enum HandBack {
+    /// The browser quit on its own: automation relaunches with this launch.
+    Relaunch(Relaunch),
+    /// The view ends as a failed restart that repeats this launch, if any.
+    Fail(Option<Relaunch>),
+}
+
 /// What follows a sign-in browser's stop: automation relaunches only after
 /// the browser quit on its own. After a forced stop, what the person just
 /// signed in to may be lost, so the hand-back fails with the launch a
 /// person's `restart` repeats; without a launch to repeat it fails too.
-fn after_stop(stop: Stop, relaunch: Option<Relaunch>) -> Result<Relaunch, Option<Relaunch>> {
+fn after_stop(stop: Stop, relaunch: Option<Relaunch>) -> HandBack {
     match (stop, relaunch) {
-        (Stop::Quit, Some(relaunch)) => Ok(relaunch),
-        (_, relaunch) => Err(relaunch),
+        (Stop::Quit, Some(relaunch)) => HandBack::Relaunch(relaunch),
+        (_, relaunch) => HandBack::Fail(relaunch),
     }
 }
 
@@ -668,16 +676,22 @@ mod tests {
     #[test]
     fn only_a_whole_quit_hands_the_browser_back() {
         let relaunch = || Some(unlaunchable());
-        assert!(after_stop(Stop::Quit, relaunch()).is_ok());
+        assert!(matches!(
+            after_stop(Stop::Quit, relaunch()),
+            HandBack::Relaunch(_)
+        ));
         assert!(matches!(
             after_stop(Stop::Forced, relaunch()),
-            Err(Some(Relaunch {
+            HandBack::Fail(Some(Relaunch {
                 window: (800, 600),
                 ..
             }))
         ));
-        assert!(matches!(after_stop(Stop::Quit, None), Err(None)));
-        assert!(matches!(after_stop(Stop::Forced, None), Err(None)));
+        assert!(matches!(after_stop(Stop::Quit, None), HandBack::Fail(None)));
+        assert!(matches!(
+            after_stop(Stop::Forced, None),
+            HandBack::Fail(None)
+        ));
     }
 
     /// A relaunch that fails keeps its launch: the view is restartable, a

@@ -209,7 +209,11 @@ fn a_whole_page_change() {
                     .unwrap();
                 let elapsed = started.elapsed().as_secs_f64() * 1000.0;
                 let decoded = decode(&mut decoder, &unit.data, codec.chroma());
-                times.push((elapsed, unit.data.len(), rgb_psnr(&page.window(0), &decoded)));
+                times.push((
+                    elapsed,
+                    unit.data.len(),
+                    rgb_psnr(&page.window(0), &decoded),
+                ));
             }
             println!(
                 "PAGE_CHANGE q{quantizer} controls[{}] key {:.0}ms {}KB {:.2}dB, changes {:?}",
@@ -498,7 +502,7 @@ fn text_page(width: usize, height: usize) -> Vec<u8> {
             seed ^= seed << 13;
             seed ^= seed >> 17;
             seed ^= seed << 5;
-            if seed % 7 == 0 {
+            if seed.is_multiple_of(7) {
                 continue;
             }
             for y in line..line + 30 {
@@ -542,7 +546,11 @@ fn a_typed_key_by_coded_size_region_and_threads() {
                     let left = 48 + key * 40;
                     for y in 24..104 {
                         for x in left..left + 28 {
-                            source[(y * width + x) * 4..][..3].fill(if (x + y) % 5 == 0 { 0 } else { 40 });
+                            source[(y * width + x) * 4..][..3].fill(if (x + y) % 5 == 0 {
+                                0
+                            } else {
+                                40
+                            });
                         }
                     }
                     assert!(planar.convert(&source, width * 4, (width, height), (top, bottom)));
@@ -583,7 +591,8 @@ fn a_typed_key_by_coded_size_region_and_threads() {
 #[ignore = "measurement harness"]
 fn a_key_unit_by_coded_size_and_intra_tools() {
     let mut results = Vec::new();
-    let every_predictor: &[(i32, i32)] = &[(98, 1), (99, 1), (100, 1), (101, 1), (106, 1), (141, 1)];
+    let every_predictor: &[(i32, i32)] =
+        &[(98, 1), (99, 1), (100, 1), (101, 1), (106, 1), (141, 1)];
     for (width, height) in [(2048usize, 2048usize), (2816, 2048)] {
         for (name, controls) in [
             ("encoder", &[][..]),

@@ -366,7 +366,10 @@ impl Band {
     /// holds every visible row, or none of them (a change beside the window
     /// is coded whole rather than not at all).
     pub(super) fn within(self, visible: crate::native::display::Rect) -> Option<EncoderRegion> {
-        let (x, y) = (u32::try_from(visible.x).ok()?, u32::try_from(visible.y).ok()?);
+        let (x, y) = (
+            u32::try_from(visible.x).ok()?,
+            u32::try_from(visible.y).ok()?,
+        );
         let top = self.top.max(y);
         let bottom = self.bottom.min(y + visible.height);
         (top < bottom && bottom - top < visible.height).then_some(EncoderRegion {

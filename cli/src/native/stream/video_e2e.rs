@@ -1013,7 +1013,9 @@ async fn e2e_native_input_latency_stages() {
         for seen in &all[from..] {
             if let Seen::Unit(header, _, at) = seen {
                 if header["quality"] == "motion" {
-                    arrivals.entry(header["ts"].as_u64().unwrap()).or_insert(*at);
+                    arrivals
+                        .entry(header["ts"].as_u64().unwrap())
+                        .or_insert(*at);
                 }
             }
         }

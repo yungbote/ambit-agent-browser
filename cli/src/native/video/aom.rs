@@ -711,8 +711,10 @@ impl AomEncoder {
         region: EncoderRegion,
     ) -> Result<(), VideoError> {
         // SAFETY: initialized encoder; preview remains owned by it until the next codec call and is copied here.
-        let preview = unsafe { (self.api.preview_frame)(&mut *self.context).as_ref() }
-            .ok_or_else(|| VideoError::Failed("no reconstructed picture for a regional unit".into()))?;
+        let preview =
+            unsafe { (self.api.preview_frame)(&mut *self.context).as_ref() }.ok_or_else(|| {
+                VideoError::Failed("no reconstructed picture for a regional unit".into())
+            })?;
         let format = match self.codec.chroma() {
             Chroma::Full => IMG_FMT_I444,
             Chroma::Subsampled => IMG_FMT_I420,
