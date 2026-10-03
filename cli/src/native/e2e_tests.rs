@@ -229,11 +229,19 @@ async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     let mut state = DaemonState::new();
     let html = r#"<!doctype html><div id=hidden><input id=control type=checkbox style='display:none'></div><input id=labelled type=checkbox style='display:none'><label for=labelled id=label>Visible checkbox label</label><div id=semantic role=checkbox aria-checked=false tabindex=0 style=padding:20px>Custom checkbox<input type=checkbox style=display:none></div><script>window.buttons=0;window.domClicks=0;window.refuse=false;window.ask=false;addEventListener('pointerdown',()=>buttons++,true);control.addEventListener('click',e=>{domClicks++;if(refuse)e.preventDefault();if(ask){ask=false;confirm('Apply checkbox?')}});semantic.addEventListener('click',()=>{const checked=semantic.getAttribute('aria-checked')!=='true';semantic.setAttribute('aria-checked',String(checked));semantic.querySelector('input').checked=checked});</script>"#;
     assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
-    for (action, method) in [("check", "dom"), ("check", "unchanged"), ("uncheck", "dom")] {
+    for action in ["check", "uncheck"] {
         let result =
             control_test_command(&json!({"action":action,"selector":"#hidden"}), &mut state).await;
-        assert_success(&result);
-        assert_eq!(result["data"]["method"], method);
+        if action == "check" {
+            assert_eq!(result["success"], false);
+            assert!(result["error"]
+                .as_str()
+                .unwrap()
+                .contains("visible control or label"));
+        } else {
+            assert_success(&result);
+            assert_eq!(result["data"]["method"], "unchanged");
+        }
     }
     let measured = control_test_command(
         &json!({"action":"evaluate","script":"({buttons,domClicks,checked:control.checked})"}),
@@ -243,7 +251,7 @@ async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     assert_success(&measured);
     assert_eq!(
         measured["data"]["result"],
-        json!({"buttons":0,"domClicks":2,"checked":false})
+        json!({"buttons":0,"domClicks":0,"checked":false})
     );
     assert_success(
         &control_test_command(
@@ -281,7 +289,7 @@ async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     assert!(refused["error"]
         .as_str()
         .unwrap()
-        .contains("requested state"));
+        .contains("visible control or label"));
     let measured = control_test_command(
         &json!({"action":"evaluate","script":"({buttons,domClicks,checked:control.checked})"}),
         &mut state,
@@ -290,7 +298,7 @@ async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     assert_success(&measured);
     assert_eq!(
         measured["data"]["result"],
-        json!({"buttons":0,"domClicks":3,"checked":false})
+        json!({"buttons":0,"domClicks":0,"checked":false})
     );
     assert_success(
         &control_test_command(
@@ -301,12 +309,11 @@ async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     );
     let blocked =
         control_test_command(&json!({"action":"check","selector":"#hidden"}), &mut state).await;
-    assert_success(&blocked);
-    assert_eq!(blocked["data"]["method"], "dom");
-    assert_eq!(blocked["data"]["dialogOpened"], true);
-    assert_success(
-        &control_test_command(&json!({"action":"dialog","response":"accept"}), &mut state).await,
-    );
+    assert_eq!(blocked["success"], false);
+    assert!(blocked["error"]
+        .as_str()
+        .unwrap()
+        .contains("visible control or label"));
     let completed = control_test_command(
         &json!({"action":"evaluate","script":"({buttons,domClicks,checked:control.checked})"}),
         &mut state,
@@ -315,7 +322,7 @@ async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     assert_success(&completed);
     assert_eq!(
         completed["data"]["result"],
-        json!({"buttons":0,"domClicks":4,"checked":true})
+        json!({"buttons":0,"domClicks":0,"checked":false})
     );
     // An associated visible label remains a real native pointer activation,
     // even when the selector names its hidden input.
@@ -334,7 +341,7 @@ async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     assert_success(&measured);
     assert_eq!(
         measured["data"]["result"],
-        json!({"buttons":1,"domClicks":4,"checked":true})
+        json!({"buttons":1,"domClicks":0,"checked":true})
     );
     let semantic = control_test_command(
         &json!({"action":"check","selector":"#semantic"}),
@@ -347,8 +354,77 @@ async fn e2e_native_checkbox_selects_one_truthful_activation_method() {
     assert_success(&measured);
     assert_eq!(
         measured["data"]["result"],
-        json!({"buttons":2,"domClicks":4,"checked":"true"})
+        json!({"buttons":2,"domClicks":0,"checked":"true"})
     );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
+#[tokio::test]
+#[ignore]
+async fn e2e_native_select_uses_real_pointer_and_keys_without_dom_selection() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let html = r#"<!doctype html><style>select{margin:30px;width:180px;font-size:20px}</style><form onsubmit="submits++;event.preventDefault()"><select id=single><option value=a>Alpha</option><option value=b disabled>Beta</option><option value=c>Gamma</option><option value=d>Delta</option></select><select id=multi multiple size=4><option value=a selected>Alpha</option><option value=b selected>Beta</option><option value=c>Gamma</option><option value=d>Delta</option></select><select id=disabled disabled><option value=a>Alpha</option><option value=d>Delta</option></select></form><script>window.events=[];window.submits=0;for(const type of ['pointerdown','keydown','input','change'])addEventListener(type,e=>events.push({type,trusted:e.isTrusted,target:e.target.id,key:e.key??null}),true)</script>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}), &mut state).await);
+    let read = json!({"action":"evaluate","script":"({single:single.value,multi:[...multi.selectedOptions].map(o=>o.value),events,submits})"});
+    assert_success(
+        &control_test_command(
+            &json!({"action":"select","selector":"#single","values":["Gamma"]}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"select","selector":"#multi","values":["a","Delta"]}),
+            &mut state,
+        )
+        .await,
+    );
+    let actual = control_test_command(&read, &mut state).await;
+    assert_success(&actual);
+    let actual = &actual["data"]["result"];
+    assert_eq!(actual["single"], "c");
+    assert_eq!(actual["multi"], json!(["a", "d"]));
+    assert_eq!(actual["submits"], 0);
+    let events = actual["events"].as_array().unwrap();
+    assert!(events.iter().any(|event| event["type"] == "pointerdown"));
+    assert!(events.iter().any(|event| event["type"] == "keydown"));
+    assert!(events.iter().any(|event| event["type"] == "change"));
+    assert!(
+        events.iter().all(|event| event["trusted"] == true),
+        "Native selection emitted synthetic events: {events:?}"
+    );
+    let before = events.len();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"select","selector":"#multi","values":["a","d"]}),
+            &mut state,
+        )
+        .await,
+    );
+    for command in [
+        json!({"action":"select","selector":"#single","values":["missing"]}),
+        json!({"action":"select","selector":"#single","values":["b"]}),
+        json!({"action":"select","selector":"#disabled","values":["d"]}),
+    ] {
+        let result = control_test_command(&command, &mut state).await;
+        assert_eq!(result["success"], false);
+    }
+    let final_state = control_test_command(&read, &mut state).await;
+    assert_success(&final_state);
+    assert_eq!(
+        final_state["data"]["result"]["events"]
+            .as_array()
+            .unwrap()
+            .len(),
+        before,
+        "A no-op or refused selection performed input"
+    );
+    assert_eq!(final_state["data"]["result"]["single"], "c");
+    assert_eq!(final_state["data"]["result"]["multi"], json!(["a", "d"]));
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
 
