@@ -10,7 +10,7 @@
 //! reported as `default` too). The hovered element's computed `cursor` in
 //! the visible page picks the member of that image's class, so a person
 //! under control sees the cursor the page asked for, and never one the
-//! window does not show. Without DevTools (sign-in), past a cross-origin
+//! window does not show. Without automation (sign-in), past a cross-origin
 //! frame or past the deadline, the class keyword stands. Identities reach
 //! viewers in the order the helper reported them, and a refinement never
 //! outlives a newer identity.
@@ -514,7 +514,7 @@ mod tests {
         assert!(media.cursor().is_none());
     }
 
-    /// Without DevTools (a sign-in window) the class keyword stands.
+    /// Without automation (a sign-in window) the class keyword stands.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn without_devtools_the_class_keyword_stands() {
         let (identities, mut messages, _media) = identities(None);

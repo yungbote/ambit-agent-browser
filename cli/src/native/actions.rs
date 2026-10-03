@@ -2629,7 +2629,7 @@ pub(crate) async fn close_current_browser(
         None
     };
     if let Some(sign_in) = state.sign_in.take() {
-        sign_in.stop().await;
+        sign_in.quit().await;
     }
 
     close_active_provider_session(state).await;
@@ -5088,7 +5088,7 @@ fn launch_options_from_env() -> LaunchOptions {
         no_xvfb: no_xvfb_from_env(),
         restrict_webrtc: env::var("AGENT_BROWSER_ALLOWED_DOMAINS")
             .is_ok_and(|domains| !domains.trim().is_empty()),
-        remote_debugging: true,
+        automation: true,
         restore_last_session: false,
         retained_display: None,
     }
@@ -5581,7 +5581,7 @@ async fn handle_launch(cmd: &Value, state: &mut DaemonState) -> Result<Value, St
             }),
         no_xvfb: no_xvfb_from_launch_cmd(cmd),
         restrict_webrtc,
-        remote_debugging: true,
+        automation: true,
         restore_last_session: false,
         retained_display: None,
     };

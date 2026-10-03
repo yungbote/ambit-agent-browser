@@ -67,7 +67,7 @@ async fn seed_main_frame_id(
 type CdpEvents = (Arc<CdpClient>, broadcast::Receiver<CdpEvent>);
 
 /// The next event of this session's CDP client, with that client; never for
-/// a window shown without DevTools.
+/// a window shown without automation.
 async fn next_cdp_event(
     cdp: &mut Option<CdpEvents>,
 ) -> (
@@ -179,7 +179,7 @@ async fn publish_url(
 }
 
 /// Streams the current source to its viewers: the owned window's display,
-/// the active page's CDP events, or both. A browser running without DevTools
+/// the active page's CDP events, or both. A browser running without automation
 /// streams its window alone.
 ///
 /// Frames use `frame_watch` so the latest value wins. Other messages stay on

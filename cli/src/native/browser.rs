@@ -704,10 +704,14 @@ impl BrowserProcess {
         }
     }
 
-    pub fn wait_or_kill(&mut self, timeout: std::time::Duration) {
+    /// End an owned browser by `deadline`: Chrome quits through its own
+    /// endpoint (`ChromeProcess::quit`); Lightpanda keeps nothing to flush.
+    pub(crate) async fn quit(self, deadline: tokio::time::Instant) {
         match self {
-            BrowserProcess::Chrome(p) => p.wait_or_kill(timeout),
-            BrowserProcess::Lightpanda(p) => p.kill(),
+            BrowserProcess::Chrome(process) => {
+                process.quit(deadline).await;
+            }
+            BrowserProcess::Lightpanda(mut process) => process.kill(),
         }
     }
 
@@ -926,7 +930,7 @@ impl BrowserManager {
                 let chrome = launch_chrome(options).await?;
                 let url = chrome
                     .devtools_url()
-                    .ok_or("This Chrome was launched without DevTools and cannot be automated")?
+                    .ok_or("This Chrome was launched without its automation channel")?
                     .to_string();
                 (url, BrowserProcess::Chrome(chrome))
             }
@@ -1845,32 +1849,12 @@ impl BrowserManager {
     }
 
     /// Close gracefully within `timeout`, then kill what remains of an owned
-    /// browser. It is gone when this returns.
+    /// browser. It is gone when this returns. An attached browser (--cdp,
+    /// --auto-connect) is the user's: it is only disconnected.
     pub(crate) async fn close_within(&mut self, timeout: Duration) -> Result<(), String> {
-        let deadline = tokio::time::Instant::now() + timeout;
-        // The window's end is this owner's choice, not a display failure.
-        if let Some(display) = self.display_client() {
-            display.retire();
+        if let Some(process) = self.browser_process.take() {
+            process.quit(tokio::time::Instant::now() + timeout).await;
         }
-        if self.browser_process.is_some() {
-            // Only send Browser.close when we launched the browser ourselves.
-            // For external connections (--auto-connect, --cdp) we just disconnect
-            // without shutting down the user's browser.
-            let _ = tokio::time::timeout_at(
-                deadline,
-                self.client.send_command_no_params("Browser.close", None),
-            )
-            .await;
-        }
-
-        if let Some(mut process) = self.browser_process.take() {
-            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-            let _ = tokio::task::spawn_blocking(move || {
-                process.wait_or_kill(remaining);
-            })
-            .await;
-        }
-
         Ok(())
     }
 

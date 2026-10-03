@@ -61,9 +61,10 @@ impl SiteProfileDisposition {
 pub struct ChromeProcess {
     site_profile: Arc<SiteProfileDisposition>,
     child: Child,
-    /// Absent when Chrome runs without any remote-debugging switch: such a
-    /// browser has no automation channel at all.
-    devtools_url: Option<String>,
+    /// The browser's DevTools endpoint, which every launch opens. Only an
+    /// automation launch publishes it (`devtools_url`); otherwise this owner
+    /// alone holds it and only ever uses it to quit the browser (`quit`).
+    endpoint: Option<String>,
     /// The effective options that launched this browser and its resolved
     /// executable; a relaunch starts from exactly these.
     launch: Box<LaunchOptions>,
@@ -185,9 +186,10 @@ impl ChromeProcess {
         })
     }
 
-    /// The DevTools endpoint, or `None` for a browser without one.
+    /// The automation channel's DevTools endpoint, or `None` for a browser
+    /// whose endpoint is private to this owner.
     pub fn devtools_url(&self) -> Option<&str> {
-        self.devtools_url.as_deref()
+        self.endpoint.as_deref().filter(|_| self.launch.automation)
     }
 
     /// Options that relaunch this browser exactly: its executable and flags,
@@ -281,23 +283,56 @@ impl ChromeProcess {
         matches!(self.child.try_wait(), Ok(Some(_)) | Err(_))
     }
 
-    /// Wait for Chrome to exit on its own (after Browser.close CDP command),
-    /// falling back to kill() if it doesn't exit within the timeout.
-    /// This allows Chrome to flush cookies and other state to the user-data-dir.
-    pub fn wait_or_kill(&mut self, timeout: Duration) {
+    /// Quit the browser as Chrome's own application quit does: `Browser.close`
+    /// over this owner's endpoint, which closes every window without running
+    /// `beforeunload` handlers or waiting on dialogs, so Chrome keeps the
+    /// session it ends, session cookies included, for the next launch to
+    /// restore. Closing the last window instead (`WM_DELETE_WINDOW`, as a
+    /// person does) deletes session data, and SIGTERM ends Chrome as a system
+    /// shutdown would, before recent writes reach the profile.
+    ///
+    /// What has not exited by `deadline` is killed with its process group.
+    /// Answers whether the browser exited on its own: only then is its
+    /// profile whole.
+    pub(crate) async fn quit(mut self, deadline: tokio::time::Instant) -> bool {
+        // The window's end is this owner's choice, not a display failure.
+        #[cfg(target_os = "linux")]
+        if let Some(display) = self.display_client() {
+            display.retire();
+        }
+        // A browser that has exited no longer holds its port, which another
+        // process may have taken: nothing is sent to it.
+        if let Some(endpoint) = self.endpoint.clone().filter(|_| !self.has_exited()) {
+            let _ = tokio::time::timeout_at(deadline, async {
+                super::client::CdpClient::connect(&endpoint)
+                    .await?
+                    .send_command_no_params("Browser.close", None)
+                    .await
+            })
+            .await;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        tokio::task::spawn_blocking(move || self.wait_or_kill(remaining))
+            .await
+            .unwrap_or(false)
+    }
+
+    /// Wait up to `timeout` for the browser to exit, then kill what remains.
+    /// Answers whether it exited on its own. Blocking.
+    fn wait_or_kill(&mut self, timeout: Duration) -> bool {
         self.discontinue_audio();
         let start = std::time::Instant::now();
-        let poll_interval = Duration::from_millis(50);
-
-        while start.elapsed() < timeout {
+        loop {
             match self.child.try_wait() {
-                Ok(Some(_)) => return,
-                Ok(None) => std::thread::sleep(poll_interval),
-                Err(_) => break,
+                Ok(Some(_)) => return true,
+                Ok(None) if start.elapsed() < timeout => {
+                    std::thread::sleep(Duration::from_millis(50))
+                }
+                _ => break,
             }
         }
-
         self.kill();
+        false
     }
 
     fn discontinue_audio(&self) {
@@ -310,27 +345,6 @@ impl ChromeProcess {
             audio.discontinue();
         }
     }
-
-    /// Bounded signal-close fallback when native window closure is unavailable.
-    /// SIGTERM gives the process a chance to exit; it does not guarantee that
-    /// Chrome flushes a recent sign-in. Whatever remains after `timeout` is
-    /// killed with its process group. Blocking.
-    pub(crate) fn terminate(&mut self, timeout: Duration) {
-        #[cfg(target_os = "linux")]
-        if let Some(display) = self.display_client() {
-            display.retire();
-        }
-        // An unreaped child keeps its pid, so the signal cannot reach
-        // another process.
-        #[cfg(unix)]
-        if matches!(self.child.try_wait(), Ok(None)) {
-            // SAFETY: kill(2) on this owned, unreaped child.
-            unsafe {
-                libc::kill(self.child.id() as i32, libc::SIGTERM);
-            }
-        }
-        self.wait_or_kill(timeout);
-    }
 }
 
 #[cfg(test)]
@@ -341,7 +355,7 @@ impl ChromeProcess {
         Self {
             site_profile: Arc::default(),
             child,
-            devtools_url: None,
+            endpoint: None,
             launch: Box::new(launch),
             executable: PathBuf::from("/opt/ambit/browser/chrome/chrome"),
             temp_user_data_dir: None,
@@ -681,9 +695,12 @@ pub struct LaunchOptions {
     /// Restrict WebRTC to proxied transports so direct UDP cannot bypass the
     /// HTTP domain filter. Enabled automatically with `--allowed-domains`.
     pub restrict_webrtc: bool,
-    /// Open the DevTools endpoint (`--remote-debugging-port=0`). Only sign-in
-    /// mode turns it off: that browser has no automation channel at all.
-    pub remote_debugging: bool,
+    /// Publish the browser's DevTools endpoint as its automation channel.
+    /// Chrome then chooses the port (`--remote-debugging-port=0`), which it
+    /// reports to pages as automation (`navigator.webdriver`). Only sign-in
+    /// mode turns it off: that browser opens a private loopback port instead,
+    /// which pages do not observe and only its process owner uses, to quit it.
+    pub automation: bool,
     /// Reopen the tabs of this profile's previous session. Explicit, never a
     /// profile preference, because both sign-in relaunches rely on it.
     pub restore_last_session: bool,
@@ -713,11 +730,11 @@ impl LaunchOptions {
             && self.extensions.as_ref().is_none_or(|exts| exts.is_empty())
     }
 
-    /// The same launch with no automation channel at all, or why sign-in
-    /// mode cannot remove it. Nothing is masked: the switch is absent.
+    /// The same launch with no automation channel, or why sign-in mode cannot
+    /// remove it. Nothing is masked: no switch makes Chrome report automation.
     pub(crate) fn without_automation(self) -> Result<Self, String> {
         let options = Self {
-            remote_debugging: false,
+            automation: false,
             ..self
         };
         build_chrome_args(&options)?;
@@ -759,7 +776,7 @@ impl Default for LaunchOptions {
             webmcp: true,
             no_xvfb: false,
             restrict_webrtc: false,
-            remote_debugging: true,
+            automation: true,
             restore_last_session: false,
             retained_display: None,
         }
@@ -887,14 +904,15 @@ fn custom_window_theme(options: &LaunchOptions) -> bool {
 fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
     options.require_site_clear()?;
     validate_sandbox_options(options, Some("chrome"), false)?;
-    // Without DevTools nothing can observe or drive the browser but its own
-    // window, so only an owned window reopening its own profile qualifies.
-    if !options.remote_debugging
+    // Without the automation channel nothing can observe or drive the browser
+    // but its own window, so only an owned window reopening its own profile
+    // qualifies.
+    if !options.automation
         && !(options.window_stream
             && (options.profile.is_some() || options.retained_profile.is_some()))
     {
         return Err(
-            "A browser without DevTools must be an owned window relaunched into its own profile"
+            "A browser without automation must be an owned window relaunched into its own profile"
                 .to_string(),
         );
     }
@@ -930,11 +948,8 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         }
     }
 
-    let mut args = Vec::new();
-    if options.remote_debugging {
-        args.push("--remote-debugging-port=0".to_string());
-    }
-    args.extend([
+    // The DevTools switch is chosen per launch attempt (`devtools_switch`).
+    let mut args = vec![
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
         "--disable-background-networking".to_string(),
@@ -947,7 +962,7 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         "--disable-features=Translate".to_string(),
         format!("--enable-features={}", enable_features.join(",")),
         "--metrics-recording-only".to_string(),
-    ]);
+    ];
     if options.restore_last_session {
         args.push("--restore-last-session".to_string());
     }
@@ -1121,9 +1136,9 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         args.push("--disable-dev-shm-usage".to_string());
     }
 
-    // Removing the managed switch must leave no other automation channel;
-    // a remaining one is refused, never silently stripped.
-    if !options.remote_debugging {
+    // A launch without automation carries no other automation channel; one
+    // in its arguments is refused, never silently stripped.
+    if !options.automation {
         if let Some(arg) = args.iter().find(|arg| automation_switch(arg)) {
             return Err(format!(
                 "The browser launch carries the automation argument '{arg}', which sign-in mode cannot remove"
@@ -1136,6 +1151,25 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         user_data_dir,
         temp_user_data_dir,
     })
+}
+
+/// The switch that opens a launch's DevTools endpoint. An automation launch
+/// lets Chrome choose the port. Any other launch names a free loopback port:
+/// Chrome reports automation to pages only for port 0, so a private endpoint
+/// leaves `navigator.webdriver` truthfully false.
+fn devtools_switch(options: &LaunchOptions) -> Result<String, String> {
+    let port = if options.automation {
+        0
+    } else {
+        // Chrome binds the port itself, so it is released first. A port taken
+        // in between leaves the launch without an endpoint, which readiness
+        // refuses; an endpoint is only ever read from this launch's own Chrome.
+        std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .and_then(|listener| listener.local_addr())
+            .map_err(|e| format!("No loopback port is free for the browser: {e}"))?
+            .port()
+    };
+    Ok(format!("--remote-debugging-port={port}"))
 }
 
 #[cfg(target_os = "linux")]
@@ -1341,13 +1375,9 @@ fn launch_chrome_blocking(
 
     let effective_options = resolved_options.as_ref().unwrap_or(options);
 
-    // A browser without DevTools serves a person waiting for its window: its
-    // caller falls back promptly instead of retrying.
-    let max_attempts = if effective_options.remote_debugging {
-        3
-    } else {
-        1
-    };
+    // A browser without automation serves a person waiting for its window:
+    // its caller falls back promptly instead of retrying.
+    let max_attempts = if effective_options.automation { 3 } else { 1 };
     let mut last_err = String::new();
 
     for attempt in 1..=max_attempts {
@@ -1403,10 +1433,11 @@ fn try_launch_chrome(
         .map_err(String::from)?
         .is_browser_host();
     let ChromeArgs {
-        args,
+        mut args,
         user_data_dir,
         temp_user_data_dir,
     } = build_chrome_args(options)?;
+    args.insert(0, devtools_switch(options)?);
     let new_host_profile = browser_host && temp_user_data_dir.is_some();
     let temp_user_data_dir = options
         .retained_profile
@@ -1564,7 +1595,7 @@ fn try_launch_chrome(
             })
             .unwrap_or_default(),
         child,
-        devtools_url: None,
+        endpoint: None,
         launch: Box::new(options.clone()),
         executable: chrome_path.to_path_buf(),
         temp_user_data_dir,
@@ -1577,7 +1608,7 @@ fn try_launch_chrome(
         #[cfg(target_os = "linux")]
         display_process: None,
     };
-    if !options.remote_debugging
+    if !options.automation
         || options.profile.is_some()
         || options
             .args
@@ -1619,62 +1650,66 @@ fn try_launch_chrome(
         #[cfg(not(target_os = "linux"))]
         return Err("Private window streaming is supported on Linux".into());
     }
+    // Every launch is ready once Chrome reports its endpoint. A launch without
+    // automation serves a person, so its own normal window must also be
+    // mapped on its private display, as the pid-bound helper sees it.
     let started = std::time::Instant::now();
-    process.devtools_url = if options.remote_debugging {
-        Some(wait_for_startup(
-            &mut process.child,
-            &stderr_rx,
-            started + DEVTOOLS_STARTUP,
-            canceled,
-            options.require_sandbox,
+    let (startup, messages) = if options.automation {
+        (
+            DEVTOOLS_STARTUP,
             (
                 "Chrome exited before providing DevTools URL",
                 "Timeout waiting for Chrome DevTools URL",
             ),
-            |observed| match observed {
-                Startup::Poll => read_devtools_active_port(&user_data_dir)
-                    .map(|(port, ws_path)| format!("ws://127.0.0.1:{}{}", port, ws_path)),
-                Startup::Stderr(line) => line
-                    .strip_prefix("DevTools listening on ")
-                    .map(|url| url.trim().to_string()),
-            },
-        )?)
+        )
     } else {
-        #[cfg(target_os = "linux")]
-        {
-            // Without DevTools, readiness is this Chrome's own normal window
-            // mapped on its private display, as the pid-bound helper sees it.
-            let display = process.display_client();
-            let runtime = tokio::runtime::Handle::current();
-            wait_for_startup(
-                &mut process.child,
-                &stderr_rx,
-                started + WINDOW_STARTUP,
-                canceled,
-                options.require_sandbox,
-                (
-                    "Chrome exited before showing its window",
-                    "Timeout waiting for the Chrome window",
-                ),
-                |observed| {
-                    let display = display.as_ref().filter(|_| observed == Startup::Poll)?;
-                    // Blocking-pool threads may drive the display helper's
-                    // runtime I/O; this thread is not an async context.
-                    let info = runtime.block_on(display.info()).ok()?;
-                    info.active_window().map(|_| ())
-                },
-            )?;
-        }
-        None
+        (
+            WINDOW_STARTUP,
+            (
+                "Chrome exited before showing its window",
+                "Timeout waiting for the Chrome window",
+            ),
+        )
     };
+    #[cfg(target_os = "linux")]
+    let window = (!options.automation)
+        .then(|| (process.display_client(), tokio::runtime::Handle::current()));
+    let mut endpoint = None;
+    process.endpoint = Some(wait_for_startup(
+        &mut process.child,
+        &stderr_rx,
+        started + startup,
+        canceled,
+        options.require_sandbox,
+        messages,
+        |observed| {
+            if endpoint.is_none() {
+                endpoint = match observed {
+                    Startup::Poll => read_devtools_active_port(&user_data_dir)
+                        .map(|(port, ws_path)| format!("ws://127.0.0.1:{port}{ws_path}")),
+                    Startup::Stderr(line) => line
+                        .strip_prefix("DevTools listening on ")
+                        .map(|url| url.trim().to_string()),
+                };
+            }
+            endpoint.as_ref()?;
+            #[cfg(target_os = "linux")]
+            if let Some((display, runtime)) = &window {
+                let display = display.as_ref().filter(|_| observed == Startup::Poll)?;
+                // Blocking-pool threads may drive the display helper's
+                // runtime I/O; this thread is not an async context.
+                runtime.block_on(display.info()).ok()?.active_window()?;
+            }
+            endpoint.clone()
+        },
+    )?);
     Ok(process)
 }
 
 /// How long Chrome may take to open its DevTools endpoint.
 const DEVTOOLS_STARTUP: Duration = Duration::from_secs(30);
-/// How long a browser without DevTools may take to show its window. A person
-/// is waiting; the sign-in transition falls back to automation after it.
-#[cfg(target_os = "linux")]
+/// How long a browser without automation may take to show its window. A
+/// person is waiting; the sign-in transition falls back to automation after.
 const WINDOW_STARTUP: Duration = Duration::from_secs(4);
 
 /// What one readiness probe observes: a periodic poll, or one new stderr line.
@@ -2615,10 +2650,11 @@ mod tests {
         }
     }
 
-    /// Sign-in mode removes the one automation switch and nothing else:
-    /// every other managed flag stays byte-identical and in order.
+    /// Sign-in mode changes only the DevTools switch: Chrome's own port 0 for
+    /// automation, a free loopback port for the private endpoint. Every other
+    /// managed flag stays byte-identical and in order.
     #[test]
-    fn sign_in_launch_drops_only_the_automation_switch() {
+    fn sign_in_launch_differs_only_in_its_private_devtools_port() {
         // Both launches are built under one environment: the dev-shm
         // fallback reads `CI`, which other tests set under the same guard.
         let guard = crate::test_utils::EnvGuard::new(&["CI"]);
@@ -2636,16 +2672,31 @@ mod tests {
             ..Default::default()
         };
         let managed = build_chrome_args(&automation).unwrap().args;
-        assert_eq!(managed[0], "--remote-debugging-port=0");
+        assert!(
+            !managed.iter().any(|arg| automation_switch(arg)),
+            "{managed:?}"
+        );
+        assert_eq!(
+            devtools_switch(&automation).unwrap(),
+            "--remote-debugging-port=0"
+        );
         assert!(
             !managed.iter().any(|arg| arg == "--disable-sync"),
             "owned launch defaults must not disable Chrome Sync"
         );
         let sign_in = automation.clone().without_automation().unwrap();
-        assert!(!sign_in.remote_debugging);
+        assert!(!sign_in.automation);
         let args = build_chrome_args(&sign_in).unwrap().args;
-        assert_eq!(args, managed[1..]);
-        assert!(!args.iter().any(|arg| automation_switch(arg)), "{args:?}");
+        assert_eq!(args, managed);
+        let port: u16 = devtools_switch(&sign_in)
+            .unwrap()
+            .strip_prefix("--remote-debugging-port=")
+            .and_then(|port| port.parse().ok())
+            .expect("a numbered DevTools port");
+        assert_ne!(
+            port, 0,
+            "Chrome reports port 0 to pages as automation; the private port is never 0"
+        );
         for expected in [
             "--restore-last-session",
             "--proxy-server=http://proxy.internal:3128",
@@ -2769,7 +2820,7 @@ mod tests {
                 ..Default::default()
             },
         );
-        process.devtools_url = Some("ws://127.0.0.1:1/devtools/browser/test".into());
+        process.endpoint = Some("ws://127.0.0.1:1/devtools/browser/test".into());
         process.temp_user_data_dir =
             Some(Arc::new(TemporaryBrowserDirectory { path: dir.clone() }));
         process.temp_nss_home = Some(nss.clone());
@@ -2795,7 +2846,7 @@ mod tests {
             &display.server
         ));
         assert!(relaunch.restore_last_session);
-        assert!(relaunch.remote_debugging);
+        assert!(relaunch.automation);
         assert_eq!(relaunch.storage_state, None);
         assert_eq!(relaunch.args, vec!["--lang=fr".to_string()]);
         drop(display);
@@ -2808,48 +2859,129 @@ mod tests {
         assert!(!auth_file.exists());
     }
 
+    /// A browser endpoint that records the method of every command it is
+    /// sent. When it answers, it quits `browser` as Chrome quits on
+    /// `Browser.close`; otherwise it never answers, as a hung browser.
     #[cfg(unix)]
-    #[test]
-    fn terminate_lets_the_browser_exit_before_killing_it() {
-        use std::os::unix::process::ExitStatusExt;
-        let shell = |script: &str| {
-            Command::new("/bin/sh")
-                .args(["-c", script])
-                .stdin(Stdio::null())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .unwrap()
-        };
-        // Wait until the shell has installed its handler before signalling.
-        let started_shell = |script: &str| {
-            let child = shell(script);
-            std::thread::sleep(Duration::from_millis(200));
-            child
-        };
-
-        let mut graceful = ChromeProcess::for_test(
-            started_shell("trap 'exit 0' TERM; while :; do sleep 0.05; done"),
-            LaunchOptions::default(),
+    async fn browser_endpoint(
+        answers: Option<u32>,
+    ) -> (String, Arc<std::sync::Mutex<Vec<String>>>) {
+        use futures_util::{SinkExt, StreamExt};
+        use tokio_tungstenite::tungstenite::Message;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "ws://{}/devtools/browser/fixture",
+            listener.local_addr().unwrap()
         );
-        let started = std::time::Instant::now();
-        graceful.terminate(Duration::from_secs(5));
+        let methods = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = methods.clone();
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                    while let Some(Ok(Message::Text(text))) = socket.next().await {
+                        let command: serde_json::Value = serde_json::from_str(&text).unwrap();
+                        seen.lock()
+                            .unwrap()
+                            .push(command["method"].as_str().unwrap_or_default().into());
+                        let Some(browser) = answers else { continue };
+                        let reply = serde_json::json!({ "id": command["id"], "result": {} });
+                        let _ = socket.send(Message::Text(reply.to_string())).await;
+                        // SAFETY: signalling the child this test spawned.
+                        unsafe {
+                            libc::kill(browser as i32, libc::SIGTERM);
+                        }
+                    }
+                });
+            }
+        });
+        (url, methods)
+    }
+
+    /// Quitting sends the one constant `Browser.close` over the owner's
+    /// endpoint and waits for the browser to exit on its own.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quit_closes_through_the_endpoint_and_waits_for_the_exit() {
+        let browser = Command::new("/bin/sh")
+            .args(["-c", "trap 'exit 0' TERM; while :; do sleep 0.05; done"])
+            .spawn()
+            .unwrap();
+        // The shell installs its handler before the endpoint can signal it.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        let (endpoint, methods) = browser_endpoint(Some(browser.id())).await;
+        let mut process = ChromeProcess::for_test(
+            browser,
+            LaunchOptions {
+                automation: false,
+                ..LaunchOptions::default()
+            },
+        );
+        process.endpoint = Some(endpoint);
+        let started = tokio::time::Instant::now();
+        assert!(process.quit(started + Duration::from_secs(5)).await);
         assert!(started.elapsed() < Duration::from_secs(2));
-        let status = graceful.child.try_wait().unwrap().unwrap();
-        assert!(
-            status.success(),
-            "SIGTERM let it exit on its own: {status:?}"
-        );
+        assert_eq!(*methods.lock().unwrap(), ["Browser.close"]);
+    }
 
-        let mut stubborn = ChromeProcess::for_test(
-            started_shell("trap '' TERM; while :; do sleep 0.05; done"),
-            LaunchOptions::default(),
-        );
-        let started = std::time::Instant::now();
-        stubborn.terminate(Duration::from_millis(300));
+    /// A browser that has not exited by the deadline, whose endpoint never
+    /// answers, is killed at the deadline, and the answer says so.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quit_kills_a_browser_that_has_not_exited_by_the_deadline() {
+        let browser = Command::new("sleep").arg("30").spawn().unwrap();
+        let pid = browser.id() as i32;
+        let (endpoint, methods) = browser_endpoint(None).await;
+        let mut process = ChromeProcess::for_test(browser, LaunchOptions::default());
+        process.endpoint = Some(endpoint);
+        let started = tokio::time::Instant::now();
+        assert!(!process.quit(started + Duration::from_millis(300)).await);
         assert!(started.elapsed() >= Duration::from_millis(300));
-        let status = stubborn.child.try_wait().unwrap().unwrap();
-        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(*methods.lock().unwrap(), ["Browser.close"]);
+        // SAFETY: probing the pid of the child this test spawned.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "the browser was killed and reaped"
+        );
+    }
+
+    /// A browser that has already exited is sent nothing: its port may
+    /// belong to another process by now.
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quit_sends_nothing_once_the_browser_has_exited() {
+        let mut browser = spawn_noop_child();
+        browser.wait().unwrap();
+        let (endpoint, methods) = browser_endpoint(None).await;
+        let mut process = ChromeProcess::for_test(browser, LaunchOptions::default());
+        process.endpoint = Some(endpoint);
+        let started = tokio::time::Instant::now();
+        assert!(process.quit(started + Duration::from_secs(5)).await);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(methods.lock().unwrap().is_empty());
+    }
+
+    /// Only an automation launch publishes its endpoint; a sign-in browser's
+    /// stays with its process owner.
+    #[test]
+    fn only_an_automation_launch_publishes_its_endpoint() {
+        let endpoint = "ws://127.0.0.1:1/devtools/browser/fixture";
+        let mut automation = ChromeProcess::for_test(spawn_noop_child(), LaunchOptions::default());
+        automation.endpoint = Some(endpoint.into());
+        assert_eq!(automation.devtools_url(), Some(endpoint));
+        let mut sign_in = ChromeProcess::for_test(
+            spawn_noop_child(),
+            LaunchOptions {
+                automation: false,
+                ..LaunchOptions::default()
+            },
+        );
+        sign_in.endpoint = Some(endpoint.into());
+        assert_eq!(sign_in.devtools_url(), None);
     }
 
     /// The readiness loop both launch kinds share returns what its probe
@@ -3835,7 +3967,7 @@ mod tests {
             let _process = ChromeProcess {
                 site_profile: Arc::default(),
                 child,
-                devtools_url: None,
+                endpoint: None,
                 launch: Box::default(),
                 executable: PathBuf::new(),
                 temp_user_data_dir: Some(Arc::new(TemporaryBrowserDirectory { path: dir.clone() })),
@@ -3864,7 +3996,7 @@ mod tests {
         let process = ChromeProcess {
             site_profile: Arc::default(),
             child: spawn_noop_child(),
-            devtools_url: None,
+            endpoint: None,
             launch: Box::default(),
             executable: PathBuf::new(),
             temp_user_data_dir: Some(Arc::new(TemporaryBrowserDirectory { path: dir.clone() })),

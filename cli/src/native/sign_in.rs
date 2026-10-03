@@ -1,12 +1,16 @@
 //! Sign-in mode: while a person signs in to a site, the owned window runs the
-//! same Chrome (executable, flags, profile, private display and sandbox) with
-//! no remote-debugging switch at all, so the browser has no automation
-//! channel and truthfully reports `navigator.webdriver === false`. Handing
-//! back relaunches it with DevTools. Nothing is masked in either direction.
+//! same Chrome (executable, flags, profile, private display and sandbox)
+//! without its automation channel, so it truthfully reports
+//! `navigator.webdriver === false`. Its only DevTools switch is a private
+//! loopback port its process owner uses to quit it (`ChromeProcess::quit`);
+//! Chrome reports automation to pages only for port 0. Handing back relaunches
+//! it with automation. Nothing is masked in either direction.
 //!
-//! Tabs, cookies and the profile survive both relaunches. Isolated windows
-//! (CDP browser contexts), unsaved page state and a temporary download
-//! directory's contents do not; this is why sign-in is an explicit mode.
+//! Both transitions quit Chrome as an application quit, so tabs, cookies
+//! (session cookies included) and the profile survive both relaunches.
+//! Isolated windows (CDP browser contexts), unsaved page state and a temporary
+//! download directory's contents do not; this is why sign-in is an explicit
+//! mode.
 //!
 //! Both transitions relaunch Chrome, so they return boxed futures: their
 //! large state machines live on the heap while they run instead of inside
@@ -33,12 +37,12 @@ const TRANSITION: Duration = Duration::from_secs(8);
 /// The sign-in window must be up by then, leaving the rest of the transition
 /// to bring automation back if it is not.
 const SIGN_IN_READY: Duration = Duration::from_millis(6500);
-/// Graceful close before the browser's process group is killed.
+/// How long a browser may take to quit before its process group is killed.
 const STOP: Duration = Duration::from_secs(2);
 
 const NOT_OWNED: &str = "Sign-in mode needs a locally launched browser with its own window.";
 
-/// The browser a person signs in to: the owned window, without DevTools.
+/// The browser a person signs in to: the owned window, without automation.
 pub(crate) struct SignInBrowser {
     chrome: ChromeProcess,
 }
@@ -65,46 +69,13 @@ impl SignInBrowser {
         self.chrome.has_exited()
     }
 
-    /// Ask its owned windows to close so Chrome flushes recent sign-ins;
-    /// its profile and display stay retained by whoever relaunches into them.
-    /// Older helpers retain the bounded signal-close path.
-    pub(crate) async fn stop(self) {
-        let mut chrome = self.chrome;
-        let deadline = std::time::Instant::now() + STOP;
-        #[cfg(target_os = "linux")]
-        let window_close = if let Some(display) = chrome.display_client() {
-            close_owned_windows(&display, deadline).await
-        } else {
-            false
-        };
-        #[cfg(not(target_os = "linux"))]
-        let window_close = false;
-        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-        let _ = tokio::task::spawn_blocking(move || {
-            if window_close {
-                chrome.wait_or_kill(remaining);
-            } else {
-                chrome.terminate(remaining);
-            }
-        })
-        .await;
+    /// Quit the browser so Chrome keeps what the person signed in to, session
+    /// cookies included; its profile and display stay retained by whoever
+    /// relaunches into them. Answers whether it quit within `STOP` rather
+    /// than being killed, which can lose a recent sign-in.
+    pub(crate) async fn quit(self) -> bool {
+        self.chrome.quit(Instant::now() + STOP).await
     }
-}
-
-#[cfg(target_os = "linux")]
-async fn close_owned_windows(display: &DisplayClient, deadline: std::time::Instant) -> bool {
-    if !display.has("closeWindows") {
-        return false;
-    }
-    display.retire();
-    matches!(
-        tokio::time::timeout_at(
-            Instant::from_std(deadline),
-            display.request(serde_json::json!({ "op": "close_windows" }))
-        )
-        .await,
-        Ok(Ok(_))
-    )
 }
 
 impl DaemonState {
@@ -183,7 +154,7 @@ impl Relaunch {
         let display = sign_in.display()?;
         Some(Self {
             options: LaunchOptions {
-                remote_debugging: true,
+                automation: true,
                 ..sign_in.chrome.relaunch_options().ok()?
             },
             window: window_size(&display),
@@ -270,7 +241,7 @@ pub(super) fn enter<'a>(
                 &format!("sign-in could not start: {}", error.message),
             );
             if let Some(sign_in) = state.sign_in.take() {
-                sign_in.stop().await;
+                sign_in.quit().await;
             }
             let restored = relaunch_automation(
                 state,
@@ -298,10 +269,11 @@ pub(super) fn enter<'a>(
     .boxed()
 }
 
-/// Hand the browser back to the agent: close the sign-in browser as a person
-/// would, relaunch automation into the same profile and window, require a
-/// fresh observation and end the lease. If the relaunch fails, custody still
-/// returns and the agent's next command launches the browser normally.
+/// Hand the browser back to the agent: quit the sign-in browser, keeping
+/// what the person signed in to, relaunch automation into the same profile
+/// and window, require a fresh observation and end the lease. If the
+/// relaunch fails, custody still returns and the agent's next command
+/// launches the browser normally.
 pub(super) fn hand_back(state: &mut DaemonState) -> BoxFuture<'_, ()> {
     async move {
         let deadline = Instant::now() + TRANSITION;
@@ -310,11 +282,16 @@ pub(super) fn hand_back(state: &mut DaemonState) -> BoxFuture<'_, ()> {
             state.publish_browser_status().await;
             let window = sign_in.display().map(|display| window_size(&display));
             let automation = sign_in.chrome.relaunch_options();
-            sign_in.stop().await;
+            if !sign_in.quit().await {
+                session_log(
+                    &state.session_id,
+                    "the sign-in browser did not quit in time and was stopped; a recent sign-in may not be kept",
+                );
+            }
             match (automation, window) {
                 (Ok(options), Some(window)) => {
                     let options = LaunchOptions {
-                        remote_debugging: true,
+                        automation: true,
                         theme: state.theme,
                         ..options
                     };
@@ -481,86 +458,6 @@ mod tests {
     use serde_json::json;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-    #[tokio::test]
-    async fn native_window_close_is_sent_once_only_when_advertised() {
-        let (legacy, peer, _frames) = DisplayClient::test_channel();
-        assert!(!close_owned_windows(&legacy, std::time::Instant::now() + STOP).await);
-        let mut unread = [0_u8; 64];
-        assert_eq!(
-            peer.try_read(&mut unread).unwrap_err().kind(),
-            std::io::ErrorKind::WouldBlock
-        );
-        assert!(legacy.available());
-
-        let (display, peer, _frames) = DisplayClient::test_channel();
-        display.advertise(&["closeWindows"]);
-        let mut peer = BufReader::new(peer);
-        let closing = tokio::spawn({
-            let display = display.clone();
-            async move { close_owned_windows(&display, std::time::Instant::now() + STOP).await }
-        });
-        let mut line = String::new();
-        peer.read_line(&mut line).await.unwrap();
-        let request: Value = serde_json::from_str(&line).unwrap();
-        assert_eq!(request["op"], "close_windows");
-        peer.get_mut()
-            .write_all(
-                format!(
-                    "{}\n",
-                    json!({ "id": request["id"], "success": true, "data": {} })
-                )
-                .as_bytes(),
-            )
-            .await
-            .unwrap();
-        assert!(closing.await.unwrap());
-        assert!(display.available());
-    }
-
-    #[tokio::test]
-    async fn a_refused_native_close_keeps_the_signal_fallback() {
-        let (display, peer, _frames) = DisplayClient::test_channel();
-        display.advertise(&["closeWindows"]);
-        let mut peer = BufReader::new(peer);
-        let closing = tokio::spawn({
-            let display = display.clone();
-            async move { close_owned_windows(&display, std::time::Instant::now() + STOP).await }
-        });
-        let mut line = String::new();
-        peer.read_line(&mut line).await.unwrap();
-        let request: Value = serde_json::from_str(&line).unwrap();
-        peer.get_mut().write_all(format!("{}\n", json!({ "id": request["id"], "success": false, "error": {"code":"display_unavailable", "message":"fixture", "operationPerformed":false} })).as_bytes()).await.unwrap();
-        assert!(!closing.await.unwrap());
-        assert!(
-            display.available(),
-            "a refused operation did not break the transport"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_unacknowledged_native_close_ends_at_the_existing_shutdown_deadline() {
-        let (display, peer, _frames) = DisplayClient::test_channel();
-        display.advertise(&["closeWindows"]);
-        let mut peer = BufReader::new(peer);
-        let closing = tokio::spawn({
-            let display = display.clone();
-            async move {
-                close_owned_windows(
-                    &display,
-                    std::time::Instant::now() + Duration::from_millis(50),
-                )
-                .await
-            }
-        });
-        let mut line = String::new();
-        peer.read_line(&mut line).await.unwrap();
-        assert!(!closing.await.unwrap());
-        assert!(
-            !display.available(),
-            "an uncertain reply cannot be read as another command's response"
-        );
-    }
-
     use crate::native::stream::{IdleActivity, StreamServer};
     use crate::test_utils::EnvGuard;
     use futures_util::StreamExt;
@@ -699,6 +596,39 @@ mod tests {
             "no launch to repeat: {failed}"
         );
         assert!(!state.browser_restarting);
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// A sign-in browser that has not quit by the deadline is killed, so the
+    /// hand-back stays inside the relay's deadline, and the session log says
+    /// a recent sign-in may be lost rather than that it was kept.
+    #[tokio::test]
+    async fn a_sign_in_browser_that_does_not_quit_is_killed_at_the_deadline() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR"]);
+        let (mut state, _viewer, directory) = viewed(&guard, "hand-back-hung").await;
+        let hung = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let pid = hung.id() as i32;
+        state.sign_in = Some(SignInBrowser {
+            chrome: ChromeProcess::for_test(hung, LaunchOptions::default()),
+        });
+        let started = std::time::Instant::now();
+        hand_back(&mut state).await;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed >= STOP && elapsed < STOP + Duration::from_secs(2),
+            "{elapsed:?}"
+        );
+        // SAFETY: probing the pid of the child this test spawned.
+        assert_eq!(
+            unsafe { libc::kill(pid, 0) },
+            -1,
+            "the browser was killed and reaped"
+        );
+        assert!(state.sign_in.is_none());
+        assert!(log(&directory, "hand-back-hung").contains("a recent sign-in may not be kept"));
         let _ = std::fs::remove_dir_all(directory);
     }
 

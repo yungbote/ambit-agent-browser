@@ -114,7 +114,7 @@ pub(crate) fn page_media(
 /// The result says where the theme took effect: `pages` is `live` when page
 /// sessions switched now (a page behind an open dialog switches when the
 /// dialog closes) and `next_launch` when no automated browser runs (none, or
-/// a window a person is signing in to, which has no DevTools); `ui` is
+/// a window a person is signing in to, which has no automation); `ui` is
 /// `none` for a browser without a window UI the daemon drew (headless or
 /// attached), `live` when its owned system settings acknowledged the update,
 /// `pinned` for explicit custom UI settings, and otherwise `next_launch`.

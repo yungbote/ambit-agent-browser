@@ -1096,7 +1096,7 @@ impl StreamServer {
 }
 
 /// A stream is connected while it has a source: a CDP client, an owned
-/// window's display, or both. A browser without DevTools streams its window.
+/// window's display, or both. A browser without automation streams its window.
 pub(super) async fn source_connected(
     client_slot: &RwLock<Option<Arc<CdpClient>>>,
     display_slot: &RwLock<Option<Arc<super::display::DisplayClient>>>,
@@ -1476,7 +1476,7 @@ mod tests {
         }
     }
 
-    /// A browser without DevTools streams its window alone: the viewer is told
+    /// A browser without automation streams its window alone: the viewer is told
     /// the stream is connected, frames flow from the display, and a display
     /// its owner retires and replaces never reads as a failed or stopped view.
     #[cfg(target_os = "linux")]

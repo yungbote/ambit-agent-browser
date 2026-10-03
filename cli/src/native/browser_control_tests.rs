@@ -1348,7 +1348,7 @@ async fn sign_in_custody_outlasts_the_lease_deadline_until_the_browser_is_handed
 }
 
 /// The idle clock follows the person, not the dock: renewing keeps it,
-/// applied input restarts it, and a window without DevTools takes native
+/// applied input restarts it, and a window without automation takes native
 /// input with no page session at all.
 #[cfg(target_os = "linux")]
 #[tokio::test]

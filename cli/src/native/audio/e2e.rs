@@ -319,7 +319,7 @@ async fn e2e_audio_two_sessions_page_output_and_sign_in() {
         signing_in.observe().startup_us,
         source_a.observe().startup_us
     );
-    // Calibrated before handover; this actual person's input has no DevTools channel.
+    // Calibrated before handover; this actual person's input has no automation channel.
     let mut click = control("input", &controller);
     click["sequence"] = json!(2);
     click["expectedSurfaceGeneration"] = response["data"]["surface"]["generation"].clone();

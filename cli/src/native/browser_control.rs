@@ -370,7 +370,7 @@ struct Lease {
     sign_in: Option<SignIn>,
 }
 
-/// The lease's browser runs without DevTools while a person signs in. Its
+/// The lease's browser runs without automation while a person signs in. Its
 /// custody lasts until the daemon hands the browser back, not until the
 /// lease deadline: no agent command may launch another browser meanwhile.
 struct SignIn {
@@ -1117,7 +1117,7 @@ impl BrowserControl {
         })
     }
 
-    /// The lease's browser runs without DevTools while a person signs in.
+    /// The lease's browser runs without automation while a person signs in.
     pub(crate) fn signing_in(&self) -> bool {
         self.lease
             .as_ref()
@@ -1189,7 +1189,7 @@ impl BrowserControl {
         })
     }
 
-    /// The browser now runs without DevTools: the same lease keeps its
+    /// The browser now runs without automation: the same lease keeps its
     /// controller and sequence line, consumes `sequence` and starts the idle
     /// clock. The replaced display took any native input it held with it.
     pub(crate) fn begin_sign_in(
@@ -1396,7 +1396,7 @@ impl BrowserControl {
             Operation::Inspect => {
                 let mut inspected =
                     json!({ "supported": true, "controlled": self.agent_error().is_some() });
-                // A browser without DevTools has no file pickers to report on.
+                // A browser without automation has no file pickers to report on.
                 if !self.signing_in() {
                     inspected["filesSupported"] =
                         json!(page.as_ref().is_some_and(|page| page.files_supported()));

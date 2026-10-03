@@ -196,7 +196,7 @@ impl DaemonState {
         Ok(surface)
     }
 
-    /// A window without DevTools, as while a person signs in, follows its
+    /// A window without automation, as while a person signs in, follows its
     /// display alone: the helper resizes it, with no page paint to confirm.
     async fn apply_display_layout(&mut self, width: u32, height: u32) -> Result<Surface, String> {
         let display = self.window_display().ok_or("Browser not launched")?;
