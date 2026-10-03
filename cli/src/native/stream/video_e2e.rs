@@ -1112,9 +1112,10 @@ async fn e2e_native_input_latency_stages() {
         .find(|(header, at)| *at > released && header["visible"]["width"] == 1840);
     // Each layout the drag reached the display with (asked, answered,
     // width): how long it waited for the layout loop after its presentation,
-    // how long the helper took to answer it (it first lets the browser paint
-    // the layout before it), and when a picture read the browser's paint of
-    // it, if one did before the next layout began.
+    // how long the helper took to answer it (it first waits for the
+    // browser's paint of the layout before it, and for a waiting capture to
+    // read that paint), and when a picture read the browser's paint of it,
+    // if one did before the next layout changed the window.
     let laid_out: Vec<(u64, u64, u64)> = layouts
         .iter()
         .map(|line| {
@@ -1137,7 +1138,7 @@ async fn e2e_native_input_latency_stages() {
         .iter()
         .enumerate()
         .filter_map(|(index, (_, answered, width))| {
-            let until = laid_out.get(index + 1).map_or(u64::MAX, |next| next.0);
+            let until = laid_out.get(index + 1).map_or(u64::MAX, |next| next.1);
             units
                 .iter()
                 .map(|(header, _)| (header["ts"].as_u64().unwrap(), header))

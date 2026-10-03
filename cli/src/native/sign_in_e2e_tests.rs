@@ -200,7 +200,7 @@ const GUARDED: &str = r#"<!doctype html><title>Guarded fixture</title>
 <input id=field autocomplete=off aria-label="Field">
 <script>
 const report=(kind,extra)=>fetch('/report?'+new URLSearchParams({kind,webdriver:String(navigator.webdriver),...extra}));
-report('load',{cookie:document.cookie});
+report('load',{cookie:document.cookie,browserUi:String(outerHeight-innerHeight)});
 document.addEventListener('pointermove',e=>report('event',{type:'pointermove'}),true);
 if(!navigator.webdriver){
 addEventListener('beforeunload',e=>{e.preventDefault();e.returnValue=''});
@@ -1195,7 +1195,8 @@ async fn e2e_hand_back_quits_past_an_open_dialog_and_a_beforeunload_guard() {
             .await,
         );
     }
-    assert_eq!(site.wait_for_report("load", 0).await["webdriver"], "true");
+    let automated = site.wait_for_report("load", 0).await;
+    assert_eq!(automated["webdriver"], "true");
     let (x, y, _) = window_point(&state, 320.0, 240.0).await;
 
     let controller = acquire(&mut state).await;
@@ -1206,7 +1207,16 @@ async fn e2e_hand_back_quits_past_an_open_dialog_and_a_beforeunload_guard() {
         .to_string();
     let person = ChromeMain::observe(&state).await;
     person.assert_without_automation();
-    assert_eq!(site.wait_for_report("load", 1).await["webdriver"], "false");
+    // The private port leaves no automation state and no bar: the browser
+    // shows the same toolbars above the page as the automation browser,
+    // whose launch carries no flag Chrome warns about (an unsupported flag,
+    // such as hiding automation from Blink, adds a bar and moves the page).
+    let signing_in = site.wait_for_report("load", 1).await;
+    assert_eq!(signing_in["webdriver"], "false");
+    assert_eq!(
+        signing_in["browserUi"], automated["browserUi"],
+        "{signing_in:?} against {automated:?}"
+    );
 
     // The person's click and key arm the guard, sign in and open the dialog.
     let mut sequence = 2;
