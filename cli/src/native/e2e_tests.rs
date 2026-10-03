@@ -15656,3 +15656,161 @@ async fn e2e_native_motion_proof() {
     }
     let _ = close_current_browser(&mut state).await;
 }
+
+/// Native strip order may differ from stable daemon tab IDs after a person's
+/// reorder; switching observes each actual target rather than guessing CtrlN.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires installed Chromium, Xvfb and browser-display"]
+async fn e2e_native_same_window_tab_switch_observes_reordered_targets() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    assert_success(
+        &control_test_command(&json!({"action":"launch","headless":true}), &mut state).await,
+    );
+    let page = |name: &str| {
+        format!("data:text/html;base64,{}", STANDARD.encode(format!(
+        "<title>{name}</title><p>{name}</p><script>window.nativeTabKeys=[];addEventListener('keydown',e=>nativeTabKeys.push({{key:e.key,trusted:e.isTrusted}}));</script>")))
+    };
+    assert_success(
+        &control_test_command(
+            &json!({"action":"navigate","url":page("alpha")}),
+            &mut state,
+        )
+        .await,
+    );
+    let first = state.browser.as_ref().unwrap().tab_list()[0]["tabId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let first_target = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .active_target_id()
+        .unwrap()
+        .to_string();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"tab_new","url":page("beta"),"label":"beta"}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"tab_new","url":page("gamma"),"label":"gamma"}),
+            &mut state,
+        )
+        .await,
+    );
+    let mgr = state.browser.as_ref().unwrap();
+    let client = mgr.client.clone();
+    let gamma_session = mgr.active_session_id().unwrap().to_string();
+    // Real native Chrome reorder: gamma moves left while its stable ID stays.
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_native_browser_keys(
+            &super::interaction::native_key_chord_events("PageUp", Some(10)),
+            super::browser_control::motion::KEY_INTERVAL,
+            &client,
+            &gamma_session,
+        )
+        .await
+        .unwrap();
+    // The pre-generator-fix fixture releases the synthetic chord itself.
+    // Shared generator settlement is qualified in Jev's independent lane.
+    state
+        .browser_control
+        .lock()
+        .await
+        .agent_native_browser_keys(
+            &[
+                super::interaction::native_key_transition("Control", "keyUp"),
+                super::interaction::native_key_transition("Shift", "keyUp"),
+            ],
+            super::browser_control::motion::KEY_INTERVAL,
+            &client,
+            &gamma_session,
+        )
+        .await
+        .unwrap();
+    assert_success(
+        &control_test_command(
+            &json!({"action":"evaluate","script":"nativeTabKeys.length=0"}),
+            &mut state,
+        )
+        .await,
+    );
+    if let Ok(directory) = std::env::var("AMBIT_NATIVE_TABS_ARTIFACT_DIR") {
+        let display = state.window_display().unwrap();
+        let (picture, _) = display
+            .capture(super::display::CaptureRequest {
+                cursor: true,
+                force: true,
+                ..Default::default()
+            })
+            .await
+            .unwrap()
+            .frame
+            .unwrap();
+        std::fs::write(
+            std::path::Path::new(&directory).join("reordered-strip.jpg"),
+            STANDARD.decode(picture.data.unwrap()).unwrap(),
+        )
+        .unwrap();
+    }
+    let started = std::time::Instant::now();
+    let switched =
+        control_test_command(&json!({"action":"tab_switch","tabId":first}), &mut state).await;
+    assert_success(&switched);
+    assert_eq!(switched["data"]["targetId"], first_target);
+    assert_eq!(switched["data"]["title"], "alpha");
+    println!(
+        "NATIVE_TAB_SWITCH {}",
+        json!({"selected":"alpha","elapsedMs":started.elapsed().as_millis()})
+    );
+    let native = client
+        .send_command(
+            "Runtime.evaluate",
+            Some(json!({"expression":"nativeTabKeys","returnByValue":true})),
+            Some(&gamma_session),
+        )
+        .await
+        .unwrap();
+    assert!(
+        native["result"]["value"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|event| event["key"] == "Control" && event["trusted"] == true),
+        "native cycle reached departing page: {native}"
+    );
+    state.browser.as_mut().unwrap().set_pin_tab(true);
+    let beta =
+        control_test_command(&json!({"action":"tab_switch","tabId":"beta"}), &mut state).await;
+    assert_success(&beta);
+    assert_eq!(beta["data"]["title"], "beta");
+    let before = state
+        .browser
+        .as_ref()
+        .unwrap()
+        .active_target_id()
+        .unwrap()
+        .to_string();
+    let denied = control_test_command(
+        &json!({"action":"tab_switch","tabId":"not-present"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(denied["success"], false);
+    assert_eq!(
+        state.browser.as_ref().unwrap().active_target_id().unwrap(),
+        before
+    );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
