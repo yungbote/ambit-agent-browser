@@ -11689,6 +11689,109 @@ async fn e2e_native_tab_new_keeps_setup_and_label_admission() {
     server.abort();
 }
 
+/// In an owned window a tab closes as a person closes it: the agent selects
+/// it with native keys and presses Ctrl+W. A protocol close skips a page's
+/// beforeunload guard and Ctrl+W honours it, so a guarded tab stays open
+/// behind its dialog until the agent accepts it; an unguarded tab closes, and
+/// the roster's active tab is the one Chrome then shows.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "requires installed Chromium, Xvfb and browser-display"]
+async fn e2e_native_tab_close_selects_the_tab_and_presses_ctrl_w() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    assert_success(
+        &control_test_command(&json!({"action":"launch","headless":true}), &mut state).await,
+    );
+    let page = |name: &str, guarded: bool| {
+        let guard = if guarded {
+            "<script>addEventListener('beforeunload',e=>{e.preventDefault();e.returnValue=''})</script>"
+        } else {
+            ""
+        };
+        format!(
+            "data:text/html;base64,{}",
+            STANDARD.encode(format!(
+                "<title>{name}</title><body style=\"height:100vh;margin:0\"><p>{name}</p>{guard}"
+            ))
+        )
+    };
+    assert_success(
+        &control_test_command(
+            &json!({"action":"navigate","url":page("alpha", true)}),
+            &mut state,
+        )
+        .await,
+    );
+    let alpha = state.browser.as_ref().unwrap().tab_list()[0]["tabId"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    for name in ["beta", "gamma"] {
+        assert_success(
+            &control_test_command(
+                &json!({"action":"tab_new","url":page(name, false),"label":name}),
+                &mut state,
+            )
+            .await,
+        );
+    }
+    let tabs = |state: &DaemonState| {
+        state
+            .browser
+            .as_ref()
+            .unwrap()
+            .tab_list()
+            .iter()
+            .map(|tab| tab["label"].as_str().unwrap_or_default().to_string())
+            .collect::<Vec<_>>()
+    };
+    // Unguarded and not shown: selected natively, then closed by Ctrl+W.
+    let closed =
+        control_test_command(&json!({"action":"tab_close","tabId":"beta"}), &mut state).await;
+    assert_success(&closed);
+    assert_eq!(closed["data"]["closed"], true);
+    assert_eq!(state.browser.as_ref().unwrap().page_count(), 2);
+    assert!(!tabs(&state).iter().any(|label| label == "beta"), "{:?}", tabs(&state));
+    assert_eq!(
+        state
+            .browser
+            .as_mut()
+            .unwrap()
+            .synchronize_visible_page()
+            .await,
+        Ok(false),
+        "the roster's active tab is the one Chrome shows"
+    );
+    // Guarded: a native click gives the page the activation its guard
+    // needs, and Ctrl+W then leaves the tab open behind its dialog.
+    assert_success(
+        &control_test_command(&json!({"action":"tab_switch","tabId":alpha}), &mut state).await,
+    );
+    assert_success(&control_test_command(&json!({"action":"click","selector":"p"}), &mut state).await);
+    let held = control_test_command(&json!({"action":"tab_close"}), &mut state).await;
+    assert_eq!(held["success"], false, "{held}");
+    assert!(
+        held["error"]
+            .as_str()
+            .is_some_and(|error| error.starts_with("browser_tab_close_held")),
+        "{held}"
+    );
+    assert_eq!(state.browser.as_ref().unwrap().page_count(), 2);
+    assert_success(&control_test_command(&json!({"action":"dialog","response":"accept"}), &mut state).await);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    loop {
+        assert_success(&control_test_command(&json!({"action":"tab_list"}), &mut state).await);
+        if state.browser.as_ref().unwrap().page_count() == 1 {
+            break;
+        }
+        assert!(std::time::Instant::now() < deadline, "{:?}", tabs(&state));
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+}
+
 /// Native strip order may differ from stable daemon tab IDs after a person's
 /// reorder; switching observes each actual target rather than guessing CtrlN.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

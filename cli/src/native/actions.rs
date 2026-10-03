@@ -8330,7 +8330,52 @@ async fn handle_tab_close(cmd: &Value, state: &mut DaemonState) -> Result<Value,
         }
     };
     let dialog_session = state.dialog_session();
-    let result = {
+    let native = dialog_session.is_none() && state.browser_control.lock().await.has_native_display();
+    let result = if native {
+        // In an owned window the agent closes a tab as a person does: it
+        // selects the tab, then presses Ctrl+W.
+        let interrupts = state.browser_control.lock().await.interrupts();
+        let control = state.browser_control.clone();
+        let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
+        let client = mgr.client.clone();
+        if let Some(id) = tab_id.filter(|id| mgr.active_tab_id() != Some(*id)) {
+            let select = control.clone();
+            let select_client = client.clone();
+            Box::pin(mgr.tab_switch_native(id, None, &interrupts, move |session| {
+                let control = select.clone();
+                let client = select_client.clone();
+                async move {
+                    control
+                        .lock()
+                        .await
+                        .agent_native_browser_keys(
+                            &interaction::native_key_chord_events("PageDown", Some(2)),
+                            browser_control::motion::KEY_INTERVAL,
+                            &client,
+                            &session,
+                        )
+                        .await
+                        .map_err(|error| error.error)
+                }
+            }))
+            .await?;
+        }
+        let session = mgr.active_session_id().unwrap_or_default().to_string();
+        Box::pin(mgr.tab_close_native(tab_id, None, async {
+            control
+                .lock()
+                .await
+                .agent_native_browser_keys(
+                    &interaction::native_key_chord_events("w", Some(2)),
+                    browser_control::motion::KEY_INTERVAL,
+                    &client,
+                    &session,
+                )
+                .await
+                .map_err(|error| error.error)
+        }))
+        .await?
+    } else {
         let mgr = state.browser.as_mut().ok_or("Browser not launched")?;
         mgr.tab_close_by_id(tab_id, dialog_session.as_deref())
             .await?

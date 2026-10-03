@@ -2483,28 +2483,8 @@ impl BrowserManager {
         index: Option<usize>,
         dialog_session: Option<&str>,
     ) -> Result<Value, String> {
-        if index.is_none() {
-            // "Close the current tab" must not silently close a fallback tab
-            // when the bound tab is already gone.
-            self.check_bound()?;
-        }
-        let target_index = index.unwrap_or(self.active_page_index);
-
-        if target_index >= self.pages.len() {
-            return Err(format!("Tab index {} out of range", target_index));
-        }
-
-        if self.pages.len() <= 1 {
-            return Err("Cannot close the last tab".to_string());
-        }
-
-        let page = self.pages.remove(target_index);
-        self.documents.forget(&page.target_id);
-        self.update_active_page_after_removal(target_index);
-        let closed_tab_id = page.tab_id;
-        let closed_label = page.label.clone();
-        let closed_target_id = page.target_id.clone();
-        self.handle_bound_target_removed(&page.target_id, &page.url);
+        let target_index = self.closable(index)?;
+        let page = self.retire_page(target_index);
         // Chrome acknowledges the close before it destroys the target. The
         // close is reported once the target is gone, so the next command's
         // view of the browser (its tab roster, its contexts) already holds.
@@ -2514,7 +2494,7 @@ impl BrowserManager {
             .send_command_typed::<_, Value>(
                 "Target.closeTarget",
                 &CloseTargetParams {
-                    target_id: page.target_id,
+                    target_id: page.target_id.clone(),
                 },
                 None,
             )
@@ -2525,7 +2505,7 @@ impl BrowserManager {
                     match events.recv().await {
                         Ok(event)
                             if event.method == "Target.targetDestroyed"
-                                && event.params["targetId"] == closed_target_id.as_str() =>
+                                && event.params["targetId"] == page.target_id.as_str() =>
                         {
                             break
                         }
@@ -2536,11 +2516,90 @@ impl BrowserManager {
             };
             let _ = tokio::time::timeout(Duration::from_secs(5), destroyed).await;
         }
+        self.closed(page, dialog_session).await
+    }
 
+    /// Closes a tab as a person does in an owned window: the tab is the
+    /// visible one (the caller selected it with native input), `close`
+    /// presses the window's close shortcut, and the tab leaves the roster
+    /// only once Chrome destroyed it, Chrome's own successor becoming the
+    /// visible tab. A page that asks before it is left keeps its tab open
+    /// behind that dialog, which the agent answers with native input.
+    pub(crate) async fn tab_close_native(
+        &mut self,
+        tab_id: Option<u32>,
+        dialog_session: Option<&str>,
+        close: impl Future<Output = Result<(), String>>,
+    ) -> Result<Value, String> {
+        let index = tab_id.map(|id| self.tab_index(id)).transpose()?;
+        let target_index = self.closable(index)?;
+        if target_index != self.active_page_index {
+            return Err("browser_control_outcome_unknown: The tab to close is not the visible tab. Observe the browser before continuing.".into());
+        }
+        let (target_id, session_id) = {
+            let page = &self.pages[target_index];
+            (page.target_id.clone(), page.session_id.clone())
+        };
+        let mut events = self.client.subscribe();
+        close.await?;
+        tokio::time::timeout(Duration::from_millis(self.default_timeout_ms), async {
+            loop {
+                let event = events.recv().await.map_err(|_| {
+                    "browser_control_outcome_unknown: Browser tab observation was interrupted. Observe the browser before continuing."
+                })?;
+                if event.method == "Target.targetDestroyed" && event.params["targetId"] == target_id.as_str() {
+                    return Ok(());
+                }
+                if event.method == "Page.javascriptDialogOpening"
+                    && event.session_id.as_deref() == Some(session_id.as_str())
+                    && event.params["type"] == "beforeunload"
+                {
+                    return Err("browser_tab_close_held: The page asks before it is left and its dialog is open; the tab is still open. Accept or dismiss the dialog.");
+                }
+            }
+        })
+        .await
+        .map_err(|_| "browser_control_outcome_unknown: The tab did not close. Observe the browser before continuing.")??;
+        let page = self.retire_page(target_index);
+        // Chrome chose the tab that now shows; a successor it cannot name
+        // keeps the roster's neighbour, as a protocol close does.
+        let _ = self.synchronize_visible_page().await;
+        self.closed(page, dialog_session).await
+    }
+
+    /// The roster index a close addresses: `index`, or the current tab while
+    /// the session still holds it; never the last tab.
+    fn closable(&self, index: Option<usize>) -> Result<usize, String> {
+        if index.is_none() {
+            // "Close the current tab" must not silently close a fallback tab
+            // when the bound tab is already gone.
+            self.check_bound()?;
+        }
+        let target_index = index.unwrap_or(self.active_page_index);
+        if target_index >= self.pages.len() {
+            return Err(format!("Tab index {} out of range", target_index));
+        }
+        if self.pages.len() <= 1 {
+            return Err("Cannot close the last tab".to_string());
+        }
+        Ok(target_index)
+    }
+
+    /// Takes the closed tab out of the roster and its document custody.
+    fn retire_page(&mut self, index: usize) -> PageInfo {
+        let page = self.pages.remove(index);
+        self.documents.forget(&page.target_id);
+        self.update_active_page_after_removal(index);
+        self.handle_bound_target_removed(&page.target_id, &page.url);
+        page
+    }
+
+    /// The close's answer, once the tab is gone, with the successor revived.
+    async fn closed(&mut self, page: PageInfo, dialog_session: Option<&str>) -> Result<Value, String> {
         let mut result = json!({
-            "tabId": format_tab_id(closed_tab_id),
-            "targetId": closed_target_id,
-            "label": closed_label,
+            "tabId": format_tab_id(page.tab_id),
+            "targetId": page.target_id,
+            "label": page.label,
             "closed": true,
         });
 
@@ -2835,16 +2894,16 @@ impl BrowserManager {
         tab_id: Option<u32>,
         dialog_session: Option<&str>,
     ) -> Result<Value, String> {
-        let index = match tab_id {
-            Some(id) => Some(
-                self.pages
-                    .iter()
-                    .position(|p| p.tab_id == id)
-                    .ok_or_else(|| tab_id_not_found(id))?,
-            ),
-            None => None,
-        };
+        let index = tab_id.map(|id| self.tab_index(id)).transpose()?;
         self.tab_close(index, dialog_session).await
+    }
+
+    /// The roster index of tab `id`.
+    fn tab_index(&self, id: u32) -> Result<usize, String> {
+        self.pages
+            .iter()
+            .position(|page| page.tab_id == id)
+            .ok_or_else(|| tab_id_not_found(id))
     }
 
     pub fn assign_tab_id(&mut self) -> u32 {
