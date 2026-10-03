@@ -772,3 +772,59 @@ fn a_typed_key_as_an_exact_rectangle() {
         std::fs::write(out, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
     }
 }
+
+/// A scroll of the dense text page (40 device px a picture) coded at the
+/// window's own size rounded to 64 px and at its size class, interleaved:
+/// what a coded size nearer the window saves on large damage.
+/// `VIDEO_BENCH_OUT` names a results file.
+#[test]
+#[ignore = "measurement harness: needs the rendered pages (VIDEO_BENCH_PAGES)"]
+fn a_scroll_by_coded_size() {
+    let pages = std::path::PathBuf::from(std::env::var_os("VIDEO_BENCH_PAGES").unwrap());
+    let text = Page::load(&pages.join("pageA.png"));
+    let mut results = Vec::new();
+    for round in 0..2 {
+        for (width, height) in [(1856usize, 1920usize), (2048, 2048)] {
+            let mut encoder =
+                AomEncoder::new(VideoCodec::Av1Full, width as u32, height as u32, 4).unwrap();
+            let mut planar = Planar::new(Chroma::Full, width as u32, height as u32);
+            let mut wall = Vec::new();
+            for picture in 0..31usize {
+                let window = text.window(picture * 40);
+                assert!(planar.convert_visible(
+                    &window,
+                    WIDTH * 4,
+                    (WIDTH, HEIGHT),
+                    super::EncoderRegion {
+                        x: 0,
+                        y: 0,
+                        width: WIDTH as u32,
+                        height: HEIGHT as u32
+                    },
+                    (0, HEIGHT)
+                ));
+                let started = Instant::now();
+                encoder
+                    .encode(
+                        &planar.picture(),
+                        EncodeRequest {
+                            key: picture == 0,
+                            quantizer: 32,
+                            refine: false,
+                        },
+                    )
+                    .unwrap();
+                if picture > 0 {
+                    wall.push(started.elapsed().as_secs_f64() * 1000.0);
+                }
+            }
+            let result = json!({"round": round, "coded": [width, height],
+                "p50Ms": percentile(&wall, 0.5), "p95Ms": percentile(&wall, 0.95)});
+            println!("SCROLL {result}");
+            results.push(result);
+        }
+    }
+    if let Some(out) = std::env::var_os("VIDEO_BENCH_OUT") {
+        std::fs::write(out, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
+    }
+}
