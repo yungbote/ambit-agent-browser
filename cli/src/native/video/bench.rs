@@ -636,3 +636,139 @@ fn a_key_unit_by_coded_size_and_intra_tools() {
         std::fs::write(out, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
     }
 }
+
+/// One typed key on the rendered app page, coded as the lead's exact-rect
+/// candidates: the rectangle of changed pixels (found by comparing the
+/// damaged rows) as a lossless PNG, the whole damaged band as a PNG, and the
+/// band and the rectangle as key pictures of a small second AV1 encoder at
+/// the motion and still quantizers. The glyph is the most inked 40 by 68
+/// block of the dense text page (one 34 px character at device pixel ratio
+/// 2). Median time of 20 and bytes; `VIDEO_BENCH_OUT` names a results file.
+#[test]
+#[ignore = "measurement harness: needs the rendered pages (VIDEO_BENCH_PAGES)"]
+fn a_typed_key_as_an_exact_rectangle() {
+    use image::codecs::png::{CompressionType, FilterType, PngEncoder};
+    use image::{ExtendedColorType, ImageEncoder};
+    let pages = std::path::PathBuf::from(std::env::var_os("VIDEO_BENCH_PAGES").unwrap());
+    let (text, app) = (
+        Page::load(&pages.join("pageA.png")),
+        Page::load(&pages.join("pageB.png")),
+    );
+    let (glyph_width, glyph_height) = (40usize, 68usize);
+    let ink = |page: &Page, x: usize, y: usize| {
+        (y..y + glyph_height)
+            .flat_map(|row| (x..x + glyph_width).map(move |column| (row, column)))
+            .filter(|(row, column)| page.bgrx[(row * page.width + column) * 4] < 128)
+            .count()
+    };
+    let (source_x, source_y) = (0..HEIGHT - glyph_height)
+        .step_by(4)
+        .flat_map(|y| (0..WIDTH - glyph_width).step_by(8).map(move |x| (x, y)))
+        .max_by_key(|(x, y)| ink(&text, *x, *y))
+        .unwrap();
+    let before = app.window(0);
+    let mut after = before.clone();
+    let (left, top) = (88usize, 30usize);
+    for row in 0..glyph_height {
+        let from = ((source_y + row) * text.width + source_x) * 4;
+        let to = ((top + row) * WIDTH + left) * 4;
+        after[to..to + glyph_width * 4].copy_from_slice(&text.bgrx[from..from + glyph_width * 4]);
+    }
+    let band = (16usize, 112usize);
+    let median = |mut runs: Vec<f64>| {
+        runs.sort_by(f64::total_cmp);
+        runs[runs.len() / 2]
+    };
+    let timed = |work: &mut dyn FnMut() -> usize| {
+        let mut bytes = 0;
+        let runs = (0..20)
+            .map(|_| {
+                let started = Instant::now();
+                bytes = work();
+                started.elapsed().as_secs_f64() * 1000.0
+            })
+            .collect::<Vec<_>>();
+        (median(runs), bytes)
+    };
+    // The exact rectangle: the bounds of every pixel that differs in the band.
+    let find = || {
+        let (mut x0, mut y0, mut x1, mut y1) = (usize::MAX, usize::MAX, 0, 0);
+        for y in band.0..band.1 {
+            let row = y * WIDTH * 4;
+            for x in 0..WIDTH {
+                let at = row + x * 4;
+                if before[at..at + 3] != after[at..at + 3] {
+                    (x0, y0, x1, y1) = (x0.min(x), y0.min(y), x1.max(x + 1), y1.max(y + 1));
+                }
+            }
+        }
+        (x0, y0, x1 - x0, y1 - y0)
+    };
+    let (search_ms, rect) = {
+        let mut rect = (0, 0, 0, 0);
+        let (ms, _) = timed(&mut || {
+            rect = find();
+            0
+        });
+        (ms, rect)
+    };
+    let rgb = |(x, y, width, height): (usize, usize, usize, usize)| {
+        (y..y + height)
+            .flat_map(|row| {
+                after[(row * WIDTH + x) * 4..(row * WIDTH + x + width) * 4]
+                    .chunks_exact(4)
+                    .flat_map(|pixel| [pixel[2], pixel[1], pixel[0]])
+                    .collect::<Vec<_>>()
+            })
+            .collect::<Vec<u8>>()
+    };
+    let png = |area: (usize, usize, usize, usize), filter: FilterType| {
+        let mut out = Vec::new();
+        PngEncoder::new_with_quality(&mut out, CompressionType::Fast, filter)
+            .write_image(&rgb(area), area.2 as u32, area.3 as u32, ExtendedColorType::Rgb8)
+            .unwrap();
+        out.len()
+    };
+    let whole_band = (0, band.0, WIDTH, band.1 - band.0);
+    let mut results = vec![json!({"rect": [rect.0, rect.1, rect.2, rect.3], "searchMs": search_ms})];
+    for (name, area) in [("rect", rect), ("band", whole_band)] {
+        for (filter_name, filter) in [("sub", FilterType::Sub), ("adaptive", FilterType::Adaptive)] {
+            let (ms, bytes) = timed(&mut || png(area, filter));
+            results.push(json!({"coding": format!("png-{filter_name}"), "area": name, "ms": ms, "bytes": bytes}));
+        }
+        let (width, height) = (area.2.next_multiple_of(2), area.3.next_multiple_of(2));
+        let mut padded = vec![255u8; width * height * 4];
+        for row in 0..area.3 {
+            let from = ((area.1 + row) * WIDTH + area.0) * 4;
+            padded[row * width * 4..row * width * 4 + area.2 * 4]
+                .copy_from_slice(&after[from..from + area.2 * 4]);
+        }
+        let mut planar = Planar::new(Chroma::Full, width as u32, height as u32);
+        assert!(planar.convert(&padded, width * 4, (width, height), (0, height)));
+        let mut encoder =
+            AomEncoder::new(VideoCodec::Av1Full, width as u32, height as u32, 2).unwrap();
+        for quantizer in [32u8, 8, 0] {
+            let (ms, bytes) = timed(&mut || {
+                encoder
+                    .encode(
+                        &planar.picture(),
+                        EncodeRequest {
+                            key: true,
+                            quantizer,
+                            refine: false,
+                        },
+                    )
+                    .unwrap()
+                    .data
+                    .len()
+            });
+            results.push(json!({"coding": format!("av1-key-q{quantizer}"), "area": name, "ms": ms, "bytes": bytes}));
+        }
+    }
+    for result in &results {
+        println!("EXACT_RECT {result}");
+    }
+    if let Some(out) = std::env::var_os("VIDEO_BENCH_OUT") {
+        std::fs::write(out, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
+    }
+}
