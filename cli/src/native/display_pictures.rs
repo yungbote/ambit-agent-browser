@@ -579,3 +579,26 @@ mod tests {
         assert!(reply(json!([[0, 4]])).coherent(request()));
     }
 }
+
+    #[test]
+    fn aperture_admission_accepts_real_nonzero_origins_only_within_the_framebuffer() {
+        let header = json!({"width":1536,"height":2048,"stride":6144,"rows":[[0,2048]],"cursorIncluded":false,
+            "visible":{"x":100,"y":80,"width":1418,"height":1888},"pointer":{"x":400,"y":500}});
+        let reply: PictureReply = serde_json::from_value(header.clone()).unwrap();
+        assert!(reply.coherent(PictureRequest {
+            force: true,
+            ..Default::default()
+        }));
+        for invalid in [
+            json!({"x":-1,"y":80,"width":1418,"height":1888}),
+            json!({"x":119,"y":80,"width":1418,"height":1888}),
+            json!({"x":100,"y":161,"width":1418,"height":1888}),
+            json!({"x":i32::MAX,"y":80,"width":u32::MAX,"height":1888}),
+            json!({"x":100,"y":80,"width":0,"height":1888}),
+        ] {
+            let mut header = header.clone();
+            header["visible"] = invalid;
+            let reply: PictureReply = serde_json::from_value(header).unwrap();
+            assert!(!reply.coherent(PictureRequest::default()));
+        }
+    }
