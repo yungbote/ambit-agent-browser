@@ -91,12 +91,34 @@ fn video_description(
     {
         return None;
     }
-    let mut header = json!({
-        "type": "media", "track": "video", "codec": codec.token(), "streamId": stream_id,
-        "seq": seq, "ts": unit.ts, "key": unit.key,
-        "coded": {"width": width, "height": height}, "visible": visible, "surface": unit.surface,
-        "quality": unit.quality.label(), "byteLength": unit.data.len(),
-    });
+    // An exact unit (contract browser-presentation-units) is a PNG of a
+    // rectangle inside `visible`, never a key and never a quality.
+    let mut header = if let Some(rect) = unit.exact {
+        let within = |offset: i32, extent: u32, start: i32, bound: u32| {
+            offset >= start
+                && extent > 0
+                && i64::from(offset) + i64::from(extent) <= i64::from(start) + i64::from(bound)
+        };
+        if unit.key
+            || !within(rect.x, rect.width, visible.x, visible.width)
+            || !within(rect.y, rect.height, visible.y, visible.height)
+        {
+            return None;
+        }
+        json!({
+            "type": "media", "track": "video", "codec": codec.token(), "streamId": stream_id,
+            "seq": seq, "ts": unit.ts, "kind": "exact", "format": "png", "rect": rect,
+            "coded": {"width": width, "height": height}, "visible": visible, "surface": unit.surface,
+            "byteLength": unit.data.len(),
+        })
+    } else {
+        json!({
+            "type": "media", "track": "video", "codec": codec.token(), "streamId": stream_id,
+            "seq": seq, "ts": unit.ts, "key": unit.key,
+            "coded": {"width": width, "height": height}, "visible": visible, "surface": unit.surface,
+            "quality": unit.quality.label(), "byteLength": unit.data.len(),
+        })
+    };
     if let Some(codec_string) = &unit.codec_string {
         header["codecString"] = json!(codec_string);
     }
@@ -350,6 +372,7 @@ mod tests {
             input_seq: Some(4411),
             quality: crate::native::stream::video::Quality::Motion,
             codec_string: key.then(|| "av01.1.12M.08".into()),
+            exact: None,
             stages: None,
         }
     }
@@ -394,6 +417,49 @@ mod tests {
         untagged.input_seq = None;
         let (header, _) = decode(&binary_video(&untagged, VideoCodec::Av1, &stream, 3).unwrap());
         assert!(header.get("inputSeq").is_none(), "absent, never null");
+    }
+
+    /// An exact unit (contract browser-presentation-units) is the picture's
+    /// header with `kind`, `format` and `rect` instead of `key` and `quality`;
+    /// one whose rectangle leaves `visible`, or that claims to be a key, is
+    /// refused.
+    #[test]
+    fn an_exact_unit_is_its_contracts_header_and_stays_inside_visible() {
+        let stream = uuid::Uuid::new_v4().to_string();
+        let rect = |x, y, width, height| crate::native::display::Rect {
+            x,
+            y,
+            width,
+            height,
+        };
+        let mut exact = video_unit(false, 2_887);
+        exact.exact = Some(rect(88, 30, 40, 68));
+        let message = binary_video(&exact, VideoCodec::Av1Full, &stream, 7).unwrap();
+        let (header, payload) = decode(&message);
+        assert_eq!(payload, exact.data.as_slice());
+        assert_eq!(
+            header,
+            json!({"type":"media","track":"video","codec":"av1-444","streamId":stream,
+                "seq":7,"ts":1_234_567,"kind":"exact","format":"png",
+                "rect":{"x":88,"y":30,"width":40,"height":68},
+                "coded":{"width":2048,"height":2048},
+                "visible":{"x":0,"y":0,"width":1840,"height":1888},
+                "surface":serde_json::to_value(&exact.surface).unwrap(),
+                "inputSeq":4411,"byteLength":2_887})
+        );
+        for outside in [
+            rect(1800, 30, 41, 68),
+            rect(0, 1880, 40, 9),
+            rect(-1, 0, 4, 4),
+            rect(0, 0, 0, 4),
+        ] {
+            let mut unit = video_unit(false, 10);
+            unit.exact = Some(outside);
+            assert!(binary_video(&unit, VideoCodec::Av1Full, &stream, 8).is_none(), "{outside:?}");
+        }
+        let mut key = video_unit(true, 10);
+        key.exact = Some(rect(0, 0, 4, 4));
+        assert!(binary_video(&key, VideoCodec::Av1Full, &stream, 9).is_none());
     }
 
     /// What the contract forbids never becomes a unit: every hop would close

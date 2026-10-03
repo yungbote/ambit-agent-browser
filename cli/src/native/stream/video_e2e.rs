@@ -851,7 +851,7 @@ fn attribute(typed: &[Typed], lines: &[Value], arrivals: &HashMap<u64, u64>) -> 
         let Some(line) = lines
             .iter()
             .filter(|line| {
-                line["quality"] == "motion"
+                (line["quality"] == "motion" || line["quality"] == "exact")
                     && line["rows"].as_u64() > Some(0)
                     && line["inputSeq"]
                         .as_u64()
@@ -945,7 +945,7 @@ async fn e2e_native_input_latency_stages() {
     .await;
     let mut request = format!(
         "ws://127.0.0.1:{port}/?frames=binary&patches=1&cursor=viewer&visible=crop\
-         &video=av1-444,av1&width=920&height=944"
+         &video=av1-444,av1&videoExact=png&width=920&height=944"
     )
     .into_client_request()
     .unwrap();
@@ -1008,11 +1008,11 @@ async fn e2e_native_input_latency_stages() {
         rest(&mut received, &mut all).await;
         let lines = super::video::stages::logged::take();
         // A still picture's refinement carries its capture's `ts` too: only
-        // the picture of motion is the one that showed the key.
+        // the picture of motion, or the exact unit, showed the key.
         let mut arrivals: HashMap<u64, u64> = HashMap::new();
         for seen in &all[from..] {
             if let Seen::Unit(header, _, at) = seen {
-                if header["quality"] == "motion" {
+                if header["quality"] == "motion" || header["kind"] == "exact" {
                     arrivals
                         .entry(header["ts"].as_u64().unwrap())
                         .or_insert(*at);
@@ -1075,7 +1075,7 @@ async fn e2e_native_input_latency_stages() {
         .iter()
         .filter(|(header, _)| {
             (dragged_from..released).contains(&header["ts"].as_u64().unwrap())
-                && header["quality"] == "motion"
+                && (header["quality"] == "motion" || header["kind"] == "exact")
         })
         .collect();
     let mut shown_after = Vec::new();

@@ -31,11 +31,24 @@ pub(crate) struct Unit {
     pub quality: Quality,
     /// The stream's WebCodecs codec string, on key units only.
     pub codec_string: Option<String>,
+    /// An exact unit (contract browser-presentation-units): `data` is a PNG
+    /// of the capture's pixels in this rectangle of the coded picture, drawn
+    /// over the viewer's surface and never decoded as video. Never a key; its
+    /// `quality` is the picture's under it and goes unsent.
+    pub exact: Option<Rect>,
     /// With diagnostics on, when the picture passed each producer stage.
     pub stages: Option<super::stages::Stages>,
 }
 
 impl Unit {
+    /// What the unit is, as diagnostics name it: `exact`, or its quality.
+    pub(crate) fn label(&self) -> &'static str {
+        match self.exact {
+            Some(_) => "exact",
+            None => self.quality.label(),
+        }
+    }
+
     /// Raster geometry of the actual applied owned window. Cursor inclusion
     /// changes pixels, not the source's coordinate/identity contract.
     pub(super) fn follows(&self, surface: &Surface, window: (u32, u32)) -> bool {
@@ -78,10 +91,12 @@ pub(crate) struct Subscriber {
     /// Pictures per second this viewer is served at most.
     rate: AtomicU32,
     link_rate: AtomicU64,
+    /// The viewer declared `videoExact=png`: it draws exact units.
+    exact: bool,
 }
 
 impl Subscriber {
-    pub(super) fn new(rate: u32) -> Self {
+    pub(super) fn new(rate: u32, exact: bool) -> Self {
         Self {
             queue: Mutex::new(Queue {
                 awaiting_key: true,
@@ -91,7 +106,12 @@ impl Subscriber {
             ready: AtomicBool::new(true),
             rate: AtomicU32::new(rate),
             link_rate: AtomicU64::new(0),
+            exact,
         }
+    }
+
+    pub(super) fn exact(&self) -> bool {
+        self.exact
     }
 
     pub(super) fn rate(&self) -> u32 {
@@ -352,6 +372,7 @@ mod tests {
             input_seq: None,
             quality: Quality::Motion,
             codec_string: key.then(|| "av01.1.12M.08".into()),
+            exact: None,
             stages: None,
         };
         unit.wire_bytes = crate::native::stream::wire::video_budget_bytes(
@@ -384,7 +405,7 @@ mod tests {
     /// and it says so by asking for one.
     #[tokio::test]
     async fn an_epoch_begins_at_a_key_unit() {
-        let subscriber = Subscriber::new(60);
+        let subscriber = Subscriber::new(60, false);
         assert!(subscriber.push(&unit(1, false, 10)), "asks for a key unit");
         assert!(!subscriber.push(&unit(2, true, 10)));
         assert!(!subscriber.push(&unit(3, false, 10)));
@@ -395,7 +416,7 @@ mod tests {
     /// a new epoch at the next key unit; the units before it never reach it.
     #[tokio::test]
     async fn a_viewer_a_second_behind_begins_a_new_epoch_at_the_next_key_unit() {
-        let subscriber = Subscriber::new(60);
+        let subscriber = Subscriber::new(60, false);
         subscriber.push(&unit(0, true, 10));
         for ts in [100_000, 500_000, 1_000_000] {
             assert!(!subscriber.push(&unit(ts, false, 10)));
@@ -417,7 +438,7 @@ mod tests {
     /// A viewer that keeps up is never resynchronized, however long it runs.
     #[tokio::test]
     async fn a_viewer_that_keeps_up_stays_in_its_epoch() {
-        let subscriber = Subscriber::new(60);
+        let subscriber = Subscriber::new(60, false);
         subscriber.push(&unit(0, true, 10));
         for picture in 1..=180 {
             let ts = picture * 16_667;
@@ -430,7 +451,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_ended_subscription_says_why_and_takes_nothing_more() {
-        let subscriber = Subscriber::new(60);
+        let subscriber = Subscriber::new(60, false);
         subscriber.push(&unit(0, true, 10));
         subscriber.end("encoder failed");
         assert!(!subscriber.push(&unit(1, true, 10)));
@@ -439,7 +460,7 @@ mod tests {
 
     #[tokio::test]
     async fn tiny_units_charge_their_complete_wire_cost_while_queued_and_release_it_on_pull() {
-        let subscriber = Subscriber::new(60);
+        let subscriber = Subscriber::new(60, false);
         let key = unit(1, true, 42);
         let delta = unit(2, false, 42);
         assert!(key.wire_bytes > key.data.len() && delta.wire_bytes > delta.data.len());
@@ -463,7 +484,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_stalled_same_capture_queue_is_quarantined_without_repeated_keys() {
-        let subscriber = Subscriber::new(60);
+        let subscriber = Subscriber::new(60, false);
         subscriber.set_link_rate(LinkRate {
             bits_per_second: 500_000,
             burst_bytes: 1024,
@@ -525,7 +546,7 @@ mod tests {
         )
         .unwrap();
         let key = Arc::new(shared);
-        let viewers: Vec<_> = (0..8).map(|_| Subscriber::new(60)).collect();
+        let viewers: Vec<_> = (0..8).map(|_| Subscriber::new(60, false)).collect();
         for viewer in &viewers {
             viewer.set_link_rate(LinkRate {
                 bits_per_second: 500_000,

@@ -13,6 +13,8 @@ mod bench;
 #[cfg(target_os = "linux")]
 pub(crate) mod convert;
 #[cfg(target_os = "linux")]
+pub(crate) mod exact;
+#[cfg(target_os = "linux")]
 mod library;
 #[cfg(all(test, target_os = "linux"))]
 mod webcodecs_e2e;

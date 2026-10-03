@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use super::policy::{
     period, rate, Band, CodedSize, LinkRate, Pace, Quality, Refinement, RefinementCredit,
-    RefinementSweep,
+    RefinementSweep, EXACT_ROWS,
 };
 use super::stages::{self, Stages};
 use super::subscription::{Delivery, Subscriber, Unit};
@@ -110,6 +110,17 @@ struct Mailbox {
     behind: bool,
     /// The rows that changed since the last picture handed to the encoder.
     changed: Option<Band>,
+    /// The rows that changed since this encoding's last unit, picture or
+    /// exact.
+    unsent: Option<Band>,
+    /// The coded size of the picture the encoder holds, while that picture
+    /// is final and the encoder has nothing else to do: only then may small
+    /// damage leave as an exact unit (contract browser-presentation-units),
+    /// so no refinement of an older capture ever follows one.
+    settled: Option<(u32, u32)>,
+    /// An exact unit left after the held picture: a key unit is then of a
+    /// fresh capture, never of the held one.
+    exact_since_held: bool,
     key_requested: bool,
     stop: bool,
 }
@@ -194,6 +205,8 @@ enum Work {
     Key,
     /// The held picture again, at the still target.
     Refine,
+    /// A fresh capture for a key unit: the capture thread is woken.
+    Recapture,
 }
 
 fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
@@ -256,6 +269,7 @@ impl Producer {
         self: &Arc<Self>,
         codec: VideoCodec,
         requested_rate: u32,
+        exact: bool,
     ) -> Result<Subscription, VideoError> {
         let mut state = lock(&self.inner.state);
         if let Some(failure) = &state.failed {
@@ -284,7 +298,7 @@ impl Producer {
                 encoding
             }
         };
-        let subscriber = Arc::new(Subscriber::new(rate(requested_rate)));
+        let subscriber = Arc::new(Subscriber::new(rate(requested_rate), exact));
         lock(&encoding.subscribers).push(subscriber.clone());
         drop(state);
         encoding.request_key();
@@ -363,6 +377,9 @@ impl Encoding {
                 visible: None,
                 behind: true,
                 changed: None,
+                unsent: None,
+                settled: None,
+                exact_since_held: false,
                 key_requested: false,
                 stop: false,
             }),
@@ -463,6 +480,7 @@ impl Encoding {
                     .changed
                     .map_or(wrote, |changed| changed.union(wrote)),
             );
+            mailbox.unsent = Some(mailbox.unsent.map_or(wrote, |unsent| unsent.union(wrote)));
         }
         let height = reply.height as usize;
         for rows in mailbox.stale.iter_mut() {
@@ -474,6 +492,93 @@ impl Encoding {
                 rows[*top as usize..*bottom as usize].fill(true);
             }
         }
+    }
+
+    /// Where small damage leaves as an exact unit, with the coded size of the
+    /// picture under it: only while every viewer draws exact units, the held
+    /// picture is final and nothing else is pending, and the rows changed
+    /// since this encoding's last unit are at most `EXACT_ROWS` of an
+    /// unmoved window (a moved window changed every row).
+    fn exact(&self, mailbox: &Mailbox, capture: &Capture) -> Option<(Rect, (u32, u32))> {
+        let coded = mailbox.settled?;
+        if mailbox.job.is_some() || mailbox.key_requested || !self.exact_viewers() {
+            return None;
+        }
+        let rows = mailbox.unsent?.within(capture.visible)?;
+        (rows.height <= EXACT_ROWS).then(|| {
+            let rect = Rect {
+                x: rows.x as i32,
+                y: rows.y as i32,
+                width: rows.width,
+                height: rows.height,
+            };
+            (rect, coded)
+        })
+    }
+
+    /// Whether this encoding has viewers and every one draws exact units.
+    fn exact_viewers(&self) -> bool {
+        let subscribers = lock(&self.subscribers);
+        !subscribers.is_empty() && subscribers.iter().all(|subscriber| subscriber.exact())
+    }
+
+    /// Publishes the capture's pixels in `rect` as an exact unit over the
+    /// held picture of size `coded`. Units leave in capture order: while an
+    /// exact unit is newer than the held picture, the encoder answers a key
+    /// request with a fresh capture (`next_work`), and a settled picture
+    /// owes no refinement.
+    fn publish_exact(
+        &self,
+        capture: &Capture,
+        reply: &PictureReply,
+        pixels: &[u8],
+        rect: Rect,
+        coded: (u32, u32),
+    ) {
+        let started = crate::native::stream::monotonic_us();
+        let area = (
+            rect.x as usize,
+            rect.y as usize,
+            rect.width as usize,
+            rect.height as usize,
+        );
+        let Some(data) = crate::native::video::exact::png(pixels, reply.stride as usize, area)
+        else {
+            self.fail("an exact unit's rectangle is outside its picture");
+            return;
+        };
+        let mut unit = Unit {
+            data,
+            wire_bytes: 0,
+            key: false,
+            ts: capture.ts,
+            coded,
+            visible: capture.visible,
+            surface: capture.surface.clone(),
+            input_seq: capture.input_seq,
+            quality: Quality::Final,
+            codec_string: None,
+            exact: Some(rect),
+            stages: capture.stages.map(|stages| Stages {
+                converted: started,
+                encode_started: started,
+                encoded: crate::native::stream::monotonic_us(),
+                ..stages
+            }),
+        };
+        let Some(wire_bytes) = crate::native::stream::wire::video_budget_bytes(&unit, self.codec)
+        else {
+            self.fail("an exact unit is outside the video wire contract");
+            return;
+        };
+        unit.wire_bytes = wire_bytes;
+        self.publish(Arc::new(unit));
+    }
+
+    /// The encoder published its picture at the still target: small damage
+    /// may now leave as exact units over it.
+    fn settle(&self, coded: (u32, u32)) {
+        lock(&self.mailbox).settled = Some(coded);
     }
 
     /// Hands an admitted capture to the encoder only while some subscriber's
@@ -496,6 +601,15 @@ impl Encoding {
         if !mailbox.behind {
             return;
         }
+        if let Some((rect, coded)) = self.exact(&mailbox, capture) {
+            mailbox.pace.took(capture.read, period);
+            mailbox.behind = false;
+            mailbox.unsent = None;
+            mailbox.exact_since_held = true;
+            drop(mailbox);
+            self.publish_exact(capture, reply, pixels, rect, coded);
+            return;
+        }
         let Some(mut buffer) = mailbox.free.pop() else {
             return;
         };
@@ -508,6 +622,7 @@ impl Encoding {
         let coded = mailbox.coded.fit(window, capture.read);
         mailbox.pace.took(capture.read, period);
         mailbox.behind = false;
+        mailbox.unsent = None;
         let changed = mailbox
             .changed
             .take()
@@ -566,9 +681,19 @@ impl Encoding {
             }
             if let Some(job) = mailbox.job.take() {
                 let key = std::mem::take(&mut mailbox.key_requested);
+                mailbox.settled = None;
+                mailbox.exact_since_held = false;
                 return Some(Work::Picture(Box::new(job), key));
             }
-            if holds && std::mem::take(&mut mailbox.key_requested) {
+            if holds && mailbox.key_requested && mailbox.exact_since_held {
+                // The held picture is older than an exact unit sent after
+                // it: the key is of a fresh capture, which the job carries.
+                if !mailbox.behind {
+                    mailbox.behind = true;
+                    return Some(Work::Recapture);
+                }
+            } else if holds && std::mem::take(&mut mailbox.key_requested) {
+                mailbox.settled = None;
                 return Some(Work::Key);
             }
             let due = refinement
@@ -898,6 +1023,12 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
                 (Quality::Motion, true, None)
             }
             Work::Refine => (Quality::Final, false, None),
+            Work::Recapture => {
+                if let Some(producer) = producer.upgrade() {
+                    producer.nudge();
+                }
+                continue;
+            }
         };
         let (buffer, capture) = held.as_ref().expect("work needs a held picture");
         // A new coded size needs a new encoder, whose first unit is a key
@@ -1050,6 +1181,7 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
             input_seq: capture.input_seq,
             quality,
             codec_string: unit.codec_string,
+            exact: None,
             stages: capture.stages.map(|stages| Stages {
                 encode_started,
                 encoded: crate::native::stream::monotonic_us(),
@@ -1073,6 +1205,9 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
             }
         }
         encoding.publish(Arc::new(unit));
+        if quality == Quality::Final {
+            encoding.settle(buffer.coded);
+        }
     }
 }
 

@@ -217,6 +217,7 @@ mod tests {
             input_seq: None,
             quality: Quality::Motion,
             codec_string: Some("av01.1.12M.08".into()),
+            exact: None,
             stages: None,
         });
         Parts::new(
@@ -392,6 +393,7 @@ mod tests {
             input_seq: Some(4411),
             quality: Quality::Motion,
             codec_string: Some("av01.1.16M.08".into()),
+            exact: None,
             stages: None,
         });
         let stream = "00000000-0000-4000-8000-000000000001";

@@ -122,8 +122,9 @@ impl VideoHub {
         display: &Arc<DisplayClient>,
         codec: VideoCodec,
         rate: u32,
+        exact: bool,
     ) -> Result<Subscription, VideoError> {
-        self.producer_for(display)?.subscribe(codec, rate)
+        self.producer_for(display)?.subscribe(codec, rate, exact)
     }
 
     /// Demand on the same producer used by every video subscriber, retaining
@@ -170,6 +171,7 @@ impl VideoHub {
         _display: &Arc<DisplayClient>,
         _codec: VideoCodec,
         _rate: u32,
+        _exact: bool,
     ) -> Result<Subscription, VideoError> {
         Err(VideoError::Unavailable(
             "pictures need the Linux display helper".into(),
@@ -308,6 +310,8 @@ pub(super) struct VideoTrack {
     /// The upgrade declared the dimensional source allowance; absent is legacy.
     coded_capacity: bool,
     chunked: bool,
+    /// The viewer draws exact units (`videoExact=png`).
+    exact: bool,
     parts: Option<Parts>,
     layout: Option<super::presentation::Applied>,
     acks: u64,
@@ -348,6 +352,7 @@ impl VideoTrack {
         let track = Self {
             coded_capacity: false,
             chunked: false,
+            exact: false,
             parts: None,
             layout: None,
             acks: 0,
@@ -405,7 +410,7 @@ impl VideoTrack {
         if !self.demand.enabled || self.subscription.is_some() {
             return;
         }
-        match self.hub.subscribe(&display, codec, self.rate) {
+        match self.hub.subscribe(&display, codec, self.rate, self.exact) {
             Ok(subscription) => {
                 if let Some(rate) = self.link_rate {
                     subscription.set_link_rate(rate);
@@ -586,6 +591,12 @@ impl VideoTrack {
         self.chunked = supported && self.coded_capacity;
     }
 
+    /// Exact units need their own explicit capability (contract
+    /// browser-presentation-units); without it the producer sends none.
+    pub(super) fn declare_exact(&mut self, supported: bool) {
+        self.exact = supported;
+    }
+
     /// An actual layout can make a partial picture obsolete before it could
     /// paint. Retake the same standing subscription, retaining its producer
     /// while the replacement is taken; started/seq1 names the new key epoch.
@@ -661,7 +672,7 @@ impl VideoTrack {
             if let Some(stages) = unit.stages {
                 stages.written(
                     unit.ts,
-                    unit.quality.label(),
+                    unit.label(),
                     unit.key,
                     unit.data.len(),
                     super::monotonic_us(),
@@ -774,6 +785,7 @@ mod tests {
             input_seq: Some(4411),
             quality: Quality::Motion,
             codec_string: Some("av01.1.12M.08".into()),
+            exact: None,
             stages: None,
         })
     }
@@ -993,6 +1005,7 @@ mod tests {
             input_seq: None,
             quality: Quality::Motion,
             codec_string: Some("av01.1.16M.08".into()),
+            exact: None,
             stages: None,
         });
         let (records, body) = make_track(false).deliver(Delivery::Unit(unit.clone()), true);
@@ -1334,6 +1347,7 @@ mod tests {
                 input_seq: None,
                 quality: Quality::Motion,
                 codec_string: key.then(|| "av01.1.08M.08".into()),
+                exact: None,
                 stages: None,
             })
         };

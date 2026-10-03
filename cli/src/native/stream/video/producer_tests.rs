@@ -55,7 +55,14 @@ impl Rig {
     }
 
     fn subscribe_to(&self, codec: VideoCodec, rate: u32) -> Subscription {
-        self.producer.subscribe(codec, rate).unwrap()
+        self.producer.subscribe(codec, rate, false).unwrap()
+    }
+
+    /// A viewer that declared `videoExact=png`.
+    fn subscribe_exact(&self) -> Subscription {
+        self.producer
+            .subscribe(VideoCodec::Av1Full, 60, true)
+            .unwrap()
     }
 
     fn paint(&self, top: u32, bottom: u32, colour: [u8; 4]) {
@@ -117,6 +124,8 @@ struct Viewer {
     decoder: Decoder,
     decoded: usize,
     shown: Option<Decoded>,
+    /// Exact units drawn over the last decoded picture, in order.
+    exact: Vec<(Rect, image::RgbImage)>,
 }
 
 impl Viewer {
@@ -128,6 +137,7 @@ impl Viewer {
             decoder: Decoder::new(),
             decoded: 0,
             shown: None,
+            exact: Vec::new(),
         }
     }
 
@@ -163,7 +173,7 @@ impl Viewer {
     async fn refined(&mut self) -> Arc<Unit> {
         loop {
             let unit = self.unit().await;
-            if unit.quality == Quality::Final {
+            if unit.quality == Quality::Final && unit.exact.is_none() {
                 return unit;
             }
         }
@@ -172,12 +182,19 @@ impl Viewer {
     /// Every unit is a newer capture than the one before, the key unit a
     /// viewer asked for of the same capture, or the one refinement of the
     /// capture before it: no picture is doubled and none goes back in time.
+    /// An exact unit is always of a newer capture, so nothing after it
+    /// refines or repeats an older one.
     fn assert_ordered(&self) {
         for pair in self.units.windows(2) {
             let (before, after) = (&pair[0], &pair[1]);
-            let ordered = match after.quality {
-                Quality::Motion => after.ts > before.ts || (after.key && after.ts == before.ts),
-                Quality::Refine | Quality::Final => after.ts == before.ts,
+            let ordered = match (after.exact, after.quality) {
+                (Some(_), _) => after.ts > before.ts,
+                (None, Quality::Motion) => {
+                    after.ts > before.ts || (after.key && after.ts == before.ts)
+                }
+                (None, Quality::Refine | Quality::Final) => {
+                    before.exact.is_none() && after.ts == before.ts
+                }
             };
             assert!(
                 ordered,
@@ -201,11 +218,29 @@ impl Viewer {
     /// received so far is painted.
     fn painted(&mut self, row: u32) -> [u8; 3] {
         for unit in &self.units[self.decoded..] {
-            self.shown = Some(self.decoder.decode(&unit.data));
+            match unit.exact {
+                Some(rect) => self.exact.push((
+                    rect,
+                    image::load_from_memory(&unit.data).unwrap().to_rgb8(),
+                )),
+                None => {
+                    self.shown = Some(self.decoder.decode(&unit.data));
+                    self.exact.clear();
+                }
+            }
         }
         self.decoded = self.units.len();
-        let shown = self.shown.as_ref().expect("a painted picture");
         let (x, y) = (320, row as usize);
+        let drawn = self.exact.iter().rev().find(|(rect, _)| {
+            (rect.x..rect.x + rect.width as i32).contains(&(x as i32))
+                && (rect.y..rect.y + rect.height as i32).contains(&(y as i32))
+        });
+        if let Some((rect, pixels)) = drawn {
+            return pixels
+                .get_pixel((x as i32 - rect.x) as u32, (y as i32 - rect.y) as u32)
+                .0;
+        }
+        let shown = self.shown.as_ref().expect("a painted picture");
         let (cx, cy, chroma_width) = match shown.chroma {
             Chroma::Full => (x, y, shown.width as usize),
             Chroma::Subsampled => (x / 2, y / 2, shown.width as usize / 2),
@@ -459,7 +494,7 @@ async fn snapshot_demand_does_not_encode_for_a_blocked_viewer() {
 #[test]
 fn a_capture_admitted_before_backpressure_is_marked_but_not_encoded_after_blocking() {
     let encoding = Arc::new(Encoding::new(VideoCodec::Av1Full));
-    let subscriber = Arc::new(Subscriber::new(rate(60)));
+    let subscriber = Arc::new(Subscriber::new(rate(60), false));
     lock(&encoding.subscribers).push(subscriber.clone());
     let Decision::Capture(plan) = decide(std::slice::from_ref(&encoding), Instant::now()) else {
         panic!("a ready first viewer admits its initial capture")
@@ -694,6 +729,88 @@ async fn a_stream_starts_whole_follows_damage_and_refines_a_still_picture() {
     viewer.assert_ordered();
     assert!(near(viewer.painted(120), RED));
     assert!(near(viewer.painted(200), GREY));
+}
+
+/// Small damage after a final picture leaves as an exact unit (contract
+/// browser-presentation-units): the rows that changed, across the window,
+/// exactly, with nothing after it to refine. Damage past `EXACT_ROWS` is a
+/// picture again, and it carries what the exact unit showed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn small_damage_after_a_final_picture_leaves_exact_and_owes_no_refinement() {
+    let rig = rig();
+    let mut viewer = Viewer::new(rig.subscribe_exact());
+    viewer.motion().await;
+    viewer.refined().await;
+    rig.paint(100, 140, RED);
+    let exact = viewer.unit().await;
+    let visible = exact.visible;
+    assert_eq!(
+        exact.exact,
+        Some(Rect {
+            x: visible.x,
+            y: 100,
+            width: visible.width,
+            height: 40
+        })
+    );
+    assert!(!exact.key);
+    assert_eq!(viewer.painted(120), [RED[2], RED[1], RED[0]], "exactly");
+    viewer.settle().await;
+    assert_eq!(
+        viewer.units.last().unwrap().ts,
+        exact.ts,
+        "nothing follows an exact unit while the screen is still"
+    );
+    rig.paint(200, 200 + EXACT_ROWS + 1, BLUE);
+    let picture = viewer.until_shows(250, BLUE).await;
+    assert!(picture.exact.is_none());
+    assert!(near(viewer.painted(120), RED), "the picture carries it");
+    viewer.assert_ordered();
+}
+
+/// A viewer that asks for a key unit after an exact unit gets one of a
+/// fresh capture: a key of the held picture would take back what the exact
+/// unit showed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_key_after_an_exact_unit_is_of_a_fresh_capture() {
+    let rig = rig();
+    let mut viewer = Viewer::new(rig.subscribe_exact());
+    viewer.motion().await;
+    viewer.refined().await;
+    rig.paint(100, 140, RED);
+    let exact = viewer.unit().await;
+    assert!(exact.exact.is_some());
+    viewer.subscription.keyframe();
+    let key = loop {
+        let unit = viewer.unit().await;
+        if unit.key {
+            break unit;
+        }
+    };
+    assert!(key.exact.is_none());
+    assert!(key.ts > exact.ts, "{} after {}", key.ts, exact.ts);
+    assert!(near(viewer.painted(120), RED));
+    viewer.assert_ordered();
+}
+
+/// An encoding sends exact units only while every viewer of it draws them:
+/// beside a viewer that did not declare them, small damage is a picture.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn small_damage_is_a_picture_while_any_viewer_draws_no_exact_units() {
+    let rig = rig();
+    let mut exact = Viewer::new(rig.subscribe_exact());
+    let mut plain = Viewer::new(rig.subscribe());
+    exact.motion().await;
+    plain.motion().await;
+    exact.refined().await;
+    plain.refined().await;
+    rig.paint(100, 140, RED);
+    let shown = plain.until_shows(120, RED).await;
+    assert!(shown.exact.is_none());
+    let shared = exact.until_shows(120, RED).await;
+    assert!(shared.exact.is_none());
+    exact.assert_ordered();
+    plain.assert_ordered();
 }
 
 /// A unit of motion codes only the rows that changed since the unit before
@@ -1053,7 +1170,7 @@ fn encoding(
     now: Instant,
 ) -> Arc<Encoding> {
     let encoding = Arc::new(Encoding::new(VideoCodec::Av1Full));
-    lock(&encoding.subscribers).push(Arc::new(Subscriber::new(rate)));
+    lock(&encoding.subscribers).push(Arc::new(Subscriber::new(rate, false)));
     let mut mailbox = lock(&encoding.mailbox);
     if let Some(ago) = ago {
         mailbox.pace = Pace::due_at(now - ago + period(rate));
@@ -1148,7 +1265,7 @@ async fn a_broken_helper_ends_every_subscription_with_its_reason() {
         }
     }
     assert!(
-        rig.producer.subscribe(VideoCodec::Av1Full, 60).is_err(),
+        rig.producer.subscribe(VideoCodec::Av1Full, 60, false).is_err(),
         "a failed producer serves no one"
     );
 }

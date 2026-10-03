@@ -75,6 +75,9 @@ struct ClientConfig {
     video: Option<Declared>,
     video_coded_capacity: bool,
     video_chunks: bool,
+    /// `videoExact=png`: the viewer draws exact units (contract
+    /// browser-presentation-units).
+    video_exact: bool,
     video_demand: Demand,
 }
 
@@ -105,6 +108,7 @@ impl Default for ClientConfig {
             video: None,
             video_coded_capacity: false,
             video_chunks: false,
+            video_exact: false,
             video_demand: Demand::default(),
         }
     }
@@ -314,6 +318,7 @@ fn config_from_upgrade(request: &str) -> ClientConfig {
             "video" => cfg.video = Declared::parse(value),
             "videoCapacity" => cfg.video_coded_capacity = value == "coded",
             "videoFraming" => cfg.video_chunks = value == "chunks",
+            "videoExact" => cfg.video_exact = value == "png",
             "frameWindow" => {
                 if let Some(window) = value
                     .parse::<usize>()
@@ -707,6 +712,7 @@ async fn handle_ws_client(
         );
         track.declare_coded_capacity(initial_config.video_coded_capacity);
         track.declare_chunks(initial_config.video_chunks);
+        track.declare_exact(initial_config.video_exact);
         (track, inbox, feedback)
     });
     let (mut video, video_inbox, mut video_feedback) = match declared_video {
@@ -1302,6 +1308,23 @@ mod tests {
             ));
             assert_eq!(cfg.video_coded_capacity, capacity);
             assert_eq!(cfg.video_chunks, chunks);
+        }
+    }
+
+    /// Exact units are their own explicit declaration (contract
+    /// browser-presentation-units): only `videoExact=png` asks for them.
+    #[test]
+    fn exact_units_are_an_explicit_upgrade() {
+        for (query, exact) in [
+            ("", false),
+            ("videoExact=png", true),
+            ("videoExact=jpeg", false),
+            ("videoFraming=chunks&videoCapacity=coded", false),
+        ] {
+            let cfg = config_from_upgrade(&format!(
+                "GET /?frames=binary&cursor=viewer&video=av1-444&{query} HTTP/1.1\r\n"
+            ));
+            assert_eq!(cfg.video_exact, exact, "{query}");
         }
     }
 

@@ -158,6 +158,12 @@ impl Quality {
 /// damage.
 pub(super) const STILL_AFTER: Duration = Duration::from_millis(30);
 
+/// The most rows of the window a change may cover and still leave as an
+/// exact unit (contract browser-presentation-units): a typed key, a caret or
+/// a hover changes fewer. Agreed with fe-browser-media until their decode and
+/// composite are measured; a 96-row band of the window codes in about 2 ms.
+pub(super) const EXACT_ROWS: u32 = 128;
+
 /// One refinement quantum of byte credit. An indivisible update can cost
 /// more than a quantum; its complete cost becomes debt, never an increased
 /// allowance or an excuse to queue further updates.
