@@ -849,7 +849,10 @@ mod tests {
         assert_eq!(line["inputSeq"], 4411);
         assert_eq!(line["applied"], 10);
         assert_eq!(line["read"], 30);
-        assert_eq!((&line["rowsTop"], &line["rowsBottom"]), (&json!(100), &json!(140)));
+        assert_eq!(
+            (&line["rowsTop"], &line["rowsBottom"]),
+            (&json!(100), &json!(140))
+        );
         assert_eq!(line["encoded"], 44);
         assert!(line["written"].as_u64().unwrap() >= 44, "{line}");
         assert!(written(unit(None)).is_empty());

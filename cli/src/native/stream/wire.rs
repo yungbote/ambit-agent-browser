@@ -455,7 +455,10 @@ mod tests {
         ] {
             let mut unit = video_unit(false, 10);
             unit.exact = Some(outside);
-            assert!(binary_video(&unit, VideoCodec::Av1Full, &stream, 8).is_none(), "{outside:?}");
+            assert!(
+                binary_video(&unit, VideoCodec::Av1Full, &stream, 8).is_none(),
+                "{outside:?}"
+            );
         }
         let mut key = video_unit(true, 10);
         key.exact = Some(rect(0, 0, 4, 4));

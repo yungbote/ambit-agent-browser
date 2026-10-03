@@ -66,8 +66,14 @@ mod tests {
             assert_eq!(pixel.0, [bgrx[at + 2], bgrx[at + 1], bgrx[at]]);
         }
         assert!(png(&bgrx, stride, (0, 0, width, height)).is_some());
-        assert!(png(&bgrx, stride, (36, 0, 8, 1)).is_none(), "past a row's bytes");
-        assert!(png(&bgrx, stride, (0, 20, 4, 4)).is_none(), "past the last row");
+        assert!(
+            png(&bgrx, stride, (36, 0, 8, 1)).is_none(),
+            "past a row's bytes"
+        );
+        assert!(
+            png(&bgrx, stride, (0, 20, 4, 4)).is_none(),
+            "past the last row"
+        );
         assert!(png(&bgrx, stride, (0, 0, 0, 4)).is_none(), "empty");
     }
 }

@@ -15800,7 +15800,10 @@ fn displayed_cursor(pid: u32, env: &EnvGuard) -> (u16, u16) {
             assert!(!library.is_null(), "{name:?}");
             library
         };
-        let (x11, xfixes) = (open_library(c"libX11.so.6"), open_library(c"libXfixes.so.3"));
+        let (x11, xfixes) = (
+            open_library(c"libX11.so.6"),
+            open_library(c"libXfixes.so.3"),
+        );
         let symbol = |library: *mut c_void, name: &CStr| {
             let symbol = libc::dlsym(library, name.as_ptr());
             assert!(!symbol.is_null(), "{name:?}");
@@ -15886,16 +15889,17 @@ async fn e2e_native_cursor_is_24_css_px_at_every_presentation_width() {
             if frame["type"] != "frame" {
                 continue;
             }
-            sink.send(Message::Text(json!({"type":"ack","seq":frame["seq"]}).to_string()))
-                .await
-                .unwrap();
+            sink.send(Message::Text(
+                json!({"type":"ack","seq":frame["seq"]}).to_string(),
+            ))
+            .await
+            .unwrap();
             if frame["visible"]["width"] == width * 2 {
                 break;
             }
         }
         assert_success(
-            &control_test_command(&json!({"action":"hover","selector":"#area"}), &mut state)
-                .await,
+            &control_test_command(&json!({"action":"hover","selector":"#area"}), &mut state).await,
         );
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let pid = state
@@ -15912,7 +15916,11 @@ async fn e2e_native_cursor_is_24_css_px_at_every_presentation_width() {
             .expect("the browser window names its process");
         let size = displayed_cursor(pid, &env);
         seen.push(json!({"width": width, "height": height, "cursor": [size.0, size.1]}));
-        assert_eq!(size, (expected, expected), "at {width} by {height}: {seen:?}");
+        assert_eq!(
+            size,
+            (expected, expected),
+            "at {width} by {height}: {seen:?}"
+        );
     }
     println!("CURSOR_WITNESS {}", json!(seen));
     assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);

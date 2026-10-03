@@ -725,14 +725,21 @@ fn a_typed_key_as_an_exact_rectangle() {
     let png = |area: (usize, usize, usize, usize), filter: FilterType| {
         let mut out = Vec::new();
         PngEncoder::new_with_quality(&mut out, CompressionType::Fast, filter)
-            .write_image(&rgb(area), area.2 as u32, area.3 as u32, ExtendedColorType::Rgb8)
+            .write_image(
+                &rgb(area),
+                area.2 as u32,
+                area.3 as u32,
+                ExtendedColorType::Rgb8,
+            )
             .unwrap();
         out.len()
     };
     let whole_band = (0, band.0, WIDTH, band.1 - band.0);
-    let mut results = vec![json!({"rect": [rect.0, rect.1, rect.2, rect.3], "searchMs": search_ms})];
+    let mut results =
+        vec![json!({"rect": [rect.0, rect.1, rect.2, rect.3], "searchMs": search_ms})];
     for (name, area) in [("rect", rect), ("band", whole_band)] {
-        for (filter_name, filter) in [("sub", FilterType::Sub), ("adaptive", FilterType::Adaptive)] {
+        for (filter_name, filter) in [("sub", FilterType::Sub), ("adaptive", FilterType::Adaptive)]
+        {
             let (ms, bytes) = timed(&mut || png(area, filter));
             results.push(json!({"coding": format!("png-{filter_name}"), "area": name, "ms": ms, "bytes": bytes}));
         }

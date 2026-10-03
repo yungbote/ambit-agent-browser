@@ -1040,11 +1040,7 @@ async fn e2e_native_input_latency_stages() {
         json!({"action":"ambit_browser_control","op":"release","controllerId":controller}),
     )
     .await;
-    let typed_text = command(
-        &mut state,
-        json!({"action":"evaluate","script":"n"}),
-    )
-    .await["result"]
+    let typed_text = command(&mut state, json!({"action":"evaluate","script":"n"})).await["result"]
         .as_u64()
         .unwrap();
     assert_eq!(typed_text, 80, "every key reached the page");

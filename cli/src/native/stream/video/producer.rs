@@ -647,7 +647,13 @@ impl Encoding {
         drop(mailbox);
         let mut shown = lock(&self.shown);
         if self.exact_viewers() {
-            Shown::picture(&mut shown, pixels, reply.stride as usize, capture.visible, unsent);
+            Shown::picture(
+                &mut shown,
+                pixels,
+                reply.stride as usize,
+                capture.visible,
+                unsent,
+            );
         } else {
             *shown = None;
         }

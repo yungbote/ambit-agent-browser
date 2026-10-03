@@ -219,10 +219,9 @@ impl Viewer {
     fn painted(&mut self, row: u32) -> [u8; 3] {
         for unit in &self.units[self.decoded..] {
             match unit.exact {
-                Some(rect) => self.exact.push((
-                    rect,
-                    image::load_from_memory(&unit.data).unwrap().to_rgb8(),
-                )),
+                Some(rect) => self
+                    .exact
+                    .push((rect, image::load_from_memory(&unit.data).unwrap().to_rgb8())),
                 None => {
                     self.shown = Some(self.decoder.decode(&unit.data));
                     self.exact.clear();
@@ -779,10 +778,17 @@ async fn damage_that_changes_nothing_shown_leaves_no_unit() {
     let before = viewer.units.len();
     rig.paint(100, 140, GREY);
     viewer.settle().await;
-    assert_eq!(viewer.units.len(), before, "{:?}", viewer.units.last().map(|unit| unit.ts));
+    assert_eq!(
+        viewer.units.len(),
+        before,
+        "{:?}",
+        viewer.units.last().map(|unit| unit.ts)
+    );
     rig.paint(100, 140, RED);
     let exact = viewer.unit().await;
-    assert!(exact.exact.is_some_and(|rect| (rect.y, rect.height) == (100, 40)));
+    assert!(exact
+        .exact
+        .is_some_and(|rect| (rect.y, rect.height) == (100, 40)));
     viewer.assert_ordered();
 }
 
@@ -822,13 +828,20 @@ async fn the_surface_equals_the_newest_applied_capture_under_interleaved_units()
         for row in (0..480).step_by(5) {
             let painted = viewer.painted(row as u32);
             let expected = screen[row];
-            let inside = shown.exact.is_some_and(|rect| {
-                (rect.y..rect.y + rect.height as i32).contains(&(row as i32))
-            });
+            let inside = shown
+                .exact
+                .is_some_and(|rect| (rect.y..rect.y + rect.height as i32).contains(&(row as i32)));
             if inside {
-                assert_eq!(painted, [expected[2], expected[1], expected[0]], "row {row}");
+                assert_eq!(
+                    painted,
+                    [expected[2], expected[1], expected[0]],
+                    "row {row}"
+                );
             } else {
-                assert!(near(painted, expected), "row {row}: {painted:?} for {expected:?}");
+                assert!(
+                    near(painted, expected),
+                    "row {row}: {painted:?} for {expected:?}"
+                );
             }
         }
         if shown.exact.is_none() {
@@ -1337,7 +1350,9 @@ async fn a_broken_helper_ends_every_subscription_with_its_reason() {
         }
     }
     assert!(
-        rig.producer.subscribe(VideoCodec::Av1Full, 60, false).is_err(),
+        rig.producer
+            .subscribe(VideoCodec::Av1Full, 60, false)
+            .is_err(),
         "a failed producer serves no one"
     );
 }

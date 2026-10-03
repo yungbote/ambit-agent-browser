@@ -40,7 +40,11 @@ impl Shown {
             return;
         };
         let whole = Band::whole(visible.y as u32 + visible.height);
-        let rows = if current { rows.unwrap_or(whole) } else { whole };
+        let rows = if current {
+            rows.unwrap_or(whole)
+        } else {
+            whole
+        };
         if record.copy(source, stride, rows).is_none() {
             *shown = None;
         }
@@ -95,7 +99,8 @@ impl Shown {
     /// Framebuffer rows `rows` inside the window.
     fn clip(&self, rows: Band) -> (usize, usize) {
         let top = (rows.top as usize).max(self.visible.y as usize);
-        let bottom = (rows.bottom as usize).min(self.visible.y as usize + self.visible.height as usize);
+        let bottom =
+            (rows.bottom as usize).min(self.visible.y as usize + self.visible.height as usize);
         (top, bottom.max(top))
     }
 
@@ -126,7 +131,9 @@ mod tests {
     /// a distinct value.
     fn framebuffer() -> (Vec<u8>, usize, Rect) {
         let stride = 32 * BYTES_PER_PIXEL;
-        let pixels = (0..stride * 24).map(|index| (index * 7 % 251) as u8).collect();
+        let pixels = (0..stride * 24)
+            .map(|index| (index * 7 % 251) as u8)
+            .collect();
         let visible = Rect {
             x: 6,
             y: 4,
@@ -182,7 +189,13 @@ mod tests {
         Shown::picture(&mut shown, &pixels, stride, visible, None);
         set(&mut pixels, stride, (10, 6));
         set(&mut pixels, stride, (10, 15));
-        Shown::picture(&mut shown, &pixels, stride, visible, Some(Band { top: 6, bottom: 7 }));
+        Shown::picture(
+            &mut shown,
+            &pixels,
+            stride,
+            visible,
+            Some(Band { top: 6, bottom: 7 }),
+        );
         let all = Band { top: 0, bottom: 24 };
         let record = shown.as_mut().unwrap();
         assert_eq!(
@@ -197,7 +210,16 @@ mod tests {
         );
         let moved = Rect { x: 5, ..visible };
         assert_eq!(record.change(&pixels, stride, moved, all), None);
-        Shown::picture(&mut shown, &pixels, stride, moved, Some(Band { top: 0, bottom: 1 }));
-        assert_eq!(shown.as_mut().unwrap().change(&pixels, stride, moved, all), Some(None));
+        Shown::picture(
+            &mut shown,
+            &pixels,
+            stride,
+            moved,
+            Some(Band { top: 0, bottom: 1 }),
+        );
+        assert_eq!(
+            shown.as_mut().unwrap().change(&pixels, stride, moved, all),
+            Some(None)
+        );
     }
 }
