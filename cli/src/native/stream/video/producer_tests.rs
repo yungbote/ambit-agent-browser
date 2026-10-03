@@ -453,6 +453,48 @@ async fn snapshot_demand_does_not_encode_for_a_blocked_viewer() {
     );
 }
 
+#[test]
+fn a_capture_admitted_before_backpressure_is_marked_but_not_encoded_after_blocking() {
+    let encoding = Arc::new(Encoding::new(VideoCodec::Av1Full));
+    let subscriber = Arc::new(Subscriber::new(rate(60)));
+    lock(&encoding.subscribers).push(subscriber.clone());
+    let Decision::Capture(plan) = decide(&[encoding.clone()], Instant::now()) else {
+        panic!("a ready first viewer admits its initial capture")
+    };
+    assert_eq!(plan.encodings.len(), 1);
+    subscriber.set_ready(false);
+
+    let reply: PictureReply = serde_json::from_value(serde_json::json!({
+        "width": 640,
+        "height": 480,
+        "stride": 2560,
+        "rows": [[0, 480]],
+        "cursorIncluded": false
+    }))
+    .unwrap();
+    let capture = Capture {
+        ts: 1,
+        read: Instant::now(),
+        visible: reply.window(),
+        surface: Surface::new(640, 480),
+        input_seq: None,
+        pointer: None,
+    };
+    let pixels = vec![128u8; 640 * 480 * 4];
+    encoding.mark(&reply);
+    plan.encodings[0].take(&capture, &reply, &pixels);
+
+    let mailbox = lock(&encoding.mailbox);
+    assert!(
+        mailbox.behind,
+        "the blocked viewer must catch up when ready"
+    );
+    assert!(
+        mailbox.job.is_none(),
+        "backpressure survives an in-flight capture"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cancelled_snapshot_demand_has_no_plan_and_stopped_or_failed_producers_retire_requests() {
     let stopped = rig();
