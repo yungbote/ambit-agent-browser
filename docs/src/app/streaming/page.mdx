@@ -4,6 +4,8 @@ Stream the browser viewport via WebSocket for live preview or "pair browsing" wh
 
 ## Streaming
 
+Host agent-channel landings may carry an optional `changedText` diff of visible, non-editable text, bounded to eight fragments and 1024 UTF-8 bytes. Its original page generation and addressed node identify the evidence. Field values, secret/editor ancestry, pending/takeover reads and replaced documents are omitted; the diff never authorizes or replays input.
+
 Every session automatically starts a WebSocket stream server on an OS-assigned port. The server streams viewport frames and accepts input events (mouse, keyboard, touch).
 
 To bind to a specific port, set `AGENT_BROWSER_STREAM_PORT`:
@@ -86,6 +88,8 @@ A delta's `baseSeq` must equal the last painted frame with matching surface gene
 For a viewer across a network, negotiate `pacing=ack&frameWindow=8` to allow up to eight delivered frames and at most 12 MiB awaiting acknowledgment. The default window is one for compatibility. A cumulative ACK names the newest frame actually painted; it also retires the preceding delivered frames whose pixels that composed frame includes. A slow viewer stops at the count or byte bound, and skipped delta dependencies still require a whole frame.
 
 ### Video track
+
+An enabled video generation accepts `{"type":"rate","generation":1,"bitsPerSecond":5000000,"burstBytes":200000}` from its media relay. Bitrates are integral, from 1000 through 4294967295, and bursts from 1 through 12582912 bytes; stale or malformed feedback is ignored. Motion uses real-time bitrate control and a cadence that follows the path's picture cost. The burst replaces the delivery estimate's capture budget. Without feedback the driver keeps fixed quality. Feedback never grants input custody or changes audio or geometry. The motion-control checkpoint still refines a complete still picture; bounded refinement steps require further qualification before a constrained-link release.
 
 A binary viewer that draws its own pointer (`frames=binary&cursor=viewer`) can declare `video=av1-444,av1`. The driver answers `{"type":"video","state":"available","codec":"av1-444"}` when it can encode one of them (the owned Linux window, a display helper serving pictures, and `libaom.so.3`), otherwise `unavailable`. After `{"type":"video","enabled":true,"generation":1}` it answers `started` with a `streamId` and `codecString`, then sends binary AV1 units instead of frames: a four-byte header length, a JSON header (`track: "video"`, `streamId`, `seq`, `ts`, `key`, `codecString` on key units, `coded`, `visible`, `surface`, `quality`, `byteLength`), and one temporal unit. Pictures are BT.709 at full range, as each key unit's sequence header signals. Acknowledge painted units with `{"type":"ack","track":"video","streamId":"<uuid>","seq":n}`; ask for a key unit with `{"type":"video","keyframe":true,"generation":n}`. A new `started` under the same generation begins a new stream at `seq` 1 with a key unit. `enabled:false` is answered `stopped`, and frames resume with a whole one.
 

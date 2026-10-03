@@ -1,8 +1,11 @@
 pub mod chrome;
 pub mod client;
+#[cfg(target_os = "linux")]
+mod desktop_portal;
 pub mod discovery;
 pub mod lightpanda;
 mod pointer;
+mod presentation;
 pub(crate) mod profiles;
 #[cfg(test)]
 mod round_trip_e2e;

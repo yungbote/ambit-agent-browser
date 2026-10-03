@@ -11,6 +11,8 @@ pub(crate) mod layout;
 pub(crate) mod presentation;
 mod track;
 mod video;
+#[cfg(target_os = "linux")]
+pub(crate) use video::snapshot::Snapshot as ViewportSnapshot;
 #[cfg(all(test, target_os = "linux"))]
 mod video_e2e;
 #[cfg(all(test, target_os = "linux"))]
@@ -522,6 +524,7 @@ pub struct StreamServer {
     audio_source: watch::Sender<Option<super::audio::AudioSource>>,
     /// The connected viewers' declarations, cursor identity and applied input.
     pub(crate) media: Arc<StreamMedia>,
+    video: Arc<video::VideoHub>,
     /// The active CDP page session ID (from Target.attachToTarget).
     cdp_session_id: Arc<RwLock<Option<String>>>,
     client_notify: Arc<Notify>,
@@ -765,6 +768,7 @@ impl StreamServer {
         let accept_shutdown_rx = shutdown_rx.clone();
         let session_name_clone = session_id.clone();
         let frame_watch_accept = frame_watch_rx.clone();
+        let video_accept = video.clone();
         let accept_task = tokio::spawn(async move {
             websocket::accept_loop(
                 listener,
@@ -774,7 +778,7 @@ impl StreamServer {
                 client_slot_clone,
                 display_slot_accept,
                 audio_accept,
-                video,
+                video_accept,
                 notify_clone,
                 idle_activity_clone,
                 browser_control_clone,
@@ -848,6 +852,7 @@ impl StreamServer {
                 display_changed,
                 audio_source,
                 media,
+                video,
                 cdp_session_id,
                 client_notify,
                 idle_activity,
@@ -869,6 +874,16 @@ impl StreamServer {
 
     pub fn port(&self) -> u16 {
         self.port
+    }
+
+    /// Viewport screenshot demand shares the video's one picture producer.
+    #[cfg(target_os = "linux")]
+    pub(crate) async fn viewport_picture(
+        &self,
+        display: &Arc<super::display::DisplayClient>,
+        after_us: u64,
+    ) -> Result<Arc<video::snapshot::Snapshot>, String> {
+        self.video.snapshot(display, after_us).await
     }
 
     pub(crate) fn set_audio(&self, source: Option<super::audio::AudioSource>) {

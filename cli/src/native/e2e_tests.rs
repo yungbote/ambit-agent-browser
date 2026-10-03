@@ -29,8 +29,533 @@ fn assert_success(resp: &Value) {
     );
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore]
+async fn e2e_w11_viewport_screenshot_uses_shared_picture_without_a_video_viewer() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let idle = Arc::new(super::stream::IdleActivity::new());
+    let (server, client_slot) = super::stream::StreamServer::start_without_client(
+        0,
+        "w11-test".into(),
+        false,
+        idle.clone(),
+    )
+    .await
+    .unwrap();
+    let server = Arc::new(server);
+    let mut state = DaemonState::new_with_stream(Some(client_slot), Some(server.clone()), idle);
+    let temp = tempfile::TempDir::new().unwrap();
+    let directory = std::env::var("AMBIT_W11_SCREENSHOTS")
+        .unwrap_or_else(|_| temp.path().to_string_lossy().into_owned());
+    std::fs::create_dir_all(&directory).unwrap();
+    let html = r#"<!doctype html><style>body{margin:0;background:rgb(160,10,20);height:2000px}button{position:absolute;left:100px;top:100px;width:220px;height:60px}</style><button id=paint onclick="document.body.style.background=document.body.style.background==='rgb(10, 180, 30)'?'rgb(160,10,20)':'rgb(10,180,30)'">Paint green</button>"#;
+    assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(html))}),&mut state).await);
+    // No native mapping yet: preserve the existing explicit CDP source.
+    let options = super::screenshot::ScreenshotOptions {
+        path: Some(format!("{directory}/viewport.png")),
+        ..Default::default()
+    };
+    assert!(super::viewport_screenshot::take(&state, &options)
+        .await
+        .unwrap()
+        .is_none());
+    assert_success(
+        &control_test_command(&json!({"action":"click","selector":"#paint"}), &mut state).await,
+    );
+    let observe = control_test_command(
+        &json!({"action":"evaluate","script":"getComputedStyle(document.body).backgroundColor"}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(observe["data"]["result"], "rgb(10, 180, 30)");
+    let began = std::time::Instant::now();
+    let captured = super::viewport_screenshot::take(&state, &options)
+        .await
+        .unwrap()
+        .expect("A foreground proven native page must use the existing producer without a viewer");
+    let elapsed = began.elapsed().as_secs_f64() * 1000.0;
+    let picture = image::open(&captured.path).unwrap().to_rgba8();
+    let browser = state.browser.as_ref().unwrap();
+    let session = browser.active_session_id().unwrap();
+    let binding = state
+        .browser_control
+        .lock()
+        .await
+        .viewport_picture_binding(&browser.client, session)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        picture.dimensions(),
+        (binding.crop.width, binding.crop.height)
+    );
+    assert_eq!(
+        picture.get_pixel(20, 20).0,
+        [10, 180, 30, 255],
+        "The snapshot shows Chrome UI, old/unapplied pixels or transparent BGRX"
+    );
+    println!(
+        "W11_SHARED_SCREENSHOT {}",
+        json!({"path":captured.path,"width":picture.width(),"height":picture.height(),"commandToFileMs":elapsed,"source":"shared picture producer","cursorIncluded":false})
+    );
+    assert_success(
+        &control_test_command(
+            &json!({"action":"screenshot","path":format!("{directory}/named.png")}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_eq!(
+        image::open(format!("{directory}/named.png"))
+            .unwrap()
+            .to_rgba8()
+            .get_pixel(20, 20)
+            .0,
+        [10, 180, 30, 255]
+    );
+    let compared=control_test_command(&json!({"action":"diff_screenshot","baseline":format!("{directory}/named.png"),"threshold":0.0}),&mut state).await;
+    assert_success(&compared);
+    assert_eq!(compared["data"]["match"], true);
+    let baseline_began = std::time::Instant::now();
+    let browser = state.browser.as_ref().unwrap();
+    let session = browser.active_session_id().unwrap();
+    let baseline = super::screenshot::take_screenshot(
+        &browser.client,
+        session,
+        &state.ref_map,
+        &super::screenshot::ScreenshotOptions {
+            path: Some(format!("{directory}/cdp-baseline.png")),
+            ..Default::default()
+        },
+        &state.iframe_sessions,
+    )
+    .await
+    .unwrap();
+    let baseline_ms = baseline_began.elapsed().as_secs_f64() * 1000.0;
+    let baseline = image::open(&baseline.path).unwrap().to_rgba8();
+    assert_eq!(
+        baseline.dimensions(),
+        picture.dimensions(),
+        "Shared capture changed the viewport image dimensions"
+    );
+    assert_eq!(baseline.get_pixel(20, 20), picture.get_pixel(20, 20));
+    println!(
+        "W11_SOURCE_COMPARISON {}",
+        json!({"sharedCaptureToFileMs":elapsed,"cdpCaptureToFileMs":baseline_ms,"decodedDimensions":picture.dimensions(),"sharedBytes":std::fs::metadata(&captured.path).unwrap().len()})
+    );
+    for options in [
+        super::screenshot::ScreenshotOptions {
+            full_page: true,
+            ..Default::default()
+        },
+        super::screenshot::ScreenshotOptions {
+            selector: Some("#paint".into()),
+            ..Default::default()
+        },
+        super::screenshot::ScreenshotOptions {
+            annotate: true,
+            ..Default::default()
+        },
+        super::screenshot::ScreenshotOptions {
+            format: "webp".into(),
+            ..Default::default()
+        },
+    ] {
+        assert!(super::viewport_screenshot::take(&state, &options)
+            .await
+            .unwrap()
+            .is_none());
+    }
+    assert_success(
+        &control_test_command(
+            &json!({"action":"screenshot","fullPage":true,"path":format!("{directory}/full.png")}),
+            &mut state,
+        )
+        .await,
+    );
+    assert!(
+        image::open(format!("{directory}/full.png"))
+            .unwrap()
+            .height()
+            > picture.height()
+    );
+    assert_success(&control_test_command(&json!({"action":"screenshot","selector":"#paint","path":format!("{directory}/element.png")}),&mut state).await);
+    // No DOM observation or renderer screenshot between a temporary clip
+    // and this demand: those probes can themselves give Chrome time to
+    // publish the restored viewport and hide the source defect.
+    for attempt in 0..3 {
+        assert_success(&control_test_command(&json!({"action":"screenshot","selector":"#paint","path":format!("{directory}/element-{attempt}.png")}),&mut state).await);
+        let raw = super::viewport_screenshot::take(
+            &state,
+            &super::screenshot::ScreenshotOptions {
+                path: Some(format!("{directory}/after-element-{attempt}.png")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let raw = image::open(raw.path).unwrap().to_rgba8();
+        println!(
+            "W11_AFTER_SPECIALIZED_NATIVE {}",
+            json!({"attempt":attempt,"pixel":raw.get_pixel(20,20).0,"dimensions":raw.dimensions()})
+        );
+        assert_eq!(
+            raw.get_pixel(20, 20).0,
+            [10, 180, 30, 255],
+            "Clip capture returned before the restored viewport was presented"
+        );
+    }
+    let jpeg_options = super::screenshot::ScreenshotOptions {
+        format: "jpeg".into(),
+        quality: Some(75),
+        path: Some(format!("{directory}/shared-jpeg.jpg")),
+        ..Default::default()
+    };
+    let jpeg = super::viewport_screenshot::take(&state, &jpeg_options)
+        .await
+        .unwrap()
+        .expect("JPEG vision must share the same viewport source");
+    let jpeg_image = image::open(&jpeg.path).unwrap().to_rgb8();
+    assert_eq!(jpeg_image.dimensions(), picture.dimensions());
+    for (actual, expected) in jpeg_image
+        .get_pixel(20, 20)
+        .0
+        .into_iter()
+        .zip([10u8, 180, 30])
+    {
+        assert!(actual.abs_diff(expected) <= 3)
+    }
+    let feedback_request = super::feedback::FeedbackRequest {
+        namespace: std::env::var("AGENT_BROWSER_NAMESPACE").unwrap_or_default(),
+        session: state.session_id.clone(),
+        capture_directory: std::path::PathBuf::from(&directory),
+        timeout_ms: 10_000,
+        expected_observation: None,
+        launch: None,
+    };
+    let vision = super::feedback::capture_for(&feedback_request, &state).await;
+    println!("W11_VISION_FEEDBACK {}", vision);
+    assert_eq!(vision["capture"]["mimeType"], "image/jpeg");
+    assert_eq!(vision["capture"]["width"], picture.width());
+    assert_eq!(vision["capture"]["height"], picture.height());
+    assert_eq!(vision["capture"]["coordinateSpace"]["name"], "viewport-css");
+    let vision_image = image::open(vision["capture"]["path"].as_str().unwrap())
+        .unwrap()
+        .to_rgb8();
+    for (actual, expected) in vision_image
+        .get_pixel(20, 20)
+        .0
+        .into_iter()
+        .zip([10u8, 180, 30])
+    {
+        assert!(actual.abs_diff(expected) <= 3)
+    }
+    assert_success(&control_test_command(&json!({"action":"screenshot","format":"jpeg","path":format!("{directory}/default-quality.jpg")}),&mut state).await);
+    assert_success(&control_test_command(&json!({"action":"screenshot","format":"jpeg","quality":80,"path":format!("{directory}/explicit-quality80.jpg")}),&mut state).await);
+    assert_eq!(
+        std::fs::read(format!("{directory}/default-quality.jpg")).unwrap(),
+        std::fs::read(format!("{directory}/explicit-quality80.jpg")).unwrap(),
+        "Default screenshot JPEG quality changed from the original80"
+    );
+    if std::env::var("AMBIT_W11_CAPTURE_BENCH").as_deref() == Ok("1") {
+        for sample in 0..5 {
+            for format in ["png", "jpeg"] {
+                let options = super::screenshot::ScreenshotOptions {
+                    format: format.into(),
+                    quality: (format == "jpeg").then_some(75),
+                    ..Default::default()
+                };
+                let started = std::time::Instant::now();
+                let shared = super::viewport_screenshot::take(&state, &options)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let shared_ms = started.elapsed().as_secs_f64() * 1000.;
+                let browser = state.browser.as_ref().unwrap();
+                let started = std::time::Instant::now();
+                let renderer = super::screenshot::take_screenshot(
+                    &browser.client,
+                    browser.active_session_id().unwrap(),
+                    &state.ref_map,
+                    &options,
+                    &state.iframe_sessions,
+                )
+                .await
+                .unwrap();
+                let renderer_ms = started.elapsed().as_secs_f64() * 1000.;
+                let shared = image::open(shared.path).unwrap().to_rgba8();
+                let renderer = image::open(renderer.path).unwrap().to_rgba8();
+                assert_eq!(shared.dimensions(), renderer.dimensions());
+                for (left, right) in shared
+                    .get_pixel(20, 20)
+                    .0
+                    .into_iter()
+                    .zip(renderer.get_pixel(20, 20).0)
+                {
+                    assert!(left.abs_diff(right) <= 3);
+                }
+                println!(
+                    "W11_FORMAT_CAPTURE {}",
+                    json!({"sample":sample,"format":format,"sharedToFileMs":shared_ms,"rendererToFileMs":renderer_ms,"dimensions":shared.dimensions()})
+                );
+            }
+        }
+    }
+    // Previous input ACK does not prove that its effect is on screen.
+    // Capture immediately through the actual vision consumer, with no
+    // intervening DOM observation or renderer screenshot to force paint.
+    for attempt in 0..4 {
+        assert_success(
+            &control_test_command(&json!({"action":"click","selector":"#paint"}), &mut state).await,
+        );
+        let vision = super::feedback::capture_for(&feedback_request, &state).await;
+        let path = vision["capture"]["path"]
+            .as_str()
+            .expect("A post-input vision capture");
+        let image = image::open(path).unwrap().to_rgb8();
+        let expected = if attempt % 2 == 0 {
+            [160u8, 10, 20]
+        } else {
+            [10u8, 180, 30]
+        };
+        println!(
+            "W11_POST_INPUT_PIXELS {}",
+            json!({"attempt":attempt,"pixel":image.get_pixel(20,20).0,"expected":expected})
+        );
+        for (actual, expected) in image.get_pixel(20, 20).0.into_iter().zip(expected) {
+            assert!(
+                actual.abs_diff(expected) <= 3,
+                "Vision showed pre-input pixels"
+            );
+        }
+    }
+    assert_success(&control_test_command(&json!({"action":"screenshot","annotate":true,"path":format!("{directory}/annotated.png")}),&mut state).await);
+    let cleared = super::viewport_screenshot::take(
+        &state,
+        &super::screenshot::ScreenshotOptions {
+            path: Some(format!("{directory}/after-annotation.png")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let cleared = image::open(cleared.path).unwrap().to_rgba8();
+    assert_eq!(
+        cleared.get_pixel(205, 205),
+        picture.get_pixel(205, 205),
+        "Capture-only annotation remained in native pixels"
+    );
+    // Exercise the channel's conditional first-paint branch on this real
+    // window. The fixture reports no paint entries; the old 1x1 force
+    // could leave a clip raster even though the original document remained.
+    assert_success(&control_test_command(&json!({"action":"evaluate","script":"const originalPaint=performance.getEntriesByType.bind(performance);performance.getEntriesByType=k=>k==='paint'?[]:originalPaint(k)"}),&mut state).await);
+    let recorders = super::agent_channel::target::Recorders::default();
+    let mut landing =
+        super::agent_channel::landed::Landing::arm(&state, &recorders, None, false).await;
+    landing
+        .read(
+            &mut state,
+            false,
+            std::time::Instant::now() + std::time::Duration::from_secs(3),
+        )
+        .await;
+    let painted = super::viewport_screenshot::take(
+        &state,
+        &super::screenshot::ScreenshotOptions {
+            path: Some(format!("{directory}/after-channel-first-paint.png")),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        image::open(painted.path)
+            .unwrap()
+            .to_rgba8()
+            .get_pixel(20, 20)
+            .0,
+        [10, 180, 30, 255]
+    );
+    let browser = state.browser.as_ref().unwrap();
+    let client = browser.client.clone();
+    let session = browser.active_session_id().unwrap().to_owned();
+    let original = browser.active_target_id().unwrap().to_owned();
+    let other=client.send_command("Target.createTarget",Some(json!({"url":"data:text/html,<title>Other page</title><body>Other foreground</body>"})),None).await.unwrap()["targetId"].as_str().unwrap().to_owned();
+    client
+        .send_command(
+            "Target.activateTarget",
+            Some(json!({"targetId":other})),
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3),client.send_command("Runtime.evaluate",Some(json!({"expression":"new Promise(resolve=>{if(!document.hasFocus())resolve(true);else addEventListener('blur',()=>resolve(true),{once:true})})","awaitPromise":true,"returnByValue":true})),Some(&session))).await.unwrap().unwrap();
+    assert!(
+        super::viewport_screenshot::take(&state, &options)
+            .await
+            .unwrap()
+            .is_none(),
+        "A background page captured another tab's displayed pixels"
+    );
+    client
+        .send_command(
+            "Target.activateTarget",
+            Some(json!({"targetId":original})),
+            None,
+        )
+        .await
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3),client.send_command("Runtime.evaluate",Some(json!({"expression":"new Promise(resolve=>{if(document.hasFocus())resolve(true);else addEventListener('focus',()=>resolve(true),{once:true})})","awaitPromise":true,"returnByValue":true})),Some(&session))).await.unwrap().unwrap();
+    client.send_command("Page.navigate",Some(json!({"url":"data:text/html,<title>Successor document</title><body>Successor</body>"})),Some(&session)).await.unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(3),client.send_command("Runtime.evaluate",Some(json!({"expression":"new Promise(resolve=>{if(document.readyState==='complete')resolve(true);else addEventListener('load',()=>resolve(true),{once:true})})","awaitPromise":true,"returnByValue":true})),Some(&session))).await.unwrap().unwrap();
+    assert!(
+        super::viewport_screenshot::take(&state, &options)
+            .await
+            .unwrap()
+            .is_none(),
+        "A successor document reused the prior page's measured viewport proof"
+    );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+    server.shutdown().await;
+}
+
 fn get_data(resp: &Value) -> &Value {
     resp.get("data").expect("Missing 'data' in response")
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore]
+async fn e2e_semantic_landing_text_only_result_and_redaction() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let mut state = DaemonState::new();
+    let recorders = super::agent_channel::target::Recorders::default();
+    let mut evidence = Vec::new();
+    for (outcome, expected) in [
+        ("ready", "Report ready"),
+        ("unchanged", "Unrelated ticker changed"),
+        ("failed", "Report failed: could not load data"),
+    ] {
+        // nosecret: explicit privacy test markers, no user data/credentials.
+        let html = format!(
+            r#"<!doctype html><style>body{{font:20px sans-serif}}textarea,input{{display:block}}#hidden{{opacity:0}}</style><h2 id=result>Report pending</h2><button id=run type=button onclick="result.textContent='{result}';ticker.textContent='Unrelated ticker changed';draft.textContent='test-only private editor';readonly.textContent='test-only private readonly field';hidden.textContent='test-only invisible text';password.type='text';password.value='test-only private password'">Generate report</button><p id=ticker>Idle</p><div id=draft contenteditable aria-label=Draft>Initial draft</div><textarea id=readonly readonly aria-label='Read only field'>Initial readonly field</textarea><input id=password type=password aria-label=Password value='test-only initial password'><p id=hidden>Hidden initial</p>"#,
+            result = if outcome == "ready" {
+                "Report ready"
+            } else if outcome == "failed" {
+                "Report failed: could not load data"
+            } else {
+                "Report pending"
+            }
+        );
+        assert_success(&control_test_command(&json!({"action":"navigate","url":format!("data:text/html,{}",urlencoding::encode(&html))}),&mut state).await);
+        let before = super::agent_channel::observe::observation(&mut state, &recorders).await;
+        let candidate = before["candidates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["name"] == "Generate report")
+            .unwrap();
+        let browser = state.browser.as_ref().unwrap();
+        let session = browser.active_session_id().unwrap();
+        let context = recorders.world(&browser.client, session).await.unwrap();
+        let target = super::agent_channel::target::node(
+            &browser.client,
+            session,
+            context,
+            candidate["backendNodeId"].as_i64().unwrap(),
+        )
+        .await
+        .unwrap();
+        let mut landing =
+            super::agent_channel::landed::Landing::arm(&state, &recorders, Some(target), true)
+                .await;
+        assert_success(
+            &control_test_command(&json!({"action":"click","selector":"#run"}), &mut state).await,
+        );
+        let mut person = super::agent_channel::landed::PersonWatch::of(&state).await;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        let pending = landing.wait(deadline, &mut person).await;
+        landing.stop_watching().await;
+        let landed = landing.read(&mut state, pending, deadline).await;
+        let after = super::agent_channel::observe::observation(&mut state, &recorders).await;
+        let (_, page) = super::feedback::page_identity(&state).await.unwrap();
+        let refs = |value: &Value| {
+            value["candidates"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|c| c["ref"].clone())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            refs(&before),
+            refs(&after),
+            "The fixture changed controls instead of only after-state text"
+        );
+        assert!(landed["changedNodes"].as_u64().unwrap() > 0);
+        let texts = landed["changedText"]["texts"]
+            .as_array()
+            .expect("A same-document physical action must carry its bounded text diff");
+        assert_eq!(
+            landed["changedText"]["pageGeneration"],
+            page["pageGeneration"]
+        );
+        assert_eq!(
+            landed["changedText"]["backendNodeId"],
+            landed["target"]["backendNodeId"]
+        );
+        assert!(
+            texts.iter().any(|t| t == expected),
+            "Missing actual text-only result: {landed}"
+        );
+        assert!(
+            !landed.to_string().contains("test-only"),
+            "Editable/secret/invisible text escaped: {landed}"
+        );
+        if outcome != "ready" {
+            assert!(!texts.iter().any(|t| t == "Report ready"));
+        }
+        evidence.push(
+            json!({"outcome":outcome,"landed":landed,"page":page,"before":before,"after":after}),
+        );
+        assert!(
+            landing.without_read().get("changedText").is_none(),
+            "A pending/takeover block disclosed semantic text"
+        );
+        state
+            .browser
+            .as_ref()
+            .unwrap()
+            .client
+            .rotate_page_generation(state.browser.as_ref().unwrap().active_session_id().unwrap());
+        let stale = landing
+            .read(
+                &mut state,
+                false,
+                std::time::Instant::now() + std::time::Duration::from_secs(2),
+            )
+            .await;
+        assert!(
+            stale.get("changedText").is_none(),
+            "A successor document reused the old semantic diff"
+        );
+        println!(
+            "SEMANTIC_LANDING_SOURCE {}",
+            json!({"case":outcome,"landed":landed,"controlCount":refs(&after).len()})
+        );
+    }
+    if let Ok(path) = std::env::var("AMBIT_BROWSER_LANDED_CASES_OUT") {
+        std::fs::write(path, serde_json::to_vec_pretty(&evidence).unwrap()).unwrap();
+    }
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
 }
 
 fn assert_error_code(resp: &Value, code: &str) {

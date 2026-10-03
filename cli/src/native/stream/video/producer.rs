@@ -22,18 +22,22 @@
 //! Lock order: the producer's state, then an encoding's mailbox, then its
 //! subscribers or the display's surface state; never the reverse.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, Weak};
 use std::time::{Duration, Instant};
 
-use super::policy::{period, rate, CodedSize, Quality, Refinement};
+use super::policy::{
+    period, rate, CodedSize, LinkRate, Quality, Refinement, RefinementCredit, RefinementSweep,
+};
 use super::subscription::{Delivery, Subscriber, Unit};
 use crate::native::display::pictures::{PictureReply, PictureRequest};
 use crate::native::display::{DisplayClient, Rect, Surface};
 use crate::native::stream::cursor_identity::CursorIdentities;
 use crate::native::stream::StreamMedia;
 use crate::native::video::convert::Planar;
-use crate::native::video::{self as codec, EncodeRequest, VideoCodec, VideoEncoder, VideoError};
+use crate::native::video::{
+    self as codec, EncodeRequest, EncoderRate, VideoCodec, VideoEncoder, VideoError,
+};
 
 /// The longest a picture request waits in the helper for damage. The helper
 /// serves one request at a time, so a wait holds back every encoding:
@@ -70,6 +74,7 @@ struct Inner {
 #[derive(Default)]
 struct State {
     encodings: Vec<Arc<Encoding>>,
+    snapshots: super::snapshot::Requests,
     /// The failure that ended the producer, if one did.
     failed: Option<String>,
 }
@@ -82,6 +87,7 @@ struct Encoding {
     /// Wakes the encode thread: a job, a key request, a path with room
     /// again, or stopping.
     changed: Condvar,
+    motion_bytes: AtomicU32,
 }
 
 struct Mailbox {
@@ -127,6 +133,7 @@ struct Capture {
     visible: Rect,
     surface: Surface,
     input_seq: Option<u64>,
+    pointer: Option<(i32, i32)>,
 }
 
 /// One capture: the request, and the encodings its picture is for.
@@ -186,6 +193,27 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 }
 
 impl Producer {
+    /// Demand on the existing capture thread; no second picture reader.
+    pub(crate) fn snapshot(
+        &self,
+        after_us: u64,
+    ) -> Result<
+        tokio::sync::oneshot::Receiver<Result<Arc<super::snapshot::Snapshot>, String>>,
+        VideoError,
+    > {
+        let receive = {
+            let mut state = lock(&self.inner.state);
+            if self.inner.stopping.load(Ordering::Acquire) {
+                return Err(VideoError::Unavailable(
+                    "the picture producer has stopped".into(),
+                ));
+            }
+            state.snapshots.request(after_us)
+        };
+        self.inner.nudge();
+        Ok(receive)
+    }
+
     /// A producer of `source`'s pictures; it captures once it has a
     /// subscriber and stops when the last reference goes.
     pub(crate) fn start(source: Source) -> Result<Arc<Self>, VideoError> {
@@ -277,7 +305,11 @@ impl Inner {
 
     fn stop(&self) {
         self.stopping.store(true, Ordering::Release);
-        let encodings = std::mem::take(&mut lock(&self.state).encodings);
+        let encodings = {
+            let mut state = lock(&self.state);
+            state.snapshots.fail("the picture producer has stopped");
+            std::mem::take(&mut state.encodings)
+        };
         for encoding in encodings {
             encoding.stop();
         }
@@ -290,6 +322,7 @@ impl Inner {
         let encodings = {
             let mut state = lock(&self.state);
             state.failed.get_or_insert(reason.clone());
+            state.snapshots.fail(&reason);
             std::mem::take(&mut state.encodings)
         };
         for encoding in encodings {
@@ -325,6 +358,7 @@ impl Encoding {
                 stop: false,
             }),
             changed: Condvar::new(),
+            motion_bytes: AtomicU32::new(1),
         }
     }
 
@@ -355,11 +389,25 @@ impl Encoding {
     /// The fastest rate among the viewers whose path has room; none when no
     /// path has room, which skips this encoding's captures.
     fn rate(&self) -> Option<u32> {
-        lock(&self.subscribers)
+        let requested = lock(&self.subscribers)
             .iter()
             .filter(|subscriber| subscriber.ready())
             .map(|subscriber| subscriber.rate())
-            .max()
+            .max()?;
+        Some(self.link_rate().map_or(requested, |rate| {
+            rate.capture_rate(requested, self.motion_bytes.load(Ordering::Acquire))
+        }))
+    }
+
+    /// Several viewers share one encoding; the lowest path budget governs it.
+    fn link_rate(&self) -> Option<LinkRate> {
+        lock(&self.subscribers)
+            .iter()
+            .filter_map(|subscriber| subscriber.link_rate())
+            .reduce(|left, right| LinkRate {
+                bits_per_second: left.bits_per_second.min(right.bits_per_second),
+                burst_bytes: left.burst_bytes.min(right.burst_bytes),
+            })
     }
 
     /// When this encoding may take its next picture; none once it stops or
@@ -399,6 +447,16 @@ impl Encoding {
         }
     }
 
+    /// Hands an admitted capture to the encoder only while some subscriber's
+    /// path still has room. Readiness can change after `decide` selected this
+    /// encoding and while the helper was waiting for damage; marking above
+    /// retains the changed rows so the next ready capture catches up.
+    fn take_if_ready(&self, capture: &Capture, reply: &PictureReply, pixels: &[u8]) {
+        if self.rate().is_some() {
+            self.take(capture, reply, pixels);
+        }
+    }
+
     /// Converts the screen into a free buffer and hands it to the encoder,
     /// when this encoding has not seen it yet; an unencoded picture it
     /// supersedes goes back to the free buffers.
@@ -410,7 +468,8 @@ impl Encoding {
         let Some(mut buffer) = mailbox.free.pop() else {
             return;
         };
-        // PictureChannel checked these global extents inside the framebuffer.
+        // Admission checked these global device extents inside the source.
+        // Cropping must never discard the right/bottom edge of an offset window.
         let window = (
             capture.visible.x as u32 + capture.visible.width,
             capture.visible.y as u32 + capture.visible.height,
@@ -455,6 +514,7 @@ impl Encoding {
         &self,
         holds: bool,
         refinement: &Refinement,
+        credit: &mut RefinementCredit,
         geometry: &dyn Fn() -> Instant,
     ) -> Option<Work> {
         let mut mailbox = lock(&self.mailbox);
@@ -471,7 +531,12 @@ impl Encoding {
             }
             let due = refinement
                 .due(geometry())
-                .filter(|_| holds && self.rate().is_some());
+                .filter(|_| holds && !mailbox.behind && self.rate().is_some())
+                .map(|at| {
+                    self.link_rate().map_or(at, |path| {
+                        at.max(credit.due(path.bits_per_second, Instant::now()))
+                    })
+                });
             mailbox = match due {
                 Some(at) => {
                     let now = Instant::now();
@@ -523,6 +588,8 @@ fn convert(
         whole = true;
     }
     if buffer.source != Some(source) {
+        // A new aperture may expose old gutter rows without pixel damage.
+        // Clear stale padding and reconvert the complete coherent slot.
         buffer.picture.clear_outside(0, 0);
         buffer.source = Some(source);
         whole = true;
@@ -545,7 +612,12 @@ fn convert(
             pixels,
             reply.stride as usize,
             (reply.width as usize, height),
-            window,
+            codec::EncoderRegion {
+                x: window.x as u32,
+                y: window.y as u32,
+                width: window.width,
+                height: window.height,
+            },
             (top, row),
         );
     }
@@ -580,12 +652,27 @@ fn capture_loop(inner: Weak<Inner>) {
                 visible: reply.window(),
                 surface,
                 input_seq: inner.source.media.applied_input_at(ts),
+                pointer: reply.pointer.map(|point| (point.x, point.y)),
             };
+            // Remember every encoding's damage before a snapshot wakes its
+            // caller; a blocked viewer must already owe this same picture.
             for encoding in &encodings {
                 encoding.mark(reply);
             }
+            lock(&inner.state).snapshots.captured(
+                reply,
+                pixels,
+                capture.surface.clone(),
+                inner.source.display.layout_epoch(),
+                super::snapshot::CaptureBounds {
+                    requested_us: requested,
+                    received_us: crate::native::stream::monotonic_us(),
+                    picture_us: ts,
+                },
+                capture.input_seq,
+            );
             for encoding in &plan.encodings {
-                encoding.take(&capture, reply, pixels);
+                encoding.take_if_ready(&capture, reply, pixels);
             }
             ts
         });
@@ -615,8 +702,28 @@ fn plan(inner: &Inner) -> Option<Plan> {
             return None;
         }
         let now = Instant::now();
+        let snapshot = state.snapshots.pending();
+        // Ready video receives the same picture at its ordinary cadence. With
+        // no scheduled capture, snapshot demand needs neither encoder nor a second reader.
         state = match decide(&state.encodings, now) {
-            Decision::Capture(plan) => return Some(plan),
+            Decision::Capture(mut plan) => {
+                if snapshot {
+                    plan.request.force = true;
+                    plan.request.wait_ms = 0;
+                }
+                return Some(plan);
+            }
+            Decision::Wait(None) if snapshot => {
+                return Some(Plan {
+                    request: PictureRequest {
+                        cursor: false,
+                        force: true,
+                        wait_ms: 0,
+                        cursor_identity: false,
+                    },
+                    encodings: Vec::new(),
+                })
+            }
             Decision::Wait(Some(at)) => {
                 inner
                     .wake
@@ -710,12 +817,17 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
     let mut encoder: Option<Box<dyn VideoEncoder>> = None;
     let mut held: Option<(Buffer, Capture)> = None;
     let mut refinement = Refinement::default();
+    let mut credit = RefinementCredit::default();
+    let mut sweep: Option<RefinementSweep> = None;
+    let mut native_key_bytes = 0usize;
     loop {
-        let Some(work) = encoding.next_work(held.is_some(), &refinement, &geometry) else {
+        let Some(work) = encoding.next_work(held.is_some(), &refinement, &mut credit, &geometry)
+        else {
             return;
         };
-        let (quality, asked) = match work {
+        let (mut quality, asked) = match work {
             Work::Picture(job, asked) => {
+                sweep = None;
                 if let Some((previous, _)) = held.replace((job.buffer, job.capture)) {
                     lock(&encoding.mailbox).free.push(previous);
                     if let Some(producer) = producer.upgrade() {
@@ -724,7 +836,10 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
                 }
                 (Quality::Motion, asked)
             }
-            Work::Key => (Quality::Motion, true),
+            Work::Key => {
+                sweep = None;
+                (Quality::Motion, true)
+            }
             Work::Refine => (Quality::Final, false),
         };
         let (buffer, capture) = held.as_ref().expect("work needs a held picture");
@@ -748,10 +863,68 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
             }
         }
         let encoder = encoder.as_mut().expect("an encoder is open");
+        let path = encoding.link_rate();
+        if let Err(error) = encoder.set_rate(path.map(|path| EncoderRate {
+            bits_per_second: path.bits_per_second,
+            pictures_per_second: encoding.rate().unwrap_or(10),
+        })) {
+            fail(&producer, &encoding, error);
+            return;
+        }
+        // Native key size is an observed entropy estimate, not a packet-size
+        // proof. Cheap whole refinements retain the existing fast path;
+        // constrained paths cover the same capture in finite aligned regions.
+        let region = if quality == Quality::Final {
+            if let Some(path) =
+                path.filter(|path| native_key_bytes > path.bits_per_second as usize / 320)
+            {
+                let plan = sweep.get_or_insert_with(|| {
+                    let pixels =
+                        u64::from(capture.visible.width) * u64::from(capture.visible.height);
+                    let affordable = pixels.saturating_mul(u64::from(path.bits_per_second) / 320)
+                        / native_key_bytes.max(1) as u64;
+                    let mut edge = 32u32;
+                    while edge < 1024 && u64::from(edge * 2).pow(2) <= affordable {
+                        edge *= 2;
+                    }
+                    RefinementSweep::new(
+                        // PictureChannel has validated this rectangle inside
+                        // its framebuffer. Keep its signed device origin in
+                        // the same space as the helper's fresh pointer.
+                        crate::native::video::EncoderRegion {
+                            x: capture.visible.x as u32,
+                            y: capture.visible.y as u32,
+                            width: capture.visible.width,
+                            height: capture.visible.height,
+                        },
+                        edge,
+                        capture.pointer,
+                    )
+                });
+                plan.next()
+            } else {
+                sweep = None;
+                None
+            }
+        } else {
+            None
+        };
+        let actual = match encoder.set_refinement_region(region) {
+            Ok(actual) => actual,
+            Err(error) => {
+                fail(&producer, &encoding, error);
+                return;
+            }
+        };
+        if let (Some(plan), Some(actual)) = (sweep.as_mut(), actual) {
+            if !plan.covered(actual) {
+                quality = Quality::Refine;
+            }
+        }
         let request = EncodeRequest {
             key: asked || fresh,
             quantizer: quality.quantizer(),
-            refine: quality == Quality::Final,
+            refine: matches!(quality, Quality::Refine | Quality::Final),
         };
         #[cfg(test)]
         let encoding_started = Instant::now();
@@ -762,6 +935,17 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
                 return;
             }
         };
+        if unit.key {
+            native_key_bytes = unit.data.len();
+        }
+        if quality == Quality::Motion && !unit.key {
+            let previous = encoding.motion_bytes.load(Ordering::Acquire);
+            encoding.motion_bytes.store(
+                ((u64::from(previous) * 3 + unit.data.len() as u64) / 4).min(u64::from(u32::MAX))
+                    as u32,
+                Ordering::Release,
+            );
+        }
         #[cfg(test)]
         measured::encoded(measured::Encoded {
             ts: capture.ts,
@@ -773,10 +957,12 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
         });
         match quality {
             Quality::Motion => refinement.moved(capture.read),
+            Quality::Refine => {}
             Quality::Final => refinement.refined(),
         }
-        encoding.publish(Arc::new(Unit {
+        let mut unit = Unit {
             data: unit.data,
+            wire_bytes: 0,
             key: unit.key,
             ts: capture.ts,
             coded: buffer.coded,
@@ -784,8 +970,25 @@ fn encode_loop(producer: Weak<Inner>, encoding: Arc<Encoding>) {
             surface: capture.surface.clone(),
             input_seq: capture.input_seq,
             quality,
-            codec_string: unit.key.then(|| encoder.codec_string()),
-        }));
+            codec_string: unit.codec_string,
+        };
+        let Some(wire_bytes) =
+            crate::native::stream::wire::video_budget_bytes(&unit, encoding.codec)
+        else {
+            fail(
+                &producer,
+                &encoding,
+                VideoError::Failed("encoded picture is outside the video wire contract".into()),
+            );
+            return;
+        };
+        unit.wire_bytes = wire_bytes;
+        if matches!(quality, Quality::Refine | Quality::Final) {
+            if let Some(path) = path {
+                credit.spent(path.bits_per_second, wire_bytes, Instant::now());
+            }
+        }
+        encoding.publish(Arc::new(unit));
     }
 }
 
@@ -825,6 +1028,9 @@ impl Subscription {
     /// wakes both a skipped capture and a deferred refinement.
     pub(crate) fn set_ready(&self, ready: bool) {
         if self.subscriber.set_ready(ready) && ready {
+            if self.subscriber.needs_key() {
+                self.encoding.request_key();
+            }
             self.encoding.nudge();
             self.producer.inner.nudge();
         }
@@ -833,6 +1039,12 @@ impl Subscription {
     /// The viewer's rate changed (0: its display's).
     pub(crate) fn set_rate(&self, requested: u32) {
         self.subscriber.set_rate(rate(requested));
+        self.producer.inner.nudge();
+    }
+
+    pub(crate) fn set_link_rate(&self, rate: LinkRate) {
+        self.subscriber.set_link_rate(rate);
+        self.encoding.nudge();
         self.producer.inner.nudge();
     }
 

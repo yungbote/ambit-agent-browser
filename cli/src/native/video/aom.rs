@@ -15,7 +15,10 @@ use std::sync::OnceLock;
 
 use super::convert::COLOUR;
 use super::library::Library;
-use super::{Chroma, EncodeRequest, EncodedUnit, Picture, VideoCodec, VideoEncoder, VideoError};
+use super::{
+    Chroma, EncodeRequest, EncodedUnit, EncoderRate, EncoderRegion, Picture, VideoCodec,
+    VideoEncoder, VideoError,
+};
 
 const SONAME: &CStr = c"libaom.so.3";
 /// `AOM_ENCODER_ABI_VERSION` of the headers the layouts below come from.
@@ -30,6 +33,7 @@ const FRAME_IS_KEY: u32 = 1;
 const EFLAG_FORCE_KF: c_long = 1;
 const RC_ONE_PASS: c_uint = 0;
 const Q: c_uint = 3;
+const CBR: c_uint = 1;
 const KF_DISABLED: c_uint = 0;
 const BITS_8: c_uint = 8;
 
@@ -50,8 +54,10 @@ const REFINE_SPEED: c_int = 8;
 /// Encoder controls (`aomcx.h` ids) this encoder sets.
 mod control {
     use std::ffi::c_int;
+    pub(super) const ACTIVE_MAP: c_int = 9;
     pub(super) const CPU_USED: c_int = 13;
     pub(super) const ROW_MT: c_int = 32;
+    pub(super) const MAX_INTER_BITRATE_PCT: c_int = 28;
     pub(super) const TILE_COLUMNS: c_int = 33;
     pub(super) const TILE_ROWS: c_int = 34;
     pub(super) const ENABLE_TPL_MODEL: c_int = 35;
@@ -61,7 +67,6 @@ mod control {
     pub(super) const TRANSFER_CHARACTERISTICS: c_int = 46;
     pub(super) const MATRIX_COEFFICIENTS: c_int = 47;
     pub(super) const COLOR_RANGE: c_int = 52;
-    pub(super) const TARGET_SEQ_LEVEL_IDX: c_int = 54;
     pub(super) const SUPERBLOCK_SIZE: c_int = 56;
     pub(super) const ENABLE_CDEF: c_int = 58;
     pub(super) const ENABLE_ORDER_HINT: c_int = 79;
@@ -71,6 +76,15 @@ mod control {
     pub(super) const MODE_COST_UPD_FREQ: c_int = 127;
     pub(super) const MV_COST_UPD_FREQ: c_int = 128;
     pub(super) const QUANTIZER_ONE_PASS: c_int = 159;
+    pub(super) const LOOPFILTER_CONTROL: c_int = 149;
+}
+
+/// aom_active_map_t: one flag per 16x16 coded block. Both pointer and backing storage remain owned.
+#[repr(C)]
+struct ActiveMap {
+    cells: *mut u8,
+    rows: c_uint,
+    columns: c_uint,
 }
 
 #[repr(C)]
@@ -217,8 +231,8 @@ type Destroy = unsafe extern "C" fn(*mut Context) -> c_int;
 type Describe = unsafe extern "C" fn(*const Context) -> *const c_char;
 type ImageWrap =
     unsafe extern "C" fn(*mut Image, c_uint, c_uint, c_uint, c_uint, *mut u8) -> *mut Image;
-#[cfg(test)]
 type ConfigSet = unsafe extern "C" fn(*mut Context, *const EncoderConfig) -> c_int;
+type PreviewFrame = unsafe extern "C" fn(*mut Context) -> *const Image;
 
 /// The functions this encoder calls, resolved once per process.
 struct Api {
@@ -233,8 +247,8 @@ struct Api {
     error: Describe,
     error_detail: Describe,
     image_wrap: ImageWrap,
-    #[cfg(test)]
     config_set: ConfigSet,
+    preview_frame: PreviewFrame,
 }
 
 impl Api {
@@ -253,8 +267,8 @@ impl Api {
                 error: library.function(c"aom_codec_error")?,
                 error_detail: library.function(c"aom_codec_error_detail")?,
                 image_wrap: library.function(c"aom_img_wrap")?,
-                #[cfg(test)]
                 config_set: library.function(c"aom_codec_enc_config_set")?,
+                preview_frame: library.function(c"aom_codec_get_preview_frame")?,
                 _library: library,
             })
         }
@@ -299,27 +313,114 @@ pub(super) fn available() -> bool {
     })
 }
 
-/// The AV1 level of a stream of `width` × `height` at up to 60 pictures per
-/// second: the smallest whose picture size, dimensions and display rate
-/// hold it (AV1 specification, annex A.3).
-fn level(width: u32, height: u32) -> u8 {
-    let samples = u64::from(width) * u64::from(height);
-    let rate = samples * 60;
-    // (seq_level_idx, max picture size, max width, max height, max display rate)
-    const LEVELS: [(u8, u64, u32, u32, u64); 6] = [
-        (8, 2_228_224, 4096, 2176, 70_778_880),
-        (9, 2_228_224, 4096, 2176, 141_557_760),
-        (12, 8_912_896, 8192, 4352, 267_386_880),
-        (13, 8_912_896, 8192, 4352, 534_773_760),
-        (14, 8_912_896, 8192, 4352, 1_069_547_520),
-        (16, 35_651_584, 16384, 8704, 1_069_547_520),
-    ];
-    LEVELS
-        .iter()
-        .find(|(_, size, max_width, max_height, display)| {
-            samples <= *size && width <= *max_width && height <= *max_height && rate <= *display
-        })
-        .map_or(16, |level| level.0)
+/// Read only the configuration fields needed by the codec parameter string
+/// from operating point zero of the key's sequence header. Bounds-checked
+/// reads keep a malformed library result a stream failure, never a panic.
+fn key_codec_string(unit: &[u8]) -> Option<String> {
+    struct Bits<'a> {
+        data: &'a [u8],
+        position: usize,
+    }
+    impl Bits<'_> {
+        fn read(&mut self, count: usize) -> Option<u32> {
+            if count > 32 || self.position.checked_add(count)? > self.data.len().checked_mul(8)? {
+                return None;
+            }
+            let mut value = 0;
+            for _ in 0..count {
+                value = (value << 1)
+                    | u32::from((self.data[self.position / 8] >> (7 - self.position % 8)) & 1);
+                self.position += 1;
+            }
+            Some(value)
+        }
+    }
+    let mut at = 0usize;
+    while let Some(&header) = unit.get(at) {
+        at += 1;
+        if header & 0x81 != 0 {
+            return None;
+        }
+        if header & 4 != 0 {
+            unit.get(at)?;
+            at += 1;
+        }
+        let size = if header & 2 != 0 {
+            let mut value = 0usize;
+            let mut ended = false;
+            for shift in (0..56).step_by(7) {
+                let byte = *unit.get(at)?;
+                at += 1;
+                value = value.checked_add(usize::from(byte & 127).checked_shl(shift)?)?;
+                if byte & 128 == 0 {
+                    ended = true;
+                    break;
+                }
+            }
+            if !ended {
+                return None;
+            }
+            value
+        } else {
+            unit.len().checked_sub(at)?
+        };
+        let end = at.checked_add(size)?;
+        let payload = unit.get(at..end)?;
+        at = end;
+        if (header >> 3) & 15 != 1 {
+            continue;
+        }
+        let mut bits = Bits {
+            data: payload,
+            position: 0,
+        };
+        let profile = bits.read(3)?;
+        if profile > 2 {
+            return None;
+        }
+        let still = bits.read(1)? != 0;
+        let reduced = bits.read(1)? != 0;
+        let (level, tier) = if reduced {
+            if !still {
+                return None;
+            }
+            (bits.read(5)?, 0)
+        } else {
+            if bits.read(1)? != 0 {
+                bits.read(32)?;
+                bits.read(32)?;
+                if bits.read(1)? != 0 {
+                    let mut zeros = 0usize;
+                    while bits.read(1)? == 0 {
+                        zeros += 1;
+                        if zeros == 32 {
+                            break;
+                        }
+                    }
+                    if zeros < 32 {
+                        bits.read(zeros)?;
+                    }
+                }
+                if bits.read(1)? != 0 {
+                    bits.read(5)?;
+                    bits.read(32)?;
+                    bits.read(5)?;
+                    bits.read(5)?;
+                }
+            }
+            bits.read(1)?; // initial_display_delay_present_flag
+            bits.read(5)?; // operating_points_cnt_minus_1
+            bits.read(12)?; // operating_point_idc[0]
+            let level = bits.read(5)?;
+            let tier = if level > 7 { bits.read(1)? } else { 0 };
+            (level, tier)
+        };
+        return Some(format!(
+            "av01.{profile}.{level:02}{}.08",
+            if tier == 0 { 'M' } else { 'H' }
+        ));
+    }
+    None
 }
 
 /// libaom's configuration of one stream: its real-time defaults, then every
@@ -353,7 +454,7 @@ fn configuration(
     config.input_bit_depth = BITS_8;
     config.timebase = Rational {
         numerator: 1,
-        denominator: 1_000_000,
+        denominator: 60,
     };
     config.error_resilient = 0;
     config.pass = RC_ONE_PASS;
@@ -381,7 +482,12 @@ pub(crate) struct AomEncoder {
     codec: VideoCodec,
     width: u32,
     height: u32,
-    level: u8,
+    config: Box<EncoderConfig>,
+    rate: Option<EncoderRate>,
+    region: Option<EncoderRegion>,
+    active_cells: Vec<u8>,
+    active_map: Box<ActiveMap>,
+    refinement_data: Vec<u8>,
     /// The quantizer and speed the encoder holds; set only when a request
     /// differs.
     quantizer: Option<u8>,
@@ -437,6 +543,14 @@ impl AomEncoder {
         if status != CODEC_OK {
             return Err(VideoError::Unavailable(api.describe(&context)));
         }
+        let rows = height.div_ceil(16);
+        let columns = width.div_ceil(16);
+        let active_cells = vec![1; (rows * columns) as usize];
+        let active_map = Box::new(ActiveMap {
+            cells: std::ptr::null_mut(),
+            rows,
+            columns,
+        });
         let mut encoder = Self {
             api,
             context,
@@ -444,7 +558,12 @@ impl AomEncoder {
             codec,
             width,
             height,
-            level: level(width, height),
+            config,
+            rate: None,
+            region: None,
+            active_cells,
+            active_map,
+            refinement_data: Vec::new(),
             quantizer: None,
             speed: MOTION_SPEED,
             pictures: 0,
@@ -479,7 +598,6 @@ impl AomEncoder {
             ),
             (control::MATRIX_COEFFICIENTS, c_int::from(COLOUR.matrix)),
             (control::COLOR_RANGE, c_int::from(COLOUR.full_range)),
-            (control::TARGET_SEQ_LEVEL_IDX, c_int::from(encoder.level)),
         ] {
             encoder
                 .control(id, value)
@@ -508,7 +626,160 @@ impl AomEncoder {
             return Err(self.api.describe(&self.context));
         }
         self.quantizer = None;
+        self.config = config;
         self.control(control::TILE_COLUMNS, tile_columns)
+    }
+
+    fn rate_configuration(&mut self, refine: bool, key: bool) -> Result<(), VideoError> {
+        // Initial/reference-reset pictures retain the native fixed-quality
+        // policy. CBR governs dependent motion, never a fictional key bound.
+        let end_usage = if self.rate.is_some() && !key { CBR } else { Q };
+        let bitrate = self.rate.map_or(self.config.target_bitrate, |rate| {
+            rate.bits_per_second.div_ceil(1000)
+        });
+        let picture_rate = self.rate.map_or(60, |rate| rate.pictures_per_second) as c_int;
+        let minimum = if end_usage == CBR {
+            if refine {
+                8
+            } else {
+                20
+            }
+        } else {
+            0
+        };
+        let maximum = if end_usage == CBR {
+            if refine {
+                8
+            } else {
+                48
+            }
+        } else {
+            63
+        };
+        if self.config.end_usage == end_usage
+            && self.config.target_bitrate == bitrate
+            && self.config.min_quantizer == minimum
+            && self.config.max_quantizer == maximum
+            && self.config.timebase.denominator == picture_rate
+        {
+            return Ok(());
+        }
+        self.config.end_usage = end_usage;
+        self.config.target_bitrate = bitrate;
+        self.config.min_quantizer = minimum;
+        self.config.max_quantizer = maximum;
+        self.config.timebase = Rational {
+            numerator: 1,
+            denominator: picture_rate,
+        };
+        self.config.buffer_size = 300;
+        self.config.buffer_initial_size = 150;
+        self.config.buffer_optimal_size = 150;
+        // SAFETY: initialized context and the same owned configuration used at open.
+        if unsafe { (self.api.config_set)(&mut *self.context, &*self.config) } != CODEC_OK {
+            return Err(VideoError::Failed(self.api.describe(&self.context)));
+        }
+        self.quantizer = None;
+        Ok(())
+    }
+
+    /// Refinement reuses reconstructed pixels outside its region; source pixels there would invite a different prediction.
+    fn prepare_refinement(
+        &mut self,
+        picture: &Picture<'_>,
+        region: EncoderRegion,
+    ) -> Result<(), VideoError> {
+        // SAFETY: initialized encoder; preview remains owned by it until the next codec call and is copied here.
+        let preview = unsafe { (self.api.preview_frame)(&mut *self.context).as_ref() }
+            .ok_or_else(|| VideoError::Failed("no reconstructed picture for refinement".into()))?;
+        let format = match self.codec.chroma() {
+            Chroma::Full => IMG_FMT_I444,
+            Chroma::Subsampled => IMG_FMT_I420,
+        };
+        if preview.format != format
+            || preview.display_width != self.width
+            || preview.display_height != self.height
+        {
+            return Err(VideoError::Failed(
+                "reconstructed refinement geometry differs from its stream".into(),
+            ));
+        }
+        let chroma = self.codec.chroma();
+        self.refinement_data.resize(
+            chroma.picture_bytes(self.width as usize, self.height as usize),
+            0,
+        );
+        let source = picture
+            .planes()
+            .ok_or_else(|| VideoError::Failed("invalid refinement source".into()))?;
+        let mut offset = 0usize;
+        for (index, (capture, capture_stride)) in source.iter().enumerate() {
+            let scale = if index > 0 && chroma == Chroma::Subsampled {
+                2
+            } else {
+                1
+            };
+            let width = self.width as usize / scale;
+            let height = self.height as usize / scale;
+            let stride = preview.strides[index];
+            if preview.planes[index].is_null() || stride < width as c_int {
+                return Err(VideoError::Failed(
+                    "invalid reconstructed refinement plane".into(),
+                ));
+            }
+            let target = &mut self.refinement_data[offset..offset + width * height];
+            for row in 0..height {
+                // SAFETY: validated coded plane dimensions/stride; the preview owns every referenced row for this call.
+                let pixels = unsafe {
+                    std::slice::from_raw_parts(
+                        preview.planes[index].add(row * stride as usize),
+                        width,
+                    )
+                };
+                target[row * width..(row + 1) * width].copy_from_slice(pixels);
+            }
+            let left = region.x as usize / scale;
+            let right = (region.x + region.width).div_ceil(scale as u32) as usize;
+            let top = region.y as usize / scale;
+            let bottom = (region.y + region.height).div_ceil(scale as u32) as usize;
+            for row in top..bottom {
+                target[row * width + left..row * width + right].copy_from_slice(
+                    &capture[row * capture_stride + left..row * capture_stride + right],
+                );
+            }
+            offset += width * height;
+        }
+        Ok(())
+    }
+
+    /// Active blocks are applied after rate/configuration changes. Filtering a regional update would also alter inactive references.
+    fn configure_region(&mut self, region: Option<EncoderRegion>) -> Result<(), VideoError> {
+        if let Some(region) = region {
+            self.active_cells.fill(0);
+            for row in region.y / 16..(region.y + region.height).div_ceil(16) {
+                for column in region.x / 16..(region.x + region.width).div_ceil(16) {
+                    self.active_cells[(row * self.active_map.columns + column) as usize] = 1;
+                }
+            }
+            self.active_map.cells = self.active_cells.as_mut_ptr();
+        } else if self.active_map.cells.is_null() {
+            return Ok(());
+        } else {
+            self.active_map.cells = std::ptr::null_mut();
+        }
+        // SAFETY: pinned aom_active_map_t layout; descriptor and fixed-size cells outlive the encoder call.
+        if unsafe {
+            (self.api.control)(
+                &mut *self.context,
+                control::ACTIVE_MAP,
+                &mut *self.active_map,
+            )
+        } != CODEC_OK
+        {
+            return Err(VideoError::Failed(self.api.describe(&self.context)));
+        }
+        self.control(control::LOOPFILTER_CONTROL, i32::from(region.is_none()))
+            .map_err(VideoError::Failed)
     }
 
     fn control(&mut self, id: c_int, value: c_int) -> Result<(), String> {
@@ -534,12 +805,63 @@ impl VideoEncoder for AomEncoder {
         (self.width, self.height)
     }
 
-    fn codec_string(&self) -> String {
-        let profile = match self.codec.chroma() {
-            Chroma::Subsampled => 0,
-            Chroma::Full => 1,
-        };
-        format!("av01.{profile}.{:02}M.08", self.level)
+    fn set_rate(&mut self, rate: Option<EncoderRate>) -> Result<(), VideoError> {
+        if rate.is_some_and(|rate| {
+            rate.bits_per_second < 1000
+                || rate.pictures_per_second == 0
+                || rate.pictures_per_second > 60
+        }) {
+            return Err(VideoError::Failed("invalid video rate budget".into()));
+        }
+        if self.rate == rate {
+            return Ok(());
+        }
+        self.rate = rate;
+        self.rate_configuration(false, false)?;
+        self.control(
+            control::MAX_INTER_BITRATE_PCT,
+            if rate.is_some() { 115 } else { 0 },
+        )
+        .map_err(VideoError::Failed)
+    }
+
+    fn set_refinement_region(
+        &mut self,
+        region: Option<EncoderRegion>,
+    ) -> Result<Option<EncoderRegion>, VideoError> {
+        if let Some(region) = region {
+            if region.width == 0
+                || region.height == 0
+                || region
+                    .x
+                    .checked_add(region.width)
+                    .is_none_or(|end| end > self.width)
+                || region
+                    .y
+                    .checked_add(region.height)
+                    .is_none_or(|end| end > self.height)
+            {
+                return Err(VideoError::Failed(
+                    "refinement region is outside the coded picture".into(),
+                ));
+            }
+        }
+        // This realtime preset codes mixed active-map cells in32px blocks.
+        // Return its actual update scope instead of pretending16px map cells
+        // are independent coding units. Source pixels outside it stay exact.
+        self.region = region.map(|region| {
+            let x = region.x / 32 * 32;
+            let y = region.y / 32 * 32;
+            let right = (region.x + region.width).div_ceil(32) * 32;
+            let bottom = (region.y + region.height).div_ceil(32) * 32;
+            EncoderRegion {
+                x,
+                y,
+                width: right.min(self.width) - x,
+                height: bottom.min(self.height) - y,
+            }
+        });
+        Ok(self.region)
     }
 
     fn encode(
@@ -570,7 +892,18 @@ impl VideoEncoder for AomEncoder {
                 request.quantizer
             )));
         }
-        if self.quantizer != Some(request.quantizer) {
+        if !request.refine || request.key {
+            self.region = None;
+        }
+        let region = self.region;
+        let regional = region.is_some();
+        if let Some(region) = region {
+            self.prepare_refinement(picture, region)?;
+        }
+        self.rate_configuration(request.refine, request.key)?;
+        if (self.rate.is_none() || request.refine || request.key)
+            && self.quantizer != Some(request.quantizer)
+        {
             self.control(control::QUANTIZER_ONE_PASS, c_int::from(request.quantizer))
                 .map_err(VideoError::Failed)?;
             self.quantizer = Some(request.quantizer);
@@ -585,9 +918,27 @@ impl VideoEncoder for AomEncoder {
                 .map_err(VideoError::Failed)?;
             self.speed = speed;
         }
+        self.configure_region(region)?;
         let format = match self.codec.chroma() {
             Chroma::Subsampled => IMG_FMT_I420,
             Chroma::Full => IMG_FMT_I444,
+        };
+        let refined;
+        let (picture, planes) = if regional {
+            refined = Picture {
+                chroma: self.codec.chroma(),
+                width: self.width,
+                height: self.height,
+                data: &self.refinement_data,
+            };
+            (
+                &refined,
+                refined
+                    .planes()
+                    .expect("the copied refinement has exact coded planes"),
+            )
+        } else {
+            (picture, planes)
         };
         // SAFETY: the image struct outlasts the call; the data pointer is
         // only read by libaom, and the planes are set exactly below.
@@ -614,10 +965,28 @@ impl VideoEncoder for AomEncoder {
         self.image.range = c_uint::from(COLOUR.full_range);
         let flags = if request.key { EFLAG_FORCE_KF } else { 0 };
         let pts = self.pictures;
+        // The codec clock is frame ticks at its configured rate. Sandbox
+        // capture timestamps remain in the unit envelope, never this clock.
+        let duration = 1u64;
         self.pictures += 1;
+        #[cfg(test)]
+        if std::env::var_os("AMBIT_CODEC_FRAME_TRACE").is_some() {
+            eprintln!(
+                "CODEC_FRAME {}",
+                serde_json::json!({"picture":pts,"key":request.key,"refine":request.refine,"rate":self.rate.map(|rate|rate.bits_per_second),"timebase":[self.config.timebase.numerator,self.config.timebase.denominator],"mode":self.config.end_usage,"region":self.region.map(|region|[region.x,region.y,region.width,region.height])})
+            );
+        }
         // SAFETY: an initialized context and an image whose planes borrow
         // `picture` for this call; libaom copies the source before returning.
-        let status = unsafe { (self.api.encode)(&mut *self.context, &*self.image, pts, 1, flags) };
+        let status = unsafe {
+            (self.api.encode)(
+                &mut *self.context,
+                &*self.image,
+                pts,
+                duration as c_ulong,
+                flags,
+            )
+        };
         if status != CODEC_OK {
             return Err(VideoError::Failed(self.api.describe(&self.context)));
         }
@@ -638,11 +1007,30 @@ impl VideoEncoder for AomEncoder {
                     "libaom returned other than one picture for one picture".into(),
                 ));
             }
+            if packet.size
+                > self
+                    .codec
+                    .coded_capacity(self.width, self.height)
+                    .expect("validated native dimensions")
+            {
+                return Err(VideoError::Failed(
+                    "libaom exceeded its dimensional output storage".into(),
+                ));
+            }
             // SAFETY: libaom owns `size` bytes at `data` until the next call.
             let data = unsafe { std::slice::from_raw_parts(packet.data, packet.size) }.to_vec();
+            let key = packet.flags & FRAME_IS_KEY != 0;
+            let codec_string = if key {
+                Some(key_codec_string(&data).ok_or_else(|| {
+                    VideoError::Failed("libaom key lacks a valid AV1 sequence header".into())
+                })?)
+            } else {
+                None
+            };
             unit = Some(EncodedUnit {
                 data,
-                key: packet.flags & FRAME_IS_KEY != 0,
+                key,
+                codec_string,
             });
         }
         let unit = unit.ok_or_else(|| {

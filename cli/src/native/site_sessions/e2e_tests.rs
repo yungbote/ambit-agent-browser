@@ -289,9 +289,13 @@ async fn e2e_site_state_roundtrips_native_cookie_storage_and_revocation() {
         true
     );
     assert_eq!(evaluate(&first, "new Promise(resolve=>{const r=indexedDB.open('fixture-db');r.onsuccess=()=>{const d=r.result;const q=d.transaction('records').objectStore('records').get('entry');q.onsuccess=()=>{const v=q.result;resolve(v.text==='nosecret-idb-canary'&&v.date.getTime()===1000&&v.binary[2]===3&&v.map.get('answer')===42);d.close();};};})").await, true);
-    let captured = storage::capture(&first.client, "http://127.0.0.1", &[origin.clone()])
-        .await
-        .unwrap();
+    let captured = storage::capture(
+        &first.client,
+        "http://127.0.0.1",
+        std::slice::from_ref(&origin),
+    )
+    .await
+    .unwrap();
     assert_eq!(captured.cookies.len(), 1);
     assert_eq!(captured.origins[0].indexed_db[0].version, 3);
     if let Ok(directory) = std::env::var("AMBIT_SITE_CUSTODY_EVIDENCE") {
@@ -324,9 +328,13 @@ async fn e2e_site_state_roundtrips_native_cookie_storage_and_revocation() {
     );
     second.client.send_command("Network.setCookie",Some(json!({"name":"rotated-fixture","value":"nosecret-rotated-cookie","domain":"127.0.0.1","path":"/","httpOnly":true})),Some(second.active_session_id().unwrap())).await.unwrap();
     storage::clear(&second.client, &captured).await.unwrap();
-    let revoked = storage::capture(&second.client, "http://127.0.0.1", &[origin.clone()])
-        .await
-        .unwrap();
+    let revoked = storage::capture(
+        &second.client,
+        "http://127.0.0.1",
+        std::slice::from_ref(&origin),
+    )
+    .await
+    .unwrap();
     assert!(revoked.cookies.is_empty());
     assert!(revoked.origins[0].local_storage.is_empty());
     assert!(revoked.origins[0].indexed_db.is_empty());
@@ -585,7 +593,7 @@ async fn e2e_lazy_site_attach_applies_before_the_first_real_document_request() {
         snapshot["states"][0]["cookies"].as_array().unwrap().len(),
         1
     );
-    assert_eq!(evaluate(&browser,r#"new Promise((resolve,reject)=>{const opening=indexedDB.open('large-cache',1);opening.onupgradeneeded=()=>opening.result.createObjectStore('cache');opening.onsuccess=()=>{const database=opening.result;const writing=database.transaction('cache','readwrite');writing.objectStore('cache').put(new Blob([new Uint8Array(16*1024*1024)]),'large');writing.oncomplete=()=>{database.close();resolve(true)};writing.onerror=()=>reject(writing.error)};opening.onerror=()=>reject(opening.error)})"#).await,true);
+    assert_eq!(evaluate(browser,r#"new Promise((resolve,reject)=>{const opening=indexedDB.open('large-cache',1);opening.onupgradeneeded=()=>opening.result.createObjectStore('cache');opening.onsuccess=()=>{const database=opening.result;const writing=database.transaction('cache','readwrite');writing.objectStore('cache').put(new Blob([new Uint8Array(16*1024*1024)]),'large');writing.oncomplete=()=>{database.close();resolve(true)};writing.onerror=()=>reject(writing.error)};opening.onerror=()=>reject(opening.error)})"#).await,true);
     let deadline = chrono::Utc::now() + chrono::Duration::milliseconds(200);
     let expires_at = deadline.to_rfc3339_opts(chrono::SecondsFormat::Millis, true);
     custody.request(foreign,Request::read("site_sessions.offer",json!({"sites":[{"site":"http://127.0.0.1","mode":"act","useId":"22222222-2222-4222-8222-222222222222","expiresAt":expires_at}]})).unwrap()).await.unwrap();

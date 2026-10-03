@@ -1218,7 +1218,10 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":false,"error":"secr
         .await
         .unwrap_err();
 
-        assert!(err.contains("success=false"));
+        assert!(
+            err.contains("success=false"),
+            "unexpected plugin error: {err}"
+        );
         assert!(!err.contains("secret-token-value"));
     }
 
@@ -1339,7 +1342,7 @@ printf '%s' '{"protocol":"agent-browser.plugin.v1","success":true,"data":{}}'
         .await
         .unwrap_err();
 
-        assert!(err.contains("timed out"));
+        assert!(err.contains("timed out"), "unexpected plugin error: {err}");
         tokio::time::sleep(std::time::Duration::from_millis(2_500)).await;
         assert!(!marker_path.exists());
     }
