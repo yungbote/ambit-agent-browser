@@ -8018,6 +8018,160 @@ async fn start_stream_navigation_server() -> (String, tokio::task::JoinHandle<()
     (format!("http://127.0.0.1:{port}"), handle)
 }
 
+/// Navigation keeps the real owned window's input owner, while observation
+/// follows its main frame through redirect, fragment, history and reload.
+async fn native_navigation_capture(state: &DaemonState, name: &str) {
+    let Some(directory) = std::env::var_os("AMBIT_NATIVE_NAV_EVIDENCE") else {
+        return;
+    };
+    let display = state.window_display().expect("owned browser display");
+    let captured = display
+        .capture(super::display::CaptureRequest {
+            force: true,
+            patches: false,
+            cursor: true,
+            budget_bytes: 4 * 1024 * 1024,
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+    let (capture, _) = captured.frame.expect("forced whole-window capture");
+    std::fs::create_dir_all(&directory).unwrap();
+    let path = std::path::PathBuf::from(directory).join(format!("{name}.{}", capture.encoding));
+    std::fs::write(path, STANDARD.decode(capture.data.unwrap()).unwrap()).unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore]
+async fn e2e_native_browser_navigation_uses_chrome_ui_and_keeps_page_guards() {
+    let env = EnvGuard::new(&["AGENT_BROWSER_WINDOW_STREAM", "DISPLAY"]);
+    env.set("AGENT_BROWSER_WINDOW_STREAM", "1");
+    env.set("DISPLAY", "");
+    let (base, server) = start_stream_navigation_server().await;
+    let mut state = DaemonState::new();
+    assert_success(
+        &control_test_command(&json!({"action":"navigate","url":base}), &mut state).await,
+    );
+    let client = state.browser.as_ref().unwrap().client.clone();
+    let mut events = client.subscribe();
+    let destination = format!("{base}/redirect/next");
+    let opened =
+        control_test_command(&json!({"action":"navigate","url":destination}), &mut state).await;
+    assert_success(&opened);
+    assert_eq!(opened["data"]["url"], format!("{base}/landed/next"));
+    native_navigation_capture(&state, "01-redirect").await;
+    let mut typing = 0;
+    while let Ok(event) = events.try_recv() {
+        if event.method == super::activity::EVENT
+            && event.params["source"] == "agent"
+            && event.params["kind"] == "typing"
+        {
+            typing += 1;
+        }
+    }
+    assert!(
+        typing > 0,
+        "the address bar received real acknowledged native typing"
+    );
+    let fragment = format!("{base}/landed/next#section");
+    let opened =
+        control_test_command(&json!({"action":"navigate","url":fragment}), &mut state).await;
+    assert_success(&opened);
+    assert_eq!(opened["data"]["url"], fragment);
+    for (action, expected) in [
+        ("back", format!("{base}/landed/next")),
+        ("forward", fragment.clone()),
+        ("reload", fragment),
+    ] {
+        let response = control_test_command(&json!({"action":action}), &mut state).await;
+        assert_success(&response);
+        assert_eq!(response["data"]["url"], expected, "{action}: {response}");
+        native_navigation_capture(&state, action).await;
+    }
+    let secret =
+        "data:text/html,<title>Private field</title><input id=field type=password autofocus>";
+    assert_success(
+        &control_test_command(&json!({"action":"navigate","url":secret}), &mut state).await,
+    );
+    // Fixture focus only; no secret value is supplied or read.
+    assert_success(
+        &control_test_command(
+            &json!({"action":"evaluate","script":"field.focus();true"}),
+            &mut state,
+        )
+        .await,
+    );
+    assert_error_code(
+        &control_test_command(&json!({"action":"press","key":"x"}), &mut state).await,
+        "browser_effect_refused",
+    );
+    native_navigation_capture(&state, "05-secret-page").await;
+    let opened = control_test_command(&json!({"action":"navigate","url":base}), &mut state).await;
+    assert_success(&opened);
+    assert_eq!(opened["data"]["url"], format!("{base}/"));
+    // A busy renderer can delay the commit, but cannot delay browser UI
+    // input. Signal from the actual document request before the busy loop.
+    let mut busy = client.subscribe();
+    assert_success(&control_test_command(&json!({"action":"evaluate","script":"setTimeout(()=>{fetch('/busy-start');const until=Date.now()+3000;while(Date.now()<until){}},0);true"}), &mut state).await);
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let event = busy.recv().await.unwrap();
+            if event.method == "Network.requestWillBeSent"
+                && event.params["request"]["url"] == format!("{base}/busy-start")
+            {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the renderer is now busy");
+    let mut acknowledged = client.subscribe();
+    let next = json!({"action":"navigate","url":format!("{base}/after-busy")});
+    let started = std::time::Instant::now();
+    let first_native_input = async {
+        tokio::time::timeout(std::time::Duration::from_millis(500), async {
+            loop {
+                let event = acknowledged.recv().await.unwrap();
+                if event.method == super::activity::EVENT && event.params["kind"] == "typing" {
+                    return started.elapsed();
+                }
+            }
+        })
+        .await
+        .expect("Chrome UI input does not wait for the busy page")
+    };
+    let (opened, first_input) =
+        tokio::join!(control_test_command(&next, &mut state), first_native_input);
+    assert_success(&opened);
+    assert_eq!(opened["data"]["url"], format!("{base}/after-busy"));
+    native_navigation_capture(&state, "06-after-busy").await;
+    println!(
+        "NATIVE_NAVIGATION {}",
+        json!({"addressBarTypingAcknowledgements":typing,"busyPageFirstTypingMs":first_input.as_millis()})
+    );
+    let unused = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let unused_port = unused.local_addr().unwrap().port();
+    drop(unused);
+    let failed = control_test_command(
+        &json!({"action":"navigate","url":format!("http://127.0.0.1:{unused_port}/unavailable")}),
+        &mut state,
+    )
+    .await;
+    assert_eq!(
+        failed["success"], false,
+        "a browser error page is not a successful open: {failed}"
+    );
+    assert!(
+        failed["error"]
+            .as_str()
+            .unwrap()
+            .contains("ERR_CONNECTION_REFUSED"),
+        "{failed}"
+    );
+    assert_success(&control_test_command(&json!({"action":"close"}), &mut state).await);
+    server.abort();
+}
+
 async fn next_stream_url(
     ws: &mut tokio_tungstenite::WebSocketStream<
         tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
