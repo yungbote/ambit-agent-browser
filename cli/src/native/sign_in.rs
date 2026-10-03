@@ -1,10 +1,16 @@
 //! Sign-in mode: while a person signs in to a site, the owned window runs the
 //! same Chrome (executable, flags, profile, private display and sandbox)
 //! without its automation channel, so it truthfully reports
-//! `navigator.webdriver === false`. Its only DevTools switch is a private
-//! loopback port its process owner uses to quit it (`ChromeProcess::quit`);
-//! Chrome reports automation to pages only for port 0. Handing back relaunches
-//! it with automation. Nothing is masked in either direction.
+//! `navigator.webdriver === false`. Its only DevTools switch is a loopback
+//! port its process owner uses only to quit it (`ChromeProcess::quit`);
+//! Chrome reports automation to pages for port 0 and for a pipe, not for a
+//! numbered port. Handing back relaunches it with automation. Nothing is
+//! masked in either direction.
+//!
+//! The port is private by convention, not by isolation: any process in the
+//! same network namespace can attach to it while a person signs in and read
+//! what they type. Only a browser host that runs apart from untrusted code
+//! confines a sign-in.
 //!
 //! Both transitions quit Chrome as an application quit, so tabs, cookies
 //! (session cookies included) and the profile survive both relaunches.
@@ -28,7 +34,7 @@ use tokio::time::Instant;
 use super::{adopt_launched_browser, close_current_browser, session_log, DaemonState};
 use crate::native::browser::BrowserManager;
 use crate::native::browser_control::{ControlError, ControlRequest, SignInAdmission};
-use crate::native::cdp::chrome::{self, ChromeProcess, LaunchOptions};
+use crate::native::cdp::chrome::{self, ChromeProcess, LaunchOptions, Stop};
 use crate::native::display::{DisplayClient, DEVICE_SCALE_FACTOR};
 use crate::native::stream::ClosedReason;
 
@@ -71,9 +77,9 @@ impl SignInBrowser {
 
     /// Quit the browser so Chrome keeps what the person signed in to, session
     /// cookies included; its profile and display stay retained by whoever
-    /// relaunches into them. Answers whether it quit within `STOP` rather
-    /// than being killed, which can lose a recent sign-in.
-    pub(crate) async fn quit(self) -> bool {
+    /// relaunches into them. Answers whether it quit within `STOP` or was
+    /// stopped by force, which can lose a recent sign-in.
+    pub(crate) async fn quit(self) -> Stop {
         self.chrome.quit(Instant::now() + STOP).await
     }
 }
@@ -205,7 +211,8 @@ pub(super) fn enter<'a>(
         let retired = state.browser.take();
         state.publish_browser_status().await;
         if let Some(mut browser) = retired {
-            let _ = browser.close_within(STOP).await;
+            let stop = browser.close_within(STOP).await;
+            state.stopped(stop);
         }
         super::forget_browser_session(state);
         let ready_by = started + SIGN_IN_READY;
@@ -241,7 +248,8 @@ pub(super) fn enter<'a>(
                 &format!("sign-in could not start: {}", error.message),
             );
             if let Some(sign_in) = state.sign_in.take() {
-                sign_in.quit().await;
+                let stop = sign_in.quit().await;
+                state.stopped(stop);
             }
             let restored = relaunch_automation(
                 state,
@@ -282,12 +290,8 @@ pub(super) fn hand_back(state: &mut DaemonState) -> BoxFuture<'_, ()> {
             state.publish_browser_status().await;
             let window = sign_in.display().map(|display| window_size(&display));
             let automation = sign_in.chrome.relaunch_options();
-            if !sign_in.quit().await {
-                session_log(
-                    &state.session_id,
-                    "the sign-in browser did not quit in time and was stopped; a recent sign-in may not be kept",
-                );
-            }
+            let stop = sign_in.quit().await;
+            state.stopped(stop);
             match (automation, window) {
                 (Ok(options), Some(window)) => {
                     let options = LaunchOptions {
@@ -600,12 +604,13 @@ mod tests {
     }
 
     /// A sign-in browser that has not quit by the deadline is killed, so the
-    /// hand-back stays inside the relay's deadline, and the session log says
-    /// a recent sign-in may be lost rather than that it was kept.
+    /// hand-back stays inside the relay's deadline. What follows does not
+    /// claim a clean transfer: every viewer's status record says the stop
+    /// was forced, and the session log says a recent sign-in may be lost.
     #[tokio::test]
     async fn a_sign_in_browser_that_does_not_quit_is_killed_at_the_deadline() {
         let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR"]);
-        let (mut state, _viewer, directory) = viewed(&guard, "hand-back-hung").await;
+        let (mut state, mut viewer, directory) = viewed(&guard, "hand-back-hung").await;
         let hung = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
@@ -629,6 +634,28 @@ mod tests {
         );
         assert!(state.sign_in.is_none());
         assert!(log(&directory, "hand-back-hung").contains("a recent sign-in may not be kept"));
+        let mut after = status(&mut viewer).await;
+        while after["browser"] == "restarting" {
+            after = status(&mut viewer).await;
+        }
+        assert_eq!(after["forcedStop"], true, "{after}");
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    /// Only the last stop counts: a browser that quits on its own after a
+    /// forced stop clears it, and no record of a whole stop mentions it.
+    #[tokio::test]
+    async fn a_whole_stop_after_a_forced_one_clears_it() {
+        let guard = EnvGuard::new(&["AGENT_BROWSER_SOCKET_DIR"]);
+        let (mut state, mut viewer, directory) = viewed(&guard, "stop-cleared").await;
+        state.stopped(Stop::Forced);
+        state.publish_browser_status().await;
+        assert_eq!(status(&mut viewer).await["forcedStop"], true);
+        state.sign_in = Some(ended_sign_in());
+        let _ = close_current_browser(&mut state, ClosedReason::Closed).await;
+        let closed = status(&mut viewer).await;
+        assert_eq!(closed["browser"], "closed", "{closed}");
+        assert!(closed.get("forcedStop").is_none(), "{closed}");
         let _ = std::fs::remove_dir_all(directory);
     }
 

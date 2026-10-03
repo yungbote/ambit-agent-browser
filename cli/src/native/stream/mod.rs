@@ -467,13 +467,18 @@ pub(crate) struct BrowserNote {
     pub restarting: bool,
     pub closed: ClosedReason,
     pub restartable: bool,
+    /// The view's browser last stopped by force: what it wrote just before,
+    /// such as a person's sign-in, may be lost.
+    pub forced_stop: bool,
 }
 
 /// The status record, the one form every producer sends. `connected` says
 /// whether a browser is the view's source (a retired window stays it while a
 /// sign-in or hand-back starts the successor); `browser` says which state it
 /// is in and, while none runs, why and whether it can be started again, so
-/// `connected` is false exactly when `browser` is `closed`.
+/// `connected` is false exactly when `browser` is `closed`. `forcedStop`,
+/// present only when true, says the view's browser last stopped by force,
+/// so a recent sign-in may be lost.
 pub(super) fn status_record(
     connected: bool,
     note: BrowserNote,
@@ -500,6 +505,9 @@ pub(super) fn status_record(
     if !connected {
         record["reason"] = json!(note.closed.token());
         record["restartable"] = json!(note.restartable);
+    }
+    if note.forced_stop {
+        record["forcedStop"] = json!(true);
     }
     record
 }
@@ -1386,6 +1394,7 @@ mod tests {
             restarting,
             closed,
             restartable,
+            forced_stop: false,
         };
         let record =
             |connected, note| status_record(connected, note, false, (1280, 720), "chrome", false);
@@ -1411,8 +1420,17 @@ mod tests {
                     assert_eq!(closed["browser"], "closed");
                     assert_eq!(closed["reason"], token);
                     assert_eq!(closed["restartable"], restartable);
+                    assert!(closed.get("forcedStop").is_none(), "{closed}");
                 }
             }
+        }
+        // A forced stop is said whatever the browser does now, and only then.
+        for connected in [false, true] {
+            let forced = BrowserNote {
+                forced_stop: true,
+                ..note(false, ClosedReason::Closed, false)
+            };
+            assert_eq!(record(connected, forced)["forcedStop"], true);
         }
     }
 
@@ -1434,6 +1452,7 @@ mod tests {
             restarting: false,
             closed: ClosedReason::Exited,
             restartable: true,
+            forced_stop: false,
         });
         let mut viewer = connect_client(server.port()).await;
         let opening = next_status(&mut viewer).await;

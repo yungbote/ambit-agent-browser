@@ -22,7 +22,7 @@ mod sign_in;
 #[path = "window_actions.rs"]
 mod window_actions;
 pub(crate) const OBSERVATION_REQUIRED: &str = window_actions::OBSERVATION_REQUIRED;
-use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
+use super::cdp::chrome::{prepare_nss_home, LaunchOptions, Stop};
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
     AttachToTargetParams, AttachToTargetResult, CdpEvent, DispatchMouseEventParams,
@@ -604,6 +604,8 @@ pub struct DaemonState {
     browser_restarting: bool,
     /// Why the view's last browser closed.
     browser_closed: ClosedReason,
+    /// How the view's browser last stopped (`DaemonState::stopped`).
+    browser_stop: Stop,
     /// The launch a person's `restart` repeats, kept when the browser closed
     /// without being asked to.
     restart_from: Option<sign_in::Relaunch>,
@@ -846,6 +848,7 @@ impl DaemonState {
             sign_in: None,
             browser_restarting: false,
             browser_closed: ClosedReason::Closed,
+            browser_stop: Stop::Quit,
             restart_from: None,
             appium: None,
             safari_driver: None,
@@ -1321,7 +1324,22 @@ impl DaemonState {
         BrowserNote {
             restarting: self.browser_restarting && !running,
             closed: self.browser_closed,
+            forced_stop: self.browser_stop == Stop::Forced,
             restartable: !running && self.restartable(),
+        }
+    }
+
+    /// Records how the view's browser stopped. A forced stop may have lost
+    /// what the browser wrote just before, such as a person's sign-in: the
+    /// status record says so (`forcedStop`) until a later stop is whole, and
+    /// the session log keeps it.
+    pub(crate) fn stopped(&mut self, stop: Stop) {
+        self.browser_stop = stop;
+        if stop == Stop::Forced {
+            session_log(
+                &self.session_id,
+                "the browser did not quit in time and was stopped; a recent sign-in may not be kept",
+            );
         }
     }
 
@@ -2623,13 +2641,13 @@ pub(crate) async fn close_current_browser(
             state.restart_from = Some(relaunch);
         }
     }
-    let close_error = if let Some(mut mgr) = state.browser.take() {
-        mgr.close().await.err()
-    } else {
-        None
-    };
+    if let Some(mut mgr) = state.browser.take() {
+        let stop = mgr.close().await;
+        state.stopped(stop);
+    }
     if let Some(sign_in) = state.sign_in.take() {
-        sign_in.quit().await;
+        let stop = sign_in.quit().await;
+        state.stopped(stop);
     }
 
     close_active_provider_session(state).await;
@@ -2639,10 +2657,6 @@ pub(crate) async fn close_current_browser(
     state.webmcp_enabled = false;
     forget_browser_session(state);
     state.update_stream_client().await;
-
-    if let Some(err) = close_error {
-        return Err(err);
-    }
     Ok(())
 }
 
