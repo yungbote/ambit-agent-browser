@@ -206,7 +206,7 @@ impl Site {
                     let (status, headers, body) = match path {
                         "/login" => (
                             "200 OK",
-                            "Content-Type: text/html\r\nSet-Cookie: ambit_sign_in=1; Path=/; Max-Age=86400; SameSite=Lax\r\n",
+                            "Content-Type: text/html\r\nSet-Cookie: ambit_sign_in=1; Path=/; Max-Age=86400; SameSite=Lax\r\nSet-Cookie: ambit_session=1; Path=/; SameSite=Lax\r\n",
                             "<!doctype html><title>Signed in</title><p>Cookie set</p>",
                         ),
                         "/second" => (
@@ -241,9 +241,14 @@ impl Site {
                                     && line.contains("ambit_recent_sign_in=1")
                             });
                             report.insert("recentSignIn".into(), signed_in.to_string());
+                            let signed_in_session = request.lines().any(|line| {
+                                line.to_ascii_lowercase().starts_with("cookie:")
+                                    && line.contains("ambit_recent_session=1")
+                            });
+                            report.insert("recentSession".into(), signed_in_session.to_string());
                             recorded.lock().unwrap().push(report);
                             ("204 No Content", if submitted {
-                                "Set-Cookie: ambit_recent_sign_in=1; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax\r\n"
+                                "Set-Cookie: ambit_recent_sign_in=1; Path=/; Max-Age=86400; HttpOnly; SameSite=Lax\r\nSet-Cookie: ambit_recent_session=1; Path=/; HttpOnly; SameSite=Lax\r\n"
                             } else { "" }, "")
                         }
                         "/" => ("200 OK", "Content-Type: text/html\r\n", FORM),
@@ -910,6 +915,7 @@ async fn e2e_sign_in_relaunches_without_automation_and_hands_back() {
     let load = site.wait_for_report("load", 1).await;
     assert_eq!(load["webdriver"], "false");
     assert!(load["cookie"].contains("ambit_sign_in=1"), "{load:?}");
+    assert!(load["cookie"].contains("ambit_session=1"), "{load:?}");
 
     // Every agent command is refused for the sign-in, before any effect.
     for agent in [
@@ -1013,6 +1019,10 @@ async fn e2e_sign_in_relaunches_without_automation_and_hands_back() {
         site.wait_for_report("signed_in", 0).await["recentSignIn"],
         "true"
     );
+    assert_eq!(
+        site.wait_for_report("signed_in", 0).await["recentSession"],
+        "true"
+    );
     viewer.never_failed_since(before);
 
     // Hand back: automation again, on the same profile, tabs and cookies.
@@ -1077,6 +1087,12 @@ async fn e2e_sign_in_relaunches_without_automation_and_hands_back() {
         site.wait_for_report("load", loads).await["recentSignIn"],
         "true"
     );
+    let restored = site.wait_for_report("load", loads).await;
+    assert!(
+        restored["cookie"].contains("ambit_session=1"),
+        "{restored:?}"
+    );
+    assert_eq!(restored["recentSession"], "true");
     let tabs = command(&json!({ "action": "tab_list" }), &mut state).await;
     let urls: Vec<String> = assert_success(&tabs)["tabs"]
         .as_array()
