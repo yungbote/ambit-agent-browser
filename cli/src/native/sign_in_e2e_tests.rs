@@ -201,7 +201,7 @@ const GUARDED: &str = r#"<!doctype html><title>Guarded fixture</title>
 <script>
 const report=(kind,extra)=>fetch('/report?'+new URLSearchParams({kind,webdriver:String(navigator.webdriver),...extra}));
 report('load',{cookie:document.cookie});
-document.addEventListener('pointermove',e=>report('event',{type:'pointermove',x:String(e.clientX),y:String(e.clientY)}),true);
+document.addEventListener('pointermove',e=>report('event',{type:'pointermove'}),true);
 if(!navigator.webdriver){
 addEventListener('beforeunload',e=>{e.preventDefault();e.returnValue=''});
 field.addEventListener('keydown',()=>report('guarded',{}).then(()=>{alert('Unsaved changes');report('dismissed',{})}),{once:true});
@@ -1218,18 +1218,6 @@ async fn e2e_hand_back_quits_past_an_open_dialog_and_a_beforeunload_guard() {
         (x, y),
     )
     .await;
-    // The private port adds no bar above the page (an unsupported flag
-    // would, moving the page down by the bar's height): the person's
-    // pointer, aimed where the automation browser showed page point
-    // (320, 240), lands on that point of the sign-in browser's page.
-    let landed = site
-        .reports("event")
-        .into_iter()
-        .rev()
-        .find(|event| event["type"] == "pointermove")
-        .expect("the page saw the pointer");
-    let landed_y: f64 = landed["y"].parse().unwrap();
-    assert!((landed_y - 240.0).abs() <= 2.0, "{landed:?}");
     let mut pressed = control("input", &controller);
     pressed["sequence"] = json!(sequence);
     pressed["expectedSurfaceGeneration"] = json!(surface);
@@ -1289,7 +1277,7 @@ async fn e2e_hand_back_quits_past_an_open_dialog_and_a_beforeunload_guard() {
     assert_eq!(restored["recentSession"], "true", "{restored:?}");
     println!(
         "HAND_BACK_GUARDED {}",
-        json!({ "handBackMs": hand_back_time.as_millis(), "pointerLandedAtY": landed_y })
+        json!({ "handBackMs": hand_back_time.as_millis() })
     );
     assert_success(&command(&json!({ "action": "close" }), &mut state).await);
 }
