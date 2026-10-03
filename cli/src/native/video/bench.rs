@@ -484,3 +484,44 @@ fn a_refinement_after_a_scroll() {
         std::fs::write(out, serde_json::to_vec_pretty(&results).unwrap()).unwrap();
     }
 }
+
+/// Export the production encoder's packets for a matched viewer comparison.
+#[test]
+#[ignore = "qualification fixture: AMBIT_NATIVE_FIXTURE_INPUT and AMBIT_NATIVE_FIXTURE_OUT"]
+fn export_native_viewer_fixture() {
+    use base64::Engine;
+    let input = std::path::PathBuf::from(std::env::var("AMBIT_NATIVE_FIXTURE_INPUT").unwrap());
+    let out = std::path::PathBuf::from(std::env::var("AMBIT_NATIVE_FIXTURE_OUT").unwrap());
+    std::fs::create_dir_all(&out).unwrap();
+    let paths = (0..30).map(|index| input.join(format!("frame-{index:03}.jpg"))).collect::<Vec<_>>();
+    let first = image::open(&paths[0]).unwrap().to_rgb8();
+    let (width, height) = (first.width(), first.height());
+    let coded = (1536, 2048);
+    let codec = VideoCodec::Av1Full;
+    let pictures = paths.iter().map(|path| {
+        let source = image::open(path).unwrap().to_rgb8();
+        let bgrx = source.pixels().flat_map(|pixel| [pixel[2], pixel[1], pixel[0], 0]).collect::<Vec<_>>();
+        let mut picture = Planar::new(Chroma::Full, coded.0, coded.1);
+        assert!(picture.convert(&bgrx, width as usize * 4, (width as usize, height as usize), (0, height as usize)));
+        picture
+    }).collect::<Vec<_>>();
+    let mut padded = image::RgbImage::new(coded.0, coded.1);
+    image::imageops::replace(&mut padded, &first, 0, 0);
+    let jpeg = std::fs::File::create(out.join("whole.jpg")).unwrap();
+    image::codecs::jpeg::JpegEncoder::new_with_quality(jpeg, 100).encode_image(&padded).unwrap();
+    let mut encoder = AomEncoder::new(codec, coded.0, coded.1, 4).unwrap();
+    let mut decoder = super::aom::tests::Decoder::new();
+    let mut units = Vec::new();
+    let rate: Option<u32> = None;
+    for index in 0..360 {
+        let unit = encoder.encode(&pictures[index % pictures.len()].picture(), EncodeRequest { key: index == 0, quantizer: 32, refine: false }).unwrap();
+        assert_eq!(unit.key, index == 0, "no repair or resize: the reference chain has one key");
+        let decoded = decoder.decode(&unit.data);
+        assert_eq!((decoded.width, decoded.height), coded);
+        assert_eq!((decoded.colour.primaries, decoded.colour.transfer, decoded.colour.matrix, decoded.colour.full_range), (1, 1, 1, true));
+        units.push(json!({"key":unit.key,"bytes":unit.data.len(),"data":base64::engine::general_purpose::STANDARD.encode(unit.data)}));
+    }
+    let bytes = units.iter().map(|unit| unit["bytes"].as_u64().unwrap()).collect::<Vec<_>>();
+    println!("NATIVE_FIXTURE {}", json!({"coded":coded,"sourceWindow":[width,height],"bitsPerSecond":rate,"unitBytes":bytes}));
+    std::fs::write(out.join("fixture.json"), serde_json::to_vec(&json!({"codec":"av1-444","codecString":encoder.codec_string(),"coded":{"width":coded.0,"height":coded.1},"sourceWindow":{"width":width,"height":height},"threads":4,"motionQuantizer":32,"bitsPerSecond":rate,"units":units})).unwrap()).unwrap();
+}
