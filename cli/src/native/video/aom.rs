@@ -581,12 +581,13 @@ impl AomEncoder {
         // for 1% more bytes. Speeds 9, 10 and 11 cost the same here.
         // Screen content is coded by the palette and the plain directional
         // predictors; searching the filter, smooth, Paeth, chroma-from-luma,
-        // angle-delta and diagonal predictors as well tripled the cost of
-        // every intra-coded block for no bytes. On the two rendered pages at
-        // the motion quantizer, without them a key unit took 147 ms instead
-        // of 401 for 1% more bytes, and a whole change of dense text 142 to
-        // 152 ms instead of 294 to 542 for the same bytes (unit 2 of
-        // ab-native-20261003, `a_whole_page_change`).
+        // angle-delta and diagonal predictors as well made a key unit two to
+        // three times as slow for no bytes: 326 instead of 762 ms on a page
+        // of text at 2048x2048, 341 instead of 922 at 2816x2048 (the drag's
+        // size class), and 159 instead of 239 ms on the rendered app page for
+        // 1% more bytes and 0.4 dB less at the motion quantizer. Pictures of
+        // motion, whole page changes included, cost the same either way
+        // (`a_key_unit_by_coded_size_and_intra_tools`, `a_whole_page_change`).
         for (id, value) in [
             (control::CPU_USED, MOTION_SPEED),
             (control::TUNE_CONTENT, CONTENT_SCREEN),
