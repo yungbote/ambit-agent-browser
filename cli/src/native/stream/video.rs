@@ -22,6 +22,8 @@ mod policy;
 #[cfg(target_os = "linux")]
 mod producer;
 #[cfg(target_os = "linux")]
+mod shown;
+#[cfg(target_os = "linux")]
 pub(crate) mod snapshot;
 pub(crate) mod stages;
 mod subscription;

@@ -30,6 +30,7 @@ use super::policy::{
     period, rate, Band, CodedSize, LinkRate, Pace, Quality, Refinement, RefinementCredit,
     RefinementSweep, EXACT_ROWS,
 };
+use super::shown::Shown;
 use super::stages::{self, Stages};
 use super::subscription::{Delivery, Subscriber, Unit};
 use crate::native::display::pictures::{PictureReply, PictureRequest};
@@ -90,6 +91,9 @@ struct Encoding {
     /// again, or stopping.
     changed: Condvar,
     motion_bytes: AtomicU32,
+    /// What its viewers show, while every one draws exact units. Only the
+    /// capture thread uses it.
+    shown: Mutex<Option<Shown>>,
 }
 
 struct Mailbox {
@@ -385,6 +389,7 @@ impl Encoding {
             }),
             changed: Condvar::new(),
             motion_bytes: AtomicU32::new(1),
+            shown: Mutex::new(None),
         }
     }
 
@@ -494,26 +499,24 @@ impl Encoding {
         }
     }
 
-    /// Where small damage leaves as an exact unit, with the coded size of the
-    /// picture under it: only while every viewer draws exact units, the held
-    /// picture is final and nothing else is pending, and the rows changed
-    /// since this encoding's last unit are at most `EXACT_ROWS` of an
-    /// unmoved window (a moved window changed every row).
-    fn exact(&self, mailbox: &Mailbox, capture: &Capture) -> Option<(Rect, (u32, u32))> {
+    /// The rows small damage may leave in as an exact unit, with the coded
+    /// size of the picture under it: only while every viewer draws exact
+    /// units, the held picture is final and nothing else is pending, and the
+    /// rows changed since this encoding's last unit are at most `EXACT_ROWS`
+    /// of an unmoved window (a moved window changed every row).
+    fn exact(&self, mailbox: &Mailbox, capture: &Capture) -> Option<(Band, (u32, u32))> {
         let coded = mailbox.settled?;
         if mailbox.job.is_some() || mailbox.key_requested || !self.exact_viewers() {
             return None;
         }
         let rows = mailbox.unsent?.within(capture.visible)?;
-        (rows.height <= EXACT_ROWS).then(|| {
-            let rect = Rect {
-                x: rows.x as i32,
-                y: rows.y as i32,
-                width: rows.width,
-                height: rows.height,
-            };
-            (rect, coded)
-        })
+        (rows.height <= EXACT_ROWS).then_some((
+            Band {
+                top: rows.y,
+                bottom: rows.y + rows.height,
+            },
+            coded,
+        ))
     }
 
     /// Whether this encoding has viewers and every one draws exact units.
@@ -601,14 +604,25 @@ impl Encoding {
         if !mailbox.behind {
             return;
         }
-        if let Some((rect, coded)) = self.exact(&mailbox, capture) {
-            mailbox.pace.took(capture.read, period);
-            mailbox.behind = false;
-            mailbox.unsent = None;
-            mailbox.exact_since_held = true;
+        if let Some((rows, coded)) = self.exact(&mailbox, capture) {
             drop(mailbox);
-            self.publish_exact(capture, reply, pixels, rect, coded);
-            return;
+            let stride = reply.stride as usize;
+            let change = lock(&self.shown)
+                .as_mut()
+                .and_then(|shown| shown.change(pixels, stride, capture.visible, rows));
+            mailbox = lock(&self.mailbox);
+            if let Some(change) = change {
+                mailbox.behind = false;
+                mailbox.unsent = None;
+                // Damage that changed nothing the viewer shows owes no unit.
+                if let Some(rect) = change {
+                    mailbox.pace.took(capture.read, period);
+                    mailbox.exact_since_held = true;
+                    drop(mailbox);
+                    self.publish_exact(capture, reply, pixels, rect, coded);
+                }
+                return;
+            }
         }
         let Some(mut buffer) = mailbox.free.pop() else {
             return;
@@ -622,7 +636,7 @@ impl Encoding {
         let coded = mailbox.coded.fit(window, capture.read);
         mailbox.pace.took(capture.read, period);
         mailbox.behind = false;
-        mailbox.unsent = None;
+        let unsent = mailbox.unsent.take();
         let changed = mailbox
             .changed
             .take()
@@ -631,6 +645,13 @@ impl Encoding {
         // the mailbox while the encoder keeps using it.
         let mut stale = std::mem::take(&mut mailbox.stale[buffer.id]);
         drop(mailbox);
+        let mut shown = lock(&self.shown);
+        if self.exact_viewers() {
+            Shown::picture(&mut shown, pixels, reply.stride as usize, capture.visible, unsent);
+        } else {
+            *shown = None;
+        }
+        drop(shown);
         let mut capture = capture.clone();
         #[cfg(test)]
         let converting = Instant::now();

@@ -711,8 +711,10 @@ async fn e2e_native_video_producer_proof() {
 }
 
 /// The production probe's page (`probe/measure.mjs`): each key echoes into a
-/// fixed box at the top left, and nothing else on the page moves.
-const TYPING_PAGE: &str = r#"<!doctype html><title>viewer probe</title><body style="margin:0;font:18px sans-serif"><div id=t style="position:fixed;left:24px;top:8px;width:520px;height:48px;font:34px monospace;background:#fff;border:2px solid #888;overflow:hidden;white-space:nowrap"></div><div id=l style="padding-top:270px"></div><script>for(let i=1;i<=600;i++){const p=document.createElement('p');p.style.margin='4px 24px';p.textContent='Line '+i+' the quick brown fox jumps over the lazy dog '+'abc'.repeat(i%7);l.append(p)}onkeydown=e=>{if(e.key.length==1)t.textContent+=e.key}</script></body>"#;
+/// fixed box at the top left, and nothing else on the page moves. The box
+/// holds a phase's 40 keys and starts its line again every 40 (`n` counts
+/// them), so every key changes what a viewer sees.
+const TYPING_PAGE: &str = r#"<!doctype html><title>viewer probe</title><body style="margin:0;font:18px sans-serif"><div id=t style="position:fixed;left:24px;top:8px;width:860px;height:48px;font:34px monospace;background:#fff;border:2px solid #888;overflow:hidden;white-space:nowrap"></div><div id=l style="padding-top:270px"></div><script>for(let i=1;i<=600;i++){const p=document.createElement('p');p.style.margin='4px 24px';p.textContent='Line '+i+' the quick brown fox jumps over the lazy dog '+'abc'.repeat(i%7);l.append(p)}let n=0;onkeydown=e=>{if(e.key.length==1){n++;t.textContent=(n%40==1?'':t.textContent)+e.key}}</script></body>"#;
 
 /// How keys follow each other.
 #[derive(Clone, Copy)]
@@ -1040,7 +1042,7 @@ async fn e2e_native_input_latency_stages() {
     .await;
     let typed_text = command(
         &mut state,
-        json!({"action":"evaluate","script":"document.getElementById('t').textContent.length"}),
+        json!({"action":"evaluate","script":"n"}),
     )
     .await["result"]
         .as_u64()

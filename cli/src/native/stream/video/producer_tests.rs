@@ -768,6 +768,24 @@ async fn small_damage_after_a_final_picture_leaves_exact_and_owes_no_refinement(
     viewer.assert_ordered();
 }
 
+/// Damage that changes nothing a viewer shows (text repainted out of view)
+/// leaves no unit at all; the next change that does is exact.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn damage_that_changes_nothing_shown_leaves_no_unit() {
+    let rig = rig();
+    let mut viewer = Viewer::new(rig.subscribe_exact());
+    viewer.motion().await;
+    viewer.refined().await;
+    let before = viewer.units.len();
+    rig.paint(100, 140, GREY);
+    viewer.settle().await;
+    assert_eq!(viewer.units.len(), before, "{:?}", viewer.units.last().map(|unit| unit.ts));
+    rig.paint(100, 140, RED);
+    let exact = viewer.unit().await;
+    assert!(exact.exact.is_some_and(|rect| (rect.y, rect.height) == (100, 40)));
+    viewer.assert_ordered();
+}
+
 /// The one rule that holds exact units and pictures together (contract
 /// browser-presentation-units): a viewer that applies units in sequence
 /// order, a picture replacing the window and an exact unit drawing its
