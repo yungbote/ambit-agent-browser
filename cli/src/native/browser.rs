@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{broadcast, Mutex};
 
 use super::cdp::chrome::{
-    auto_connect_cdp, launch_chrome, ChromeProcess, LaunchOptions, RetainedChromeProfile,
+    auto_connect_cdp, launch_chrome, ChromeProcess, LaunchOptions, RetainedChromeProfile, Stop,
 };
 use super::cdp::client::CdpClient;
 use super::cdp::discovery::discover_cdp_url;
@@ -704,14 +704,16 @@ impl BrowserProcess {
         }
     }
 
-    /// End an owned browser by `deadline`: Chrome quits through its own
-    /// endpoint (`ChromeProcess::quit`); Lightpanda keeps nothing to flush.
-    pub(crate) async fn quit(self, deadline: tokio::time::Instant) {
+    /// End an owned browser by `deadline` and say how it ended: Chrome quits
+    /// through its own endpoint (`ChromeProcess::quit`); Lightpanda keeps
+    /// nothing to flush, so stopping it loses nothing.
+    pub(crate) async fn quit(self, deadline: tokio::time::Instant) -> Stop {
         match self {
-            BrowserProcess::Chrome(process) => {
-                process.quit(deadline).await;
+            BrowserProcess::Chrome(process) => process.quit(deadline).await,
+            BrowserProcess::Lightpanda(mut process) => {
+                process.kill();
+                Stop::Quit
             }
-            BrowserProcess::Lightpanda(mut process) => process.kill(),
         }
     }
 
@@ -1842,18 +1844,19 @@ impl BrowserManager {
         Ok(())
     }
 
-    pub async fn close(&mut self) -> Result<(), String> {
+    pub async fn close(&mut self) -> Stop {
         self.close_within(Duration::from_secs(5)).await
     }
 
     /// Close gracefully within `timeout`, then kill what remains of an owned
-    /// browser. It is gone when this returns. An attached browser (--cdp,
-    /// --auto-connect) is the user's: it is only disconnected.
-    pub(crate) async fn close_within(&mut self, timeout: Duration) -> Result<(), String> {
-        if let Some(process) = self.browser_process.take() {
-            process.quit(tokio::time::Instant::now() + timeout).await;
+    /// browser, and say how it ended. It is gone when this returns. An
+    /// attached browser (--cdp, --auto-connect) is the user's: it is only
+    /// disconnected, which stops nothing.
+    pub(crate) async fn close_within(&mut self, timeout: Duration) -> Stop {
+        match self.browser_process.take() {
+            Some(process) => process.quit(tokio::time::Instant::now() + timeout).await,
+            None => Stop::Quit,
         }
-        Ok(())
     }
 
     pub fn has_pages(&self) -> bool {

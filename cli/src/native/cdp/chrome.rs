@@ -292,9 +292,9 @@ impl ChromeProcess {
     /// shutdown would, before recent writes reach the profile.
     ///
     /// What has not exited by `deadline` is killed with its process group.
-    /// Answers whether the browser exited on its own: only then is its
-    /// profile whole.
-    pub(crate) async fn quit(mut self, deadline: tokio::time::Instant) -> bool {
+    /// Answers how the browser ended: only a browser whose every process
+    /// exited on its own has a whole profile (`Stop`).
+    pub(crate) async fn quit(mut self, deadline: tokio::time::Instant) -> Stop {
         // The window's end is this owner's choice, not a display failure.
         #[cfg(target_os = "linux")]
         if let Some(display) = self.display_client() {
@@ -314,24 +314,49 @@ impl ChromeProcess {
         let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
         tokio::task::spawn_blocking(move || self.wait_or_kill(remaining))
             .await
-            .unwrap_or(false)
+            .unwrap_or(Stop::Forced)
     }
 
-    /// Wait up to `timeout` for the browser to exit, then kill what remains.
-    /// Answers whether it exited on its own. Blocking.
-    fn wait_or_kill(&mut self, timeout: Duration) -> bool {
+    /// Wait up to `timeout` for the browser and every process of its tree to
+    /// exit, then kill what remains. Chrome's main process can exit while
+    /// its helpers (the network service, which writes cookies, among them)
+    /// still finish, so the quit is whole only once the whole group is gone.
+    /// Blocking.
+    fn wait_or_kill(&mut self, timeout: Duration) -> Stop {
         self.discontinue_audio();
         let start = std::time::Instant::now();
         loop {
-            match self.child.try_wait() {
-                Ok(Some(_)) => return true,
-                Ok(None) if start.elapsed() < timeout => {
-                    std::thread::sleep(Duration::from_millis(50))
-                }
-                _ => break,
+            let exited = match self.child.try_wait() {
+                Ok(Some(_)) => true,
+                Ok(None) => false,
+                Err(_) => break,
+            };
+            if exited && !self.tree_runs() {
+                return Stop::Quit;
             }
+            if start.elapsed() >= timeout {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
         }
         self.kill();
+        Stop::Forced
+    }
+
+    /// Whether a process of this browser's group still runs. A zombie that
+    /// has exited but is not yet reaped by its new parent does not.
+    fn tree_runs(&self) -> bool {
+        #[cfg(unix)]
+        if let Some(pgid) = self.pgid {
+            // SAFETY: kill(2) with signal 0 only checks for the group.
+            if unsafe { libc::kill(-pgid, 0) } != 0 {
+                return false;
+            }
+            #[cfg(target_os = "linux")]
+            return group_runs(std::path::Path::new("/proc"), pgid);
+            #[cfg(not(target_os = "linux"))]
+            return true;
+        }
         false
     }
 
@@ -369,6 +394,46 @@ impl ChromeProcess {
             display_process: None,
         }
     }
+}
+
+/// How an owned browser ended.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Stop {
+    /// Every process of the browser exited on its own: its profile is whole.
+    Quit,
+    /// The browser, or a process of its tree, still ran at the deadline and
+    /// was killed: recent writes to its profile, such as a sign-in's cookies,
+    /// may be lost.
+    Forced,
+}
+
+/// Whether `proc` lists a live (not zombie) process in group `pgid`. A
+/// `stat` line is `pid (comm) state ppid pgrp …`; `comm` may hold spaces and
+/// parentheses, so the fields are read after its last `)`.
+#[cfg(target_os = "linux")]
+fn group_runs(proc: &Path, pgid: i32) -> bool {
+    let Ok(entries) = std::fs::read_dir(proc) else {
+        return true;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|b| b.is_ascii_digit())
+        })
+        .filter_map(|entry| std::fs::read_to_string(entry.path().join("stat")).ok())
+        .any(|stat| {
+            let mut fields = stat
+                .rsplit_once(')')
+                .map_or("", |(_, rest)| rest)
+                .split_whitespace();
+            let state = fields.next();
+            let group = fields.nth(1).and_then(|group| group.parse::<i32>().ok());
+            group == Some(pgid) && !matches!(state, Some("Z" | "X"))
+        })
 }
 
 impl Drop for ChromeProcess {
@@ -948,7 +1013,7 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
         }
     }
 
-    // The DevTools switch is chosen per launch attempt (`devtools_switch`).
+    // The DevTools switch is chosen per launch attempt (`launch_args`).
     let mut args = vec![
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
@@ -1153,23 +1218,96 @@ fn build_chrome_args(options: &LaunchOptions) -> Result<ChromeArgs, String> {
     })
 }
 
-/// The switch that opens a launch's DevTools endpoint. An automation launch
-/// lets Chrome choose the port. Any other launch names a free loopback port:
-/// Chrome reports automation to pages only for port 0, so a private endpoint
-/// leaves `navigator.webdriver` truthfully false.
-fn devtools_switch(options: &LaunchOptions) -> Result<String, String> {
-    let port = if options.automation {
-        0
-    } else {
-        // Chrome binds the port itself, so it is released first. A port taken
-        // in between leaves the launch without an endpoint, which readiness
-        // refuses; an endpoint is only ever read from this launch's own Chrome.
+/// The DevTools endpoint one launch attempt opens. An automation launch lets
+/// Chrome choose the port (`--remote-debugging-port=0`), which Chrome reports
+/// to pages as automation (`navigator.webdriver`), and publishes it. Any
+/// other launch names a free loopback port of its own, so `webdriver` stays
+/// truthfully false; its process owner alone uses it, only to quit the
+/// browser (`ChromeProcess::quit`). A Chrome DevTools pipe is no alternative:
+/// Chrome reports it to pages as automation too.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Devtools {
+    Automation,
+    Private(u16),
+}
+
+/// Chrome's stderr line naming the endpoint it opened.
+const DEVTOOLS_LISTENING: &str = "DevTools listening on ";
+/// Chrome's stderr line when its DevTools port cannot be bound.
+const DEVTOOLS_UNBOUND: &str = "Cannot start http server for devtools";
+
+impl Devtools {
+    fn for_launch(options: &LaunchOptions) -> Result<Self, String> {
+        if options.automation {
+            return Ok(Self::Automation);
+        }
+        // Chrome binds the port itself, so it is released first. Another
+        // process that takes it in between fails this launch (`endpoint`).
         std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .and_then(|listener| listener.local_addr())
-            .map_err(|e| format!("No loopback port is free for the browser: {e}"))?
-            .port()
-    };
-    Ok(format!("--remote-debugging-port={port}"))
+            .map(|address| Self::Private(address.port()))
+            .map_err(|e| format!("No loopback port is free for the browser: {e}"))
+    }
+
+    fn switch(self) -> String {
+        let port = match self {
+            Self::Automation => 0,
+            Self::Private(port) => port,
+        };
+        format!("--remote-debugging-port={port}")
+    }
+
+    /// The endpoint this launch's Chrome reports in what readiness observed,
+    /// or why it cannot have one. An automation endpoint is taken from
+    /// Chrome's stderr or its profile's `DevToolsActivePort`. A private one
+    /// only from this Chrome's own stderr, on loopback at exactly its port:
+    /// any process of the same user can write a file into the profile. When
+    /// another process holds the port on 127.0.0.1, Chrome listens on `[::1]`
+    /// instead, and says so; when it holds both, Chrome has no server.
+    fn endpoint(
+        self,
+        observed: Startup<'_>,
+        user_data_dir: &Path,
+    ) -> Option<Result<String, String>> {
+        let line = match (self, observed) {
+            (Self::Automation, Startup::Poll) => {
+                return read_devtools_active_port(user_data_dir)
+                    .map(|(port, path)| Ok(format!("ws://127.0.0.1:{port}{path}")))
+            }
+            (Self::Private(_), Startup::Poll) => return None,
+            (_, Startup::Stderr(line)) => line,
+        };
+        let Self::Private(port) = self else {
+            return line
+                .strip_prefix(DEVTOOLS_LISTENING)
+                .map(|url| Ok(url.trim().to_string()));
+        };
+        if line.contains(DEVTOOLS_UNBOUND) {
+            return Some(Err(format!(
+                "Another process took the browser's private DevTools port {port}"
+            )));
+        }
+        let url = line.strip_prefix(DEVTOOLS_LISTENING)?.trim();
+        let browser = ["127.0.0.1", "[::1]"]
+            .iter()
+            .find_map(|host| url.strip_prefix(&format!("ws://{host}:{port}/devtools/browser/")))
+            .filter(|id| !id.is_empty() && id.chars().all(|c| c.is_ascii_hexdigit() || c == '-'));
+        Some(match browser {
+            Some(_) => Ok(url.to_string()),
+            None => Err(format!(
+                "The browser opened DevTools at {url}, not at its private port {port}"
+            )),
+        })
+    }
+}
+
+/// One launch attempt's arguments: the managed flags with the attempt's own
+/// DevTools switch first, and the endpoint that switch opens.
+fn launch_args(options: &LaunchOptions) -> Result<(ChromeArgs, Devtools), String> {
+    let mut launch = build_chrome_args(options)?;
+    let devtools = Devtools::for_launch(options)?;
+    launch.args.insert(0, devtools.switch());
+    Ok((launch, devtools))
 }
 
 #[cfg(target_os = "linux")]
@@ -1376,7 +1514,12 @@ fn launch_chrome_blocking(
     let effective_options = resolved_options.as_ref().unwrap_or(options);
 
     // A browser without automation serves a person waiting for its window:
-    // its caller falls back promptly instead of retrying.
+    // its caller falls back promptly instead of retrying. A private DevTools
+    // port another process took on both loopback addresses (Chrome takes
+    // `[::1]` when only 127.0.0.1 is held) fails that launch at once with its
+    // own reason (`Devtools::endpoint`), and the person's next sign-in picks
+    // another port: a retry here would only add a second launch to a rare
+    // race the person already recovers from.
     let max_attempts = if effective_options.automation { 3 } else { 1 };
     let mut last_err = String::new();
 
@@ -1432,12 +1575,14 @@ fn try_launch_chrome(
     let browser_host = crate::native::workspace_role::current()
         .map_err(String::from)?
         .is_browser_host();
-    let ChromeArgs {
-        mut args,
-        user_data_dir,
-        temp_user_data_dir,
-    } = build_chrome_args(options)?;
-    args.insert(0, devtools_switch(options)?);
+    let (
+        ChromeArgs {
+            args,
+            user_data_dir,
+            temp_user_data_dir,
+        },
+        devtools,
+    ) = launch_args(options)?;
     let new_host_profile = browser_host && temp_user_data_dir.is_some();
     let temp_user_data_dir = options
         .retained_profile
@@ -1684,15 +1829,11 @@ fn try_launch_chrome(
         messages,
         |observed| {
             if endpoint.is_none() {
-                endpoint = match observed {
-                    Startup::Poll => read_devtools_active_port(&user_data_dir)
-                        .map(|(port, ws_path)| format!("ws://127.0.0.1:{port}{ws_path}")),
-                    Startup::Stderr(line) => line
-                        .strip_prefix("DevTools listening on ")
-                        .map(|url| url.trim().to_string()),
-                };
+                match devtools.endpoint(observed, &user_data_dir)? {
+                    Ok(url) => endpoint = Some(url),
+                    Err(error) => return Some(Err(error)),
+                }
             }
-            endpoint.as_ref()?;
             #[cfg(target_os = "linux")]
             if let Some((display, runtime)) = &window {
                 let display = display.as_ref().filter(|_| observed == Startup::Poll)?;
@@ -1700,7 +1841,7 @@ fn try_launch_chrome(
                 // runtime I/O; this thread is not an async context.
                 runtime.block_on(display.info()).ok()?.active_window()?;
             }
-            endpoint.clone()
+            endpoint.clone().map(Ok)
         },
     )?);
     Ok(process)
@@ -1720,8 +1861,9 @@ enum Startup<'a> {
 }
 
 /// Both readiness kinds share a deadline, a cancellation boundary and the
-/// stderr tail reported on failure. Bounded stderr batches keep a noisy
-/// browser from starving the cancellation check.
+/// stderr tail reported on failure. The probe answers once what it observed
+/// proves the browser ready, or proves it cannot become ready. Bounded stderr
+/// batches keep a noisy browser from starving the cancellation check.
 fn wait_for_startup<T>(
     child: &mut Child,
     stderr: &mpsc::Receiver<String>,
@@ -1729,7 +1871,7 @@ fn wait_for_startup<T>(
     canceled: &AtomicBool,
     require_sandbox: bool,
     (exited_message, timeout_message): (&str, &str),
-    mut ready: impl FnMut(Startup<'_>) -> Option<T>,
+    mut ready: impl FnMut(Startup<'_>) -> Option<Result<T, String>>,
 ) -> Result<T, String> {
     let poll_interval = Duration::from_millis(50);
     let mut stderr_lines = std::collections::VecDeque::with_capacity(64);
@@ -1738,14 +1880,14 @@ fn wait_for_startup<T>(
         if canceled.load(Ordering::Relaxed) {
             return Err("Chrome launch canceled".to_string());
         }
-        if let Some(value) = ready(Startup::Poll) {
-            return Ok(value);
+        if let Some(answer) = ready(Startup::Poll) {
+            return answer;
         }
         for _ in 0..64 {
             match stderr.try_recv() {
                 Ok(line) => {
-                    if let Some(value) = ready(Startup::Stderr(&line)) {
-                        return Ok(value);
+                    if let Some(answer) = ready(Startup::Stderr(&line)) {
+                        return answer;
                     }
                     if stderr_lines.len() == 64 {
                         stderr_lines.pop_front();
@@ -2650,9 +2792,17 @@ mod tests {
         }
     }
 
-    /// Sign-in mode changes only the DevTools switch: Chrome's own port 0 for
-    /// automation, a free loopback port for the private endpoint. Every other
-    /// managed flag stays byte-identical and in order.
+    /// The DevTools switches of an attempt's whole argument list.
+    fn devtools_ports(args: &[String]) -> Vec<&str> {
+        args.iter()
+            .filter_map(|arg| arg.strip_prefix("--remote-debugging-port="))
+            .collect()
+    }
+
+    /// Sign-in mode changes only the DevTools switch of the arguments a
+    /// launch attempt runs with: Chrome's own port 0 for automation, a free
+    /// loopback port for the private endpoint, exactly one either way, first.
+    /// Every other managed flag stays byte-identical and in order.
     #[test]
     fn sign_in_launch_differs_only_in_its_private_devtools_port() {
         // Both launches are built under one environment: the dev-shm
@@ -2671,14 +2821,14 @@ mod tests {
             restore_last_session: true,
             ..Default::default()
         };
-        let managed = build_chrome_args(&automation).unwrap().args;
+        let (managed, devtools) = launch_args(&automation).unwrap();
+        let managed = managed.args;
+        assert_eq!(devtools, Devtools::Automation);
+        assert_eq!(devtools_ports(&managed), ["0"], "{managed:?}");
+        assert_eq!(managed[0], "--remote-debugging-port=0");
         assert!(
-            !managed.iter().any(|arg| automation_switch(arg)),
+            !managed[1..].iter().any(|arg| automation_switch(arg)),
             "{managed:?}"
-        );
-        assert_eq!(
-            devtools_switch(&automation).unwrap(),
-            "--remote-debugging-port=0"
         );
         assert!(
             !managed.iter().any(|arg| arg == "--disable-sync"),
@@ -2686,17 +2836,18 @@ mod tests {
         );
         let sign_in = automation.clone().without_automation().unwrap();
         assert!(!sign_in.automation);
-        let args = build_chrome_args(&sign_in).unwrap().args;
-        assert_eq!(args, managed);
-        let port: u16 = devtools_switch(&sign_in)
-            .unwrap()
-            .strip_prefix("--remote-debugging-port=")
-            .and_then(|port| port.parse().ok())
-            .expect("a numbered DevTools port");
+        let (args, devtools) = launch_args(&sign_in).unwrap();
+        let args = args.args;
+        let Devtools::Private(port) = devtools else {
+            panic!("a sign-in launch opens a private endpoint: {devtools:?}");
+        };
         assert_ne!(
             port, 0,
             "Chrome reports port 0 to pages as automation; the private port is never 0"
         );
+        assert_eq!(devtools_ports(&args), [port.to_string()], "{args:?}");
+        assert_eq!(args[0], format!("--remote-debugging-port={port}"));
+        assert_eq!(args[1..], managed[1..]);
         for expected in [
             "--restore-last-session",
             "--proxy-server=http://proxy.internal:3128",
@@ -2920,7 +3071,10 @@ mod tests {
         );
         process.endpoint = Some(endpoint);
         let started = tokio::time::Instant::now();
-        assert!(process.quit(started + Duration::from_secs(5)).await);
+        assert_eq!(
+            process.quit(started + Duration::from_secs(5)).await,
+            Stop::Quit
+        );
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(*methods.lock().unwrap(), ["Browser.close"]);
     }
@@ -2936,7 +3090,10 @@ mod tests {
         let mut process = ChromeProcess::for_test(browser, LaunchOptions::default());
         process.endpoint = Some(endpoint);
         let started = tokio::time::Instant::now();
-        assert!(!process.quit(started + Duration::from_millis(300)).await);
+        assert_eq!(
+            process.quit(started + Duration::from_millis(300)).await,
+            Stop::Forced
+        );
         assert!(started.elapsed() >= Duration::from_millis(300));
         assert!(started.elapsed() < Duration::from_secs(2));
         assert_eq!(*methods.lock().unwrap(), ["Browser.close"]);
@@ -2959,10 +3116,88 @@ mod tests {
         let mut process = ChromeProcess::for_test(browser, LaunchOptions::default());
         process.endpoint = Some(endpoint);
         let started = tokio::time::Instant::now();
-        assert!(process.quit(started + Duration::from_secs(5)).await);
+        assert_eq!(
+            process.quit(started + Duration::from_secs(5)).await,
+            Stop::Quit
+        );
         assert!(started.elapsed() < Duration::from_secs(1));
         tokio::time::sleep(Duration::from_millis(100)).await;
         assert!(methods.lock().unwrap().is_empty());
+    }
+
+    /// A browser of its own process group, as a launch spawns it: a shell
+    /// running `script` as the group's leader.
+    #[cfg(target_os = "linux")]
+    fn grouped(script: &str) -> ChromeProcess {
+        use std::os::unix::process::CommandExt;
+        let mut command = Command::new("/bin/sh");
+        command.args(["-c", script]);
+        // SAFETY: setpgid is async-signal-safe between fork and exec.
+        unsafe {
+            command.pre_exec(|| {
+                libc::setpgid(0, 0);
+                Ok(())
+            });
+        }
+        let child = command.spawn().unwrap();
+        let mut process = ChromeProcess::for_test(child, LaunchOptions::default());
+        process.pgid = Some(process.child.id() as i32);
+        process
+    }
+
+    /// The quit is whole only once every process of the browser's tree has
+    /// exited: a helper that outlives the main process holds it until it
+    /// exits, and one still running at the deadline makes the quit forced,
+    /// killed with its group.
+    #[cfg(target_os = "linux")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn quit_waits_for_the_browsers_whole_process_group() {
+        let finishing = grouped("sleep 0.3 & exit 0");
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            finishing.quit(started + Duration::from_secs(5)).await,
+            Stop::Quit
+        );
+        assert!(started.elapsed() >= Duration::from_millis(250));
+        assert!(started.elapsed() < Duration::from_secs(2));
+
+        let lingering = grouped("sleep 30 & exit 0");
+        let pgid = lingering.pgid.unwrap();
+        let started = tokio::time::Instant::now();
+        assert_eq!(
+            lingering.quit(started + Duration::from_millis(300)).await,
+            Stop::Forced
+        );
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert!(
+            !group_runs(std::path::Path::new("/proc"), pgid),
+            "the group was killed"
+        );
+    }
+
+    /// A group runs while a member is not a zombie; `comm` can hold spaces
+    /// and parentheses.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_group_runs_while_a_member_has_not_exited() {
+        let proc =
+            std::env::temp_dir().join(format!("agent-browser-proc-{}", uuid::Uuid::new_v4()));
+        let stat = |pid: &str, line: &str| {
+            std::fs::create_dir_all(proc.join(pid)).unwrap();
+            std::fs::write(proc.join(pid).join("stat"), line).unwrap();
+        };
+        stat("10", "10 (chrome) S 1 10 10 0 -1");
+        stat("11", "11 (Network Service) S 1 10 10 0 -1");
+        stat("12", "12 (odd ) S 9 777) Z 1 10 10 0 -1");
+        stat("13", "13 (other) S 1 20 20 0 -1");
+        std::fs::create_dir_all(proc.join("self")).unwrap();
+        assert!(group_runs(&proc, 10));
+        assert!(group_runs(&proc, 20));
+        assert!(!group_runs(&proc, 777), "a comm is never read as fields");
+        std::fs::remove_dir_all(proc.join("10")).unwrap();
+        std::fs::remove_dir_all(proc.join("11")).unwrap();
+        assert!(!group_runs(&proc, 10), "only a zombie is left");
+        std::fs::remove_dir_all(&proc).unwrap();
     }
 
     /// Only an automation launch publishes its endpoint; a sign-in browser's
@@ -2982,6 +3217,81 @@ mod tests {
         );
         sign_in.endpoint = Some(endpoint.into());
         assert_eq!(sign_in.devtools_url(), None);
+    }
+
+    /// A private endpoint is only ever this Chrome's own report, on loopback
+    /// at exactly its port; a `DevToolsActivePort` file that another process
+    /// of the same user could write is never read for it, and a port another
+    /// process bound first is a DevTools failure at once, not a window that
+    /// never came. An automation endpoint is read as before.
+    #[test]
+    fn a_private_endpoint_is_only_this_chromes_report_at_its_own_port() {
+        let profile = std::env::temp_dir().join(format!(
+            "agent-browser-devtools-endpoint-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir(&profile).unwrap();
+        std::fs::write(
+            profile.join("DevToolsActivePort"),
+            "41873\n/devtools/browser/impostor",
+        )
+        .unwrap();
+        let private = Devtools::Private(41873);
+        let listening = |url: &str| format!("{DEVTOOLS_LISTENING}{url}");
+        let own = "ws://127.0.0.1:41873/devtools/browser/3f2a9c1e-77b0-4c2d-9e1f-0a1b2c3d4e5f";
+        assert_eq!(private.endpoint(Startup::Poll, &profile), None);
+        assert_eq!(
+            private.endpoint(Startup::Stderr(&listening(own)), &profile),
+            Some(Ok(own.to_string()))
+        );
+        // Measured on Chrome 154: with 127.0.0.1 held by another process,
+        // Chrome binds the same port on the IPv6 loopback.
+        let v6 = "ws://[::1]:41873/devtools/browser/276bd9ef-dd90-4186-8948-efb7c91e0adf";
+        assert_eq!(
+            private.endpoint(Startup::Stderr(&listening(v6)), &profile),
+            Some(Ok(v6.to_string()))
+        );
+        for other in [
+            "ws://127.0.0.1:41874/devtools/browser/3f2a9c1e",
+            "ws://0.0.0.0:41873/devtools/browser/3f2a9c1e",
+            "ws://127.0.0.1:41873/devtools/page/3f2a9c1e",
+            "ws://127.0.0.1:41873/devtools/browser/",
+            "ws://127.0.0.1:41873/devtools/browser/x/../../y",
+        ] {
+            assert!(
+                matches!(
+                    private.endpoint(Startup::Stderr(&listening(other)), &profile),
+                    Some(Err(_))
+                ),
+                "{other}"
+            );
+        }
+        assert_eq!(
+            private.endpoint(
+                Startup::Stderr("[1:2:ERROR:http_server.cc] something"),
+                &profile
+            ),
+            None
+        );
+        // Measured on Chrome 154 with both loopbacks' port held elsewhere.
+        let unbound = format!(
+            "[3387717:3387916:1003/113107.531499:ERROR:content/browser/devtools/devtools_http_handler.cc:311] {DEVTOOLS_UNBOUND}."
+        );
+        let refused = private
+            .endpoint(Startup::Stderr(&unbound), &profile)
+            .unwrap()
+            .unwrap_err();
+        assert!(refused.contains("private DevTools port 41873"), "{refused}");
+
+        assert_eq!(
+            Devtools::Automation.endpoint(Startup::Poll, &profile),
+            Some(Ok("ws://127.0.0.1:41873/devtools/browser/impostor".into()))
+        );
+        assert_eq!(
+            Devtools::Automation.endpoint(Startup::Stderr(&listening(own)), &profile),
+            Some(Ok(own.to_string()))
+        );
+        std::fs::remove_dir_all(profile).unwrap();
     }
 
     /// The readiness loop both launch kinds share returns what its probe
@@ -3010,10 +3320,25 @@ mod tests {
             messages,
             |observed| {
                 polls += usize::from(observed == Startup::Poll);
-                (polls == 3).then_some("window")
+                (polls == 3).then_some(Ok("window"))
             },
         );
         assert_eq!(ready.unwrap(), "window");
+
+        // A probe that proves the browser cannot become ready ends the wait
+        // at once with its reason, not at the deadline.
+        let started = std::time::Instant::now();
+        let refused = wait_for_startup(
+            &mut alive,
+            &stderr,
+            started + Duration::from_secs(5),
+            &canceled,
+            false,
+            messages,
+            |_| Some(Err::<(), _>("the port was taken".to_string())),
+        );
+        assert_eq!(refused.unwrap_err(), "the port was taken");
+        assert!(started.elapsed() < Duration::from_secs(1));
 
         let mut exited = spawn_noop_child();
         lines
@@ -3027,7 +3352,7 @@ mod tests {
             &canceled,
             true,
             messages,
-            |_| None::<()>,
+            |_| None::<Result<(), String>>,
         )
         .unwrap_err();
         assert!(error.starts_with(messages.0), "{error}");
@@ -3042,7 +3367,7 @@ mod tests {
             &canceled,
             false,
             messages,
-            |_| None::<()>,
+            |_| None::<Result<(), String>>,
         )
         .unwrap_err();
         assert!(error.starts_with(messages.1), "{error}");

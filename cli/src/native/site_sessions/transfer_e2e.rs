@@ -296,7 +296,7 @@ async fn e2e_site_state_transfer_large_unicode_digest_and_current_lifecycle() {
     storage::clear_site(&client, "http://127.0.0.1", &[origin])
         .await
         .unwrap();
-    browser.close().await.unwrap();
+    browser.close().await;
     server.abort();
     let _ = server.await;
     eprintln!(
@@ -442,7 +442,7 @@ async fn e2e_site_state_transfer_cancelled_waiter_settles_real_partial_import() 
     );
     browser.navigate(&origin, WaitUntil::Load).await.unwrap();
     let after=client.send_command("Runtime.evaluate",Some(json!({"expression":"(async()=>({storage:localStorage.getItem('partial-import'),databases:(await indexedDB.databases()).map(database=>database.name)}))()","awaitPromise":true,"returnByValue":true})),Some(browser.active_session_id().unwrap())).await.unwrap();
-    browser.close().await.unwrap();
+    browser.close().await;
     server.abort();
     let _ = server.await;
     assert_eq!(after["result"]["value"]["storage"], Value::Null);
@@ -527,7 +527,7 @@ async fn e2e_site_state_first_capture_includes_existing_document_without_saved_u
     let captured =
         SiteState::read_streamed(serde_json::from_slice(&body).unwrap(), "http://127.0.0.1")
             .unwrap();
-    browser.close().await.unwrap();
+    browser.close().await;
     server.abort();
     let _ = server.await;
     assert_eq!(export["useId"], Value::Null);
@@ -706,7 +706,7 @@ async fn e2e_site_state_revocation_retires_cached_frames_and_preserves_unrelated
         Value::Null,
         "readonly fresh frame cannot recover prior partitioned storage"
     );
-    browser.close().await.unwrap();
+    browser.close().await;
     server.abort();
     let _ = server.await;
     eprintln!(
@@ -788,7 +788,7 @@ async fn e2e_site_state_unknown_adopted_history_refuses_before_destructive_clean
         .iter()
         .any(|cookie| cookie["name"] == "unknown_history"));
     adopted.disconnect();
-    browser.close().await.unwrap();
+    browser.close().await;
     eprintln!(
         "unknown_history_receipt={}",
         json!({"refusedBeforeMutation":true,"historyExact":true,"cookiePreserved":true})
@@ -858,7 +858,7 @@ async fn e2e_site_state_partition_inventory_after_actual_native_process_restart(
         .unwrap()
         .path()
         .to_owned();
-    browser.close().await.unwrap();
+    browser.close().await;
     let output=tokio::process::Command::new(std::env::current_exe().unwrap()).args(["--exact","native::site_sessions::custody::transfer::tests::e2e_site_state_partition_restart_child","--ignored","--nocapture","--test-threads=1"]).env("AMBIT_NATIVE_RESTART_PROFILE",path).env("AMBIT_NATIVE_RESTART_PORT",port.to_string()).output().await.unwrap();
     eprintln!("{}", String::from_utf8_lossy(&output.stderr));
     assert!(
@@ -926,7 +926,7 @@ async fn e2e_site_state_partition_restart_child() {
     );
     let own=client.send_command("Runtime.evaluate",Some(json!({"expression":"localStorage.getItem('B-own')==='nosecret-B-own' && document.cookie.includes('B_own=nosecret-B-cookie')","returnByValue":true})),Some(&session)).await.unwrap();
     assert_eq!(own["result"]["value"], true);
-    browser.close().await.unwrap();
+    browser.close().await;
     eprintln!(
         "native_restart_partition_receipt={}",
         json!({"actualIndependentNativeProcess":true,"persistedAPartitionProven":true,"unknownInventoryRefused":true,"historyExact":true,"ADataUnchangedAfterRefusal":true,"BownDataExact":true})
@@ -952,7 +952,7 @@ async fn e2e_site_state_cleanup_failure_fences_actual_reconnect_and_retained_rel
     let relaunch = browser.relaunch_options().unwrap();
     let retained_clone = relaunch.clone();
     browser.client.send_command("Storage.setCookies",Some(json!({"cookies":[{"name":"cleanup_fixture","value":"nosecret-persisted-cookie","domain":"127.0.0.1","path":"/","expires":1900000000}]})),None).await.unwrap();
-    browser.close().await.unwrap();
+    browser.close().await;
     let mut browser = crate::native::browser::BrowserManager::launch(relaunch.clone(), None)
         .await
         .unwrap();
@@ -1089,7 +1089,7 @@ async fn e2e_site_state_cleanup_failure_fences_actual_reconnect_and_retained_rel
         .iter()
         .any(|cookie| cookie["name"] == "cleanup_fixture"));
     reconnected.disconnect();
-    browser.close().await.unwrap();
+    browser.close().await;
     let mut reopened = crate::native::browser::BrowserManager::launch(relaunch, None)
         .await
         .expect("retained relaunch succeeds only after actual owner cleanup");
@@ -1103,7 +1103,7 @@ async fn e2e_site_state_cleanup_failure_fences_actual_reconnect_and_retained_rel
         .unwrap()
         .iter()
         .any(|cookie| cookie["name"] == "cleanup_fixture"));
-    reopened.close().await.unwrap();
+    reopened.close().await;
     eprintln!(
         "profile_cleanup_receipt={}",
         json!({"persistedCookieRelaunchBaseline":true,"actualClearFailure":true,"heldReceiptRetained":true,"freshConnectionDenied":true,"retainedCloneRelaunchDenied":true,"cookieSurvivedTargetRetirement":true,"existingOwnerProvedClear":true,"actualRetainedRelaunchAfterProof":true,"cookieAbsentAfterRelaunch":true})
@@ -1279,7 +1279,7 @@ async fn e2e_site_state_transfer_backend_native_consumer() {
     storage::clear_site(&client, "http://127.0.0.1", &[origin])
         .await
         .unwrap();
-    browser.close().await.unwrap();
+    browser.close().await;
     server.abort();
     let _ = server.await;
     assert!(
@@ -1656,7 +1656,7 @@ async fn worker_retirement_case(fault: Option<&str>) {
         );
         let b_data = client.send_command("Runtime.evaluate",Some(json!({"expression":"localStorage.getItem('B-own')==='nosecret-B-own'&&document.cookie.includes('B_own=nosecret-B-cookie')","returnByValue":true})),Some(&b_page)).await.unwrap();
         assert_eq!(b_data["result"]["value"], true);
-        browser.close().await.unwrap();
+        browser.close().await;
         resume.abort();
         let _ = resume.await;
         server.abort();
@@ -1703,7 +1703,7 @@ async fn worker_retirement_case(fault: Option<&str>) {
     assert_eq!(retired_history["entries"].as_array().unwrap().len(), 1);
     assert_eq!(retired_history["entries"][0]["url"], "about:blank");
     let relaunch = browser.relaunch_options().unwrap();
-    browser.close().await.unwrap();
+    browser.close().await;
     resume.abort();
     let _ = resume.await;
     let mut reopened = crate::native::browser::BrowserManager::launch(relaunch, None)
@@ -1728,7 +1728,7 @@ async fn worker_retirement_case(fault: Option<&str>) {
     let a_persisted = reopened.client.send_command("Runtime.evaluate",Some(json!({"expression":"(async()=>({registrations:(await navigator.serviceWorker.getRegistrations()).map(r=>r.scope),databases:(await indexedDB.databases()).map(db=>db.name)}))()","awaitPromise":true,"returnByValue":true})),Some(reopened.active_session_id().unwrap())).await.unwrap();
     assert_eq!(a_persisted["result"]["value"]["registrations"], json!([]));
     assert_eq!(a_persisted["result"]["value"]["databases"], json!([]));
-    reopened.close().await.unwrap();
+    reopened.close().await;
     resume.abort();
     let _ = resume.await;
     eprintln!(

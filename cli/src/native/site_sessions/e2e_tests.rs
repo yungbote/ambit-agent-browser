@@ -66,7 +66,7 @@ async fn e2e_packaged_cft_browser_has_active_sandbox_without_disabled_flags() {
             }
         }
     }
-    browser.close().await.unwrap();
+    browser.close().await;
     eprintln!(
         "packaged_sandbox_receipt={}",
         json!({"status":status,"layers":layers,"renderers":renderers,"disabledFlags":disabled_flags})
@@ -314,7 +314,7 @@ async fn e2e_site_state_roundtrips_native_cookie_storage_and_revocation() {
         .unwrap()
         .values()
         .all(|value| value == "[redacted credential]"));
-    first.close().await.unwrap();
+    first.close().await;
     let mut second = browser().await;
     storage::import(&second.client, &captured).await.unwrap();
     second.navigate(&origin, WaitUntil::Load).await.unwrap();
@@ -343,7 +343,7 @@ async fn e2e_site_state_roundtrips_native_cookie_storage_and_revocation() {
         .unwrap();
     assert!(foreign.cookies.is_empty());
     generator_proof(&second, &origin).await;
-    second.close().await.unwrap();
+    second.close().await;
     server.abort();
     let _ = server.await;
 }
@@ -1118,10 +1118,9 @@ async fn e2e_site_state_capacity_retains_valid_data_above_legacy_wire_bound() {
     )
     .await
     .unwrap();
-    let closed = owned.close().await;
+    owned.close().await;
     server.abort();
     let _ = server.await;
-    assert!(closed.is_ok());
     assert_eq!(
         cleared.pointer("/result/value"),
         Some(&json!(0)),
@@ -1250,10 +1249,9 @@ async fn e2e_site_state_capacity_cancel_closes_its_private_document() {
     )
     .await
     .unwrap();
-    let closed = owned.close().await;
+    owned.close().await;
     server.abort();
     let _ = server.await;
-    assert!(closed.is_ok());
     assert_eq!(
         database, true,
         "cancellation neither corrupts the site nor retains a storage transaction"
@@ -1331,7 +1329,7 @@ async fn e2e_site_state_clear_does_not_repopulate_from_retired_document() {
     storage::clear_site(&owned.client, "http://127.0.0.1", &[origin])
         .await
         .unwrap();
-    owned.close().await.unwrap();
+    owned.close().await;
     server.abort();
     let _ = server.await;
     assert_eq!(
@@ -1537,7 +1535,7 @@ async fn e2e_site_state_document_retirement_history_spike() {
         )
         .await
         .unwrap();
-        owned.close().await.unwrap();
+        owned.close().await;
     }
     server.abort();
     let _ = server.await;

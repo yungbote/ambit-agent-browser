@@ -720,5 +720,5 @@ async fn e2e_projection_matches_legacy_snapshot_and_current_refs() {
             }
         }
     }
-    browser.close().await.unwrap();
+    browser.close().await;
 }

@@ -22,7 +22,7 @@ mod sign_in;
 #[path = "window_actions.rs"]
 mod window_actions;
 pub(crate) const OBSERVATION_REQUIRED: &str = window_actions::OBSERVATION_REQUIRED;
-use super::cdp::chrome::{prepare_nss_home, LaunchOptions};
+use super::cdp::chrome::{prepare_nss_home, LaunchOptions, Stop};
 use super::cdp::client::CdpClient;
 use super::cdp::types::{
     AttachToTargetParams, AttachToTargetResult, CdpEvent, DispatchMouseEventParams,
@@ -1325,6 +1325,18 @@ impl DaemonState {
         }
     }
 
+    /// Records how one of the view's browsers stopped. A forced stop may have
+    /// lost what that browser wrote just before, such as a person's sign-in:
+    /// the session log keeps it whatever the debug setting.
+    pub(crate) fn stopped(&self, stop: Stop) {
+        if stop == Stop::Forced {
+            session_log(
+                &self.session_id,
+                "the browser did not quit in time and was stopped; a recent sign-in may not be kept",
+            );
+        }
+    }
+
     /// Whether a person's `restart` can relaunch the closed browser: it
     /// closed without being asked to, and its launch is kept.
     pub(crate) fn restartable(&self) -> bool {
@@ -2623,13 +2635,13 @@ pub(crate) async fn close_current_browser(
             state.restart_from = Some(relaunch);
         }
     }
-    let close_error = if let Some(mut mgr) = state.browser.take() {
-        mgr.close().await.err()
-    } else {
-        None
-    };
+    if let Some(mut mgr) = state.browser.take() {
+        let stop = mgr.close().await;
+        state.stopped(stop);
+    }
     if let Some(sign_in) = state.sign_in.take() {
-        sign_in.quit().await;
+        let stop = sign_in.quit().await;
+        state.stopped(stop);
     }
 
     close_active_provider_session(state).await;
@@ -2639,10 +2651,6 @@ pub(crate) async fn close_current_browser(
     state.webmcp_enabled = false;
     forget_browser_session(state);
     state.update_stream_client().await;
-
-    if let Some(err) = close_error {
-        return Err(err);
-    }
     Ok(())
 }
 
