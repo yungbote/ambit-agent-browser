@@ -1042,6 +1042,7 @@ async fn e2e_native_input_latency_stages() {
     // A dock drag: 300 CSS px out and back, one size a frame, three times.
     rest(&mut received, &mut all).await;
     super::video::stages::logged::take();
+    super::video::stages::logged::layouts();
     let dragged_from = monotonic_us();
     let mut steps = Vec::new();
     for pass in 0..6 {
@@ -1060,6 +1061,7 @@ async fn e2e_native_input_latency_stages() {
     let released = monotonic_us();
     let drag = gather(&mut received, Duration::from_millis(1500)).await;
     let lines = super::video::stages::logged::take();
+    let layouts = super::video::stages::logged::layouts();
     let units: Vec<(&Value, u64)> = drag
         .iter()
         .filter_map(|seen| match seen {
@@ -1108,10 +1110,50 @@ async fn e2e_native_input_latency_stages() {
     let final_size = units
         .iter()
         .find(|(header, at)| *at > released && header["visible"]["width"] == 1840);
+    // Each layout the drag reached the display with (asked, answered,
+    // width): how long it waited for the layout loop after its presentation,
+    // how long the helper took to answer it (it first lets the browser paint
+    // the layout before it), and when a picture read the browser's paint of
+    // it, if one did before the next layout began.
+    let laid_out: Vec<(u64, u64, u64)> = layouts
+        .iter()
+        .map(|line| {
+            let field = |name: &str| line[name].as_u64().unwrap();
+            (field("asked"), field("answered"), field("width"))
+        })
+        .filter(|(asked, _, _)| (dragged_from..released).contains(asked))
+        .collect();
+    let queued: Vec<f64> = laid_out
+        .iter()
+        .filter_map(|(asked, _, width)| {
+            steps
+                .iter()
+                .rev()
+                .find(|(sent, presented)| presented == width && sent <= asked)
+                .map(|(sent, _)| ms(asked - sent))
+        })
+        .collect();
+    let read_after_layout: Vec<f64> = laid_out
+        .iter()
+        .enumerate()
+        .filter_map(|(index, (_, answered, width))| {
+            let until = laid_out.get(index + 1).map_or(u64::MAX, |next| next.0);
+            units
+                .iter()
+                .map(|(header, _)| (header["ts"].as_u64().unwrap(), header))
+                .find(|(ts, header)| {
+                    header["visible"]["width"].as_u64() == Some(*width)
+                        && (*answered..until).contains(ts)
+                })
+                .map(|(ts, _)| ms(ts - answered))
+        })
+        .collect();
     phases.insert(
         "drag".into(),
         json!({
             "presentations": steps.len(),
+            "layouts": laid_out.len(),
+            "layoutsShown": read_after_layout.len(),
             "pictures": during.len(),
             "picturesPerSecond": during.len() as f64 / ((released - dragged_from) as f64 / 1e6),
             "keyUnits": units.iter().filter(|(header, _)| header["key"] == true).count(),
@@ -1120,6 +1162,9 @@ async fn e2e_native_input_latency_stages() {
             "presentationToPictureMs": stats(&shown_after),
             "releaseToFinalSizeMs": final_size.map(|(_, at)| ms(at - released)),
             "stagesMs": {
+                "presentationToLayout": stats(&queued),
+                "layout": stats(&laid_out.iter().map(|(asked, answered, _)| ms(answered - asked)).collect::<Vec<_>>()),
+                "layoutToRead": stats(&read_after_layout),
                 "helperWait": stats(&lines.iter().filter(|line| (dragged_from..released).contains(&line["read"].as_u64().unwrap())).map(|line| line["waitedUs"].as_f64().unwrap() / 1000.0).collect::<Vec<_>>()),
                 "helperReply": drag_stage("read", "received"),
                 "convert": drag_stage("received", "converted"),

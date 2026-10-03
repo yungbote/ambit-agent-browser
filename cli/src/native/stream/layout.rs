@@ -199,6 +199,7 @@ async fn follow_presenter(
     controlled: bool,
     viewport: &Viewport,
 ) {
+    let asked = super::video::stages::enabled().then(super::monotonic_us);
     let Ok(info) = display.info().await else {
         return;
     };
@@ -218,6 +219,9 @@ async fn follow_presenter(
     )
     .await
     .ok();
+    if let (Some(asked), Some(applied)) = (asked, applied.as_ref()) {
+        super::video::stages::laid_out(applied.window, asked, super::monotonic_us());
+    }
     if let Some(applied) = applied.as_ref() {
         viewport
             .set(

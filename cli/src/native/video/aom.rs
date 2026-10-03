@@ -892,10 +892,8 @@ impl VideoEncoder for AomEncoder {
                 request.quantizer
             )));
         }
-        if request.key {
-            self.region = None;
-        }
-        let region = self.region;
+        // A region confines only the unit it was set for; a key is whole.
+        let region = self.region.take().filter(|_| !request.key);
         let regional = region.is_some();
         if let Some(region) = region {
             self.prepare_region(picture, region)?;

@@ -227,11 +227,11 @@ pub(crate) trait VideoEncoder: Send {
     fn coded(&self) -> (u32, u32);
     /// A path's explicit rate budget; absence preserves fixed-quality encoding.
     fn set_rate(&mut self, rate: Option<EncoderRate>) -> Result<(), VideoError>;
-    /// Confine the dependent units that follow to `region` (none: the whole
-    /// picture; a key unit is always whole) and return the actual
-    /// codec-aligned region they update; blocks outside it keep their
-    /// reference pixels. Callers reason about this region, not an assumed
-    /// block size.
+    /// Confine the next dependent unit to `region` (none: the whole picture;
+    /// a key unit is always whole) and return the actual codec-aligned
+    /// region it updates; blocks outside it keep their reference pixels. A
+    /// unit with no region set before it codes the whole picture. Callers
+    /// reason about this region, not an assumed block size.
     fn set_region(
         &mut self,
         region: Option<EncoderRegion>,
